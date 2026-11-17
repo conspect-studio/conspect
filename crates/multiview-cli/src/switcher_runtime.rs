@@ -117,6 +117,25 @@ pub fn keyer_demand_items(keyers: &[DownstreamKeyerConfig]) -> Vec<SetItem> {
     items
 }
 
+/// The `keyer` demand items of the M/E's upstream keyers (ADR-0113 §4, K3):
+/// one lease per fill and key, labelled with the keyer object id
+/// (`<me>/<id>`).
+#[must_use]
+pub fn usk_demand_items(me: &MixEffectsConfig) -> Vec<SetItem> {
+    let mut items = Vec::with_capacity(me.keyers.len().saturating_mul(2));
+    for usk in &me.keyers {
+        let label: Arc<str> = Arc::from(format!("{}/{}", me.id, usk.id).as_str());
+        for source in std::iter::once(&usk.fill).chain(usk.key.as_ref()) {
+            items.push(SetItem {
+                id: Arc::from(source.as_str()),
+                label: Arc::clone(&label),
+                size: None,
+            });
+        }
+    }
+    items
+}
+
 /// Resolve the declared downstream keyers against the run's stores and
 /// admit them against the budget (ADR-0113 §9, reserved at definition).
 ///
@@ -126,6 +145,7 @@ pub fn keyer_demand_items(keyers: &[DownstreamKeyerConfig]) -> Vec<SetItem> {
 /// never silently dropped.
 pub fn admit_keyers<S: std::hash::BuildHasher>(
     keyers: &[DownstreamKeyerConfig],
+    me: Option<&MixEffectsConfig>,
     stores: &std::collections::HashMap<
         String,
         Arc<multiview_framestore::TileStore<multiview_compositor::pipeline::Nv12Image>>,
@@ -134,10 +154,23 @@ pub fn admit_keyers<S: std::hash::BuildHasher>(
     canvas: (u32, u32),
     budget: f32,
 ) -> Result<keyer::KeyerRuntime, String> {
-    let defs = keyers
+    let mut defs = keyers
         .iter()
         .map(|dsk| keyer::KeyerDef::from_config(dsk, stores, canvas.0, canvas.1))
         .collect::<Result<Vec<_>, _>>()?;
+    // K3: the M/E's upstream keyers, in declared order (key index 1..).
+    if let Some(me) = me {
+        for usk in &me.keyers {
+            defs.push(keyer::KeyerDef::from_usk(
+                usk,
+                &me.id,
+                &me.program,
+                stores,
+                canvas.0,
+                canvas.1,
+            )?);
+        }
+    }
     keyer::admit(defs, canvas.0, canvas.1, budget)
 }
 
@@ -189,6 +222,7 @@ pub fn attach_first_slice(
     // first one at run time (an empty runtime is a no-op per tick).
     let runtime = admit_keyers(
         pipeline.switcher_keyers(),
+        Some(&me),
         &pipeline.preview_stores(),
         pipeline.canvas_size(),
         pipeline.keyer_budget(),

@@ -2413,6 +2413,10 @@ pub struct Pipeline {
     /// ([`crate::control::command_drain_with_seams`]) can address every declared
     /// channel. Empty when no media players are configured.
     player_mailboxes: std::collections::HashMap<String, Arc<crate::player::TransportMailbox>>,
+    /// The media-player channels this run actually booted (a real store fed
+    /// by a player loop). A declared player that failed boot is absent: an
+    /// alias of it can never show a picture (review ship-1111 #4).
+    booted_players: Arc<std::collections::BTreeSet<String>>,
     /// The shared WHIP publisher rendezvous (ADR-T014): the control plane's
     /// `WhipProvider` writes a negotiated publisher into it and each webrtc
     /// source's `drive_webrtc` loop reads. Exposed to the run wiring via
@@ -3405,6 +3409,13 @@ impl Pipeline {
             player_state,
         );
         let player_mailboxes = media_player_boot.mailboxes;
+        // Players with a channel (a store) in this run: an alias of any other
+        // player can never show a picture, and its status says so.
+        let booted_players: std::collections::BTreeSet<String> = media_player_boot
+            .stores
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
         for (id, store) in media_player_boot.stores {
             stores.insert(id, store);
         }
@@ -3721,8 +3732,10 @@ impl Pipeline {
 
         // Every configured source is catalogued, demanded or not; the stores of
         // booted sources are shared so a later lease reuses them.
-        // A `media_player` source is an alias of a player channel the player
-        // boot owns: demand never starts or stops it (no catalogue entry).
+        // A `media_player` source is catalogued as an alias of its player's
+        // store (ADR-M012): demand reports and leases it like any source (its
+        // standing pin is its consumer), but never starts, stops or clears a
+        // producer — the player boot owns the channel.
         let catalogue = crate::source_rails::catalogue(
             config.sources.iter().filter(|source| {
                 !matches!(
@@ -3732,6 +3745,21 @@ impl Pipeline {
             }),
             &stores,
         );
+        for source in &config.sources {
+            if let SourceKind::MediaPlayer { player } = &source.kind {
+                let store = stores
+                    .get(&source.id)
+                    .map_or_else(|| crate::source_rails::empty_store(&source.id), Arc::clone);
+                let unavailable = (!booted_players.contains(player))
+                    .then(|| crate::source_rails::no_channel_reason(player));
+                crate::source_rails::catalogue_alias(
+                    &catalogue,
+                    source,
+                    &store,
+                    unavailable.as_deref(),
+                );
+            }
+        }
         let demand_config = crate::source_demand::demand_config(config);
         let boot_pins: Vec<(String, Vec<crate::source_demand::StandingPin>)> = config
             .sources
@@ -3780,6 +3808,7 @@ impl Pipeline {
             live_island: Arc::new(multiview_framestore::SwapCell::empty()),
             ingest_plans,
             player_mailboxes,
+            booted_players: Arc::new(booted_players),
             #[cfg(feature = "webrtc-native")]
             webrtc_registry,
             #[cfg(feature = "webrtc-native")]
@@ -4032,6 +4061,14 @@ impl Pipeline {
         &self,
     ) -> std::collections::HashMap<String, Arc<crate::player::TransportMailbox>> {
         self.player_mailboxes.clone()
+    }
+
+    /// The media-player channels this run booted, for the command drain's
+    /// `media_player` source binding (ADR-M012): an alias of any other player
+    /// reads no-signal and its switcher select is refused with the reason.
+    #[must_use]
+    pub fn booted_players(&self) -> Arc<std::collections::BTreeSet<String>> {
+        Arc::clone(&self.booted_players)
     }
 
     /// The shared per-source producer stop registry (ADR-W018): hand this to
@@ -4538,11 +4575,17 @@ impl Pipeline {
         }
         // ADR-0113 §4: a defined keyer keeps its fill and key warm, leased to
         // the keyer object id (listed in `GET /api/v1/sources/status`).
-        if !self.switcher_keyers.is_empty() {
+        // K3: the M/E's upstream keyers keep theirs warm the same way.
+        let usk_items = self
+            .switcher_me
+            .as_ref()
+            .map(crate::switcher_runtime::usk_demand_items)
+            .unwrap_or_default();
+        if !self.switcher_keyers.is_empty() || !usk_items.is_empty() {
             let keyers = manager.consumer_set(multiview_engine::ConsumerClass::Keyer, Rails::VIDEO);
-            keyers.seed(crate::switcher_runtime::keyer_demand_items(
-                &self.switcher_keyers,
-            ));
+            let mut items = crate::switcher_runtime::keyer_demand_items(&self.switcher_keyers);
+            items.extend(usk_items);
+            keyers.seed(items);
             self.keyer_demand = Some(keyers);
         }
         // K4: a run with an M/E can define its first DSK at run time
@@ -4570,6 +4613,7 @@ impl Pipeline {
                 .consumer_set(multiview_engine::ConsumerClass::SubtitleRoute, Rails::VIDEO),
             manager,
             catalogue: Arc::clone(&self.catalogue),
+            booted_players: Arc::clone(&self.booted_players),
         })
     }
 
@@ -4676,8 +4720,9 @@ impl Pipeline {
                 if self.audio_stores.contains_key(id) {
                     continue;
                 }
+                // An alias's audio is its player's channel (routed by alias).
                 let entry = self.catalogue.load().get(id).cloned();
-                let Some(entry) = entry else {
+                let Some(entry) = entry.filter(|entry| !entry.is_alias()) else {
                     continue;
                 };
                 let lifecycle = if self.ingest_plans.iter().any(|plan| plan.id == *id) {
@@ -12071,6 +12116,37 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
         true
     }
 
+    fn catalogue_alias(
+        &self,
+        source: &Source,
+        store: &Arc<TileStore<Nv12Image>>,
+        unavailable: Option<String>,
+    ) -> bool {
+        let Some((catalogue, manager)) = &self.demand else {
+            return false;
+        };
+        crate::source_rails::catalogue_alias(catalogue, source, store, unavailable.as_deref());
+        manager.set_pins(&source.id, crate::source_demand::standing_pins(source));
+        // A repoint re-baselines readiness on the new player's store.
+        manager.restart(&source.id);
+        true
+    }
+
+    fn alias_removed(&self, id: &str, store: &Arc<TileStore<Nv12Image>>) {
+        if let Some((catalogue, manager)) = &self.demand {
+            // Only the alias that was bound to `store`: a stale (retried)
+            // unbind never removes a later definition under the same id.
+            if catalogue
+                .load()
+                .get(id)
+                .is_some_and(|entry| entry.is_alias() && Arc::ptr_eq(entry.store(), store))
+            {
+                crate::source_rails::catalogue_remove(catalogue, id);
+                manager.remove_source(id);
+            }
+        }
+    }
+
     fn invalidate_live_edit(&self, id: &str) -> bool {
         if !self.clear_on_remove {
             return false;
@@ -12083,6 +12159,13 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
         let Some(entry) = catalogue.load().get(id).cloned() else {
             return false;
         };
+        if entry.is_alias() {
+            // Leaving a `media_player` alias: its store is the player
+            // channel's and is never cleared; the new definition gets its own
+            // store from the drain and is catalogued right after this.
+            crate::source_rails::catalogue_remove(catalogue, id);
+            return false;
+        }
         // A media edit (the control plane refused it already if the source
         // was on a bus). The hub's teardown has stopped and awaited the old
         // producer; fence any detached writer with a fresh lifecycle, then
@@ -12180,9 +12263,11 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
         #[cfg(feature = "youtube")]
         crate::youtube_status::forget(id);
         let retired_store = self.demand.as_ref().and_then(|(catalogue, manager)| {
+            // An alias's store is its player channel's: never cleared here.
             let store = catalogue
                 .load()
                 .get(id)
+                .filter(|entry| !entry.is_alias())
                 .map(|entry| Arc::clone(entry.store()));
             crate::source_rails::catalogue_remove(catalogue, id);
             // Every pin it owns (standing and an operator Start) and every
@@ -18580,8 +18665,10 @@ fn player_runtime_body(
                                             frame_index = index.saturating_add(1);
                                             match player.on_decoded(index) {
                                                 PlayerAction::Publish { at } => {
-                                                    if let Ok(image) = clip.scaler.convert(
-                                                        &decoded.frame,
+                                                    if let Ok(image) = tile_image_with_alpha(
+                                                        &mut clip.scaler,
+                                                        &mut clip.alpha,
+                                                        &decoded,
                                                         plan.canvas_color.output_tag(),
                                                     ) {
                                                         last = Arc::new(image);
@@ -18686,8 +18773,10 @@ fn player_runtime_body(
                                         frame_index = index.saturating_add(1);
                                         match player.on_decoded(index) {
                                             PlayerAction::Publish { at } => {
-                                                if let Ok(image) = clip.scaler.convert(
-                                                    &decoded.frame,
+                                                if let Ok(image) = tile_image_with_alpha(
+                                                    &mut clip.scaler,
+                                                    &mut clip.alpha,
+                                                    &decoded,
                                                     plan.canvas_color.output_tag(),
                                                 ) {
                                                     last = Arc::new(image);
@@ -18805,8 +18894,10 @@ fn player_runtime_body(
                                                 frame_index = frame_index.saturating_add(1);
                                                 match player.on_decoded(index) {
                                                     PlayerAction::Publish { at } => {
-                                                        if let Ok(image) = clip.scaler.convert(
-                                                            &decoded.frame,
+                                                        if let Ok(image) = tile_image_with_alpha(
+                                                            &mut clip.scaler,
+                                                            &mut clip.alpha,
+                                                            &decoded,
                                                             plan.canvas_color.output_tag(),
                                                         ) {
                                                             last = Arc::new(image);
@@ -20784,6 +20875,9 @@ fn open_and_stream(
 /// Media-player NV12+A: attaches a decoded asset's straight alpha plane (#391).
 #[path = "pipeline_alpha.rs"]
 mod media_alpha;
+pub(crate) use media_alpha::{
+    open_named as open_named_decoder, tile_image_with_alpha, vp9_alpha_decoder, MediaAlpha,
+};
 
 /// Convert a source frame index to a libav `AV_TIME_BASE` (microsecond) seek
 /// target at the given `cadence`, using exact integer rationals — never float
@@ -27495,6 +27589,36 @@ segment_ms = 1000
         config
     }
 
+    /// Ship-1111 review #4: a player that fails boot (its journal is owned
+    /// by another runtime) leaves no channel. Its identity alias still gets a
+    /// placeholder store under the player id, but it is not a booted player:
+    /// the catalogue marks the alias unavailable and the drain's booted set
+    /// excludes it, so a re-apply cannot clear the refusal.
+    #[cfg(feature = "ffmpeg")]
+    #[test]
+    fn an_identity_alias_of_a_player_that_failed_boot_is_unavailable() {
+        let _budget = crate::player::budget_test_guard();
+        let state = tempfile::tempdir().unwrap();
+        let holder = crate::player::BindingJournal::new(state.path(), "vt-1");
+        let _owned = holder.claim_runtime().expect("hold the journal");
+        let pipeline = Pipeline::build_with_player_state(&config("vt-1"), Some(state.path()))
+            .expect("a failed player never fails the build");
+        assert!(
+            pipeline.stores.contains_key("vt-1"),
+            "a placeholder store sits under the player id"
+        );
+        assert!(!pipeline.booted_players().contains("vt-1"));
+        let entry = pipeline.catalogue.load().get("vt-1").cloned().unwrap();
+        assert!(entry.is_alias());
+        assert!(
+            entry.unavailable().is_some_and(|r| r.contains("vt-1")),
+            "{:?}",
+            entry.unavailable()
+        );
+        let demand = pipeline.drain_demand();
+        assert!(demand.is_none(), "no demand before Pipeline::demand");
+    }
+
     #[test]
     fn a_media_player_source_builds_and_its_cell_samples_the_player_store() {
         let _budget = crate::player::budget_test_guard();
@@ -27514,10 +27638,13 @@ segment_ms = 1000
             .ingest_plans
             .iter()
             .any(|plan| plan.id == "vt-1" && plan.player.is_some()));
-        assert!(
-            !pipeline.catalogue.load().contains_key("vt-a"),
-            "demand never manages the alias"
-        );
+        // Catalogued as an alias of the player's store (ship-1111): demand
+        // reports and leases it, but never starts or stops a producer.
+        let entry = pipeline.catalogue.load().get("vt-a").cloned();
+        let entry = entry.expect("the alias is catalogued for demand");
+        assert!(entry.is_alias());
+        assert!(Arc::ptr_eq(entry.store(), player));
+        assert!(entry.unavailable().is_none(), "its player booted");
         // The solved layout's cell binds the source id, which the drive's
         // store map resolves to the player's store.
         let bound = pipeline
@@ -31526,6 +31653,150 @@ loop_default = true
         }
         out.truncate(want);
         out
+    }
+
+    /// Encode a canvas-sized (64x48), 25 fps, 10-frame white clip whose alpha
+    /// is four 16-px bands `[0, 85, 170, 255]` with the local `ffmpeg` CLI, or
+    /// `false` (SKIP) when the encoder is unavailable.
+    fn alpha_band_clip(path: &std::path::Path, codec: &[&str]) -> bool {
+        let source = "color=c=white:s=64x48:r=25:d=0.4,format=rgba,\
+                      geq=r=255:g=255:b=255:a='if(lt(X,16),0,if(lt(X,32),85,if(lt(X,48),170,255)))'";
+        std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg(source)
+            .args(codec)
+            .arg(path)
+            .status()
+            .is_ok_and(|s| s.success())
+            && path.exists()
+    }
+
+    /// K6 (#391), end to end on the production load path: opener (alpha
+    /// gate, decoder selection, primed NV12+A) → runtime ingest decode →
+    /// `TileStore` publish. Every picture the worker publishes after the
+    /// commit, primed and decoded alike, carries the asset's straight alpha.
+    #[allow(clippy::print_stdout, clippy::indexing_slicing)] // SKIP notes; fixed-size planes.
+    fn runtime_alpha_case(file: &str, encoder: &str, codec: &[&str], tolerance: u8) {
+        let _budget = crate::player::budget_test_guard();
+        let encoders = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-encoders"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        if !encoders.split_whitespace().any(|w| w == encoder) {
+            println!("SKIP: ffmpeg encoder `{encoder}` not available for {file}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(file);
+        if !alpha_band_clip(&path, codec) {
+            println!("SKIP: ffmpeg could not encode {file}");
+            return;
+        }
+        // WebM declares no frame count, so the clip's length is declared as a
+        // library asset would (the "no guessed length" rule, design 4.2).
+        let mut spec = ClipSpec::new(&path, LoadThen::Cue);
+        spec.out_point = Some(10);
+        let (rig, rx) = start_with_clip(spec);
+        rig.handle.mailbox.submit(TransportVerb::Play);
+        let period = MediaTime::from_tick(1, rig.cadence).as_nanos();
+        let mut now = 1_000_000_000_i64;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut distinct: Vec<*const Nv12Image> = Vec::new();
+        let mut committed = false;
+        while distinct.len() < 6 {
+            assert!(
+                Instant::now() < deadline,
+                "hang deadline: {} alpha pictures",
+                distinct.len()
+            );
+            now += period;
+            rig.clock.set(now);
+            while let Ok((_, _, image)) = rx.recv_timeout(Duration::from_millis(5)) {
+                let Some(alpha) = image.alpha_plane() else {
+                    assert!(
+                        !committed,
+                        "{file}: an opaque picture after the alpha commit"
+                    );
+                    continue; // NA heartbeat before the commit.
+                };
+                committed = true;
+                for row in [1_usize, 24, 46] {
+                    for (band, want) in [0_u8, 85, 170, 255].into_iter().enumerate() {
+                        let got = alpha[row * 64 + band * 16 + 8];
+                        assert!(
+                            got.abs_diff(want) <= tolerance,
+                            "{file}: alpha ({row}, band {band}) = {got}, want {want}"
+                        );
+                    }
+                }
+                let ptr = Arc::as_ptr(&image);
+                if !distinct.contains(&ptr) {
+                    distinct.push(ptr);
+                }
+            }
+        }
+        assert!(rig.runtime.status.load().fault.is_none());
+        assert!(rig.shutdown().is_none());
+    }
+
+    #[test]
+    fn runtime_qtrle_alpha_asset_publishes_exact_alpha_on_every_frame() {
+        runtime_alpha_case(
+            "alpha.mov",
+            "qtrle",
+            &["-c:v", "qtrle", "-pix_fmt", "argb"],
+            0,
+        );
+    }
+
+    #[test]
+    fn runtime_prores_4444_alpha_asset_publishes_its_alpha() {
+        runtime_alpha_case(
+            "alpha_prores.mov",
+            "prores_ks",
+            &[
+                "-c:v",
+                "prores_ks",
+                "-profile:v",
+                "4444",
+                "-pix_fmt",
+                "yuva444p10le",
+            ],
+            1,
+        );
+    }
+
+    /// ADR-0112 §5 on the runtime path: the opener must select `libvpx-vp9`
+    /// (libav's native `vp9` drops the alpha side stream and would publish an
+    /// opaque picture, failing this test).
+    #[test]
+    fn runtime_vp9_alpha_asset_selects_libvpx_and_publishes_its_alpha() {
+        if ffmpeg_next::decoder::find_by_name("libvpx-vp9").is_none() {
+            println!("SKIP: libav has no libvpx-vp9 decoder");
+            return;
+        }
+        runtime_alpha_case(
+            "alpha_vp9.webm",
+            "libvpx-vp9",
+            &[
+                "-c:v",
+                "libvpx-vp9",
+                "-pix_fmt",
+                "yuva420p",
+                "-lossless",
+                "1",
+            ],
+            2,
+        );
     }
 
     fn start_with_clip(spec: ClipSpec) -> (Rig, Observed) {

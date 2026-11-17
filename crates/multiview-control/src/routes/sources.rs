@@ -410,8 +410,7 @@ pub(crate) fn switcher_bus_consumers(
             consumers.push(SourceConsumerView::new("preview", "bus"));
         }
     }
-    for keyer in declared_keyers(state) {
-        let object = format!("{}/{}", keyer.program, keyer.id);
+    for (object, keyer) in declared_keyers(state) {
         if keyer.fill == id {
             consumers
                 .push(SourceConsumerView::new("keyer fill", object.clone()).naming(Some(&object)));
@@ -426,8 +425,9 @@ pub(crate) fn switcher_bus_consumers(
 
 /// The downstream keyers the running engine admitted: the committed runtime
 /// definitions when a keyer runtime is installed (K4 `keyer_set` changes
-/// them after boot), else the adopted config.
-fn declared_keyers(state: &AppState) -> Vec<multiview_config::DownstreamKeyerConfig> {
+/// them after boot), else the adopted config. Each with its object id
+/// (`<program>/<id>` for a DSK, `<me>/<id>` for a USK, K3).
+fn declared_keyers(state: &AppState) -> Vec<(String, multiview_config::DownstreamKeyerConfig)> {
     if let Some(defs) = state
         .switcher
         .as_ref()
@@ -437,23 +437,34 @@ fn declared_keyers(state: &AppState) -> Vec<multiview_config::DownstreamKeyerCon
             .defs
             .iter()
             .flatten()
-            .map(|def| (*def.config).clone())
+            .map(|def| (def.object_id.to_string(), (*def.config).clone()))
             .collect();
     }
-    if let Some(model) = &state.boot_model {
-        return model
-            .adopted_config()
-            .switcher
-            .map(|switcher| switcher.downstream_keyers)
-            .unwrap_or_default();
+    let switcher: Option<multiview_config::SwitcherConfig> = match &state.boot_model {
+        Some(model) => model.adopted_config().switcher,
+        None => state
+            .base_document
+            .as_deref()
+            .and_then(|document| document.get("switcher"))
+            .and_then(|switcher| serde_json::from_value(switcher.clone()).ok()),
+    };
+    let Some(switcher) = switcher else {
+        return Vec::new();
+    };
+    let mut out: Vec<_> = switcher
+        .downstream_keyers
+        .into_iter()
+        .map(|k| (format!("{}/{}", k.program, k.id), k))
+        .collect();
+    for me in &switcher.mix_effects {
+        for usk in &me.keyers {
+            out.push((
+                format!("{}/{}", me.id, usk.id),
+                usk.as_definition(&me.program),
+            ));
+        }
     }
-    state
-        .base_document
-        .as_deref()
-        .and_then(|document| document.get("switcher"))
-        .and_then(|switcher| switcher.get("downstream_keyers"))
-        .and_then(|keyers| serde_json::from_value(keyers.clone()).ok())
-        .unwrap_or_default()
+    out
 }
 
 /// How long `Start` waits for a source the engine adopted live to reach the

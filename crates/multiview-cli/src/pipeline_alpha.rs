@@ -34,7 +34,7 @@ use multiview_ffmpeg::{ScaleSpec, Scaler};
 /// Per-player alpha attacher: the bounded plane pool plus the reused scratch
 /// frames and scaler of the alpha path.
 #[derive(Default)]
-pub(super) struct MediaAlpha {
+pub(crate) struct MediaAlpha {
     pool: Arc<AlphaPlanePool>,
     /// The decoded-size `GRAY8` copy of the alpha (only when scaling).
     decoded: Option<ScratchFrame>,
@@ -60,7 +60,7 @@ impl MediaAlpha {
     /// A message when the alpha cannot be copied or scaled; the caller keeps
     /// the frame opaque-free by dropping it (never a panic on the decode
     /// thread).
-    pub(super) fn attach(
+    pub(crate) fn attach(
         &mut self,
         image: Nv12Image,
         source: &AlphaSource,
@@ -119,13 +119,40 @@ impl MediaAlpha {
     }
 }
 
+/// Convert one decoded player frame to its tile image, attaching the frame's
+/// straight alpha (NV12+A) when the decoder emitted an alpha format.
+///
+/// The one conversion both player executors use (the runtime opener/ingest
+/// path and the legacy `stream_player` loop), so an alpha asset publishes the
+/// same NV12+A on either. `alpha` is built on the first alpha frame only (for
+/// the runtime path that is the opener's primed frame, off the ingest thread)
+/// and reused for every later frame; an opaque asset never builds it.
+///
+/// # Errors
+/// A message when the tile conversion or the alpha attach fails; callers drop
+/// the frame and keep last-good (never a panic on a decode thread).
+pub(crate) fn tile_image_with_alpha(
+    scaler: &mut super::TileScaler,
+    alpha: &mut Option<MediaAlpha>,
+    decoded: &multiview_ffmpeg::DecodedVideoFrame,
+    tag: multiview_core::color::ColorInfo,
+) -> Result<Nv12Image, String> {
+    let image = scaler.convert(&decoded.frame, tag)?;
+    match &decoded.alpha {
+        Some(source) => alpha
+            .get_or_insert_with(MediaAlpha::default)
+            .attach(image, source),
+        None => Ok(image),
+    }
+}
+
 /// The libav decoder a media player must open for `stream_index` to keep its
 /// alpha, when the default decoder would drop it: `libvpx-vp9` for VP9 with
 /// the `WebM` `alpha_mode=1` tag (libav's native `vp9` ignores the alpha side
 /// stream). `None` for every other stream and for non-player sources (they
 /// stay opaque, ADR-0058 §5). An alpha stream whose decoder is not linked
 /// also yields `None` but logs a warning (ADR-0112 §5): it plays opaque.
-pub(super) fn vp9_alpha_decoder(
+pub(crate) fn vp9_alpha_decoder(
     id: &str,
     is_player: bool,
     input: &ffmpeg_next::format::context::Input,
@@ -203,7 +230,7 @@ fn choose_vp9_alpha(id: &str, stream: StreamAlpha, libvpx_linked: bool) -> Optio
 
 /// Open the software decoder `name`, logging and returning `None` on failure
 /// so the caller falls back to the default (opaque) decode.
-pub(super) fn open_named(
+pub(crate) fn open_named(
     id: &str,
     params: ffmpeg_next::codec::Parameters,
     time_base: multiview_core::time::Rational,

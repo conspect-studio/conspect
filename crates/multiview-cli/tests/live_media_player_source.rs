@@ -2,7 +2,12 @@
 //! removed on the running engine. The drain binds the source id to the player
 //! channel's store at the frame boundary — no producer is spawned (the player
 //! boot owns its ingest), nothing is "unsupported".
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::too_many_lines
+)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -294,6 +299,8 @@ async fn live_alias_moves_audio_with_video_and_a_kind_change_never_shares_the_pl
 /// Merge review (#474 x #477): a producer -> `media_player` alias transition
 /// while the hub queue is FULL keeps the replaced producer's teardown pending
 /// and retries it until the producer stops (never left to run teardown), and
+/// (ship-1111 #1) the teardown is part of the ONE ordered alias binding, so
+/// it is pending as that binding, never as a separate teardown; and
 /// new aliases are admitted only under the live source cap, counting an id
 /// that is both an alias and a pending teardown once.
 #[test]
@@ -351,7 +358,12 @@ fn a_shed_producer_to_alias_teardown_is_retried_and_aliases_respect_the_cap() {
         Arc::ptr_eq(drive.store("p").unwrap(), &player),
         "alias bound"
     );
-    assert_eq!(drain.pending_teardowns(), 1, "the shed teardown is kept");
+    assert_eq!(
+        drain.pending_binds(),
+        1,
+        "the shed replace (teardown + bind) is kept"
+    );
+    assert_eq!(drain.pending_teardowns(), 0, "never a separate teardown");
     assert!(!producer.stop_requested(), "still pending while full");
 
     // Cap: `p` (alias + pending teardown) counts once, so one more alias fits
@@ -360,12 +372,17 @@ fn a_shed_producer_to_alias_teardown_is_retried_and_aliases_respect_the_cap() {
     assert!(drive.store("q").is_some(), "q admitted under the cap");
     submit(&mut drain, &mut drive, alias("r", "vt-1"));
     assert!(drive.store("r").is_none(), "r held at the cap");
-    assert_eq!(drain.applied_sources(), cap);
+    // Shed bindings are pending (not yet hub-known); hub-known plus pending
+    // fills the cap exactly, counting `p` once.
+    assert_eq!(drain.admitted_sources(), cap);
 
     // The queue recovers: the retried teardown stops the old producer.
     fault.clear();
+    // One retry per tick: `p`'s replace and `q`'s shed binding.
     drain.apply(&mut drive);
-    assert_eq!(drain.pending_teardowns(), 0, "teardown reached the hub");
+    drain.apply(&mut drive);
+    assert_eq!(drain.pending_binds(), 0, "the replace reached the hub");
+    assert_eq!(drain.pending_teardowns(), 0);
     assert!(
         wait(Box::new(
             || producer.stop_requested() && running("p").is_none()
@@ -377,4 +394,142 @@ fn a_shed_producer_to_alias_teardown_is_retried_and_aliases_respect_the_cap() {
         "alias kept"
     );
     hub.shutdown();
+}
+
+/// Windy VT (ship-1111): on a demand-managed run, a `media_player` source
+/// added live is catalogued as an alias of its player's store. It is a source
+/// with standing demand: its status leaves `idle` (an `always_on` consumer,
+/// ready once the player publishes), it joins the preview/wall store map, so
+/// the wall tile composites the player's frames, and a switcher bus can lease
+/// it. An alias of a player with no channel says why it shows no picture.
+#[cfg(feature = "ffmpeg")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_alias_on_a_demand_run_has_standing_demand_and_feeds_the_wall() {
+    use multiview_cli::control::command_drain_with_live_sources_and_demand;
+    use multiview_cli::pipeline::Pipeline;
+    use multiview_control::SourceDemandProvider as _;
+    use multiview_engine::DemandPhase;
+    use std::time::{Duration, Instant};
+
+    let config = config();
+    let mut pipeline = Pipeline::build(&config).expect("pipeline builds");
+    let demand = pipeline.demand();
+    demand.start();
+    let preview = shared_stores(pipeline.preview_stores());
+    let hub = LiveSourceHub::start_with_ingest(
+        pipeline.stop_registry(),
+        Arc::clone(&preview),
+        Some(pipeline.live_ingest_spawner()),
+    );
+    let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+    let (sender, rx) = command_bus(16);
+    let mut drain = command_drain_with_live_sources_and_demand(
+        rx,
+        config.clone(),
+        publisher,
+        hub.handle(),
+        pipeline.drain_demand(),
+    );
+    let player = pipeline
+        .preview_stores()
+        .get("vt-1")
+        .cloned()
+        .expect("the player channel has a store");
+    let layout = config.solve_layout().expect("layout");
+    let canvas = CanvasColor::default();
+    let nosignal = Nv12Image::solid(64, 64, 16, 128, 128, canvas.output_tag()).unwrap();
+    let mut drive = CompositorDrive::new(
+        Arc::new(layout),
+        pipeline.preview_stores(),
+        nosignal,
+        canvas,
+        LinearRgba::opaque(0.0, 0.0, 0.0),
+    )
+    .unwrap();
+
+    sender
+        .try_submit(Command::UpsertSource {
+            op: OperationId::new(),
+            source: alias("vt-1-src", "vt-1"),
+        })
+        .unwrap();
+    sender
+        .try_submit(Command::UpsertSource {
+            op: OperationId::new(),
+            source: alias("vt-ghost", "vt-9"),
+        })
+        .unwrap();
+    drain(&mut drive);
+    // The player plays: its channel publishes frames (as the player loop does).
+    let frame = |luma: u8| {
+        Nv12Image::solid(
+            64,
+            64,
+            luma,
+            128,
+            128,
+            multiview_core::color::ColorInfo::default().resolve_defaults(64, 64),
+        )
+        .unwrap()
+    };
+    let control =
+        multiview_cli::source_demand::ControlDemand::new(demand.clone(), pipeline.catalogue());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut luma = 40_u8;
+    while Instant::now() < deadline {
+        luma = luma.wrapping_add(1).max(20);
+        player.publish(frame(luma), multiview_core::time::MediaTime::ZERO);
+        if demand.status("vt-1-src").phase == DemandPhase::Ready {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let status = control.status("vt-1-src");
+    assert_eq!(
+        status.phase,
+        multiview_control::SourceDemandPhase::Ready,
+        "a loaded, playing VT is not idle: {status:?}"
+    );
+    assert!(status.video_running, "{status:?}");
+    assert!(
+        status.consumers.iter().any(|c| c.kind == "always_on"),
+        "the bound player is a source with standing demand: {status:?}"
+    );
+    // The wall / preview map carries the alias, so its tile composites the
+    // player's frames.
+    let wall_store = preview.load().get("vt-1-src").cloned();
+    assert!(
+        wall_store.is_some_and(|store| Arc::ptr_eq(&store, &player)),
+        "the wall composites the alias from the player's own store"
+    );
+    // A switcher bus can lease it; the player channel is never torn down.
+    assert!(control.select_refusal("vt-1-src").is_none());
+    assert!(control
+        .switcher_preview_lease("vt-1-src", "switcher:me1:pvw")
+        .is_some());
+    // An alias of a player with no channel: a clear reason, not a bare 409.
+    let refusal = control.select_refusal("vt-ghost").unwrap_or_default();
+    assert!(refusal.contains("vt-9"), "{refusal:?}");
+
+    // Removing the alias withdraws it without touching the player channel.
+    sender
+        .try_submit(Command::RemoveSource {
+            op: OperationId::new(),
+            id: "vt-1-src".to_owned(),
+        })
+        .unwrap();
+    drain(&mut drive);
+    let gone = Instant::now() + Duration::from_secs(5);
+    while preview.load().contains_key("vt-1-src") && Instant::now() < gone {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!preview.load().contains_key("vt-1-src"));
+    assert!(control.switcher_preview_lease("vt-1-src", "pvw").is_none());
+    assert!(
+        preview.load().contains_key("vt-1"),
+        "the player channel stays"
+    );
+    assert!(player.is_primed(), "the player's pixels are never cleared");
+    hub.shutdown();
+    demand.shutdown();
 }

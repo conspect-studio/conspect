@@ -28,7 +28,8 @@
 // frame on the CPU, through a CPU-sanitized edge (`chroma_edge`). Scene groups fold into a second pair of vec4 registers
 // (outgoing / incoming) merged at the next top tile or the end of the list,
 // mirroring the CPU oracle's segment semantics (the last grouped tile's
-// merge wins).
+// merge wins). K3: a WIPE merge (kind >= 2) and a complemented mask (`1 − m`)
+// share `mask_coverage` with the tile wipe.
 //
 // `common.wgsl` is prepended at load time (transfer fns, mat3_apply, ids).
 
@@ -69,9 +70,11 @@ struct KeyParams {
     table: vec4<u32>,
     // Mask rectangle in fill-source pixels: x, y, w, h (half-open).
     mask: vec4<u32>,
-    // x: merge kind (0 MIX, 1 DIP); y: p | d; z: i (all in [0, 1]).
+    // x: merge kind (0 MIX, 1 DIP; >= 2 WIPE: 2 + shape + 8·reverse +
+    // 16·complement); y: p | d | softness; z: i | extent; w: radius.
     merge: vec4<f32>,
-    // Opaque DIP colour (linear, canvas gamut), a = 1.
+    // Opaque DIP colour (linear, canvas gamut), a = 1. WIPE: origin x, y,
+    // expand.
     dip_colour: vec4<f32>,
     // A chroma key's reference, tile-gamut linear RGB; w padding.
     chroma: vec4<f32>,
@@ -195,8 +198,17 @@ fn chroma_matte(k: KeyParams, yuv8: vec3<f32>, lin_tile: vec3<f32>) -> f32 {
 }
 
 // Merge the two scene accumulators (premultiplied linear). Mirrors
-// `SceneMerge::apply`: MIX lerp(out, in, p); DIP lerp(lerp(out, c, d), in, i).
-fn scene_merge(o: vec4<f32>, inc: vec4<f32>, m: vec4<f32>, dip: vec4<f32>) -> vec4<f32> {
+// `SceneMerge::apply`: MIX lerp(out, in, p); DIP lerp(lerp(out, c, d), in, i);
+// WIPE (K3) lerp(out, in, m(px, py)) with the mask in canvas coordinates.
+fn scene_merge(o: vec4<f32>, inc: vec4<f32>, m: vec4<f32>, dip: vec4<f32>,
+               px: u32, py: u32, cw: u32, ch: u32) -> vec4<f32> {
+    if m.x > 1.5 {
+        let code = u32(m.x + 0.5) - 2u;
+        let cov = mask_coverage(code & 7u, (code & 8u) != 0u, (code & 16u) != 0u,
+                                dip.xy, m.z, m.w, m.y, dip.z, px, py, cw, ch);
+        let t = clamp(cov, 0.0, 1.0);
+        return o * (1.0 - t) + inc * t;
+    }
     if m.x > 0.5 {
         let c = vec4<f32>(dip.rgb, 1.0);
         let od = o * (1.0 - m.y) + c * m.y;
@@ -222,14 +234,30 @@ fn wipe_coverage(t: TileParams, px: u32, py: u32, cw: u32, ch: u32) -> f32 {
     if shape == 0u {
         return 1.0;
     }
+    return mask_coverage(shape, t.opacity_transfer.w > 0.5, t.prim2.w > 0.5,
+                         vec2<f32>(t.yuv2rgb0.w, t.yuv2rgb1.w), t.yuv2rgb2.w, t.prim0.w,
+                         t.range.w, t.prim1.w, px, py, cw, ch);
+}
+
+// The coverage of one mask (shape id >= 1) at canvas pixel (px, py). Mirrors
+// `mask::WipeMask::coverage`, the complement (K3: `1 − coverage`) included.
+fn mask_coverage(shape: u32, reverse: bool, complement: bool, origin: vec2<f32>,
+                 extent: f32, radius_in: f32, softness: f32, expand: f32,
+                 px: u32, py: u32, cw: u32, ch: u32) -> f32 {
+    let c = edge_coverage(shape, reverse, origin, extent, radius_in, softness, expand,
+                          px, py, cw, ch);
+    return select(c, 1.0 - c, complement);
+}
+
+fn edge_coverage(shape: u32, reverse: bool, origin: vec2<f32>, extent: f32,
+                 radius_in: f32, softness: f32, expand: f32,
+                 px: u32, py: u32, cw: u32, ch: u32) -> f32 {
     let aspect = f32(max(cw, 1u)) / f32(max(ch, 1u));
     let u = (f32(px) + 0.5) / f32(max(cw, 1u));
     let v = (f32(py) + 0.5) / f32(max(ch, 1u));
-    let origin = vec2<f32>(t.yuv2rgb0.w, t.yuv2rgb1.w);
-    let extent = t.yuv2rgb2.w;
-    var radius = t.prim0.w;
+    var radius = radius_in;
     var sign = 1.0;
-    if t.opacity_transfer.w > 0.5 {
+    if reverse {
         radius = extent - radius;
         sign = -1.0;
     }
@@ -251,8 +279,6 @@ fn wipe_coverage(t: TileParams, px: u32, py: u32, cw: u32, ch: u32) -> f32 {
         }
     }
     let d = sign * inside;
-    let softness = t.range.w;
-    let expand = t.prim1.w;
     // A border band (expand > 0) is the grown edge attenuated by the edge's
     // own coverage: smooth on both sides, never the revealed interior
     // (mirrors `mask::coverage`).
@@ -327,7 +353,7 @@ fn composite_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // and a top tile closes it, exactly as on the CPU oracle.
         if group == 0u {
             if seg_open {
-                acc = scene_merge(seg_out, seg_in, seg_merge, seg_dip);
+                acc = scene_merge(seg_out, seg_in, seg_merge, seg_dip, px, py, cw, ch);
                 seg_open = false;
             }
         } else {
@@ -416,7 +442,7 @@ fn composite_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     if seg_open {
-        acc = scene_merge(seg_out, seg_in, seg_merge, seg_dip);
+        acc = scene_merge(seg_out, seg_in, seg_merge, seg_dip, px, py, cw, ch);
     }
 
     // Store the straight (un-premultiplied) linear RGBA for the encode pass.

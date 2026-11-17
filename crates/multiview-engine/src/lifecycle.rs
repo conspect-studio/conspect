@@ -372,6 +372,15 @@ mod tests {
         kill_fails: AtomicBool,
         frames: AtomicU64,
         last_generation: AtomicU64,
+        /// Every owner call in order: `Start(g)` when a start is called,
+        /// `Stopped(g)` when a stop or a kill confirms teardown (#434).
+        calls: Mutex<Vec<Call>>,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Call {
+        Start(u64),
+        Stopped(u64),
     }
 
     impl SourceOwner for FakeOwner {
@@ -383,6 +392,7 @@ mod tests {
         ) -> OwnerFuture<'_, ScopeKind> {
             self.starts.fetch_add(1, Ordering::SeqCst);
             self.last_generation.store(generation, Ordering::SeqCst);
+            lock(&self.calls).push(Call::Start(generation));
             let hang = self.hang_start.load(Ordering::SeqCst);
             Box::pin(async move {
                 if hang {
@@ -391,23 +401,25 @@ mod tests {
                 Ok(ScopeKind::ProcessTree)
             })
         }
-        fn stop(&self, _source: &str, _generation: u64) -> OwnerFuture<'_, ()> {
+        fn stop(&self, _source: &str, generation: u64) -> OwnerFuture<'_, ()> {
             self.stops.fetch_add(1, Ordering::SeqCst);
             let hang = self.hang_stop.load(Ordering::SeqCst);
             Box::pin(async move {
                 if hang {
                     std::future::pending::<()>().await;
                 }
+                lock(&self.calls).push(Call::Stopped(generation));
                 Ok(())
             })
         }
-        fn kill(&self, _source: &str, _generation: u64) -> OwnerFuture<'_, ()> {
+        fn kill(&self, _source: &str, generation: u64) -> OwnerFuture<'_, ()> {
             self.kills.fetch_add(1, Ordering::SeqCst);
             let fails = self.kill_fails.load(Ordering::SeqCst);
             Box::pin(async move {
                 if fails {
                     Err("process will not die".to_owned())
                 } else {
+                    lock(&self.calls).push(Call::Stopped(generation));
                     Ok(())
                 }
             })
@@ -587,17 +599,94 @@ mod tests {
             "no start piles onto unconfirmed resources"
         );
         assert_eq!(h.manager.status("web").phase, DemandPhase::Failed);
-        // Teardown recovers: the scope goes, and only then a new start runs.
+        assert_eq!(
+            h.scopes.get("web").map(|s| s.generation),
+            Some(1),
+            "the unconfirmed scope is still held"
+        );
+        recovers_only_after_confirmed_teardown(&h);
+    }
+
+    /// #434: the same, with teardown recovering at once (without the 300 ms
+    /// hold, so usually before the kind's retry cap is reached; the helper
+    /// presses Start in case it was). The operator Start still holds the source, so the manager
+    /// restarts it by itself right after the confirmed teardown: the old
+    /// scope's removal is a moment, not a state, and must not be asserted as
+    /// one. What must hold is the order: generation 1 confirmed stopped, then
+    /// (and only then) a new generation started.
+    #[test]
+    fn a_teardown_confirmed_at_once_restarts_on_a_new_generation() {
+        let h = harness();
+        h.owner.hang_start.store(true, Ordering::SeqCst);
+        h.owner.hang_stop.store(true, Ordering::SeqCst);
+        h.owner.kill_fails.store(true, Ordering::SeqCst);
+        h.manager.start_source("web");
+        wait("timed out and kill tried", || {
+            h.owner.kills.load(Ordering::SeqCst) >= 1
+                && h.manager.status("web").phase == DemandPhase::Failed
+        });
+        assert_eq!(
+            h.scopes.get("web").map(|s| s.generation),
+            Some(1),
+            "the attempted scope stays registered"
+        );
+        assert_eq!(h.owner.starts.load(Ordering::SeqCst), 1);
+        recovers_only_after_confirmed_teardown(&h);
+    }
+
+    /// Let teardown recover, then prove by the owner's call order (not by
+    /// catching a momentarily empty registry) that generation 1 was confirmed
+    /// stopped before any later start, and that a new generation then runs.
+    /// The confirmation may come from a fresh stop or from the kill path of a
+    /// stop that was already pending while the stop still hung. Later starts
+    /// (a recovery start that itself timed out under load) are allowed, each
+    /// only after the previous generation's teardown was confirmed.
+    fn recovers_only_after_confirmed_teardown(h: &Harness) {
         h.owner.hang_start.store(false, Ordering::SeqCst);
         h.owner.hang_stop.store(false, Ordering::SeqCst);
         h.owner.kill_fails.store(false, Ordering::SeqCst);
-        wait("teardown confirmed", || h.scopes.is_empty());
+        wait("teardown confirmed", || !h.scopes.is_current("web", 1));
         // The kind's retry cap may have been reached meanwhile: Start retries.
         h.manager.start_source("web");
+        // Read the owner's own call log (under its lock), never a counter
+        // bumped before the log entry, so the snapshot holds what was waited on.
+        let calls = || lock(&h.owner.calls).clone();
         wait("restarted after confirmed teardown", || {
-            h.owner.starts.load(Ordering::SeqCst) == 2
-                && h.scopes.get("web").is_some_and(|s| s.generation > 1)
+            calls()
+                .iter()
+                .any(|c| matches!(c, Call::Start(g) if *g > 1))
         });
+        let calls = calls();
+        let stopped = calls
+            .iter()
+            .position(|c| *c == Call::Stopped(1))
+            .unwrap_or_else(|| panic!("generation 1 confirmed stopped: {calls:?}"));
+        let restarted = calls
+            .iter()
+            .position(|c| matches!(c, Call::Start(g) if *g > 1))
+            .unwrap_or_else(|| panic!("a new generation started: {calls:?}"));
+        assert!(
+            stopped < restarted,
+            "a new start ran before teardown was confirmed: {calls:?}"
+        );
+        // A recovery start descheduled past its own deadline is legitimately
+        // torn down and retried on a later generation: allow that, but every
+        // start still runs only after the previous generation confirmed its
+        // teardown, and generations only grow.
+        let mut confirmed: Option<u64> = None;
+        let mut last: Option<u64> = None;
+        for call in &calls {
+            match *call {
+                Call::Start(g) => {
+                    assert!(
+                        last.is_none_or(|prev| g > prev && confirmed == Some(prev)),
+                        "start {g} before generation {last:?} confirmed its teardown: {calls:?}"
+                    );
+                    last = Some(g);
+                }
+                Call::Stopped(g) => confirmed = Some(g),
+            }
+        }
         h.manager.shutdown();
     }
 

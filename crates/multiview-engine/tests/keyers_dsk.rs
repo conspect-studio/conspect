@@ -1,5 +1,5 @@
 //! Downstream keyer frame coordination (ADR-0113 §5, design note §11.3, slice
-//! K2a): CUT, AUTO, TIE on CUT, MIX, DIP and WIPE, abort and reject atomicity, a held
+//! K2a, WIPE envelope K3): CUT, AUTO, TIE on CUT, MIX, DIP and WIPE, abort and reject atomicity, a held
 //! background take, `on_at_start`, tally and the snapshot. Real hook, CPU
 //! drive, exact tick PTS.
 #![allow(
@@ -296,12 +296,15 @@ fn a_tied_dsk_follows_a_dip_and_flips_on_the_terminal_tick() {
     assert_eq!(weight_of(&drive, 0), None);
 }
 
-/// K2a deviation (design note §14, K3): a tied keyer on a WIPE keeps its
-/// state through the flight (weight 0 going on, 1 going off) and flips on
-/// the terminal tick, a CUT at the transition end. The per-pixel `m(x, y)`
-/// envelope lands with K3.
+/// K3 (design note §3.2, replacing the K2a "CUT at the end" deviation): a
+/// tied keyer on a WIPE follows the per-pixel envelope in canvas
+/// coordinates: going on it is drawn through the wipe's mask `m(x, y)`,
+/// going off through its complement `1 − m(x, y)`, and it flips on the
+/// terminal tick. At mid flight the left (revealed) half shows the incoming
+/// scene with the keyer on and the right half the outgoing scene without it,
+/// and the reverse going off.
 #[test]
-fn a_tied_dsk_on_a_wipe_cuts_at_the_terminal_tick() {
+fn a_tied_dsk_on_a_wipe_follows_the_mask_and_flips_on_the_terminal_tick() {
     let rig = rig();
     let mut cfg = dsk("dsk1", "gfx", None, 1);
     cfg.tie = true;
@@ -320,14 +323,31 @@ fn a_tied_dsk_on_a_wipe_cuts_at_the_terminal_tick() {
     handle
         .try_send(cmd("wipe", SwitcherVerb::Auto(rate)))
         .unwrap();
+    let luma_at =
+        |frame: &multiview_engine::CompositedFrame, x: u32| frame.canvas.sample(x, 32).unwrap().0;
     for k in 0..u64::from(n) {
         keep_fresh(&rig, k);
-        step(&mut hook, &mut drive, k);
-        assert_eq!(
-            weight_of(&drive, 0),
-            None,
-            "stays off during the wipe at {k}"
-        );
+        let frame = step(&mut hook, &mut drive, k);
+        let draw = drive.keyer_draws().iter().flatten().find(|d| d.keyer == 0);
+        if k == 0 {
+            // Progress 0: nothing is revealed, the keyer is not drawn.
+            assert!(draw.is_none(), "invisible at the start");
+            assert!(luma_at(&frame, 60).abs_diff(LUMA_A) < 8);
+        } else {
+            let mask = draw.and_then(|d| d.wipe).expect("drawn through the mask");
+            assert!(!mask.complement, "going on uses m(x, y)");
+            assert_eq!(draw.unwrap().weight, 1.0);
+        }
+        if k == u64::from(n / 2) {
+            assert!(
+                luma_at(&frame, 2).abs_diff(LUMA_FILL) < 8,
+                "revealed: keyed"
+            );
+            assert!(
+                luma_at(&frame, 61).abs_diff(LUMA_A) < 8,
+                "ahead: outgoing, unkeyed"
+            );
+        }
         assert!(!handle.snapshot().unwrap().keyers[0].unwrap().on_air);
     }
     keep_fresh(&rig, u64::from(n));
@@ -337,18 +357,26 @@ fn a_tied_dsk_on_a_wipe_cuts_at_the_terminal_tick() {
         "flips on the terminal tick"
     );
     assert_eq!(weight_of(&drive, 0), Some(1.0));
+    assert!(drive.keyer_draws()[0].as_ref().unwrap().wipe.is_none());
     handle
         .try_send(cmd("wipe2", SwitcherVerb::Auto(rate)))
         .unwrap();
     for k in 0..u64::from(n) {
         let index = u64::from(n) + 1 + k;
         keep_fresh(&rig, index);
-        step(&mut hook, &mut drive, index);
-        assert_eq!(
-            weight_of(&drive, 0),
-            Some(1.0),
-            "stays fully on during the wipe at {k}"
-        );
+        let frame = step(&mut hook, &mut drive, index);
+        let draw = drive.keyer_draws().iter().flatten().find(|d| d.keyer == 0);
+        let mask = draw
+            .and_then(|d| d.wipe)
+            .expect("drawn through the complement");
+        assert!(mask.complement, "going off uses 1 − m(x, y)");
+        if k == u64::from(n / 2) {
+            assert!(luma_at(&frame, 2).abs_diff(LUMA_A) < 8, "revealed: off");
+            assert!(
+                luma_at(&frame, 61).abs_diff(LUMA_FILL) < 8,
+                "ahead: still keyed"
+            );
+        }
         assert!(handle.snapshot().unwrap().keyers[0].unwrap().on_air);
     }
     let end = 2 * u64::from(n) + 1;
@@ -680,4 +708,85 @@ fn a_keyer_auto_rate_override_is_bounded() {
         drain(&mut outcomes).0.is_empty(),
         "in flight, no outcome yet"
     );
+}
+
+/// Keyers K6 (#391, ADR-0058 §5): a DSK with a linear self key over a fill
+/// that carries an NV12+A alpha plane (as the media player now publishes for
+/// an alpha asset) is shaped by that alpha, end to end through the real hook
+/// and CPU drive. The expectation is computed per pixel here, independently
+/// of the kernel: fill and background through the public front half, the
+/// fill premultiplied once by its alpha, `over`, then the back half.
+#[test]
+fn a_linear_self_key_over_an_alpha_fill_is_shaped_by_the_fill_alpha() {
+    use multiview_compositor::blend::{over, LinearRgba};
+    use multiview_compositor::pipeline::{
+        canvas_linear_to_output_yuv, tile_yuv_to_canvas_linear, AlphaPlanePool, CanvasColor,
+    };
+    use std::sync::Arc;
+
+    const BANDS: [u8; 4] = [0, 85, 170, 255];
+    let side = usize::try_from(rig::SIDE).unwrap();
+    let alpha: Vec<u8> = (0..side * side)
+        .map(|i| BANDS[(i % side) / (side / BANDS.len())])
+        .collect();
+    let pool = Arc::new(AlphaPlanePool::default());
+    let rig = rig();
+    let (handle, mut hook, mut drive) = rig.build(&[dsk("dsk1", "gfx", None, 1)], 3.0, "a", "b");
+    let publish_fill = |index: u64| {
+        let fill = pool
+            .attach(Rig::solid(LUMA_FILL, rig::SIDE, rig::SIDE), &alpha)
+            .unwrap();
+        rig.store("gfx")
+            .publish_arc(Arc::new(fill), rig::pts(index));
+    };
+    rig.publish_background(0);
+    publish_fill(0);
+    step(&mut hook, &mut drive, 0);
+    handle
+        .try_send(cmd("on", SwitcherVerb::KeyerCut { keyer: 0, on: true }))
+        .unwrap();
+    rig.publish_background(1);
+    publish_fill(1);
+    let frame = step(&mut hook, &mut drive, 1);
+    assert_eq!(weight_of(&drive, 0), Some(1.0), "the keyer is fully on air");
+
+    let canvas = CanvasColor::default();
+    let lin = |y: u8| {
+        let color = rig.color;
+        tile_yuv_to_canvas_linear(y, 128, 128, color, canvas).unwrap()
+    };
+    let (fill, bg) = (lin(LUMA_FILL), lin(LUMA_A));
+    let straight = |rgb: [f32; 3], a: f32| LinearRgba {
+        r: rgb[0],
+        g: rgb[1],
+        b: rgb[2],
+        a,
+    };
+    let mut shaped = Vec::new();
+    for (band, &a8) in BANDS.iter().enumerate() {
+        let a = f32::from(a8) / 255.0;
+        let out = over(
+            straight(fill, a).premultiplied(),
+            straight(bg, 1.0).premultiplied(),
+        )
+        .unpremultiplied();
+        let want = canvas_linear_to_output_yuv([out.r, out.g, out.b], canvas).unwrap();
+        let x = u32::try_from(band * (side / BANDS.len()) + 3).unwrap();
+        for y in [1_u32, 30, 62] {
+            let (got, cb, cr) = frame.canvas.sample(x, y).unwrap();
+            assert!(
+                got.abs_diff(want[0]) <= 1
+                    && cb.abs_diff(want[1]) <= 1
+                    && cr.abs_diff(want[2]) <= 1,
+                "band {band} (alpha {a8}) at ({x},{y}): {:?} vs oracle {want:?}",
+                (got, cb, cr)
+            );
+        }
+        shaped.push(want[0]);
+    }
+    // The alpha really shapes the key: transparent shows Program, opaque the
+    // fill, and the partial bands sit strictly between, in order.
+    assert!(shaped[0].abs_diff(LUMA_A) <= 1, "{shaped:?}");
+    assert!(shaped[3].abs_diff(LUMA_FILL) <= 1, "{shaped:?}");
+    assert!(shaped.windows(2).all(|w| w[0] < w[1]), "{shaped:?}");
 }

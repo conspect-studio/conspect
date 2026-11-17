@@ -80,6 +80,13 @@ pub struct WipeMask {
     /// An exact coverage for the whole canvas at an endpoint: `Some(0.0)` at
     /// progress `<= 0`, `Some(1.0)` at progress `>= 1`, else `None`.
     pub pinned: Option<f32>,
+    /// Draw `1 − coverage` (ADR-0113 §3.2, slice K3): the envelope of a tied
+    /// keyer going **off** through a WIPE. Only keyer tiles carry it, and a
+    /// keyed tile is composed on the CPU reference until the WGSL key path
+    /// lands, so `composite.wgsl` does not read it (a GPU frame with a
+    /// complemented mask is routed to the CPU, see
+    /// [`crate::key::needs_cpu_keyer_path`]).
+    pub complement: bool,
 }
 
 impl WipeMask {
@@ -136,7 +143,17 @@ impl WipeMask {
             softness,
             expand: 0.0,
             pinned,
+            complement: false,
         }
+    }
+
+    /// The complement of this mask: coverage `1 − m(x, y)` at every pixel,
+    /// the endpoints included (ADR-0113 §3.2: a tied keyer going off through
+    /// a WIPE). Toggles, so the complement of a complement is the mask.
+    #[must_use]
+    pub const fn complemented(mut self) -> Self {
+        self.complement = !self.complement;
+        self
     }
 
     /// The border band of this edge, `expand` wide (canvas-height units):
@@ -196,6 +213,16 @@ impl WipeMask {
     /// to `wipe_coverage` in `composite.wgsl`.
     #[must_use]
     pub fn coverage(&self, px: u32, py: u32) -> f32 {
+        let c = self.edge_coverage(px, py);
+        if self.complement {
+            1.0 - c
+        } else {
+            c
+        }
+    }
+
+    /// The coverage before any complement (`wipe_coverage` in the shader).
+    fn edge_coverage(&self, px: u32, py: u32) -> f32 {
         if let Some(pinned) = self.pinned {
             return pinned;
         }
