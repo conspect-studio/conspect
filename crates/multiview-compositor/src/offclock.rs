@@ -195,9 +195,9 @@ impl FrameJob {
             .collect()
     }
 
-    /// Whether this frame needs the CPU keyer path (ADR-0113 K1: keyed or
-    /// scene-grouped tiles are composited on the CPU reference until the GPU
-    /// key path lands).
+    /// Whether this frame has a keyed or scene-grouped tile (ADR-0113): such a
+    /// frame goes to the CPU reference on a composer without a key path
+    /// ([`GpuComposer::draws_keys`]). An allocation-free scan.
     #[must_use]
     pub fn needs_cpu_keyer_path(&self) -> bool {
         self.tiles.iter().any(|t| {
@@ -246,6 +246,15 @@ pub trait GpuComposer: FrameComposer {
     /// Extra cost each CPU-fallback frame pays (chaos seam only).
     fn cpu_fallback_cost(&self) -> Option<Arc<AtomicU64>> {
         None
+    }
+    /// Whether this composer draws keyed and scene-grouped tiles itself
+    /// (ADR-0113 §3.3). `false` routes every such frame to the persistent
+    /// CPU fallback before any GPU work. The wgpu compositor draws them (a
+    /// frame past its layer limit is a typed `GpuLimit`, which falls back the
+    /// same way); the simulated GPU keeps the default, so the chaos tests of
+    /// a slow keyed fallback stay deterministic.
+    fn draws_keys(&self) -> bool {
+        false
     }
 }
 
@@ -830,6 +839,8 @@ pub struct OffClockGpu<G: GpuComposer> {
     cpu: Worker<CpuFallback>,
     health: Arc<GpuHealth>,
     period_nanos: AtomicU64,
+    /// [`GpuComposer::draws_keys`], read once at build.
+    gpu_draws_keys: bool,
 }
 
 impl<G: GpuComposer> std::fmt::Debug for OffClockGpu<G> {
@@ -888,6 +899,7 @@ impl<G: GpuComposer> OffClockGpu<G> {
             .map(Arc::clone)
             .ok_or_else(|| Error::GpuRuntime("GPU worker built no health".to_owned()))?;
         let cost_nanos = gpu.with_composer(GpuComposer::cpu_fallback_cost).flatten();
+        let gpu_draws_keys = gpu.with_composer(GpuComposer::draws_keys).unwrap_or(false);
         // If this fails, `gpu` drops here: its worker stops and drops the
         // device on its own thread.
         let cpu = Worker::spawn_with(
@@ -910,6 +922,7 @@ impl<G: GpuComposer> OffClockGpu<G> {
             cpu,
             health,
             period_nanos: AtomicU64::new(0),
+            gpu_draws_keys,
         })
     }
 
@@ -1016,13 +1029,8 @@ impl<G: GpuComposer> OffClockGpu<G> {
         if self.health.is_lost() {
             return self.cpu_frame(job, start, budget, "GPU device lost");
         }
-        if job.needs_cpu_keyer_path() {
-            return self.cpu_frame(
-                job,
-                start,
-                budget,
-                "keyed frame (CPU key path, ADR-0113 K1)",
-            );
+        if !self.gpu_draws_keys && job.needs_cpu_keyer_path() {
+            return self.cpu_frame(job, start, budget, "keyed frame (no GPU key path)");
         }
         let wait = if period.is_zero() {
             budget
@@ -1158,8 +1166,8 @@ impl<G: GpuComposer> OffClockGpu<G> {
         if self.health.is_lost() {
             return on_cpu("GPU device lost");
         }
-        if job.needs_cpu_keyer_path() {
-            return on_cpu("keyed frame (CPU key path, ADR-0113 K1)");
+        if !self.gpu_draws_keys && job.needs_cpu_keyer_path() {
+            return on_cpu("keyed frame (no GPU key path)");
         }
         match self.gpu.run(job, UNCLOCKED_FRAME_BUDGET) {
             Outcome::Done(Ok(image)) => {

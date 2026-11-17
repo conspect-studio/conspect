@@ -288,7 +288,8 @@ fn the_complement_is_one_minus_the_mask_and_an_invalid_mask_keeps_the_outgoing_s
 
 /// A keyer tile drawn through a complemented mask (a tied DSK going off
 /// through a WIPE) shows `1 − m` coverage: it stays where the wipe has not
-/// reached and is gone behind the edge.
+/// reached and is gone behind the edge. (The GPU draws it too:
+/// `keyers_gpu::k3_wipe_merges_and_complemented_masks_match_the_cpu_oracle`.)
 #[test]
 fn a_tile_through_a_complemented_mask_is_drawn_ahead_of_the_edge() {
     let a = solid(W, H, 80, 128, 128);
@@ -305,7 +306,4 @@ fn a_tile_through_a_complemented_mask_is_drawn_ahead_of_the_edge() {
         let want = lerp_px(lin(&a), lin(&d), cov);
         assert_close(yuv(&out, x, 2), encode(want), &format!("column {x}"));
     }
-    assert!(multiview_compositor::key::needs_cpu_keyer_path(&[
-        Tile::placed(&a, 0, 0, 1.0).with_mask(mask)
-    ]));
 }

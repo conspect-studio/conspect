@@ -1,11 +1,47 @@
 //! The Cast packager: HLS with CMAF fMP4 segments, written to a directory.
 //!
-//! [`CastPackager`] takes the encoder's H.264 access units and AAC frames and
-//! publishes, in one directory, a `master.m3u8`, a `video.m3u8` and (with
-//! audio) an `audio.m3u8` whose segments are single-track CMAF files built by
-//! [`super::cmaf`]. Video and audio are separate renditions with the same
-//! media-sequence numbers for the same time ranges: audio segment `n` holds
-//! the AAC frames that start inside video segment `n`.
+//! [`CastPackager`] takes the encoder's H.264 access units, the AAC frames of
+//! every audio rendition and (optionally) subtitle cues, and publishes, in one
+//! directory, a `master.m3u8`, a `video.m3u8`, one audio playlist per audio
+//! rendition and one `WebVTT` playlist per subtitle rendition. Video and audio
+//! segments are single-track CMAF files built by [`super::cmaf`]. Every
+//! playlist lists the same media-sequence numbers for the same time ranges:
+//! audio segment `n` holds the AAC frames that start inside video segment `n`,
+//! subtitle segment `n` the cues shown during it.
+//!
+//! ## File names (#418)
+//!
+//! Audio rendition 0 keeps the single-audio names (`audio.m3u8`,
+//! `seg-a-<gen>-<n>.m4s`, `init-a-<gen>-0.mp4`), so a one-audio stream is
+//! byte-identical to the first slice. Rendition `i > 0` writes `audio<i>.m3u8`,
+//! `seg-a<i>-<gen>-<n>.m4s`, `init-a<i>-<gen>-0.mp4`. Subtitle rendition `i`
+//! writes `subs<i>.m3u8` and `sub<i>-<gen>-<n>.vtt`.
+//!
+//! ## Subtitle timing (`X-TIMESTAMP-MAP` for fMP4)
+//!
+//! Each `.vtt` maps `LOCAL` (the rendition's own `WebVTT` timeline, zero at
+//! its first segment) to `MPEGTS` = the video segment start on the media
+//! timeline (the `tfdt` / pts time line, which is the tick-derived output
+//! timeline cues are stamped on) in 90 kHz units, **modulo 2^33**
+//! ([`super::subtitle::render_vtt`]). Verified against Shaka Player 4.15.56,
+//! the player of CAF Web Receiver 3.0.0157:
+//!
+//! - `lib/text/vtt_text_parser.js` `computeHlsOffset_` (lines 125-168): a cue
+//!   is placed at `periodStart + MPEGTS / 90000 - LOCAL + cueTime`; it adds
+//!   2^33 to `MPEGTS` once per 2^33/90000 s of `segmentStart - periodStart`
+//!   (lines 157-165, `TS_ROLLOVER_ = 0x200000000` at line 631), i.e. it
+//!   unwraps a 33-bit value by the segment's media time. An unwrapped value
+//!   past 2^33 would be shifted a second time, so the modulo is required.
+//! - `periodStart` is the text engine's timestamp offset
+//!   (`lib/text/text_engine.js` line 204), set from the **video** source
+//!   buffer offset before any text is parsed
+//!   (`lib/media/media_source_engine.js` lines 1193-1196 await
+//!   `textSequenceModeOffset_`, resolved at line 1297 from the video append).
+//!   For fMP4 that offset is `reference.startTime - tfdt / timescale` (lines
+//!   957 and 1272), in segments and in sequence mode alike.
+//!
+//! So a cue at media instant `t` lands at `offset + t`, exactly where video
+//! frame `t` plays: `MPEGTS` is the plain media timeline, no TS muxer offset.
 //!
 //! The packager is synchronous and single-threaded: one output sink thread
 //! drives it and it performs filesystem I/O (never call it from the engine
@@ -29,14 +65,24 @@
 //! `EXT-X-DISCONTINUITY`. Timestamps are never rebased, sequence numbers and
 //! file names never restart inside one packager. A closed video segment for
 //! which no audio frame exists is dropped rather than paired with an empty
-//! audio segment.
+//! audio segment. With several audio renditions a pair publishes only when
+//! **every** rendition holds its frames for the segment; a rendition missing
+//! them drops the pair for all.
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use multiview_core::time::{rescale, Rational};
+use multiview_core::time::{rescale, MediaTime, Rational};
 
 use super::cmaf::{self, Sample};
-use super::{AudioRendition, MasterPlaylist, MediaPlaylist, Segment, SegmentType, VariantStream};
+use super::subtitle::{
+    pts_90k_of, render_vtt, unique_rendition_names, SlotCues, SubtitleFeedReceiver,
+    SubtitleRendition, SubtitleStats,
+};
+use super::{
+    AudioRendition, MasterPlaylist, MediaPlaylist, Segment, SegmentType, SubtitleMedia,
+    VariantStream,
+};
 use crate::epoch::SharedEpoch;
 use crate::error::{Error, Result};
 
@@ -71,6 +117,10 @@ const VIDEO_PLAYLIST: &str = "video.m3u8";
 const AUDIO_PLAYLIST: &str = "audio.m3u8";
 const MASTER_PLAYLIST: &str = "master.m3u8";
 const AUDIO_GROUP: &str = "aud";
+/// Most audio renditions one packager carries.
+pub const MAX_CAST_AUDIO_RENDITIONS: usize = 16;
+/// Most subtitle renditions one packager carries (`MAX_SUBTITLE_SLOTS`).
+pub const MAX_CAST_SUBTITLE_RENDITIONS: usize = 8;
 
 /// The video rendition of a [`CastPackager`].
 #[derive(Debug, Clone)]
@@ -107,6 +157,35 @@ pub struct CastAudioConfig {
     pub audio_specific_config: Option<Vec<u8>>,
 }
 
+/// One audio rendition of a [`CastPackager`]: its stream and how the master
+/// lists it.
+#[derive(Debug, Clone)]
+pub struct CastAudioRendition {
+    /// The AAC stream.
+    pub config: CastAudioConfig,
+    /// Player menu label (`NAME`); made unique in the master.
+    pub name: String,
+    /// Optional BCP-47 language tag (`LANGUAGE`).
+    pub language: Option<String>,
+    /// Whether this is the `DEFAULT=YES` rendition. Exactly one is: the first
+    /// marked one, else rendition 0.
+    pub default: bool,
+}
+
+impl CastAudioRendition {
+    /// The single program-audio rendition of the first slice: `NAME="Program"`,
+    /// no language, default.
+    #[must_use]
+    pub fn program(config: CastAudioConfig) -> Self {
+        Self {
+            config,
+            name: "Program".to_owned(),
+            language: None,
+            default: true,
+        }
+    }
+}
+
 /// Configuration of a [`CastPackager`].
 #[derive(Debug, Clone)]
 pub struct CastPackagerConfig {
@@ -121,8 +200,17 @@ pub struct CastPackagerConfig {
     pub target_segment_ns: i64,
     /// The video rendition.
     pub video: CastVideoConfig,
-    /// The audio rendition; `None` packages video only.
-    pub audio: Option<CastAudioConfig>,
+    /// The audio renditions, in order (index = the `rendition` of
+    /// [`CastPackager::push_audio`]); empty packages video only. At most
+    /// [`MAX_CAST_AUDIO_RENDITIONS`].
+    pub audio: Vec<CastAudioRendition>,
+    /// The `WebVTT` subtitle renditions (index = [`super::SubtitleCue::slot`]).
+    /// At most [`MAX_CAST_SUBTITLE_RENDITIONS`].
+    pub subtitles: Vec<SubtitleRendition>,
+    /// The cue feed, drained (bounded, non-blocking) at every published
+    /// segment. Shared so the caller can hand the same receiver to every
+    /// packager generation (and drain it itself while none runs).
+    pub subtitle_feed: Option<Arc<SubtitleFeedReceiver>>,
     /// The `EXT-X-PROGRAM-DATE-TIME` anchor source; `None` (or a still-empty
     /// cell) falls back to [`Self::wall_anchor`].
     pub epoch: Option<SharedEpoch>,
@@ -166,8 +254,11 @@ pub struct AudioUnit<'a> {
 pub struct CastProgress {
     /// Video segments published (listed at some point).
     pub video_segments: u64,
-    /// Audio segments published.
+    /// Audio segment sets published (one per sequence number, whatever the
+    /// number of audio renditions).
     pub audio_segments: u64,
+    /// Subtitle segment sets published (one per sequence number).
+    pub subtitle_segments: u64,
     /// Whether `master.m3u8` has been written.
     pub master: bool,
 }
@@ -230,6 +321,20 @@ fn remove_quietly(path: &Path) {
     }
 }
 
+/// Unlink a retired file this packager published (#418 review
+/// ABUSE-HISTORY-R4). Unlike [`remove_quietly`], only an already missing
+/// file counts as removed: any other failure is an error, so the packager
+/// fails and is replaced under a NEW file generation (which the control
+/// plane never serves) instead of leaving retired bytes servable under the
+/// current one.
+fn remove_retired(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error("unlinking retired", path, &error)),
+    }
+}
+
 /// Whether `text` is `<digits>-<digits>` (the `<generation>-<index>` part of
 /// a packager file name).
 fn is_generation_index(text: &str) -> bool {
@@ -238,46 +343,175 @@ fn is_generation_index(text: &str) -> bool {
         .is_some_and(|(generation, index)| digits(generation) && digits(index))
 }
 
+/// A canonical decimal rendition index (`0`, `1`, `12`; never `01`) at the
+/// start of `text`, and the rest. `None` when `text` starts with no digit.
+fn leading_index(text: &str) -> Option<(usize, &str)> {
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    let (number, rest) = text.split_at(digits);
+    if number.is_empty() || (number.len() > 1 && number.starts_with('0')) {
+        return None;
+    }
+    number.parse().ok().map(|index| (index, rest))
+}
+
+/// `<i>-<gen>-<n>` with an optional audio rendition index `i` (absent =
+/// rendition 0; present = `1..MAX_CAST_AUDIO_RENDITIONS`).
+fn is_audio_generation_index(text: &str) -> bool {
+    if let Some(rest) = text.strip_prefix('-') {
+        return is_generation_index(rest);
+    }
+    leading_index(text).is_some_and(|(index, rest)| {
+        (1..MAX_CAST_AUDIO_RENDITIONS).contains(&index)
+            && rest.strip_prefix('-').is_some_and(is_generation_index)
+    })
+}
+
+/// `<i>-<gen>-<n>` with a subtitle rendition index `i` in
+/// `0..MAX_CAST_SUBTITLE_RENDITIONS`.
+fn is_subtitle_generation_index(text: &str) -> bool {
+    leading_index(text).is_some_and(|(index, rest)| {
+        index < MAX_CAST_SUBTITLE_RENDITIONS
+            && rest.strip_prefix('-').is_some_and(is_generation_index)
+    })
+}
+
+/// The media playlist name of audio rendition `index` (0 = `audio.m3u8`).
+fn audio_playlist_name(index: usize) -> String {
+    if index == 0 {
+        AUDIO_PLAYLIST.to_owned()
+    } else {
+        format!("audio{index}.m3u8")
+    }
+}
+
+/// The file-name tag of audio rendition `index`: `a` for 0, `a<i>` else.
+fn audio_tag(index: usize) -> String {
+    if index == 0 {
+        "a".to_owned()
+    } else {
+        format!("a{index}")
+    }
+}
+
 /// Whether `name` is a file name a [`CastPackager`] writes: `master.m3u8`,
-/// `video.m3u8`, `audio.m3u8`, `seg-v-<gen>-<n>.m4s`, `seg-a-<gen>-<n>.m4s`,
-/// `init-v-<gen>-<k>.mp4`, `init-a-<gen>-<k>.mp4`, or one of those with
-/// `.tmp` appended (the write-then-rename temporary).
+/// `video.m3u8`, `audio.m3u8`, `audio<i>.m3u8` (`i` in `1..16`),
+/// `subs<i>.m3u8` (`i` in `0..8`), `seg-v-<gen>-<n>.m4s`,
+/// `seg-a-<gen>-<n>.m4s`, `seg-a<i>-<gen>-<n>.m4s`, `sub<i>-<gen>-<n>.vtt`,
+/// `init-v-<gen>-<k>.mp4`, `init-a-<gen>-<k>.mp4`, `init-a<i>-<gen>-<k>.mp4`,
+/// or one of those with `.tmp` appended (the write-then-rename temporary).
+/// Indices are canonical decimals; audio rendition 0 never carries its index
+/// (`audio0.m3u8` is not a packager name).
 #[must_use]
 pub fn is_packager_file_name(name: &str) -> bool {
     let name = name.strip_suffix(".tmp").unwrap_or(name);
     if matches!(name, MASTER_PLAYLIST | VIDEO_PLAYLIST | AUDIO_PLAYLIST) {
         return true;
     }
-    let segment = name.strip_suffix(".m4s").and_then(|stem| {
-        stem.strip_prefix("seg-v-")
-            .or_else(|| stem.strip_prefix("seg-a-"))
-    });
-    let init = name.strip_suffix(".mp4").and_then(|stem| {
-        stem.strip_prefix("init-v-")
-            .or_else(|| stem.strip_prefix("init-a-"))
-    });
-    segment.or(init).is_some_and(is_generation_index)
+    if let Some(stem) = name.strip_suffix(".m3u8") {
+        let indexed = |prefix: &str, range: std::ops::Range<usize>| {
+            stem.strip_prefix(prefix)
+                .and_then(leading_index)
+                .is_some_and(|(index, rest)| rest.is_empty() && range.contains(&index))
+        };
+        return indexed("audio", 1..MAX_CAST_AUDIO_RENDITIONS)
+            || indexed("subs", 0..MAX_CAST_SUBTITLE_RENDITIONS);
+    }
+    if let Some(stem) = name.strip_suffix(".vtt") {
+        return stem
+            .strip_prefix("sub")
+            .is_some_and(is_subtitle_generation_index);
+    }
+    if let Some(stem) = name.strip_suffix(".m4s") {
+        return stem.strip_prefix("seg-v-").is_some_and(is_generation_index)
+            || stem
+                .strip_prefix("seg-a")
+                .is_some_and(is_audio_generation_index);
+    }
+    if let Some(stem) = name.strip_suffix(".mp4") {
+        return stem
+            .strip_prefix("init-v-")
+            .is_some_and(is_generation_index)
+            || stem
+                .strip_prefix("init-a")
+                .is_some_and(is_audio_generation_index);
+    }
+    false
 }
 
-/// Delete the files a [`CastPackager`] wrote directly in `dir` (best effort):
-/// only names [`is_packager_file_name`] accepts, only regular files (never a
-/// symlink, never a sub-directory). Every other file is left alone, so a
-/// directory that also holds an operator's files loses none of them.
-pub fn purge_dir(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+/// The generation a [`CastPackager`] media file name carries: `<gen>` of
+/// `seg-v-<gen>-<n>.m4s`, `seg-a[<i>]-<gen>-<n>.m4s`,
+/// `sub<i>-<gen>-<n>.vtt`, `init-v-<gen>-<k>.mp4`,
+/// `init-a[<i>]-<gen>-<k>.mp4` (also with `.tmp`). `None` for a playlist
+/// (they carry no generation) and for any name [`is_packager_file_name`]
+/// refuses.
+#[must_use]
+pub fn packager_file_generation(name: &str) -> Option<u64> {
+    if !is_packager_file_name(name) {
+        return None;
+    }
+    let name = name.strip_suffix(".tmp").unwrap_or(name);
+    // Every generation-carrying name ends in `-<gen>-<n>.<ext>` (the
+    // packager writes lower-case names only; a playlist carries none).
+    let (stem, ext) = name.rsplit_once('.')?;
+    if ext == "m3u8" {
+        return None;
+    }
+    let (head, _) = stem.rsplit_once('-')?;
+    let (_, generation) = head.rsplit_once('-')?;
+    generation.parse().ok()
+}
+
+/// Directory entries one [`purge_dir`] visits at most (#418 review r7
+/// INV418-R7-1): its work is bounded whatever the directory holds.
+pub const PURGE_SCAN_LIMIT: usize = 4096;
+
+/// Delete the files a [`CastPackager`] wrote directly in `dir`: only names
+/// [`is_packager_file_name`] accepts, only regular files (never a symlink,
+/// never a sub-directory). Every other file is left alone, so a directory
+/// that also holds an operator's files loses none of them.
+///
+/// Returns `true` only when no entry with a packager name is left (a
+/// missing directory is clean): `false` when an unlink failed, when a
+/// packager-named entry is not a regular file, when the directory cannot be
+/// read, or when it holds more than [`PURGE_SCAN_LIMIT`] entries (the scan
+/// stops there and the rest is unknown). The caller then stops writing to
+/// it (#418 review r7 INV418-R7-1), so undeletable files never accumulate.
+#[must_use]
+pub fn purge_dir(dir: &Path) -> bool {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
     };
-    for entry in entries.flatten() {
+    let mut clean = true;
+    for (visited, entry) in entries.enumerate() {
+        if visited >= PURGE_SCAN_LIMIT {
+            return false;
+        }
+        let Ok(entry) = entry else {
+            clean = false;
+            continue;
+        };
         let ours = entry
             .file_name()
             .to_str()
             .is_some_and(is_packager_file_name);
+        if !ours {
+            continue;
+        }
         // `DirEntry::file_type` does not follow symlinks: a symlink with a
-        // packager name is not a regular file and is left alone.
-        if ours && entry.file_type().is_ok_and(|kind| kind.is_file()) {
-            remove_quietly(&entry.path());
+        // packager name is not a regular file and is left alone (and the
+        // directory is then not clean).
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            clean = false;
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => clean = false,
         }
     }
+    clean
 }
 
 /// Maps video timestamps (time-base units) onto the track timescale.
@@ -387,6 +621,12 @@ struct AudioFrame {
 
 #[derive(Debug)]
 struct AudioState {
+    /// The rendition index (file names, `push_audio`).
+    index: usize,
+    /// `NAME` (already unique), `LANGUAGE` and `DEFAULT` in the master.
+    name: String,
+    language: Option<String>,
+    default: bool,
     config: CastAudioConfig,
     /// `1 / sample_rate`: the unit of every audio time held here.
     tb: Rational,
@@ -406,13 +646,32 @@ struct AudioState {
     peak_bps: u64,
     bytes: u64,
     ticks: u64,
+    /// `tfdt` + duration of the last published segment.
+    end: Option<u64>,
+}
+
+/// One `WebVTT` subtitle rendition.
+#[derive(Debug)]
+struct SubtitleState {
+    /// `NAME` (already unique) and `LANGUAGE` in the master.
+    name: String,
+    language: Option<String>,
+    /// The cues held between segments (bounded).
+    cues: SlotCues,
+    /// LOCAL zero of the rendition's `WebVTT` timeline: its first segment
+    /// start.
+    base: Option<MediaTime>,
+    playlist: MediaPlaylist,
 }
 
 /// The files of one published sequence number.
 #[derive(Debug)]
 struct PublishedFiles {
     video: String,
-    audio: Option<String>,
+    /// One per audio rendition.
+    audio: Vec<String>,
+    /// One per subtitle rendition.
+    subtitles: Vec<String>,
     video_init: String,
 }
 
@@ -426,7 +685,11 @@ pub struct CastPackager {
     epoch: Option<SharedEpoch>,
     wall_anchor: Option<(i64, i64)>,
     video: VideoState,
-    audio: Option<AudioState>,
+    /// The audio renditions (empty: video only).
+    audio: Vec<AudioState>,
+    subtitles: Vec<SubtitleState>,
+    subtitle_feed: Option<Arc<SubtitleFeedReceiver>>,
+    subtitle_stats: Arc<SubtitleStats>,
     /// Closed video segments not yet published (bounded).
     pending: VecDeque<ClosedVideo>,
     /// The start pts (video time base) of the current continuous run; `None`
@@ -443,9 +706,8 @@ pub struct CastPackager {
     /// `(wall ns, media ns)`: the single `EXT-X-PROGRAM-DATE-TIME` anchor.
     anchor: Option<(i64, i64)>,
     next_sequence: u64,
-    /// `tfdt` + duration of the last published video / audio segment.
+    /// `tfdt` + duration of the last published video segment.
     video_end: Option<u64>,
-    audio_end: Option<u64>,
     target_duration: u64,
     /// Listed and retained segment files, oldest first.
     on_disk: VecDeque<PublishedFiles>,
@@ -457,11 +719,91 @@ pub struct CastPackager {
 }
 
 fn new_playlist(window: usize, target_duration: u64) -> MediaPlaylist {
-    let mut playlist = MediaPlaylist::new(SegmentType::Fmp4);
+    new_playlist_of(SegmentType::Fmp4, window, target_duration)
+}
+
+/// A media playlist of `kind` (`MpegTs` = no `EXT-X-MAP`, for `WebVTT`).
+fn new_playlist_of(kind: SegmentType, window: usize, target_duration: u64) -> MediaPlaylist {
+    let mut playlist = MediaPlaylist::new(kind);
     playlist.set_window(window);
     playlist.set_target_duration(target_duration);
     playlist.set_extinf_decimals(EXTINF_DECIMALS);
     playlist
+}
+
+/// The audio renditions' states: unique names, exactly one default.
+fn audio_states(
+    renditions: Vec<CastAudioRendition>,
+    window: usize,
+    target_duration: u64,
+) -> Result<Vec<AudioState>> {
+    let bad = |what: &str| Error::Output(format!("cast packager: {what}"));
+    // Unique `NAME`s (RFC 8216 §4.3.4.1.1), the subtitle group's rule.
+    let audio_names = unique_rendition_names(
+        &renditions
+            .iter()
+            .map(|rendition| SubtitleRendition {
+                name: rendition.name.clone(),
+                language: None,
+            })
+            .collect::<Vec<_>>(),
+    );
+    // Exactly one `DEFAULT=YES`: the first marked, else rendition 0.
+    let default = renditions
+        .iter()
+        .position(|rendition| rendition.default)
+        .unwrap_or(0);
+    let mut audio = Vec::with_capacity(renditions.len());
+    for (index, (rendition, name)) in renditions.into_iter().zip(audio_names).enumerate() {
+        let stream = rendition.config;
+        if !positive(stream.time_base) || stream.sample_rate == 0 || stream.channels == 0 {
+            return Err(bad(
+                "the audio time base, sample rate and channels must be positive",
+            ));
+        }
+        audio.push(AudioState {
+            index,
+            name,
+            language: rendition.language.filter(|tag| !tag.is_empty()),
+            default: index == default,
+            tb: Rational::new(1, i64::from(stream.sample_rate)),
+            asc: stream
+                .audio_specific_config
+                .clone()
+                .filter(|asc| !asc.is_empty()),
+            config: stream,
+            init_written: false,
+            buffer: VecDeque::new(),
+            expected: None,
+            resume_floor: None,
+            playlist: new_playlist(window, target_duration),
+            peak_bps: 0,
+            bytes: 0,
+            ticks: 0,
+            end: None,
+        });
+    }
+    Ok(audio)
+}
+
+/// The subtitle renditions' states: unique names, no cue yet.
+fn subtitle_states(
+    renditions: Vec<SubtitleRendition>,
+    window: usize,
+    target_duration: u64,
+) -> Vec<SubtitleState> {
+    let subtitle_names = unique_rendition_names(&renditions);
+    renditions
+        .into_iter()
+        .zip(subtitle_names)
+        .map(|(rendition, name)| SubtitleState {
+            name,
+            language: rendition.language.filter(|tag| !tag.is_empty()),
+            cues: SlotCues::default(),
+            base: None,
+            playlist: new_playlist_of(SegmentType::MpegTs, window, target_duration),
+        })
+        .collect()
 }
 
 fn positive(tb: Rational) -> bool {
@@ -475,8 +817,10 @@ impl CastPackager {
     /// # Errors
     /// Returns [`Error::Output`] when the configuration is unusable (a
     /// non-positive time base, zero dimensions, window, target or sample
-    /// rate, or extradata that holds no SPS + PPS) or the directory cannot
-    /// be created.
+    /// rate, extradata that holds no SPS + PPS, more than
+    /// [`MAX_CAST_AUDIO_RENDITIONS`] audio or
+    /// [`MAX_CAST_SUBTITLE_RENDITIONS`] subtitle renditions) or the
+    /// directory cannot be created.
     pub fn new(config: CastPackagerConfig) -> Result<Self> {
         let bad = |what: &str| Error::Output(format!("cast packager: {what}"));
         if !positive(config.video.time_base) {
@@ -508,32 +852,25 @@ impl CastPackager {
                 .saturating_mul(TARGET_DURATION_MULTIPLIER),
             1_000_000_000,
         );
-        let audio = match config.audio {
-            None => None,
-            Some(audio) => {
-                if !positive(audio.time_base) || audio.sample_rate == 0 || audio.channels == 0 {
-                    return Err(bad(
-                        "the audio time base, sample rate and channels must be positive",
-                    ));
-                }
-                Some(AudioState {
-                    tb: Rational::new(1, i64::from(audio.sample_rate)),
-                    asc: audio
-                        .audio_specific_config
-                        .clone()
-                        .filter(|asc| !asc.is_empty()),
-                    config: audio,
-                    init_written: false,
-                    buffer: VecDeque::new(),
-                    expected: None,
-                    resume_floor: None,
-                    playlist: new_playlist(config.window, target_duration),
-                    peak_bps: 0,
-                    bytes: 0,
-                    ticks: 0,
-                })
-            }
-        };
+        if config.audio.len() > MAX_CAST_AUDIO_RENDITIONS {
+            return Err(bad(&format!(
+                "{} audio renditions; a cast stream carries at most {MAX_CAST_AUDIO_RENDITIONS}",
+                config.audio.len()
+            )));
+        }
+        if config.subtitles.len() > MAX_CAST_SUBTITLE_RENDITIONS {
+            return Err(bad(&format!(
+                "{} subtitle renditions; a cast stream carries at most \
+                 {MAX_CAST_SUBTITLE_RENDITIONS}",
+                config.subtitles.len()
+            )));
+        }
+        let audio = audio_states(config.audio, config.window, target_duration)?;
+        let subtitles = subtitle_states(config.subtitles, config.window, target_duration);
+        let subtitle_stats = config
+            .subtitle_feed
+            .as_ref()
+            .map_or_else(|| Arc::new(SubtitleStats::default()), |feed| feed.stats());
         std::fs::create_dir_all(&config.dir)
             .map_err(|e| io_error("creating directory", &config.dir, &e))?;
         Ok(Self {
@@ -560,6 +897,9 @@ impl CastPackager {
                 ticks: 0,
             },
             audio,
+            subtitles,
+            subtitle_feed: config.subtitle_feed,
+            subtitle_stats,
             pending: VecDeque::new(),
             run_start: None,
             gap_noted: false,
@@ -569,7 +909,6 @@ impl CastPackager {
             anchor: None,
             next_sequence: 0,
             video_end: None,
-            audio_end: None,
             target_duration,
             on_disk: VecDeque::new(),
             inits: Vec::new(),
@@ -592,8 +931,8 @@ impl CastPackager {
             && self.video.playlist.segment_count() >= 3
             && self
                 .audio
-                .as_ref()
-                .is_none_or(|audio| audio.playlist.segment_count() >= 3)
+                .iter()
+                .all(|audio| audio.playlist.segment_count() >= 3)
     }
 
     /// Report that input was lost upstream (a full queue dropped packets).
@@ -605,20 +944,21 @@ impl CastPackager {
 }
 
 /// What the audio buffer holds for one closed video segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AudioTake {
     /// Later frames may still belong to the segment.
     Wait,
     /// No frame starts at the segment start: the pair cannot be published.
     Missing,
-    /// The frames of the segment, in order.
-    Frames(Vec<AudioFrame>),
+    /// The first `n` buffered frames are the segment's, in order.
+    Frames(usize),
 }
 
 impl AudioState {
-    /// Take the frames with pts in `[start, end)` (video time base `vtb`).
-    /// The range is complete once a frame at or after `end` is buffered;
-    /// `force` takes what is there.
-    fn take_segment(&mut self, start: i64, end: i64, vtb: Rational, force: bool) -> AudioTake {
+    /// Find the frames with pts in `[start, end)` (video time base `vtb`),
+    /// without taking them. The range is complete once a frame at or after
+    /// `end` is buffered; `force` takes what is there.
+    fn probe_segment(&mut self, start: i64, end: i64, vtb: Rational, force: bool) -> AudioTake {
         self.drop_before(start, vtb);
         let mut count = 0usize;
         let mut complete = false;
@@ -644,7 +984,7 @@ impl AudioState {
         if count == 0 || !aligned {
             return AudioTake::Missing;
         }
-        AudioTake::Frames(self.buffer.drain(..count).collect())
+        AudioTake::Frames(count)
     }
 
     /// Drop the buffered frames that start before `start` (time base `vtb`).
@@ -674,9 +1014,9 @@ impl CastPackager {
     /// is negative, no parameter sets are known after 300 units ("no H.264
     /// parameter sets in-band or in extradata"), an open segment exceeds its
     /// bounds (no IDR arrives), audio falls more than three segments behind
-    /// or is missing for more than eight segments in a row, or a file cannot
-    /// be written. After an error the packager must be
-    /// replaced by a new one (a new generation).
+    /// or is missing for more than eight segments in a row, a file cannot
+    /// be written, or a retired file cannot be unlinked. After an error the
+    /// packager must be replaced by a new one (a new generation).
     pub fn push_video(&mut self, unit: VideoUnit<'_>) -> Result<()> {
         if self.gap_noted {
             self.handle_gap()?;
@@ -730,7 +1070,7 @@ impl CastPackager {
         let startable = sample.sync && sample.dts >= 0 && sample.pts >= 0;
         if !startable || self.video.sps.is_none() || self.video.pps.is_none() {
             // Audio older than this unit can never be part of the stream.
-            if let Some(audio) = self.audio.as_mut() {
+            for audio in &mut self.audio {
                 audio.drop_before(sample.pts, self.video.clock.tb);
             }
         }
@@ -760,19 +1100,23 @@ impl CastPackager {
             let wall_ns = from_epoch.or(from_caller).unwrap_or_else(system_time_ns);
             self.anchor = Some((wall_ns, media_ns));
         }
-        if let Some(audio) = self.audio.as_mut() {
-            let vtb = self.video.clock.tb;
-            let uncovered = audio.resume_floor.is_some_and(|floor| {
+        // Every audio rendition must cover the IDR (all playlists list the
+        // same sequence numbers).
+        let vtb = self.video.clock.tb;
+        let uncovered = self.audio.iter().any(|audio| {
+            audio.resume_floor.is_some_and(|floor| {
                 time_ge(
                     floor.saturating_sub(AAC_FRAME_SAMPLES),
                     audio.tb,
                     sample.pts,
                     vtb,
                 )
-            });
-            if uncovered {
-                return Ok(());
-            }
+            })
+        });
+        if uncovered {
+            return Ok(());
+        }
+        for audio in &mut self.audio {
             audio.resume_floor = None;
             audio.drop_before(sample.pts, vtb);
         }
@@ -945,35 +1289,45 @@ impl CastPackager {
         Ok(())
     }
 
-    /// Publish every closed video segment whose audio is complete. With
-    /// `force` the audio received so far is taken as complete.
+    /// Publish every closed video segment whose audio is complete in every
+    /// audio rendition. With `force` the audio received so far is taken as
+    /// complete.
     fn publish_ready(&mut self, force: bool) -> Result<()> {
         let vtb = self.video.clock.tb;
         while let Some(front) = self.pending.front() {
-            let frames = match self.audio.as_mut() {
-                None => None,
-                Some(audio) => {
-                    match audio.take_segment(front.start_pts, front.end_pts, vtb, force) {
-                        AudioTake::Wait => break,
-                        AudioTake::Missing => {
-                            // No audio starts with this video segment: drop
-                            // the pair (the next published one is marked
-                            // discontinuous) rather than list an empty
-                            // audio segment.
-                            self.pending.pop_front();
-                            self.dropped_pairs = self.dropped_pairs.saturating_add(1);
-                            if !force && self.dropped_pairs > MAX_CONSECUTIVE_DROPPED_PAIRS {
-                                return Err(Error::Output(format!(
-                                    "cast packager: no audio for {} video segments in a row",
-                                    self.dropped_pairs
-                                )));
-                            }
-                            continue;
-                        }
-                        AudioTake::Frames(frames) => Some(frames),
-                    }
+            let (start, end) = (front.start_pts, front.end_pts);
+            let takes: Vec<AudioTake> = self
+                .audio
+                .iter_mut()
+                .map(|audio| audio.probe_segment(start, end, vtb, force))
+                .collect();
+            if takes.contains(&AudioTake::Missing) {
+                // A rendition has no audio starting with this video segment:
+                // drop the pair for every rendition (the next published one
+                // is marked discontinuous) rather than list an empty audio
+                // segment or let the playlists disagree.
+                self.pending.pop_front();
+                self.dropped_pairs = self.dropped_pairs.saturating_add(1);
+                if !force && self.dropped_pairs > MAX_CONSECUTIVE_DROPPED_PAIRS {
+                    return Err(Error::Output(format!(
+                        "cast packager: no audio for {} video segments in a row",
+                        self.dropped_pairs
+                    )));
                 }
-            };
+                continue;
+            }
+            if takes.contains(&AudioTake::Wait) {
+                break;
+            }
+            let frames: Vec<Vec<AudioFrame>> = self
+                .audio
+                .iter_mut()
+                .zip(&takes)
+                .map(|(audio, take)| match take {
+                    AudioTake::Frames(count) => audio.buffer.drain(..*count).collect(),
+                    AudioTake::Wait | AudioTake::Missing => Vec::new(),
+                })
+                .collect();
             let Some(closed) = self.pending.pop_front() else {
                 break;
             };
@@ -1031,16 +1385,16 @@ impl CastPackager {
         Ok((name, replaced))
     }
 
-    fn audio_init_name(&self) -> String {
-        format!("init-a-{}-0.mp4", self.generation)
+    fn audio_init_name(&self, rendition: usize) -> String {
+        format!("init-{}-{}-0.mp4", audio_tag(rendition), self.generation)
     }
 
-    /// Write the audio init file once, with the `AudioSpecificConfig` from
-    /// the configuration, else from the first ADTS header, else built for
-    /// AAC-LC from the configured rate and channels.
-    fn ensure_audio_init(&mut self) -> Result<()> {
-        let path = self.dir.join(self.audio_init_name());
-        let Some(audio) = self.audio.as_mut() else {
+    /// Write the audio init file of `rendition` once, with the
+    /// `AudioSpecificConfig` from the configuration, else from the first ADTS
+    /// header, else built for AAC-LC from the configured rate and channels.
+    fn ensure_audio_init(&mut self, rendition: usize) -> Result<()> {
+        let path = self.dir.join(self.audio_init_name(rendition));
+        let Some(audio) = self.audio.get_mut(rendition) else {
             return Ok(());
         };
         if audio.init_written {
@@ -1077,21 +1431,23 @@ impl CastPackager {
 
     /// Publish one sequence number: the video segment, its audio segment,
     /// both playlists and (first time, or on a codec change) the master.
-    fn publish_pair(
-        &mut self,
-        closed: &ClosedVideo,
-        frames: Option<Vec<AudioFrame>>,
-    ) -> Result<()> {
+    fn publish_pair(&mut self, closed: &ClosedVideo, frames: Vec<Vec<AudioFrame>>) -> Result<()> {
         let sequence = self.next_sequence;
         let mfhd = u32::try_from(sequence.saturating_add(1)).unwrap_or(u32::MAX);
         let (init_name, init_replaced) = self.ensure_video_init(&closed.sps, &closed.pps)?;
-        self.ensure_audio_init()?;
-        let audio_start = frames
-            .as_ref()
-            .and_then(|f| f.first())
-            .and_then(|frame| u64::try_from(frame.pts).ok());
+        for rendition in 0..self.audio.len() {
+            self.ensure_audio_init(rendition)?;
+        }
+        let audio_starts: Vec<Option<u64>> = frames
+            .iter()
+            .map(|f| f.first().and_then(|frame| u64::try_from(frame.pts).ok()))
+            .collect();
         let continuous = self.video_end == Some(closed.tfdt)
-            && (frames.is_none() || self.audio_end == audio_start);
+            && self
+                .audio
+                .iter()
+                .zip(&audio_starts)
+                .all(|(audio, start)| audio.end == *start);
         let discontinuity = self.progress.video_segments > 0
             && (closed.after_gap || init_replaced || self.dropped_pairs > 0 || !continuous);
         // `EXT-X-TARGETDURATION` is fixed for the packager's lifetime (see
@@ -1107,12 +1463,22 @@ impl CastPackager {
             )));
         }
 
-        // Audio first: the video playlist never lists a sequence number the
-        // audio playlist lacks.
-        let mut audio_name = None;
-        if let (Some(frames), Some(tfdt)) = (frames, audio_start) {
-            audio_name = Some(self.publish_audio(sequence, mfhd, tfdt, frames, discontinuity)?);
+        // Audio and subtitles first: the video playlist never lists a
+        // sequence number another playlist lacks.
+        let mut audio_names = Vec::with_capacity(frames.len());
+        for (rendition, (frames, start)) in frames.into_iter().zip(audio_starts).enumerate() {
+            if let Some(tfdt) = start {
+                audio_names.push(self.publish_audio(
+                    rendition,
+                    sequence,
+                    mfhd,
+                    tfdt,
+                    frames,
+                    discontinuity,
+                )?);
+            }
         }
+        let subtitle_names = self.publish_subtitles(closed, sequence, discontinuity)?;
 
         let video_name = format!("seg-v-{}-{sequence}.m4s", self.generation);
         let bytes = cmaf::media_segment(mfhd, closed.tfdt, &closed.samples)?;
@@ -1138,14 +1504,7 @@ impl CastPackager {
         self.video
             .playlist
             .set_target_duration(self.target_duration);
-        if let Some(audio) = self.audio.as_mut() {
-            audio.playlist.set_target_duration(self.target_duration);
-            super::live::atomic_write(
-                &self.dir.join(AUDIO_PLAYLIST),
-                audio.playlist.render().as_bytes(),
-            )?;
-            self.progress.audio_segments = self.progress.audio_segments.saturating_add(1);
-        }
+        self.write_track_playlists()?;
         super::live::atomic_write(
             &self.dir.join(VIDEO_PLAYLIST),
             self.video.playlist.render().as_bytes(),
@@ -1156,27 +1515,59 @@ impl CastPackager {
         self.dropped_pairs = 0;
         self.on_disk.push_back(PublishedFiles {
             video: video_name,
-            audio: audio_name,
+            audio: audio_names,
+            subtitles: subtitle_names,
             video_init: init_name,
         });
         self.write_master(&closed.sps)?;
-        self.retire_old_files();
-        Ok(())
+        self.retire_old_files()
     }
 }
 
 impl CastPackager {
-    /// Write audio segment `sequence` and list it; returns the file name.
+    /// Write every audio and subtitle media playlist (before the video one:
+    /// the video playlist never lists a sequence number they lack).
+    fn write_track_playlists(&mut self) -> Result<()> {
+        for audio in &mut self.audio {
+            audio.playlist.set_target_duration(self.target_duration);
+            super::live::atomic_write(
+                &self.dir.join(audio_playlist_name(audio.index)),
+                audio.playlist.render().as_bytes(),
+            )?;
+        }
+        if !self.audio.is_empty() {
+            self.progress.audio_segments = self.progress.audio_segments.saturating_add(1);
+        }
+        for (index, subtitle) in self.subtitles.iter_mut().enumerate() {
+            subtitle.playlist.set_target_duration(self.target_duration);
+            super::live::atomic_write(
+                &self.dir.join(format!("subs{index}.m3u8")),
+                subtitle.playlist.render().as_bytes(),
+            )?;
+        }
+        if !self.subtitles.is_empty() {
+            self.progress.subtitle_segments = self.progress.subtitle_segments.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    /// Write segment `sequence` of audio rendition `rendition` and list it;
+    /// returns the file name.
     fn publish_audio(
         &mut self,
+        rendition: usize,
         sequence: u64,
         mfhd: u32,
         tfdt: u64,
         frames: Vec<AudioFrame>,
         discontinuity: bool,
     ) -> Result<String> {
-        let name = format!("seg-a-{}-{sequence}.m4s", self.generation);
-        let init_name = self.audio_init_name();
+        let name = format!(
+            "seg-{}-{}-{sequence}.m4s",
+            audio_tag(rendition),
+            self.generation
+        );
+        let init_name = self.audio_init_name(rendition);
         let frame_ticks = u32::try_from(AAC_FRAME_SAMPLES).unwrap_or(1024);
         let samples: Vec<Sample> = frames
             .into_iter()
@@ -1194,11 +1585,13 @@ impl CastPackager {
         let start_ns = i64::try_from(tfdt).map_or(i64::MAX, |pts| {
             to_ns(
                 pts,
-                self.audio.as_ref().map_or(Rational::new(1, 1), |a| a.tb),
+                self.audio
+                    .get(rendition)
+                    .map_or(Rational::new(1, 1), |a| a.tb),
             )
         });
         let pdt = self.segment_pdt(start_ns);
-        let Some(audio) = self.audio.as_mut() else {
+        let Some(audio) = self.audio.get_mut(rendition) else {
             return Ok(name);
         };
         let rate = audio.config.sample_rate;
@@ -1221,8 +1614,60 @@ impl CastPackager {
         segment.discontinuity = discontinuity;
         segment.program_date_time_ns = pdt;
         audio.playlist.push_segment(segment);
-        self.audio_end = Some(tfdt.saturating_add(ticks));
+        audio.end = Some(tfdt.saturating_add(ticks));
         Ok(name)
+    }
+
+    /// Write segment `sequence` of every subtitle rendition for the video
+    /// segment `closed` and list it (same `EXTINF`, discontinuity and PDT as
+    /// the video segment); returns the file names. Cues are drained from the
+    /// feed first: one bounded, non-blocking batch (the feed's capacity).
+    fn publish_subtitles(
+        &mut self,
+        closed: &ClosedVideo,
+        sequence: u64,
+        discontinuity: bool,
+    ) -> Result<Vec<String>> {
+        if self.subtitles.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut confirmed = None;
+        if let Some(feed) = self.subtitle_feed.as_ref() {
+            let batch = feed.drain_confirmed();
+            confirmed = batch.confirmed_through;
+            for cue in batch.cues {
+                if let Some(subtitle) = self.subtitles.get_mut(usize::from(cue.slot)) {
+                    subtitle.cues.push(cue, &self.subtitle_stats);
+                }
+            }
+        }
+        let clock = self.video.clock;
+        let start_ns = to_ns(closed.start_pts, clock.tb);
+        let start = MediaTime::from_nanos(start_ns);
+        let end = MediaTime::from_nanos(to_ns(closed.end_pts, clock.tb));
+        // `MPEGTS`: the 90 kHz media time of the segment start, mod 2^33 (see
+        // the module docs: Shaka maps it against the video tfdt timeline).
+        let mpegts = pts_90k_of(start);
+        let duration = seconds(closed.duration_ticks, clock.timescale);
+        let pdt = self.segment_pdt(start_ns);
+        let mut names = Vec::with_capacity(self.subtitles.len());
+        for (index, subtitle) in self.subtitles.iter_mut().enumerate() {
+            let base = *subtitle.base.get_or_insert(start);
+            let pieces = subtitle
+                .cues
+                .publish(start, end, confirmed, &self.subtitle_stats);
+            let text = render_vtt(&pieces.iter().collect::<Vec<_>>(), start, end, base, mpegts);
+            let name = format!("sub{index}-{}-{sequence}.vtt", self.generation);
+            write_renamed(&self.dir.join(&name), text.as_bytes())?;
+            let mut segment = Segment::new(name.clone(), duration);
+            segment.discontinuity = discontinuity;
+            segment.program_date_time_ns = pdt;
+            subtitle.playlist.push_segment(segment);
+            subtitle.cues.retire_before(end);
+            self.subtitle_stats.note_segment_written();
+            names.push(name);
+        }
+        Ok(names)
     }
 
     /// Write `master.m3u8` the first time, and again when `CODECS` changes or
@@ -1241,20 +1686,41 @@ impl CastPackager {
                 self.video.clock.timescale,
             )
         });
-        if let Some(audio) = self.audio.as_ref() {
+        // Every distinct `mp4a` string once, in rendition order.
+        let mut audio_codecs: Vec<String> = Vec::new();
+        for audio in &self.audio {
+            let codec = cmaf::mp4a_codec_string(audio.asc.as_deref().unwrap_or_default());
+            if !audio_codecs.contains(&codec) {
+                audio_codecs.push(codec);
+            }
+        }
+        for codec in &audio_codecs {
             codecs.push(',');
-            codecs.push_str(&cmaf::mp4a_codec_string(
-                audio.asc.as_deref().unwrap_or_default(),
-            ));
-            peak = peak.saturating_add(
+            codecs.push_str(codec);
+        }
+        // A player plays one audio rendition: add the largest, not the sum.
+        let audio_peak = self
+            .audio
+            .iter()
+            .map(|audio| {
                 audio
                     .config
                     .bit_rate
-                    .unwrap_or_else(|| audio.peak_bps.saturating_add(audio.peak_bps / 10)),
-            );
-            average = average.saturating_add(audio.config.bit_rate.unwrap_or_else(|| {
-                bits_per_second(audio.bytes, audio.ticks, audio.config.sample_rate)
-            }));
+                    .unwrap_or_else(|| audio.peak_bps.saturating_add(audio.peak_bps / 10))
+            })
+            .max();
+        let audio_average = self
+            .audio
+            .iter()
+            .map(|audio| {
+                audio.config.bit_rate.unwrap_or_else(|| {
+                    bits_per_second(audio.bytes, audio.ticks, audio.config.sample_rate)
+                })
+            })
+            .max();
+        if let (Some(audio_peak), Some(audio_average)) = (audio_peak, audio_average) {
+            peak = peak.saturating_add(audio_peak);
+            average = average.saturating_add(audio_average);
         }
         let peak = peak.max(average).max(1);
         let unchanged = self
@@ -1275,17 +1741,27 @@ impl CastPackager {
             .with_frame_rate(frame_rate);
         let mut master = MasterPlaylist::new();
         master.push_variant(variant);
-        if let Some(audio) = self.audio.as_ref() {
+        if !self.audio.is_empty() {
             master.set_audio_group_id(AUDIO_GROUP);
+            master.set_audio_autoselect_all(true);
+        }
+        for audio in &self.audio {
             master.push_audio_with_channels(
                 AudioRendition {
-                    name: "Program".to_owned(),
-                    uri: AUDIO_PLAYLIST.to_owned(),
-                    language: None,
-                    default: true,
+                    name: audio.name.clone(),
+                    uri: audio_playlist_name(audio.index),
+                    language: audio.language.clone(),
+                    default: audio.default,
                 },
                 audio.config.channels.to_string(),
             );
+        }
+        for (index, subtitle) in self.subtitles.iter().enumerate() {
+            master.push_subtitle(SubtitleMedia {
+                name: subtitle.name.clone(),
+                uri: format!("subs{index}.m3u8"),
+                language: subtitle.language.clone(),
+            });
         }
         super::live::atomic_write(&self.dir.join(MASTER_PLAYLIST), master.render().as_bytes())?;
         self.master_state = Some((codecs, peak));
@@ -1295,39 +1771,59 @@ impl CastPackager {
 
     /// Unlink the segment files that left the retention window (the listed
     /// window plus one more window) and the init files nothing refers to.
-    fn retire_old_files(&mut self) {
+    ///
+    /// # Errors
+    /// #418 review ABUSE-HISTORY-R4: an unlink that fails (other than for
+    /// an already missing file) is an error. The record of the file stays
+    /// (in `on_disk` / `inits`), so [`CastPackager::remove_files`] still
+    /// names it; the caller then replaces the packager under a new file
+    /// generation, whose media alone the control plane serves.
+    fn retire_old_files(&mut self) -> Result<()> {
         let keep = self.window.saturating_mul(2);
         while self.on_disk.len() > keep {
-            let Some(old) = self.on_disk.pop_front() else {
+            let Some(old) = self.on_disk.front() else {
                 break;
             };
-            remove_quietly(&self.dir.join(&old.video));
-            if let Some(audio) = old.audio {
-                remove_quietly(&self.dir.join(audio));
+            for name in std::iter::once(&old.video)
+                .chain(&old.audio)
+                .chain(&old.subtitles)
+            {
+                remove_retired(&self.dir.join(name))?;
             }
+            self.on_disk.pop_front();
         }
         let current = self.video.init.as_ref().map(|(_, _, name)| name.clone());
         let (on_disk, dir) = (&self.on_disk, &self.dir);
+        let mut failed = None;
         self.inits.retain(|name| {
             let used = Some(name) == current.as_ref()
                 || on_disk.iter().any(|files| &files.video_init == name);
-            if !used {
-                remove_quietly(&dir.join(name));
+            if used {
+                return true;
             }
-            used
+            match remove_retired(&dir.join(name)) {
+                Ok(()) => false,
+                Err(error) => {
+                    failed.get_or_insert(error);
+                    true
+                }
+            }
         });
+        failed.map_or(Ok(()), Err)
     }
 
-    /// Feed one AAC frame (1024 samples, raw or ADTS framed). Ignored when
-    /// no audio rendition is configured.
+    /// Feed one AAC frame (1024 samples, raw or ADTS framed) of audio
+    /// rendition `rendition` (an index into [`CastPackagerConfig::audio`]).
+    /// Ignored when no such rendition is configured.
     ///
     /// # Errors
-    /// Returns [`Error::Output`] when more than 10 s of audio is buffered
-    /// waiting for video, an ADTS header contradicts the configured sample
-    /// rate, or a file cannot be written. After an error the packager must
-    /// be replaced by a new one.
-    pub fn push_audio(&mut self, unit: AudioUnit<'_>) -> Result<()> {
-        let Some(audio) = self.audio.as_ref() else {
+    /// Returns [`Error::Output`] when more than 10 s of audio of one
+    /// rendition is buffered waiting for video, an ADTS header contradicts
+    /// the configured sample rate, a file cannot be written, or a retired
+    /// file cannot be unlinked. After an error the packager must be replaced
+    /// by a new one.
+    pub fn push_audio(&mut self, rendition: usize, unit: AudioUnit<'_>) -> Result<()> {
+        let Some(audio) = self.audio.get(rendition) else {
             return Ok(());
         };
         let pts = rescale(unit.pts, audio.config.time_base, audio.tb);
@@ -1342,17 +1838,16 @@ impl CastPackager {
             self.handle_gap()?;
         }
         if !on_grid {
-            if let Some(audio) = self.audio.as_mut() {
+            if let Some(audio) = self.audio.get_mut(rendition) {
                 audio.buffer.clear();
                 audio.expected = None;
                 audio.resume_floor = Some(pts);
             }
         }
-        let limit =
-            i64::from(audio_rate(self.audio.as_ref())).saturating_mul(MAX_AUDIO_AHEAD_SECONDS);
-        let Some(audio) = self.audio.as_mut() else {
+        let Some(audio) = self.audio.get_mut(rendition) else {
             return Ok(());
         };
+        let limit = i64::from(audio.config.sample_rate).saturating_mul(MAX_AUDIO_AHEAD_SECONDS);
         let pts = audio.expected.unwrap_or(pts);
         if pts < 0 {
             audio.expected = None;
@@ -1393,17 +1888,23 @@ impl CastPackager {
     /// `video.m3u8` already lists another generation's segments (a newer
     /// packager took over the directory).
     pub fn remove_files(self) {
-        let mut names: Vec<String> = vec![self.audio_init_name()];
+        let renditions = self.audio.len().max(1);
+        let mut names: Vec<String> = (0..renditions)
+            .map(|rendition| self.audio_init_name(rendition))
+            .collect();
         let own_segments = format!("seg-v-{}-", self.generation);
         let taken_over = std::fs::read_to_string(self.dir.join(VIDEO_PLAYLIST))
             .is_ok_and(|text| !text.contains(&own_segments));
         if !taken_over {
             names.extend([MASTER_PLAYLIST, VIDEO_PLAYLIST, AUDIO_PLAYLIST].map(str::to_owned));
+            names.extend((1..self.audio.len()).map(audio_playlist_name));
+            names.extend((0..self.subtitles.len()).map(|index| format!("subs{index}.m3u8")));
         }
         names.extend(self.inits.iter().cloned());
         for files in &self.on_disk {
             names.push(files.video.clone());
-            names.extend(files.audio.clone());
+            names.extend(files.audio.iter().cloned());
+            names.extend(files.subtitles.iter().cloned());
         }
         // A write that failed half-way may have left the next sequence
         // number's files (or their temporaries) behind.
@@ -1411,10 +1912,20 @@ impl CastPackager {
             "seg-v-{}-{}.m4s",
             self.generation, self.next_sequence
         ));
-        names.push(format!(
-            "seg-a-{}-{}.m4s",
-            self.generation, self.next_sequence
-        ));
+        for rendition in 0..renditions {
+            names.push(format!(
+                "seg-{}-{}-{}.m4s",
+                audio_tag(rendition),
+                self.generation,
+                self.next_sequence
+            ));
+        }
+        for index in 0..self.subtitles.len() {
+            names.push(format!(
+                "sub{index}-{}-{}.vtt",
+                self.generation, self.next_sequence
+            ));
+        }
         names.push(format!(
             "init-v-{}-{}.mp4",
             self.generation, self.video.next_init_index
@@ -1426,13 +1937,41 @@ impl CastPackager {
     }
 }
 
-fn audio_rate(audio: Option<&AudioState>) -> u32 {
-    audio.map_or(0, |state| state.config.sample_rate)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #418 review ABUSE-HISTORY-R4: the control plane serves a media file
+    /// only when this generation is the output's current one.
+    #[test]
+    fn cast_packager_file_generation_is_parsed_from_every_media_name() {
+        for (name, generation) in [
+            ("seg-v-17-0.m4s", 17),
+            ("seg-a-17-3.m4s", 17),
+            ("seg-a2-1700000000001-12.m4s", 1_700_000_000_001),
+            ("sub0-5-9.vtt", 5),
+            ("sub7-5-9.vtt", 5),
+            ("init-v-42-1.mp4", 42),
+            ("init-a-42-0.mp4", 42),
+            ("init-a15-42-0.mp4", 42),
+            ("seg-v-17-0.m4s.tmp", 17),
+        ] {
+            assert_eq!(packager_file_generation(name), Some(generation), "{name}");
+        }
+        for name in [
+            "master.m3u8",
+            "video.m3u8",
+            "audio3.m3u8",
+            "subs0.m3u8",
+            "seg-v-x-0.m4s",
+            "sub8-5-9.vtt",
+            "seg-v-17.m4s",
+            "other-1-2.m4s",
+            "seg-v-99999999999999999999999-0.m4s",
+        ] {
+            assert_eq!(packager_file_generation(name), None, "{name}");
+        }
+    }
 
     #[test]
     fn times_in_different_time_bases_compare_exactly() {

@@ -2,8 +2,13 @@
 //! 0, 1 and 2 full-canvas keyers, 2 flying keyers, a large source in a tiny
 //! fly, and a key-changing MIX (two scene accumulators). Reports median and
 //! p95 per composite for the persistent CPU backend and, when an adapter is
-//! present, the run backend (which composes keyed frames on the CPU until the
-//! GPU key path lands after #395, so its fallback count is printed too).
+//! present, the GPU run backend, which draws keyed and grouped frames with the
+//! WGSL key path (`key_params`, binding 6). The per-case GPU->CPU fallback
+//! delta is printed: it must be 0 (a non-zero value means that case fell back
+//! to the CPU reference and its GPU figure is not a GPU figure). The adapter
+//! name is printed so a figure is never attributed to the wrong device;
+//! a software adapter (lavapipe) times the shader on the CPU and is not a
+//! calibration of `u` / `fold` (owed on the RTX 4060).
 //!
 //! Run (release, on the target host):
 //!   `cargo run --release -p multiview-compositor --features wgpu --example keyer_composite_bench`
@@ -132,13 +137,21 @@ fn main() {
     #[cfg(not(feature = "wgpu"))]
     let run: Option<RunBackend> = None;
 
+    #[cfg(feature = "wgpu")]
+    if run.is_some() {
+        if let Ok(ctx) = multiview_compositor::GpuContext::new(None) {
+            let info = ctx.adapter().get_info();
+            println!("GPU adapter: {} ({:?})", info.name, info.backend);
+        }
+    }
     println!("{W}x{H}, {iterations} iterations; median / p95 ms");
-    println!("case | CPU median | CPU p95 | run-backend median | p95 | GPU->CPU fallbacks");
+    println!("case | CPU median | CPU p95 | GPU median | GPU p95 | GPU->CPU fallbacks (case)");
     let ms = |d: Duration| d.as_secs_f64() * 1e3;
     for (name, tiles) in &cases {
         let (cm, cp) = time(&cpu, tiles, iterations);
         match &run {
             Some(r) => {
+                let before = r.gpu_cpu_fallback_frames();
                 let (gm, gp) = time(r, tiles, iterations);
                 println!(
                     "{name} | {:.2} | {:.2} | {:.2} | {:.2} | {}",
@@ -146,7 +159,7 @@ fn main() {
                     ms(cp),
                     ms(gm),
                     ms(gp),
-                    r.gpu_cpu_fallback_frames()
+                    r.gpu_cpu_fallback_frames() - before
                 );
             }
             None => println!("{name} | {:.2} | {:.2} | n/a | n/a | -", ms(cm), ms(cp)),

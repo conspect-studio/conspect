@@ -194,6 +194,7 @@ fn router(
             max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
             boot_retry: BootRetryPolicy::default(),
             live_reset: Vec::new(),
+            passthrough: Vec::new(),
         },
         aux,
         open,
@@ -327,6 +328,10 @@ fn unroutable_and_unfresh_takes_are_refused_and_the_mailbox_bounds_floods() {
 struct Rec {
     windows: Vec<(usize, Vec<(i64, bool)>)>,
     audio: Vec<(usize, EncodedPacket)>,
+    /// Per delivered window: (output, its video packets' DTS) (#344 D2b).
+    dts: Vec<(usize, Vec<i64>)>,
+    /// Losses / discontinuities signalled, per output (#344 D2b).
+    losses: Vec<usize>,
 }
 impl WindowDelivery for Rec {
     fn offer_window(
@@ -348,11 +353,21 @@ impl WindowDelivery for Rec {
         {
             self.audio.push((o, a.clone_shared_ref().unwrap()));
         }
+        let d = p
+            .iter()
+            .filter(|p| p.kind() == multiview_ffmpeg::StreamKind::Video)
+            .map(|p| p.dts().unwrap_or(i64::MIN))
+            .collect();
+        self.dts.push((o, d));
         self.windows.push((o, v));
         Ok(())
     }
-    fn report_loss(&mut self, _o: usize, _r: multiview_output::batch::OfferError) {}
-    fn mark_discontinuity(&mut self, _o: usize, _r: multiview_output::batch::OfferError) {}
+    fn report_loss(&mut self, o: usize, _r: multiview_output::batch::OfferError) {
+        self.losses.push(o);
+    }
+    fn mark_discontinuity(&mut self, o: usize, _r: multiview_output::batch::OfferError) {
+        self.losses.push(o);
+    }
     fn take_discontinuity(&mut self, _o: usize) -> Option<multiview_output::batch::Discontinuity> {
         None
     }
@@ -440,6 +455,20 @@ fn harness(outputs: usize, max: usize, open: Option<OpenFn>) -> Harness {
 }
 
 fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: bool) -> Harness {
+    harness_full(outputs, max, open, has_preview, None, Vec::new(), None)
+}
+
+/// [`harness_with`] plus the passthrough wiring (#344 D2b).
+fn harness_full(
+    outputs: usize,
+    max: usize,
+    open: Option<OpenFn>,
+    has_preview: bool,
+    pass: Option<PassHooks>,
+    eligibility: Vec<PassEligibility>,
+    reformat: Option<ReformatOpenFn>,
+) -> Harness {
+    let live_reset = vec![reformat.is_some(); outputs];
     let store = Arc::new(TileStore::<Nv12Image>::with_defaults("cam"));
     let store2 = Arc::new(TileStore::<Nv12Image>::with_defaults("cam2"));
     let lookup = Arc::clone(&store);
@@ -459,7 +488,8 @@ fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: b
             Ok(enc)
         })
     });
-    let (r, h) = OutputRouter::new(
+    let mut open = open;
+    let (r, h) = OutputRouter::new_with_passthrough(
         RouterConfig {
             cadence: CADENCE,
             gop: 5,
@@ -471,7 +501,8 @@ fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: b
             formats: Vec::new(),
             max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
             boot_retry: BootRetryPolicy::default(),
-            live_reset: Vec::new(),
+            live_reset,
+            passthrough: eligibility,
         },
         AuxWiring {
             feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
@@ -489,7 +520,9 @@ fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: b
             sizing: None,
             source_sizing: None,
         },
-        open,
+        Box::new(move |settings, _bus| open(settings)),
+        reformat,
+        pass,
     )
     .unwrap();
     let outcomes = h.outcomes().unwrap();
@@ -2198,6 +2231,7 @@ fn audio_harness(outputs: usize, cadence: Rational, open: OpenFn) -> AudioHarnes
             max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
             boot_retry: BootRetryPolicy::default(),
             live_reset: Vec::new(),
+            passthrough: Vec::new(),
         },
         AuxWiring {
             feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
@@ -4584,6 +4618,7 @@ fn reformat_harness(outputs: usize, max: usize, mode: OpenMode) -> ReformatHarne
             formats: Vec::new(),
             boot_retry: BootRetryPolicy::default(),
             live_reset: vec![true; outputs],
+            passthrough: Vec::new(),
             max_aux_canvases: crate::output_routing::DEFAULT_MAX_AUX_CANVASES,
         },
         AuxWiring {
@@ -8466,3 +8501,6 @@ fn the_encoder_identity_includes_the_output_settings_and_format() {
     assert_ne!(id("a"), id("d"), "other feed format: another encoder");
     assert_eq!(adapter.encoder_identity("nope", &cam), None);
 }
+
+#[path = "output_routing_passthrough_tests.rs"]
+mod passthrough;

@@ -116,6 +116,201 @@ pub struct CompositeUniforms {
     pub background: [f32; 4],
 }
 
+/// `KeyParams::head[3]` bits 0-1: the key kind (`0` = no key).
+pub const KEY_KIND_BITS: u32 = 0b11;
+/// Key kind: linear (matte 1 with no key source, else the key's clamped Y).
+pub const KEY_KIND_LINEAR: u32 = 1;
+/// Key kind: luma (`clamp((y − clip) × gain, 0, 1)`).
+pub const KEY_KIND_LUMA: u32 = 2;
+/// Invert the matte (a matte from a signal only; ignored by a linear self
+/// key). Already folded into the matte table; kept for inspection.
+pub const KEY_INVERT: u32 = 1 << 2;
+/// The key signal is a separate source resident at `head[0]` of `y_planes`.
+pub const KEY_HAS_SOURCE: u32 = 1 << 3;
+/// A source-space mask in `KeyParams::mask` applies.
+pub const KEY_HAS_MASK: u32 = 1 << 4;
+/// The matte comes from a signal: it is `mattes[table[0] + code]`, the
+/// 256-entry table of the signal's 8-bit Y code (review MEDIA-1).
+pub const KEY_HAS_TABLE: u32 = 1 << 5;
+/// Shift of the 2-bit scene group (`0` top, `1` both, `2` out, `3` in).
+pub const KEY_GROUP_SHIFT: u32 = 8;
+/// Entries of one matte table: one per 8-bit Y code.
+pub const MATTE_TABLE_LEN: usize = 256;
+
+/// Per-tile key and scene-group block (ADR-0113, design note §3.3), one entry
+/// per tile, parallel to `tiles`. Mirrors `KeyParams` in `composite.wgsl`.
+/// All zero is an ordinary `Top` tile with no key.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct KeyParams {
+    /// `[key_layer, key_w, key_h, flags]`: the key source's layer in the tile
+    /// Y array and its size (zero without a source), then the `KEY_*` bits.
+    pub head: [u32; 4],
+    /// `[base, 0, 0, 0]`: the first entry of this tile's matte table in the
+    /// `mattes` storage buffer (binding 7), valid under [`KEY_HAS_TABLE`].
+    pub table: [u32; 4],
+    /// `[x, y, w, h]` of the mask in fill-source pixels.
+    pub mask: [u32; 4],
+    /// `[kind, p | d, i, 0]` of the segment merge (`0` MIX, `1` DIP), weights
+    /// already clamped to `[0, 1]` with NaN read as 0. A WIPE (K3) is
+    /// `[2 + shape_id + 8·reverse, softness, extent, radius]` (see
+    /// [`MERGE_WIPE_BASE`]).
+    pub merge: [f32; 4],
+    /// The opaque DIP colour (linear, canvas gamut), alpha 1. A WIPE merge
+    /// carries its origin here: `[origin_x, origin_y, 0, 0]`.
+    pub dip_colour: [f32; 4],
+}
+
+impl KeyParams {
+    /// Build the key/group block of `tile`. `key_layer` is the `y_planes`
+    /// layer its key source was uploaded to (`None` without a key source).
+    /// A matte from a signal (luma, or linear with a key source) appends its
+    /// 256-entry table to `mattes` (see [`push_matte_table`]) and records
+    /// its base.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnresolvedColor`] when the signal's range is unresolved
+    /// (exactly what the CPU oracle raises); [`Error::GpuLimit`] when the
+    /// table base overflows `u32`.
+    pub fn build(
+        tile: &crate::pipeline::Tile<'_>,
+        key_layer: Option<u32>,
+        mattes: &mut Vec<f32>,
+        canvas_wh: (u32, u32),
+    ) -> Result<Self> {
+        use crate::key::{unit, KeyKind, SceneMember, SceneMerge, TileGroup};
+        let mut out = Self::zeroed();
+        if let Some(key) = &tile.key {
+            let mut flags = match key.kind {
+                KeyKind::Linear => KEY_KIND_LINEAR,
+                KeyKind::Luma { .. } => KEY_KIND_LUMA,
+            };
+            if key.invert {
+                flags |= KEY_INVERT;
+            }
+            if let Some(mask) = key.mask {
+                flags |= KEY_HAS_MASK;
+                out.mask = [mask.x, mask.y, mask.w, mask.h];
+            }
+            let source = key.source.zip(key_layer);
+            if let Some((src, layer)) = source {
+                out.head[0] = layer;
+                out.head[1] = src.width();
+                out.head[2] = src.height();
+                flags |= KEY_HAS_SOURCE;
+            }
+            // The signal: the key source, else the fill (a luma self key). A
+            // linear self key has none (matte 1, invert ignored).
+            let signal = match (source, key.kind) {
+                (Some((src, _)), _) => Some(src),
+                (None, KeyKind::Luma { .. }) => Some(tile.image),
+                (None, _) => None,
+            };
+            if let Some(img) = signal {
+                let r = range::require_resolved(img.color().range)?;
+                let base = u32::try_from(mattes.len())
+                    .map_err(|_| Error::GpuLimit("matte table base overflows u32".to_owned()))?;
+                push_matte_table(mattes, key.kind, r, key.invert);
+                out.table[0] = base;
+                flags |= KEY_HAS_TABLE;
+            }
+            out.head[3] = flags;
+        }
+        if let TileGroup::Scene { member, merge } = tile.group {
+            let g: u32 = match member {
+                SceneMember::Both => 1,
+                SceneMember::Out => 2,
+                SceneMember::In => 3,
+            };
+            out.head[3] |= g << KEY_GROUP_SHIFT;
+            match merge {
+                SceneMerge::Mix { p } => out.merge = [0.0, unit(p), 0.0, 0.0],
+                SceneMerge::Dip { colour, d, i } => {
+                    out.merge = [1.0, unit(d), unit(i), 0.0];
+                    out.dip_colour = [colour.r, colour.g, colour.b, 1.0];
+                }
+                SceneMerge::Wipe { mask } => {
+                    let (merge, origin) = wipe_merge(&mask, canvas_wh);
+                    out.merge = merge;
+                    out.dip_colour = origin;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The `y_planes` layer of the key source, or `None`.
+    #[must_use]
+    pub const fn key_layer(&self) -> Option<u32> {
+        if self.head[3] & KEY_HAS_SOURCE == 0 {
+            None
+        } else {
+            Some(self.head[0])
+        }
+    }
+}
+
+/// `KeyParams::merge[0]` of a WIPE merge (K3) is `MERGE_WIPE_BASE +
+/// shape_id + 8 × reverse + 16 × complement`: exact small integers in `f32`
+/// (MIX is 0, DIP 1). The shader decodes it with integer arithmetic.
+pub const MERGE_WIPE_BASE: f32 = 2.0;
+
+/// The `(merge, dip_colour)` lanes of a WIPE scene merge (K3) on a
+/// `canvas_wh` canvas: `[code, softness, extent, radius]` and
+/// `[origin_x, origin_y, expand, 0]`. Exactly as the CPU oracle reads the
+/// mask (`SceneMerge::apply`): a mask not valid for the canvas merges at 0
+/// (an exact MIX of the outgoing scene) and a pinned endpoint at its pinned
+/// coverage (an exact MIX at 0 or 1, the complement applied), so neither
+/// depends on float rounding.
+fn wipe_merge(mask: &crate::mask::WipeMask, canvas_wh: (u32, u32)) -> ([f32; 4], [f32; 4]) {
+    if !mask.is_valid_for(canvas_wh.0, canvas_wh.1) {
+        return ([0.0; 4], [0.0; 4]);
+    }
+    if let Some(c) = mask.pinned {
+        let c = crate::key::unit(c);
+        let c = if mask.complement { 1.0 - c } else { c };
+        return ([0.0, c, 0.0, 0.0], [0.0; 4]);
+    }
+    let code = MERGE_WIPE_BASE
+        + shape_lane(mask.shape.id())
+        + if mask.reverse { 8.0 } else { 0.0 }
+        + if mask.complement { 16.0 } else { 0.0 };
+    (
+        [code, mask.softness, mask.extent, mask.radius],
+        [mask.origin[0], mask.origin[1], mask.expand, 0.0],
+    )
+}
+
+/// Append the 256-entry matte table of a signal-based key to `out`: entry `c`
+/// is the final matte (after invert) for 8-bit Y code `c` of a signal in
+/// `range`, computed with the CPU oracle's own functions
+/// ([`range::expand_luma`], then [`crate::key::luma_matte`] or
+/// [`crate::key::unit`]). The matte is a pure function of the code, so the
+/// shader's lookup is exact by construction: no step of a huge or infinite
+/// gain can flip on float fuzz (review MEDIA-1). Only `extend`s, so a pooled
+/// `out` reuses its capacity.
+pub fn push_matte_table(
+    out: &mut Vec<f32>,
+    kind: crate::key::KeyKind,
+    range: multiview_core::color::ColorRange,
+    invert: bool,
+) {
+    use crate::key::{luma_matte, unit, KeyKind};
+    out.extend((0..=u8::MAX).map(|c| {
+        let y = range::expand_luma(c, range);
+        let m = match kind {
+            KeyKind::Luma { clip, gain } => luma_matte(y, clip, gain),
+            KeyKind::Linear => unit(y),
+        };
+        if invert {
+            1.0 - m
+        } else {
+            m
+        }
+    }));
+}
+
 /// Encode-pass uniform block. Mirrors `EncodeUniforms` in `encode.wgsl`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -289,7 +484,9 @@ impl TileParams {
         Ok(Self {
             placement: [dst_x, dst_y, src_w, src_h],
             dst_size: [dw, dh, 0, 0],
-            opacity_transfer: [opacity.clamp(0.0, 1.0), transfer.as_f32(), 0.0, 0.0],
+            // `unit` reads a NaN opacity (a keyer weight rides it) as 0, as the
+            // CPU oracle does; a NaN must never reach the shader's clamp.
+            opacity_transfer: [crate::key::unit(opacity), transfer.as_f32(), 0.0, 0.0],
             range: expand_range_params(tile_range),
             yuv2rgb0: yuv[0],
             yuv2rgb1: yuv[1],
@@ -316,7 +513,8 @@ impl TileParams {
     /// Carry a wipe mask (ADR-0112 §3) in the spare `.z/.w` lanes, the same
     /// no-growth precedent as the alpha layer: `opacity_transfer.z` = shape
     /// id (`0` = none), `.w` = reverse; `range.w` = softness; `yuv2rgb0..2.w`
-    /// = origin x, origin y, extent; `prim0.w` = radius, `prim1.w` = expand.
+    /// = origin x, origin y, extent; `prim0.w` = radius, `prim1.w` = expand,
+    /// `prim2.w` = complement (K3: `1 − coverage`).
     /// The shader derives the aspect from the canvas size, as the CPU does.
     #[must_use]
     pub fn with_mask(mut self, mask: &crate::mask::WipeMask, canvas_w: u32, canvas_h: u32) -> Self {
@@ -329,14 +527,18 @@ impl TileParams {
             self.opacity_transfer[0] = 0.0;
             return self;
         }
-        match mask.pinned {
-            Some(c) if c <= 0.0 => {
+        // A pinned endpoint covers exactly 0 or 1; a complement (K3, a tied
+        // keyer going off) swaps them.
+        match mask.pinned.map(|c| (c <= 0.0) != mask.complement) {
+            Some(true) => {
                 self.opacity_transfer[0] = 0.0;
                 return self;
             }
-            Some(_) => return self,
+            Some(false) => return self,
             None => {}
         }
+        // `prim2.w` = complement: the shader draws `1 − coverage`.
+        self.prim2[3] = if mask.complement { 1.0 } else { 0.0 };
         self.opacity_transfer[2] = shape_lane(mask.shape.id());
         self.opacity_transfer[3] = if mask.reverse { 1.0 } else { 0.0 };
         self.range[3] = mask.softness;
@@ -388,5 +590,223 @@ impl EncodeUniforms {
             rgb2yuv2: rgb2yuv[2],
             range: compress_range_params(canvas.range),
         })
+    }
+}
+
+#[cfg(test)]
+mod key_params_tests {
+    #![allow(clippy::unwrap_used, clippy::float_cmp)]
+
+    use multiview_core::color::{
+        ColorInfo, ColorPrimaries, ColorRange, MatrixCoefficients, TransferCharacteristic,
+    };
+
+    use super::*;
+    use crate::key::{KeyMask, SceneMember, SceneMerge, TileGroup, TileKey};
+    use crate::pipeline::{Nv12Image, Tile};
+
+    fn img(w: u32, h: u32, range: ColorRange) -> Nv12Image {
+        let color = ColorInfo {
+            primaries: ColorPrimaries::Bt709,
+            transfer: TransferCharacteristic::Bt709,
+            matrix: MatrixCoefficients::Bt709,
+            range,
+        };
+        Nv12Image::solid(w, h, 100, 128, 128, color).unwrap()
+    }
+
+    #[test]
+    fn an_ordinary_tile_packs_all_zero() {
+        let a = img(4, 4, ColorRange::Limited);
+        let mut mattes = Vec::new();
+        let k = KeyParams::build(&Tile::placed(&a, 0, 0, 1.0), None, &mut mattes, (8, 8)).unwrap();
+        assert_eq!(k, KeyParams::zeroed());
+        assert_eq!(mattes.len(), 0);
+        assert_eq!(core::mem::size_of::<KeyParams>(), 80);
+        // The linear self key has no signal, hence no table.
+        let t = Tile::placed(&a, 0, 0, 1.0).with_key(TileKey::linear().inverted(true));
+        let k = KeyParams::build(&t, None, &mut mattes, (8, 8)).unwrap();
+        assert_eq!(k.head[3] & KEY_HAS_TABLE, 0);
+        assert_eq!(mattes.len(), 0);
+    }
+
+    #[test]
+    fn a_key_source_carries_its_own_size_layer_and_table() {
+        let fill = img(4, 4, ColorRange::Limited);
+        let key = img(8, 6, ColorRange::Full);
+        let t = Tile::placed(&fill, 0, 0, 1.0).with_key(
+            TileKey::luma(0.25, 2.0)
+                .with_source(&key)
+                .inverted(true)
+                .masked(KeyMask {
+                    x: 1,
+                    y: 2,
+                    w: 3,
+                    h: u32::MAX,
+                }),
+        );
+        let mut mattes = vec![0.5; 7];
+        let k = KeyParams::build(&t, Some(9), &mut mattes, (8, 8)).unwrap();
+        assert_eq!(k.key_layer(), Some(9));
+        assert_eq!(&k.head[..3], &[9, 8, 6]);
+        let flags = k.head[3];
+        assert_eq!(flags & KEY_KIND_BITS, KEY_KIND_LUMA);
+        assert_ne!(flags & KEY_INVERT, 0);
+        assert_ne!(flags & KEY_HAS_MASK, 0);
+        assert_ne!(flags & KEY_HAS_TABLE, 0);
+        assert_eq!(k.table, [7, 0, 0, 0]);
+        assert_eq!(mattes.len(), 7 + MATTE_TABLE_LEN);
+        // Built with the KEY SOURCE's (full) range, inverted.
+        for c in 0..=u8::MAX {
+            let y = range::expand_luma(c, ColorRange::Full);
+            let want = 1.0 - crate::key::luma_matte(y, 0.25, 2.0);
+            assert_eq!(mattes[7 + usize::from(c)], want, "code {c}");
+        }
+        assert_eq!(k.mask, [1, 2, 3, u32::MAX]);
+    }
+
+    #[test]
+    fn the_matte_table_is_the_oracle_matte_for_every_code() {
+        let nan = f32::NAN;
+        let inf = f32::INFINITY;
+        let sub = -1e-40_f32;
+        assert!(sub.is_subnormal());
+        let clips = [0.2, 0.0, nan, inf, -inf, sub, -sub, 0.502_283_1];
+        let gains = [2.0, 1e30, inf, -inf, -1.0, 0.0, nan];
+        for range in [ColorRange::Limited, ColorRange::Full] {
+            for &clip in &clips {
+                for &gain in &gains {
+                    for invert in [false, true] {
+                        let fill = img(4, 4, range);
+                        let t = Tile::placed(&fill, 0, 0, 1.0)
+                            .with_key(TileKey::luma(clip, gain).inverted(invert));
+                        let mut mattes = Vec::new();
+                        let k = KeyParams::build(&t, None, &mut mattes, (8, 8)).unwrap();
+                        assert_eq!(k.table[0], 0);
+                        assert_eq!(mattes.len(), MATTE_TABLE_LEN);
+                        for c in 0..=u8::MAX {
+                            let y = range::expand_luma(c, range);
+                            let m = crate::key::luma_matte(y, clip, gain);
+                            let want = if invert { 1.0 - m } else { m };
+                            let got = mattes[usize::from(c)];
+                            assert!(
+                                got.to_bits() == want.to_bits() && (0.0..=1.0).contains(&got),
+                                "{range:?} clip={clip} gain={gain} invert={invert} code={c}: \
+                                 {got} != {want}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Review MEDIA-1: a full-range black code, a negative subnormal clip
+        // and an infinite gain is matte 1 (a positive excess times +inf).
+        let mut mattes = Vec::new();
+        push_matte_table(
+            &mut mattes,
+            crate::key::KeyKind::Luma {
+                clip: sub,
+                gain: inf,
+            },
+            ColorRange::Full,
+            false,
+        );
+        assert_eq!(mattes[0], 1.0);
+        // Linear with a key source: unit(y) of the source's range.
+        let fill = img(4, 4, ColorRange::Full);
+        let key = img(4, 4, ColorRange::Limited);
+        let t = Tile::placed(&fill, 0, 0, 1.0).with_key(TileKey::linear().with_source(&key));
+        let mut mattes = Vec::new();
+        KeyParams::build(&t, Some(1), &mut mattes, (8, 8)).unwrap();
+        assert_eq!(mattes[16], 0.0);
+        assert_eq!(mattes[235], 1.0);
+        assert_eq!(mattes[255], 1.0);
+        assert_eq!(mattes[0], 0.0);
+    }
+
+    #[test]
+    fn a_wipe_merge_and_a_complemented_mask_pack_exactly() {
+        use crate::mask::{MaskShape, WipeMask};
+        let a = img(4, 4, ColorRange::Limited);
+        let pack = |mask: WipeMask| {
+            KeyParams::build(
+                &Tile::placed(&a, 0, 0, 1.0).in_group(TileGroup::Scene {
+                    member: SceneMember::In,
+                    merge: SceneMerge::Wipe { mask },
+                }),
+                None,
+                &mut Vec::new(),
+                (8, 8),
+            )
+            .unwrap()
+        };
+        let mid = WipeMask::new(MaskShape::Circle, 0.5, 8, 8, [0.25, 0.5], true, 0.1, 0.0);
+        let k = pack(mid);
+        // 2 + circle (5) + 8 (reverse).
+        assert_eq!(k.merge[0], 15.0);
+        assert_eq!(k.merge[1..], [mid.softness, mid.extent, mid.radius]);
+        assert_eq!(k.dip_colour[..3], [0.25, 0.5, 0.0]);
+        assert_eq!(pack(mid.complemented()).merge[0], 31.0, "+16 complement");
+        // Endpoints and a foreign mask are exact MIXes.
+        let end = WipeMask::new(MaskShape::Box, 1.0, 8, 8, [0.5, 0.5], false, 0.0, 0.0);
+        assert_eq!(pack(end).merge, [0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(pack(end.complemented()).merge, [0.0, 0.0, 0.0, 0.0]);
+        let foreign = WipeMask::new(MaskShape::Box, 0.5, 16, 8, [0.5, 0.5], false, 0.0, 0.0);
+        assert_eq!(pack(foreign).merge, [0.0; 4]);
+        // A tile mask carries the complement in `prim2.w`; a complemented
+        // endpoint flips the pinned coverage.
+        let canvas = CanvasColor::default();
+        let base = || TileParams::build(0, 0, 8, 8, 4, 4, 1.0, a.color(), canvas).unwrap();
+        assert_eq!(base().with_mask(&mid.complemented(), 8, 8).prim2[3], 1.0);
+        assert_eq!(base().with_mask(&mid, 8, 8).prim2[3], 0.0);
+        assert_eq!(
+            base().with_mask(&end.complemented(), 8, 8).opacity_transfer[0],
+            0.0
+        );
+        assert_eq!(base().with_mask(&end, 8, 8).opacity_transfer[0], 1.0);
+    }
+
+    #[test]
+    fn scene_merge_weights_are_clamped_and_nan_safe() {
+        let a = img(4, 4, ColorRange::Limited);
+        let g = |member, merge| {
+            KeyParams::build(
+                &Tile::placed(&a, 0, 0, 1.0).in_group(TileGroup::Scene { member, merge }),
+                None,
+                &mut Vec::new(),
+                (8, 8),
+            )
+            .unwrap()
+        };
+        let k = g(SceneMember::Out, SceneMerge::Mix { p: f32::NAN });
+        assert_eq!(k.head[3] >> KEY_GROUP_SHIFT, 2);
+        assert_eq!(k.merge, [0.0, 0.0, 0.0, 0.0]);
+        let k = g(
+            SceneMember::In,
+            SceneMerge::Dip {
+                colour: crate::blend::LinearRgba::opaque(0.1, 0.2, 0.3),
+                d: 2.0,
+                i: -1.0,
+            },
+        );
+        assert_eq!(k.head[3] >> KEY_GROUP_SHIFT, 3);
+        assert_eq!(k.merge, [1.0, 1.0, 0.0, 0.0]);
+        assert_eq!(k.dip_colour, [0.1, 0.2, 0.3, 1.0]);
+        let k = g(SceneMember::Both, SceneMerge::Mix { p: 0.4 });
+        assert_eq!(k.head[3] >> KEY_GROUP_SHIFT, 1);
+        // A NaN tile opacity (a keyer weight) reads as 0, never a NaN lane.
+        let p = TileParams::build(
+            0,
+            0,
+            4,
+            4,
+            4,
+            4,
+            f32::NAN,
+            a.color(),
+            crate::pipeline::CanvasColor::default(),
+        )
+        .unwrap();
+        assert_eq!(p.opacity_transfer[0], 0.0);
     }
 }

@@ -619,6 +619,7 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::routes::routing::OutputTally,
         crate::routes::routing::PendingRoute,
         crate::routes::routing::RoutingBuses,
+        crate::output_routing::PassthroughTotals,
         crate::routes::output_routing::OutputRouteRequest,
         crate::routes::switcher_keyers::KeyerFields,
         crate::routes::switcher_keyers::KeyerOnAir,
