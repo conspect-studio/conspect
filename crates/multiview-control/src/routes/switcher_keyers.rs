@@ -43,10 +43,39 @@ use crate::state::AppState;
 /// The placeholder for a source id the caller may not read.
 pub const REDACTED: &str = "redacted";
 
-/// Whether `kind` is a keyer verb handled by this module.
+/// Whether `kind` is a keyer verb handled by this module (`arm`, slice K3,
+/// included: it names keyers and is authorized like them).
 #[must_use]
 pub fn is_keyer_verb(kind: &str) -> bool {
-    matches!(kind, "keyer_cut" | "keyer_auto" | "keyer_tie" | "keyer_set")
+    matches!(
+        kind,
+        "keyer_cut" | "keyer_auto" | "keyer_tie" | "keyer_set" | "arm"
+    )
+}
+
+/// Upstream keys an `arm` may name (ADR-0113 §7).
+const MAX_ARM_KEYS: usize = multiview_engine::keyer::MAX_USK;
+
+/// Which keyer family a request names (K3). Absent: `dsk` (K4 requests are
+/// unchanged).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum KeyerFamilyWire {
+    /// A downstream keyer; object id `<program>/<keyer>`.
+    #[default]
+    Dsk,
+    /// An upstream keyer of the M/E; object id `<me>/<keyer>`.
+    Usk,
+}
+
+impl KeyerFamilyWire {
+    fn engine(self) -> KeyerFamily {
+        match self {
+            Self::Dsk => KeyerFamily::Dsk,
+            Self::Usk => KeyerFamily::Usk,
+        }
+    }
 }
 
 /// `on_air` guard of `keyer_set`.
@@ -129,6 +158,18 @@ pub struct KeyerFields {
     /// `keyer_set`: the on-air guard for a fill or key change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_air: Option<KeyerOnAir>,
+    /// Keyer verbs: `dsk` (default) or `usk` (K3). A USK's object id is
+    /// `<me>/<keyer>`; it takes `keyer_cut` (outside a transition) and
+    /// `keyer_set`, and changes on air through `arm` + CUT/AUTO.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<KeyerFamilyWire>,
+    /// `arm` (K3): whether the background moves with the next transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
+    /// `arm` (K3): the upstream keyer ids (of this M/E) that toggle with the
+    /// next transition, at most 4, distinct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<Vec<String>>,
 }
 
 impl KeyerFields {
@@ -146,7 +187,14 @@ impl KeyerFields {
         self.keyer.is_none()
             && self.on.is_none()
             && self.tie.is_none()
+            && self.family.is_none()
+            && self.background.is_none()
+            && self.keys.is_none()
             && !self.has_definition_fields()
+    }
+
+    fn family(&self) -> KeyerFamilyWire {
+        self.family.unwrap_or_default()
     }
 
     fn has_definition_fields(&self) -> bool {
@@ -174,6 +222,16 @@ pub fn object_id(program: &str, keyer: &str) -> String {
     format!("{program}/{keyer}")
 }
 
+/// The object id of a keyer of `family`: `<program>/<keyer>` for a DSK,
+/// `<me>/<keyer>` for a USK (K3).
+#[must_use]
+pub fn family_object_id(family: KeyerFamilyWire, me: &str, program: &str, keyer: &str) -> String {
+    match family {
+        KeyerFamilyWire::Dsk => object_id(program, keyer),
+        KeyerFamilyWire::Usk => object_id(me, keyer),
+    }
+}
+
 /// BOLA for a keyer verb (plan and command, before any existence answer):
 /// the M/E object, the Program scope, the keyer object and every named
 /// source. A missing `keyer` is a shape error, answered after this.
@@ -189,10 +247,37 @@ pub fn authorize(
     authorize_object(principal, me)?;
     authorize_scope(principal, AuthzScope::Program(program))?;
     if let Some(keyer) = &fields.keyer {
-        authorize_object(principal, &object_id(program, keyer))?;
+        authorize_object(
+            principal,
+            &family_object_id(fields.family(), me, program, keyer),
+        )?;
+    }
+    // `arm` (K3): Control on every armed keyer object id. Bounded first, so
+    // a huge list is never walked (a longer one is a 422 after BOLA).
+    for key in fields.keys.iter().flatten().take(MAX_ARM_KEYS + 1) {
+        authorize_object(principal, &object_id(me, key))?;
     }
     for source in fields.sources() {
         authorize_object(principal, source)?;
+    }
+    Ok(())
+}
+
+/// `arm` (K3): `Read` on the fill and key of every armed key. Called after
+/// [`authorize`] (the caller holds every armed keyer object), so looking a
+/// key's sources up never answers existence for an object it may not see.
+fn authorize_arm_sources(
+    principal: &Principal,
+    defs: &KeyerDefinitions,
+    keys: &[String],
+) -> ControlResult<()> {
+    for key in keys {
+        if let Some((_, def)) = defs.find_in(KeyerFamily::Usk, key) {
+            authorize_object(principal, &def.fill_id)?;
+            if let Some(k) = &def.key_id {
+                authorize_object(principal, k)?;
+            }
+        }
     }
     Ok(())
 }
@@ -205,6 +290,28 @@ fn typed(status: u16, kind: &str, detail: impl Into<String>) -> Response {
 
 /// Shape: which fields a verb takes, `in:<n>` refused, keyer present.
 fn shape(kind: &str, fields: &KeyerFields, other_refs: bool) -> Result<String, Box<Response>> {
+    if kind == "arm" {
+        return arm_shape(fields, other_refs).map(|()| String::new());
+    }
+    if fields.background.is_some() || fields.keys.is_some() {
+        return Err(Box::new(typed(
+            422,
+            "validation",
+            "background and keys belong to arm",
+        )));
+    }
+    if fields.family() == KeyerFamilyWire::Usk
+        && (matches!(kind, "keyer_auto" | "keyer_tie")
+            || fields.rate.is_some()
+            || fields.on_at_start.is_some())
+    {
+        return Err(Box::new(typed(
+            422,
+            "keyer-usk",
+            "an upstream keyer changes on air through arm and a CUT or AUTO; keyer_auto, \
+             keyer_tie, rate and on_at_start are downstream keyer fields",
+        )));
+    }
     let Some(keyer) = fields.keyer.clone().filter(|k| !k.trim().is_empty()) else {
         return Err(Box::new(typed(422, "validation", "keyer is required")));
     };
@@ -249,6 +356,49 @@ fn shape(kind: &str, fields: &KeyerFields, other_refs: bool) -> Result<String, B
             format!("invalid fields for {kind}"),
         )))
     }
+}
+
+/// `arm` shape: `background` and/or `keys` (at most 4, distinct, ids
+/// without '/'), nothing else.
+fn arm_shape(fields: &KeyerFields, other_refs: bool) -> Result<(), Box<Response>> {
+    let only_arm = fields.keyer.is_none()
+        && fields.on.is_none()
+        && fields.tie.is_none()
+        && fields.family.is_none()
+        && !fields.has_definition_fields();
+    if other_refs || !only_arm {
+        return Err(Box::new(typed(
+            422,
+            "validation",
+            "arm takes background and keys only",
+        )));
+    }
+    let keys = fields.keys.as_deref().unwrap_or_default();
+    if keys.len() > MAX_ARM_KEYS {
+        return Err(Box::new(typed(
+            422,
+            "validation",
+            format!("arm names at most {MAX_ARM_KEYS} keys"),
+        )));
+    }
+    if keys.iter().any(|k| k.trim().is_empty() || k.contains('/')) {
+        return Err(Box::new(typed(422, "validation", "a key id is non-empty without '/'")));
+    }
+    if keys
+        .iter()
+        .enumerate()
+        .any(|(i, k)| keys.iter().skip(i + 1).any(|o| o == k))
+    {
+        return Err(Box::new(typed(422, "validation", "arm keys must be distinct")));
+    }
+    if !fields.background.unwrap_or(false) && keys.is_empty() {
+        return Err(Box::new(typed(
+            422,
+            "validation",
+            "arm needs the background or at least one key",
+        )));
+    }
+    Ok(())
 }
 
 /// The request-shape checks of a keyer verb (no engine or repository state):
@@ -366,19 +516,23 @@ pub fn check(
             "this run has no downstream keyer runtime",
         )));
     };
+    if kind == "arm" {
+        return check_arm(principal, req, handle.snapshot(), &defs);
+    }
+    let family = fields.family();
     let ctx = Ctx {
-        object: object_id(&req.program, &keyer),
+        object: family_object_id(family, &req.me, &req.program, &keyer),
         snapshot: handle.snapshot(),
         defs,
     };
     if kind == "keyer_set" {
         return check_set(state, principal, handle, req, &keyer, &ctx);
     }
-    let Some((index, _)) = ctx.defs.find(&keyer) else {
+    let Some((index, _)) = ctx.defs.find_in(family.engine(), &keyer) else {
         return Ok(Err(typed(
             404,
             "unknown-keyer",
-            format!("no downstream keyer {:?} is defined", ctx.object),
+            format!("no keyer {:?} is defined", ctx.object),
         )));
     };
     let on = fields.on.unwrap_or(false);
@@ -400,16 +554,70 @@ pub fn check(
             tie: fields.tie.unwrap_or(false),
         },
     };
-    let refused =
-        (kind == "keyer_auto" && ctx.row(index).is_some_and(|r| r.ramp.is_some())).then(|| {
-            refusal(
-                "keyer-ramping",
-                multiview_engine::keyer::REFUSE_KEYER_RAMPING,
-            )
-        });
+    let in_flight = ctx.snapshot.as_ref().is_some_and(|s| s.in_flight);
+    let refused = if kind == "keyer_auto" && ctx.row(index).is_some_and(|r| r.ramp.is_some()) {
+        Some(refusal(
+            "keyer-ramping",
+            multiview_engine::keyer::REFUSE_KEYER_RAMPING,
+        ))
+    } else if family == KeyerFamilyWire::Usk && in_flight {
+        Some(refusal(
+            "keyer-in-transition",
+            multiview_engine::keyer::REFUSE_KEYER_IN_TRANSITION,
+        ))
+    } else {
+        None
+    };
     Ok(Ok(Checked {
         verb,
         plan: ctx.plan(Some(index), None, refused),
+        defines_new: false,
+        sources: Vec::new(),
+    }))
+}
+
+/// `arm` (K3): map key ids to 1-based key indices through the committed
+/// definitions, `Read` on every armed key's sources, and refuse during a
+/// transition. The `ArmedSet` is built here, off the clock.
+fn check_arm(
+    principal: &Principal,
+    req: &super::switcher::SwitcherRequest,
+    snapshot: Option<Arc<SwitcherSnapshot>>,
+    defs: &KeyerDefinitions,
+) -> ControlResult<Result<Checked, Response>> {
+    let keys = req.keyer.keys.clone().unwrap_or_default();
+    authorize_arm_sources(principal, defs, &keys)?;
+    let mut set = multiview_core::switcher::ArmedSet::default();
+    if req.keyer.background.unwrap_or(false) {
+        set = set.with_background();
+    }
+    for key in &keys {
+        let Some(index) = defs
+            .find_in(KeyerFamily::Usk, key)
+            .and_then(|(slot, _)| multiview_engine::keyer::usk_key_index(usize::from(slot)))
+        else {
+            return Ok(Err(typed(
+                404,
+                "unknown-keyer",
+                format!("no upstream keyer {:?} is defined", object_id(&req.me, key)),
+            )));
+        };
+        set = set.with_key(index);
+    }
+    let refused = snapshot
+        .as_ref()
+        .is_some_and(|s| s.in_flight)
+        .then(|| refusal("in-flight", "the arm set cannot change during a transition"));
+    Ok(Ok(Checked {
+        verb: SwitcherVerb::Arm(Arc::new(set)),
+        plan: KeyerPlan {
+            class: "class1",
+            keyer: req.me.clone(),
+            on_air: false,
+            cost: None,
+            can_take: refused.is_none(),
+            refusal: refused,
+        },
         defines_new: false,
         sources: Vec::new(),
     }))
@@ -453,6 +661,7 @@ fn new_definition(
     program: &str,
     fields: &KeyerFields,
     defs: &KeyerDefinitions,
+    family: KeyerFamily,
 ) -> Result<DownstreamKeyerConfig, Box<Response>> {
     let Some(fill) = fields.fill.clone() else {
         return Err(Box::new(typed(
@@ -476,7 +685,7 @@ fn new_definition(
         rate: multiview_config::DEFAULT_KEYER_RATE,
         tie: false,
         on_at_start: false,
-        z: next_z(defs),
+        z: next_z(defs, family),
         loss: KeyerLossPolicy::default(),
         loss_trigger: KeyerLossTrigger::default(),
         premultiplied: false,
@@ -499,11 +708,12 @@ fn check_set(
 ) -> ControlResult<Result<Checked, Response>> {
     let fields = &req.keyer;
     let defs = &ctx.defs;
-    let found = defs.find(keyer);
+    let family = fields.family();
+    let found = defs.find_in(family.engine(), keyer);
     let mut cfg = if let Some((_, def)) = found {
         (*def.config).clone()
     } else {
-        match new_definition(keyer, &req.program, fields, defs) {
+        match new_definition(keyer, &req.program, fields, defs, family.engine()) {
             Ok(cfg) => cfg,
             Err(response) => return Ok(Err(*response)),
         }
@@ -521,17 +731,32 @@ fn check_set(
     let (canvas_w, canvas_h) = defs.canvas;
     let configured = configured_sources(state)?;
     let configured: Vec<&str> = configured.iter().map(String::as_str).collect();
-    if let Err(error) = cfg.validate_definition(&configured, canvas_w, canvas_h) {
+    let usk = (family == KeyerFamilyWire::Usk)
+        .then(|| multiview_config::UpstreamKeyerConfig::from_definition(&cfg));
+    let valid = match &usk {
+        Some(usk) => usk.validate_definition(&req.program, &configured, canvas_w, canvas_h),
+        None => cfg.validate_definition(&configured, canvas_w, canvas_h),
+    };
+    if let Err(error) = valid {
         return Ok(Err(typed(422, "validation", error.to_string())));
     }
-    let Some(index) = found.map(|(i, _)| i).or_else(|| defs.free_index()) else {
+    let Some(index) = found
+        .map(|(i, _)| i)
+        .or_else(|| defs.free_index_of(family.engine()))
+    else {
         return Ok(Err(typed(
             409,
             "capacity",
-            format!(
-                "a program has at most {} downstream keyers",
-                multiview_engine::keyer::MAX_DSK
-            ),
+            match family {
+                KeyerFamilyWire::Dsk => format!(
+                    "a program has at most {} downstream keyers",
+                    multiview_engine::keyer::MAX_DSK
+                ),
+                KeyerFamilyWire::Usk => format!(
+                    "an M/E has at most {} upstream keyers",
+                    multiview_engine::keyer::MAX_USK
+                ),
+            },
         )));
     };
     let others = || {
@@ -541,7 +766,8 @@ fn check_set(
             .filter(move |(i, _)| *i != usize::from(index))
             .filter_map(|(_, d)| d.as_ref())
     };
-    if others().any(|d| d.z == cfg.z) {
+    // z is unique within a family (USKs draw below every DSK).
+    if others().any(|d| d.family == family.engine() && d.z == cfg.z) {
         return Ok(Err(typed(
             422,
             "validation",
@@ -549,7 +775,10 @@ fn check_set(
         )));
     }
     let old_cost = found.map_or(0.0, |(_, d)| d.cost);
-    let new_cost = cfg.cost(canvas_w, canvas_h);
+    let new_cost = match &usk {
+        Some(usk) => usk.cost(canvas_w, canvas_h),
+        None => cfg.cost(canvas_w, canvas_h),
+    };
     let reserved_others: f64 = others().map(|d| d.cost).sum();
     let budget = f64::from(if defs.budget.is_finite() {
         defs.budget
@@ -576,6 +805,8 @@ fn check_set(
         .is_some_and(|r| r.on_air || r.ramp.is_some() || r.pending);
     let allow = fields.on_air == Some(KeyerOnAir::Allow);
     let defines_new = found.is_none();
+    // Clean is pre-DSK Program: only a new DSK takes the Clean exclusion.
+    let new_dsk = defines_new && family == KeyerFamilyWire::Dsk;
     let refused = if !fits {
         Some(refusal(
             "capacity",
@@ -593,7 +824,7 @@ fn check_set(
             "on-air-protected",
             multiview_engine::keyer::REFUSE_KEYER_ON_AIR_PROTECTED,
         ))
-    } else if defines_new && clean_held(handle) {
+    } else if new_dsk && clean_held(handle) {
         Some(refusal(
             "clean-unavailable-with-dsk",
             "an output carries Clean; defining a downstream keyer would put DSK pixels on it \
@@ -602,7 +833,11 @@ fn check_set(
     } else {
         None
     };
-    let def = match handle.resolve_keyer(&cfg) {
+    let resolved = match &usk {
+        Some(usk) => handle.resolve_usk(usk, &req.me, &req.program),
+        None => handle.resolve_keyer(&cfg),
+    };
+    let def = match resolved {
         Ok(def) => def,
         Err(detail) => return Ok(Err(typed(422, "validation", detail))),
     };
@@ -612,7 +847,7 @@ fn check_set(
     Ok(Ok(Checked {
         verb: handle.keyer_set_verb(defs, index, def, allow),
         plan: ctx.plan(found.map(|(i, _)| i), Some(cost), refused),
-        defines_new,
+        defines_new: new_dsk,
         sources,
     }))
 }
@@ -631,10 +866,11 @@ fn auto_rate(duration_frames: Option<u32>) -> Result<Option<FrameCount>, Box<Res
     }
 }
 
-fn next_z(defs: &KeyerDefinitions) -> i32 {
+fn next_z(defs: &KeyerDefinitions, family: KeyerFamily) -> i32 {
     defs.defs
         .iter()
         .flatten()
+        .filter(|d| d.family == family)
         .map(|d| d.z)
         .max()
         .map_or(1, |z| z.saturating_add(1))
@@ -732,10 +968,13 @@ pub fn take_leases(
 #[allow(clippy::struct_excessive_bools)]
 // reason: independent wire flags of one keyer row (design note §8).
 pub struct KeyerRow {
-    /// Keyer id within the program.
+    /// Keyer id within the program (DSK) or the M/E (USK).
     pub id: String,
-    /// `dsk` (USKs arrive with K3).
+    /// `dsk` or `usk` (K3).
     pub family: &'static str,
+    /// USK: armed to toggle with the next transition (K3); always `false`
+    /// for a DSK (its next-transition flag is `tie`).
+    pub armed: bool,
     /// Fill source id, or `"redacted"`.
     pub fill: String,
     /// Key source id, `"redacted"`, or `null` (self key).
@@ -764,6 +1003,42 @@ pub struct KeyerRow {
     pub stale: bool,
     /// An operator command is held waiting for fresh sources.
     pub pending: bool,
+}
+
+/// The next-transition set (`arm`, K3) as the caller may see it.
+#[derive(Debug, Clone, Default, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ArmedView {
+    /// The background moves with the next transition.
+    pub background: bool,
+    /// Armed upstream keyer ids the caller may read (keyer object id
+    /// `<me>/<id>`); unreadable ones are dropped.
+    pub keys: Vec<String>,
+}
+
+/// The armed set the principal may read.
+#[must_use]
+pub fn armed(
+    principal: &Principal,
+    defs: Option<&KeyerDefinitions>,
+    snapshot: &SwitcherSnapshot,
+) -> ArmedView {
+    let keys = defs
+        .map(|defs| {
+            defs.defs
+                .iter()
+                .enumerate()
+                .filter(|(slot, _)| snapshot.next.key_armed(*slot))
+                .filter_map(|(_, d)| d.as_ref())
+                .filter(|d| readable(principal, &d.object_id))
+                .map(|d| d.config.id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    ArmedView {
+        background: snapshot.next.background,
+        keys,
+    }
 }
 
 /// The engine tally resolved to source ids (unreadable ids dropped).
@@ -802,7 +1077,8 @@ pub fn rows(
     defs.defs
         .iter()
         .zip(snapshot.keyers.iter())
-        .filter_map(|(def, state)| {
+        .enumerate()
+        .filter_map(|(slot, (def, state))| {
             let def = def.as_ref()?;
             if !readable(principal, &def.object_id) {
                 return None;
@@ -817,7 +1093,8 @@ pub fn rows(
             let cfg = &def.config;
             Some(KeyerRow {
                 id: cfg.id.clone(),
-                family: "dsk",
+                family: def.family.as_str(),
+                armed: snapshot.next.key_armed(slot),
                 fill: redact(principal, &cfg.fill),
                 key: cfg.key.as_deref().map(|k| redact(principal, k)),
                 key_type: match cfg.key_type {

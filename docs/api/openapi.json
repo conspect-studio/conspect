@@ -12397,7 +12397,7 @@
             }
           },
           "409": {
-            "description": "`capacity` (keyer budget; generic for scoped callers), `on-air-protected` (a fill/key change of a keyer on air without `on_air = \"allow\"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyers-unavailable`; nothing is enqueued and every lease taken is released.",
+            "description": "`capacity` (keyer budget; generic for scoped callers), `on-air-protected` (a fill/key change of a keyer on air without `on_air = \"allow\"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyer-in-transition`, `in-flight` (`arm` during a transition), `keyers-unavailable`; nothing is enqueued and every lease taken is released.",
             "content": {
               "application/json": {
                 "schema": {
@@ -12448,7 +12448,7 @@
         },
         "responses": {
           "200": {
-            "description": "`SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`).",
+            "description": "`SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set`/`arm` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`, `keyer-in-transition` (a USK `keyer_cut` during a transition), `in-flight` (`arm` during a transition)).",
             "content": {
               "application/json": {
                 "schema": {
@@ -12458,7 +12458,7 @@
             }
           },
           "403": {
-            "description": "Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source (checked before any existence answer); a keyer verb also needs the command role (Operator), so a Viewer or ReadOnly key cannot plan one.",
+            "description": "Not authorized for the M/E, the Program scope, the keyer object id (`<program>/<id>` for a DSK, `<me>/<id>` for a USK; for `arm` every armed key) or a named fill/key source (for `arm` the fill and key of every armed key) (checked before any existence answer); a keyer verb also needs the command role (Operator), so a Viewer or ReadOnly key cannot plan one.",
             "content": {
               "application/json": {
                 "schema": {
@@ -15014,6 +15014,27 @@
           }
         },
         "additionalProperties": false
+      },
+      "ArmedView": {
+        "type": "object",
+        "description": "The next-transition set (`arm`, K3) as the caller may see it.",
+        "required": [
+          "background",
+          "keys"
+        ],
+        "properties": {
+          "background": {
+            "type": "boolean",
+            "description": "The background moves with the next transition."
+          },
+          "keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Armed upstream keyer ids the caller may read (keyer object id\n`<me>/<id>`); unreadable ones are dropped."
+          }
+        }
       },
       "ArtifactRef": {
         "type": "object",
@@ -19006,10 +19027,25 @@
           }
         }
       },
+      "KeyerFamilyWire": {
+        "type": "string",
+        "description": "Which keyer family a request names (K3). Absent: `dsk` (K4 requests are\nunchanged).",
+        "enum": [
+          "dsk",
+          "usk"
+        ]
+      },
       "KeyerFields": {
         "type": "object",
         "description": "The keyer fields of a switcher request (flattened into it). Every field\nis optional; which ones a verb takes is checked by shape.",
         "properties": {
+          "background": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`arm` (K3): whether the background moves with the next transition."
+          },
           "clip": {
             "type": [
               "number",
@@ -19017,6 +19053,17 @@
             ],
             "format": "float",
             "description": "`keyer_set`: luma clip, `[0, 1]`."
+          },
+          "family": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyerFamilyWire",
+                "description": "Keyer verbs: `dsk` (default) or `usk` (K3). A USK's object id is\n`<me>/<keyer>`; it takes `keyer_cut` (outside a transition) and\n`keyer_set`, and changes on air through `arm` + CUT/AUTO."
+              }
+            ]
           },
           "fill": {
             "type": [
@@ -19060,6 +19107,16 @@
               "null"
             ],
             "description": "Keyer id within the program (`dsk1`); the object id is\n`<program>/<keyer>`. Required by every keyer verb."
+          },
+          "keys": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "`arm` (K3): the upstream keyer ids (of this M/E) that toggle with the\nnext transition, at most 4, distinct."
           },
           "loss": {
             "type": [
@@ -19211,6 +19268,7 @@
         "required": [
           "id",
           "family",
+          "armed",
           "fill",
           "type",
           "on_air",
@@ -19221,9 +19279,13 @@
           "pending"
         ],
         "properties": {
+          "armed": {
+            "type": "boolean",
+            "description": "USK: armed to toggle with the next transition (K3); always `false`\nfor a DSK (its next-transition flag is `tie`)."
+          },
           "family": {
             "type": "string",
-            "description": "`dsk` (USKs arrive with K3)."
+            "description": "`dsk` or `usk` (K3)."
           },
           "fill": {
             "type": "string",
@@ -19238,7 +19300,7 @@
           },
           "id": {
             "type": "string",
-            "description": "Keyer id within the program."
+            "description": "Keyer id within the program (DSK) or the M/E (USK)."
           },
           "key": {
             "type": [
@@ -26195,7 +26257,7 @@
         "allOf": [
           {
             "$ref": "#/components/schemas/KeyerFields",
-            "description": "Downstream keyer fields (ADR-0113 §8, K4): `keyer` names the keyer\n(object id `<program>/<keyer>`); `on`, `tie` and the `keyer_set`\ndefinition fields. Fill and key name sources only (`in:<n>` is 422)."
+            "description": "Keyer fields (ADR-0113 §8, K4/K3): `keyer` names the keyer (object id\n`<program>/<keyer>`, or `<me>/<keyer>` with `family = \"usk\"`); `on`,\n`tie` and the `keyer_set` definition fields; `arm` takes `background`\nand `keys` (upstream keyer ids). Fill and key name sources only\n(`in:<n>` is 422)."
           },
           {
             "type": "object",
@@ -26207,7 +26269,7 @@
             "properties": {
               "action": {
                 "type": "string",
-                "description": "Action to classify on `/plan`, one of `select_program`, `select_preview`,\n`cut`, `auto`, `set_transition`, `keyer_cut`, `keyer_auto`, `keyer_tie`,\n`keyer_set`; the action is part of the same validated request."
+                "description": "Action to classify on `/plan`, one of `select_program`, `select_preview`,\n`cut`, `auto`, `set_transition`, `keyer_cut`, `keyer_auto`, `keyer_tie`,\n`keyer_set`, `arm`; the action is part of the same validated request."
               },
               "duration_frames": {
                 "type": [
@@ -26282,9 +26344,14 @@
           "in_flight",
           "keyers",
           "tally",
+          "armed",
           "transition"
         ],
         "properties": {
+          "armed": {
+            "$ref": "#/components/schemas/ArmedView",
+            "description": "The next-transition set (`arm`, K3): the background flag and the\narmed upstream keyer ids the caller may read."
+          },
           "in_flight": {
             "type": "boolean",
             "description": "Active AUTO status."

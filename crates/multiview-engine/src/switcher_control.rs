@@ -562,6 +562,30 @@ impl SwitcherControl {
         KeyerDef::from_config(config, &stores, w, h).map(|def| KeyerDefinition(Arc::new(def)))
     }
 
+    /// Resolve an upstream keyer definition (K3) of M/E `me` on `program`
+    /// against this run's frame stores and canvas, off the clock.
+    ///
+    /// # Errors
+    /// As [`Self::resolve_keyer`].
+    pub fn resolve_usk(
+        &self,
+        config: &multiview_config::UpstreamKeyerConfig,
+        me: &str,
+        program: &str,
+    ) -> Result<KeyerDefinition, String> {
+        let defs = self
+            .keyer_defs
+            .latest()
+            .ok_or_else(|| "this run has no keyer runtime".to_owned())?;
+        let stores = self
+            .stores
+            .latest()
+            .ok_or_else(|| "this run has no frame stores attached".to_owned())?;
+        let (w, h) = defs.canvas;
+        KeyerDef::from_usk(config, me, program, &stores, w, h)
+            .map(|def| KeyerDefinition(Arc::new(def)))
+    }
+
     /// Build the [`SwitcherVerb::KeyerSet`] for `def` at `keyer`, admitted
     /// against the committed definitions `base`: prepares the readback the
     /// committing tick publishes (off the clock, review H6) and stamps the

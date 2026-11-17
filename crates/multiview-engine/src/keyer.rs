@@ -535,6 +535,18 @@ impl KeyerDefinitions {
         })
     }
 
+    /// The slot and definition of the `family` keyer whose config id is `id`.
+    #[must_use]
+    pub fn find_in(&self, family: KeyerFamily, id: &str) -> Option<(u8, &Arc<KeyerDef>)> {
+        family.slots().find_map(|index| {
+            self.defs
+                .get(index)
+                .and_then(Option::as_ref)
+                .filter(|d| d.config.id == id)
+                .map(|d| (index_u8(index), d))
+        })
+    }
+
     /// The first free DSK slot, if any.
     #[must_use]
     pub fn free_index(&self) -> Option<u8> {

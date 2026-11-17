@@ -40,15 +40,17 @@ pub struct SwitcherRequest {
     pub output: Option<String>,
     /// Action to classify on `/plan`, one of `select_program`, `select_preview`,
     /// `cut`, `auto`, `set_transition`, `keyer_cut`, `keyer_auto`, `keyer_tie`,
-    /// `keyer_set`; the action is part of the same validated request.
+    /// `keyer_set`, `arm`; the action is part of the same validated request.
     pub action: String,
     /// AUTO duration at the output's exact cadence; no floating milliseconds.
     /// For `keyer_auto`, an optional rate override in 1..=300 frames.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_frames: Option<u32>,
-    /// Downstream keyer fields (ADR-0113 §8, K4): `keyer` names the keyer
-    /// (object id `<program>/<keyer>`); `on`, `tie` and the `keyer_set`
-    /// definition fields. Fill and key name sources only (`in:<n>` is 422).
+    /// Keyer fields (ADR-0113 §8, K4/K3): `keyer` names the keyer (object id
+    /// `<program>/<keyer>`, or `<me>/<keyer>` with `family = "usk"`); `on`,
+    /// `tie` and the `keyer_set` definition fields; `arm` takes `background`
+    /// and `keys` (upstream keyer ids). Fill and key name sources only
+    /// (`in:<n>` is 422).
     #[serde(flatten)]
     pub keyer: super::switcher_keyers::KeyerFields,
     /// The transition `set_transition` selects for the next AUTO (ADR-0112
@@ -118,6 +120,9 @@ pub struct SwitcherStateResponse {
     pub keyers: Vec<super::switcher_keyers::KeyerRow>,
     /// Engine tally resolved to source ids; unreadable ids are dropped.
     pub tally: super::switcher_keyers::TallyView,
+    /// The next-transition set (`arm`, K3): the background flag and the
+    /// armed upstream keyer ids the caller may read.
+    pub armed: super::switcher_keyers::ArmedView,
     /// The operator's selected transition, as the engine applied it
     /// (ADR-0112 §4); an AUTO's own rate never replaces it. Same shape as
     /// the request's `transition`.
@@ -463,6 +468,7 @@ pub(crate) async fn get_switcher(
             in_flight: snapshot.in_flight,
             keyers: super::switcher_keyers::rows(&principal, defs.as_deref(), &snapshot),
             tally: super::switcher_keyers::tally(&principal, defs.as_deref(), &snapshot),
+            armed: super::switcher_keyers::armed(&principal, defs.as_deref(), &snapshot),
             transition: snapshot.transition.clone(),
         }),
     )
@@ -531,7 +537,7 @@ fn transition_error(bytes: &[u8]) -> Option<String> {
 }
 
 /// Dry-run command admission, including BOLA on every referenced object.
-#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/plan", tag = "switcher", request_body = SwitcherRequest, responses((status = 200, description = "`SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`).", body = SwitcherPlanResponseDoc), (status = 403, description = "Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source (checked before any existence answer); a keyer verb also needs the command role (Operator), so a Viewer or ReadOnly key cannot plan one.", body = crate::problem::Problem), (status = 404, description = "`unknown-keyer` (a keyer the caller may read is not defined).", body = crate::problem::Problem), (status = 409, body = crate::problem::Problem), (status = 422, description = "Invalid verb fields; `keyer-source-not-a-source` (a fill or key naming a mixer input `in:<n>`); `keyer-rate`.", body = crate::problem::Problem))))]
+#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/plan", tag = "switcher", request_body = SwitcherRequest, responses((status = 200, description = "`SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set`/`arm` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`, `keyer-in-transition` (a USK `keyer_cut` during a transition), `in-flight` (`arm` during a transition)).", body = SwitcherPlanResponseDoc), (status = 403, description = "Not authorized for the M/E, the Program scope, the keyer object id (`<program>/<id>` for a DSK, `<me>/<id>` for a USK; for `arm` every armed key) or a named fill/key source (for `arm` the fill and key of every armed key) (checked before any existence answer); a keyer verb also needs the command role (Operator), so a Viewer or ReadOnly key cannot plan one.", body = crate::problem::Problem), (status = 404, description = "`unknown-keyer` (a keyer the caller may read is not defined).", body = crate::problem::Problem), (status = 409, body = crate::problem::Problem), (status = 422, description = "Invalid verb fields; `keyer-source-not-a-source` (a fill or key naming a mixer input `in:<n>`); `keyer-rate`.", body = crate::problem::Problem))))]
 pub(crate) async fn plan_switcher(
     State(state): State<AppState>,
     principal: Principal,
@@ -585,7 +591,7 @@ pub(crate) async fn plan_switcher(
 }
 
 /// Enqueue a checked verb; a 202 never asserts frame application.
-#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/commands/{kind}", tag = "switcher", params(("kind" = String, Path, description = "The verb; must equal `action`."), ("Idempotency-Key" = String, Header, description = "Required; a replay answers the first 202.")), request_body = SwitcherRequest, responses((status = 202, description = "Queued; the outcome arrives as `switcher.operation` at the engine tick. Keyer verbs also emit `switcher.keyer` on a committed state change.", body = SwitcherAccepted), (status = 403, description = "Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source; the key is not burned.", body = crate::problem::Problem), (status = 404, description = "`unknown-keyer`.", body = crate::problem::Problem), (status = 409, description = "`capacity` (keyer budget; generic for scoped callers), `on-air-protected` (a fill/key change of a keyer on air without `on_air = \"allow\"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyers-unavailable`; nothing is enqueued and every lease taken is released.", body = crate::problem::Problem), (status = 422, body = crate::problem::Problem), (status = 503, description = "`engine-busy` (the 64-slot mailbox is full; key and leases released) or `idempotency-capacity`.", body = crate::problem::Problem))))]
+#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/commands/{kind}", tag = "switcher", params(("kind" = String, Path, description = "The verb; must equal `action`."), ("Idempotency-Key" = String, Header, description = "Required; a replay answers the first 202.")), request_body = SwitcherRequest, responses((status = 202, description = "Queued; the outcome arrives as `switcher.operation` at the engine tick. Keyer verbs also emit `switcher.keyer` on a committed state change.", body = SwitcherAccepted), (status = 403, description = "Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source; the key is not burned.", body = crate::problem::Problem), (status = 404, description = "`unknown-keyer`.", body = crate::problem::Problem), (status = 409, description = "`capacity` (keyer budget; generic for scoped callers), `on-air-protected` (a fill/key change of a keyer on air without `on_air = \"allow\"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyer-in-transition`, `in-flight` (`arm` during a transition), `keyers-unavailable`; nothing is enqueued and every lease taken is released.", body = crate::problem::Problem), (status = 422, body = crate::problem::Problem), (status = 503, description = "`engine-busy` (the 64-slot mailbox is full; key and leases released) or `idempotency-capacity`.", body = crate::problem::Problem))))]
 #[allow(clippy::too_many_lines)]
 // reason: one linear admission sequence (authz → resolve input → buses → key →
 // lease → enqueue); the input resolution added the lines, not new branches.
