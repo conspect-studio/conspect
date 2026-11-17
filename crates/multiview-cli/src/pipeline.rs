@@ -32118,6 +32118,14 @@ loop_default = true
         let slot = Arc::clone(&rig.runtime.audio_commit);
         let closer = Arc::clone(&slot);
         slot.before_claim_for_test(Box::new(move || {
+            // The ingest claims on every poll after its PREPARE put, and the
+            // live audio thread acknowledges on its own cadence: on a loaded
+            // host the first claim can precede the ack (#478, #497). Park the
+            // ingest (bounded) until the ack lands, so the close is exactly
+            // "after the PREPARE ack, before the claim takes the gate".
+            wait("the audio rail acknowledged PREPARE", &|| {
+                closer.is_prepared(closer.pending_generation())
+            });
             assert!(
                 closer.is_prepared(closer.pending_generation()),
                 "closed after the PREPARE ack"
