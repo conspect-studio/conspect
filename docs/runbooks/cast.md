@@ -33,6 +33,11 @@ Design: [ADR-0111](../decisions/ADR-0111-cast-output.md), [cast-output.md](../ar
    source = "cam1"                    # the source whose captions it carries; re-patch on the Routing page
    ```
 
+   Subtitle slots need a build with the `overlay` feature (every preset has it): it wires the caption sources the
+   slots carry. A build without it refuses a config with subtitle slots at `validate` and at start-up, instead of
+   publishing a subtitle track whose segments never carry a cue (#508; that `0 cues` came from the build features, not
+   the FFmpeg version: the cast proof's subtitle check passes on Debian's FFmpeg 7.1.5 and on the pinned 9.0.2).
+
    Several pictures (for example two cameras) are several cast outputs: a Chromecast decodes one video at a time,
    and the Cast panel's Video picker moves the device to another cast output.
 2. The host name must resolve on public DNS (Cast devices use their own resolvers and ignore LAN DNS) and serve a

@@ -1729,6 +1729,9 @@ async fn run_pipeline(
              back to the last-good copy and raise the accepted-state-rejected warning"
         );
     }
+    // #508: never report "ready" for subtitle slots this build cannot fill.
+    multiview_cli::outputs::ensure_subtitle_slots_supported(&config.outputs)
+        .map_err(|reason| anyhow::anyhow!(reason))?;
     let engine =
         SoftwareEngine::build_gated(config, plane.level()).map_err(|e| anyhow::anyhow!("{e}"))?;
     println!(
