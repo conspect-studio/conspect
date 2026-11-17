@@ -299,6 +299,8 @@ async fn live_alias_moves_audio_with_video_and_a_kind_change_never_shares_the_pl
 /// Merge review (#474 x #477): a producer -> `media_player` alias transition
 /// while the hub queue is FULL keeps the replaced producer's teardown pending
 /// and retries it until the producer stops (never left to run teardown), and
+/// (ship-1111 #1) the teardown is part of the ONE ordered alias binding, so
+/// it is pending as that binding, never as a separate teardown; and
 /// new aliases are admitted only under the live source cap, counting an id
 /// that is both an alias and a pending teardown once.
 #[test]
@@ -356,7 +358,12 @@ fn a_shed_producer_to_alias_teardown_is_retried_and_aliases_respect_the_cap() {
         Arc::ptr_eq(drive.store("p").unwrap(), &player),
         "alias bound"
     );
-    assert_eq!(drain.pending_teardowns(), 1, "the shed teardown is kept");
+    assert_eq!(
+        drain.pending_binds(),
+        1,
+        "the shed replace (teardown + bind) is kept"
+    );
+    assert_eq!(drain.pending_teardowns(), 0, "never a separate teardown");
     assert!(!producer.stop_requested(), "still pending while full");
 
     // Cap: `p` (alias + pending teardown) counts once, so one more alias fits
@@ -365,12 +372,17 @@ fn a_shed_producer_to_alias_teardown_is_retried_and_aliases_respect_the_cap() {
     assert!(drive.store("q").is_some(), "q admitted under the cap");
     submit(&mut drain, &mut drive, alias("r", "vt-1"));
     assert!(drive.store("r").is_none(), "r held at the cap");
-    assert_eq!(drain.applied_sources(), cap);
+    // Shed bindings are pending (not yet hub-known); hub-known plus pending
+    // fills the cap exactly, counting `p` once.
+    assert_eq!(drain.admitted_sources(), cap);
 
     // The queue recovers: the retried teardown stops the old producer.
     fault.clear();
+    // One retry per tick: `p`'s replace and `q`'s shed binding.
     drain.apply(&mut drive);
-    assert_eq!(drain.pending_teardowns(), 0, "teardown reached the hub");
+    drain.apply(&mut drive);
+    assert_eq!(drain.pending_binds(), 0, "the replace reached the hub");
+    assert_eq!(drain.pending_teardowns(), 0);
     assert!(
         wait(Box::new(
             || producer.stop_requested() && running("p").is_none()

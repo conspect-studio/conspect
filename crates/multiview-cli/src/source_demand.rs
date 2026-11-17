@@ -142,6 +142,8 @@ pub struct DrainDemand<T> {
     pub manager: multiview_engine::DemandManager<T>,
     /// The configured-source catalogue the rails read.
     pub catalogue: crate::source_rails::Catalogue,
+    /// The media-player channels the run booted (ADR-M012).
+    pub booted_players: std::sync::Arc<std::collections::BTreeSet<String>>,
 }
 
 /// One consumer item per source-bound cell of `cells`, in order.

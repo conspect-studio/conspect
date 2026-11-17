@@ -258,10 +258,12 @@ pub trait IngestSpawner: Send + Sync {
         false
     }
 
-    /// A `media_player` alias left the run (removed, or edited into another
-    /// kind). Its store is the player channel's and is never cleared. Hub
-    /// worker only.
-    fn alias_removed(&self, _id: &str) {}
+    /// A `media_player` alias bound to `store` left the run (removed, or
+    /// edited into another kind). Withdraw its catalogue entry and pins only
+    /// while the entry is still that very alias (a later definition under the
+    /// id is never touched). The store is the player channel's and is never
+    /// cleared. Hub worker only.
+    fn alias_removed(&self, _id: &str, _store: &Arc<TileStore<Nv12Image>>) {}
 }
 
 /// A live `media_player` alias binding (ADR-M012) for the hub: no producer,
@@ -273,6 +275,10 @@ pub struct AliasBind {
     pub store: Arc<TileStore<Nv12Image>>,
     /// Why the alias can show no picture, when its player has no channel.
     pub unavailable: Option<String>,
+    /// A producer ran (or a shed removal of one is pending) under this id:
+    /// the hub tears it down BEFORE it binds the alias, in this one ordered
+    /// request, so no separate teardown can land after the binding.
+    pub replaces_producer: bool,
 }
 
 /// A request travelling from the frame-boundary drain to the hub worker.
@@ -294,10 +300,14 @@ enum HubRequest {
     /// a full config `Source`.
     BindAlias(Box<AliasBind>),
     /// A `media_player` alias left: withdraw its catalogue entry and, unless
-    /// the id is the player's own channel, its preview entry.
+    /// the id is the player channel itself, its preview entry — each only
+    /// while it still holds `store`, so a stale (retried) unbind never removes
+    /// a later definition under the same id.
     UnbindAlias {
         /// The alias id.
         id: String,
+        /// The store the alias was bound to.
+        store: Arc<TileStore<Nv12Image>>,
         /// Keep the preview entry (the id is the player channel itself).
         keep_preview: bool,
     },
@@ -364,6 +374,23 @@ impl SubmitFault {
     pub fn gone(&self) {
         self.0.store(2, Ordering::Release);
     }
+    /// Shed only the NEXT teardown request as [`HubSubmit::Full`]; every
+    /// other submission (and every later teardown) goes through. Models a
+    /// queue that fills for one request and drains before the next.
+    pub fn full_next_teardown(&self) {
+        self.0.store(3, Ordering::Release);
+    }
+    /// The forced outcome of a teardown request (consumes a one-shot).
+    fn forced_teardown(&self) -> Option<HubSubmit> {
+        if self
+            .0
+            .compare_exchange(3, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Some(HubSubmit::Full);
+        }
+        self.forced()
+    }
     fn forced(&self) -> Option<HubSubmit> {
         match self.0.load(Ordering::Acquire) {
             1 => Some(HubSubmit::Full),
@@ -416,7 +443,7 @@ impl LiveSourceHandle {
     /// [`HubSubmit::Full`]/[`HubSubmit::Gone`].
     #[must_use]
     pub fn request_teardown(&self, id: &str) -> HubSubmit {
-        if let Some(forced) = self.forced() {
+        if let Some(forced) = self.fault.as_ref().and_then(SubmitFault::forced_teardown) {
             return forced;
         }
         let request = HubRequest::Teardown { id: id.to_owned() };
@@ -436,12 +463,18 @@ impl LiveSourceHandle {
 
     /// Request a `media_player` alias unbinding. Never blocks.
     #[must_use]
-    pub fn request_unbind_alias(&self, id: &str, keep_preview: bool) -> HubSubmit {
+    pub fn request_unbind_alias(
+        &self,
+        id: &str,
+        store: &Arc<TileStore<Nv12Image>>,
+        keep_preview: bool,
+    ) -> HubSubmit {
         if let Some(forced) = self.forced() {
             return forced;
         }
         let request = HubRequest::UnbindAlias {
             id: id.to_owned(),
+            store: Arc::clone(store),
             keep_preview,
         };
         Self::submit_outcome(&self.tx.try_send(request))
@@ -591,18 +624,32 @@ fn worker_loop(
                     source,
                     store,
                     unavailable,
+                    replaces_producer,
                 } = *bind;
+                if replaces_producer {
+                    // Producer -> alias: stop and forget the producer first,
+                    // exactly as a removal does, then bind — one ordered
+                    // request (review ship-1111 #1).
+                    teardown(&source.id, &mut owned, registry);
+                    if let Some(ingest) = ingest {
+                        ingest.source_removed(&source.id);
+                    }
+                }
                 preview_insert(preview, &source.id, &store);
                 if let Some(ingest) = ingest {
                     ingest.catalogue_alias(&source, &store, unavailable);
                 }
             }
-            HubRequest::UnbindAlias { id, keep_preview } => {
+            HubRequest::UnbindAlias {
+                id,
+                store,
+                keep_preview,
+            } => {
                 if let Some(ingest) = ingest {
-                    ingest.alias_removed(&id);
+                    ingest.alias_removed(&id, &store);
                 }
                 if !keep_preview {
-                    preview_remove(preview, &id);
+                    preview_remove_if(preview, &id, &store);
                 }
             }
             HubRequest::Shutdown => break,
@@ -916,6 +963,20 @@ fn preview_insert(preview: &SharedStores, id: &str, store: &Arc<TileStore<Nv12Im
     preview.rcu(|map| {
         let mut next = HashMap::clone(map);
         next.insert(id.to_owned(), Arc::clone(store));
+        next
+    });
+}
+
+/// RCU-remove `id` from the shared preview map only while it maps to `store`.
+fn preview_remove_if(preview: &SharedStores, id: &str, store: &Arc<TileStore<Nv12Image>>) {
+    preview.rcu(|map| {
+        let mut next = HashMap::clone(map);
+        if next
+            .get(id)
+            .is_some_and(|current| Arc::ptr_eq(current, store))
+        {
+            next.remove(id);
+        }
         next
     });
 }
