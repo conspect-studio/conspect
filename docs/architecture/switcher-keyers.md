@@ -1152,6 +1152,28 @@ merge (see "K1 GPU key path as built", wipe masks).
     the tick refuses it `arm-changed` / `keyer-definitions-changed` if either moved, so a take
     never toggles a key its caller was not authorized for. Consequence: an `arm` and a CUT sent
     in the same tick refuse the CUT; arm, see it applied, then take.
+  - **Held verbs keep their binding (review round 2 MEDIA-3 / AUTHZ-3 / K3-BOUND-1).** A bound
+    take held by the fresh gate keeps its `(arm_version, defs_version)` in the held-take slot
+    (`HeldTake`, `Copy` versions, no allocation) and is rechecked before it is applied: if the
+    definitions moved while it was held (a `keyer_set` re-pointing an armed, off-air USK is
+    legal then, since an off-air keyer is not protected), it is refused
+    `keyer-definitions-changed`, never retargeted onto the new fill. A held USK `keyer_cut`
+    keeps the definitions version in its per-keyer `Pending` (`Option<u64>`) and is refused the
+    same way when a `keyer_set` (`on_air = "allow"`) replaced its definition. Chosen over
+    refusing `keyer_set` on a referenced keyer: one integer compare on the held path, no new
+    cross-verb rule, and the refusal lands on the operation whose authorization went stale.
+  - **A held USK cut never lands mid-transition (review round 2 MEDIA-2).** When a held USK
+    `keyer_cut` becomes fresh while a background transition is in flight it is refused
+    `keyer-in-transition` (the admission rule, applied at resolution), not deferred: deferring
+    would land an abrupt key at an arbitrary later tick the operator never chose.
+  - **A take replay is not re-authorized on the armed set (review round 2 IDEMP-1).** CUT/AUTO
+    command runs every request-level check (role, M/E, Program scope, explicit sources and the
+    resolved target, static validation) first, then answers an existing principal/path-scoped
+    `Idempotency-Key` reservation with its original 202 and `operation_id`, and only then, for a
+    new admission, authorizes the currently armed USKs and binds the versions. The armed set is
+    engine state, not part of the request: the original operation already carries the versions
+    it was authorized against, so another operator's later `arm` does not turn the retry into a
+    403.
   - **Key-only takes with identical buses (review MEDIA-1).** `same-source` (PGM == PVW) is
     refused only when the armed set moves the background.
   - **USK `keyer_cut` (review AUTHZ-2)** also needs `Read` on the keyer's resolved fill and key
@@ -1202,8 +1224,14 @@ merge (see "K1 GPU key path as built", wipe masks).
     AUTOs where the drive's scratch, slate and DIP-fill odometers and the definition builds
     never move after warm-up.
   - `multiview-engine` `tests/keyers_usk.rs` also: `arm` refused while a take is held, the
-    held CUT keeping its set (review K3-INV-1).
-  - `multiview-control` `tests/switcher_keyers_usk.rs` (9; round 1 added: key-only CUT/AUTO
+    held CUT keeping its set (review K3-INV-1); round 2: a held bound CUT and AUTO refused
+    `keyer-definitions-changed` after the armed off-air USK's fill is re-pointed while held; a
+    held USK `keyer_cut` refused the same way after a `keyer_set` (`allow`); a held unarmed USK
+    `keyer_cut` whose fill becomes fresh mid-AUTO refused `keyer-in-transition`, never drawn.
+  - `multiview-control` `tests/switcher_keyers_usk.rs` (10; round 2 added: a CUT and an AUTO
+    replay answer the original 202 / `operation_id` after another operator armed a key the
+    caller may not control, while a new take is 403 and a principal without the M/E is 403 on
+    the same key; round 1 added: key-only CUT/AUTO
     with identical buses and the retained background refusal; CUT/AUTO BOLA on the armed keys
     and their sources; a take bound to a stale arm set refused `arm-changed`; USK `keyer_cut`
     BOLA on its sources and bound to its definition): the `arm` BOLA matrix on plan and
