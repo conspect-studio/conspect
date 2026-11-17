@@ -4199,6 +4199,23 @@ export interface components {
             /** @description The output API id (the id `/api/v1/outputs/{id}` addresses). */
             output: string;
         };
+        /** @description The next-transition set (`arm`, K3) as the caller may see it. */
+        ArmedView: {
+            /** @description The background moves with the next transition. */
+            background: boolean;
+            /**
+             * @description `false` when an armed key is hidden from the caller (review
+             *     K5-R2-01): `keys` is then not the whole set, and `arm` (which
+             *     replaces the set) is refused with 409 `arm-hidden-keys`. A boolean
+             *     only: it never names or counts the hidden keys.
+             */
+            complete: boolean;
+            /**
+             * @description Armed upstream keyer ids the caller may read (keyer object id
+             *     `<me>/<id>`); unreadable ones are dropped.
+             */
+            keys: string[];
+        };
         /** @description Exact immutable completed capture selector; no path or owner override. */
         ArtifactRef: {
             /** @description Exact artifact ID returned by that job. */
@@ -6231,6 +6248,245 @@ export interface components {
             program_date_time?: string | null;
             /** @description Carrying segment URI, without query or credentials. */
             segment_uri?: string | null;
+        };
+        /**
+         * @description Admission cost (ADR-0113 §9). Scoped callers see only their own delta;
+         *     the totals go to unscoped readers only (ADR-0108 decision 8).
+         */
+        KeyerCost: {
+            /**
+             * Format: double
+             * @description The keyer budget (unscoped readers only).
+             */
+            budget?: number | null;
+            /**
+             * Format: double
+             * @description The change's cost delta in canvas folds (new cost − old cost).
+             */
+            delta: number;
+            /** @description Whether it fits the remaining budget. */
+            fits: boolean;
+            /**
+             * @description Every keyer holding a reservation, by object id (unscoped readers
+             *     only).
+             */
+            holders?: string[] | null;
+            /**
+             * Format: double
+             * @description Reserved total after the change (unscoped readers only).
+             */
+            reserved?: number | null;
+        };
+        /**
+         * @description Which keyer family a request names (K3). Absent: `dsk` (K4 requests are
+         *     unchanged).
+         * @enum {string}
+         */
+        KeyerFamilyWire: "dsk" | "usk";
+        /**
+         * @description The keyer fields of a switcher request (flattened into it). Every field
+         *     is optional; which ones a verb takes is checked by shape.
+         */
+        KeyerFields: {
+            /** @description `arm` (K3): whether the background moves with the next transition. */
+            background?: boolean | null;
+            /**
+             * Format: float
+             * @description `keyer_set`: luma clip on Y, or chroma clip on the linear-RGB
+             *     distance, `[0, 1]`.
+             */
+            clip?: number | null;
+            /**
+             * @description `keyer_set`: chroma reference colour `#RRGGBB` (`type = chroma`
+             *     only); `""` clears it. Downstream keyers only (`keyer-usk` on a USK).
+             */
+            color?: string | null;
+            family?: null | components["schemas"]["KeyerFamilyWire"];
+            /** @description `keyer_set`: fill source id (a source; `in:<n>` is refused). */
+            fill?: string | null;
+            fly?: null | components["schemas"]["KeyerRectDoc"];
+            /**
+             * Format: float
+             * @description `keyer_set`: luma or chroma gain, finite and `>= 0`.
+             */
+            gain?: number | null;
+            /** @description `keyer_set`: invert the matte. */
+            invert?: boolean | null;
+            /**
+             * @description `keyer_set`: key source id; JSON `null` keeps it, `""` clears it (a
+             *     self key).
+             */
+            key?: string | null;
+            /**
+             * @description Keyer id within the program (`dsk1`); the object id is
+             *     `<program>/<keyer>`. Required by every keyer verb.
+             */
+            keyer?: string | null;
+            /**
+             * @description `arm` (K3): the upstream keyer ids (of this M/E) that toggle with the
+             *     next transition, at most 4, distinct.
+             */
+            keys?: string[] | null;
+            /** @description `keyer_set`: `drop_to_off_air` or `hold_last_good`. */
+            loss?: string | null;
+            /** @description `keyer_set`: `stale`, `reconnecting` or `no_signal`. */
+            loss_trigger?: string | null;
+            mask?: null | components["schemas"]["KeyerRectDoc"];
+            max_source?: null | components["schemas"]["KeyerSizeDoc"];
+            /** @description `keyer_cut` / `keyer_auto`: the target state. */
+            on?: boolean | null;
+            on_air?: null | components["schemas"]["KeyerOnAir"];
+            /** @description `keyer_set`: go on at boot through the fresh gate. */
+            on_at_start?: boolean | null;
+            /**
+             * Format: int32
+             * @description `keyer_set`: AUTO rate in frames, 1..=300.
+             */
+            rate?: number | null;
+            /** @description `keyer_tie`: tied to the next background take. */
+            tie?: boolean | null;
+            /**
+             * @description `keyer_set`: `linear`, `luma` or `chroma` (K7; needs `color`, refuses
+             *     a `key` source; downstream keyers only, a USK refuses it as
+             *     `usk-chroma`).
+             */
+            type?: string | null;
+            /**
+             * Format: int32
+             * @description `keyer_set` defining a new keyer: its z among DSKs.
+             */
+            z?: number | null;
+        };
+        /**
+         * @description `on_air` guard of `keyer_set`.
+         * @enum {string}
+         */
+        KeyerOnAir: "protect" | "allow";
+        /** @description The plan answer of a keyer verb. */
+        KeyerPlan: {
+            /** @description Whether the command can be taken now. */
+            can_take: boolean;
+            /** @description `class1`: every keyer verb lands at one tick. */
+            class: string;
+            cost?: null | components["schemas"]["KeyerCost"];
+            /** @description The keyer object id. */
+            keyer: string;
+            /** @description Whether the keyer is on air now. */
+            on_air: boolean;
+            refusal?: null | components["schemas"]["PatchRefusal"];
+        };
+        /**
+         * @description An in-flight keyer AUTO: the weight at output tick `t` is
+         *     `clamp((t - start_tick) / rate, 0, 1)`, reversed when `to_on` is false.
+         */
+        KeyerRampView: {
+            /**
+             * Format: int32
+             * @description Duration in output frames.
+             */
+            rate: number;
+            /**
+             * Format: int64
+             * @description Output tick the ramp started on.
+             */
+            start_tick: number;
+            /** @description Ramping on (`true`) or off. */
+            to_on: boolean;
+        };
+        /**
+         * @description A keyer rectangle in pixels (`fly` in canvas pixels, `mask` in
+         *     fill-source pixels); mirrors `multiview_config::KeyerRect`.
+         */
+        KeyerRectDoc: {
+            /**
+             * Format: int32
+             * @description Height.
+             */
+            h: number;
+            /**
+             * Format: int32
+             * @description Width.
+             */
+            w: number;
+            /**
+             * Format: int32
+             * @description Left column.
+             */
+            x: number;
+            /**
+             * Format: int32
+             * @description Top row.
+             */
+            y: number;
+        };
+        /** @description One `keyers[]` row of `GET /api/v1/switcher/{me}` (design note §8). */
+        KeyerRow: {
+            /**
+             * @description USK: armed to toggle with the next transition (K3); always `false`
+             *     for a DSK (its next-transition flag is `tie`).
+             */
+            armed: boolean;
+            /**
+             * Format: float
+             * @description Luma clip, `[0, 1]` (the committed value; meaningful for `luma`).
+             */
+            clip: number;
+            /**
+             * @description Chroma reference `#RRGGBB` / `#RGB` (K7), `null` for other types.
+             *     A colour, not a source id: never redacted.
+             */
+            color?: string | null;
+            /** @description `dsk` or `usk` (K3). */
+            family: string;
+            /** @description Fill source id, or `"redacted"`. */
+            fill: string;
+            fly?: null | components["schemas"]["KeyerRectDoc"];
+            /**
+             * Format: float
+             * @description Luma gain (the committed value; meaningful for `luma`).
+             */
+            gain: number;
+            /** @description Keyer id within the program (DSK) or the M/E (USK). */
+            id: string;
+            /** @description Matte inverted. */
+            invert: boolean;
+            /** @description Key source id, `"redacted"`, or `null` (self key). */
+            key?: string | null;
+            /** @description `drop_to_off_air` or `hold_last_good`. */
+            loss: string;
+            /** @description `stale`, `reconnecting` or `no_signal`. */
+            loss_trigger: string;
+            mask?: null | components["schemas"]["KeyerRectDoc"];
+            max_source?: null | components["schemas"]["KeyerSizeDoc"];
+            /** @description On air. */
+            on_air: boolean;
+            /** @description An operator command is held waiting for fresh sources. */
+            pending: boolean;
+            ramp?: null | components["schemas"]["KeyerRampView"];
+            /**
+             * Format: int32
+             * @description AUTO rate in frames.
+             */
+            rate: number;
+            /** @description Drawing a frozen pair past its loss trigger. */
+            stale: boolean;
+            /** @description Tied to the next background take. */
+            tie: boolean;
+            /** @description `linear`, `luma` or `chroma`. */
+            type: string;
+        };
+        /** @description A picture size in pixels; mirrors `multiview_config::KeyerSize`. */
+        KeyerSizeDoc: {
+            /**
+             * Format: int32
+             * @description Height.
+             */
+            h: number;
+            /**
+             * Format: int32
+             * @description Width.
+             */
+            w: number;
         };
         /**
          * @description `OpenAPI` mirror of [`multiview_licence::LadderState`] (the seven conditions).
@@ -9592,20 +9848,23 @@ export interface components {
              */
             scene_version: number;
         };
+        /** @description A `SwitcherPlan` for a background verb, or a `KeyerPlan` for `keyer_cut`, `keyer_auto`, `keyer_tie` and `keyer_set`. */
+        SwitcherPlanResponseDoc: components["schemas"]["SwitcherPlan"] | components["schemas"]["KeyerPlan"];
         /**
          * @description One source-select, take or output-binding request. References are checked
          *     independently; absent references never authorize implicitly.
          */
-        SwitcherRequest: {
+        SwitcherRequest: components["schemas"]["KeyerFields"] & {
             /**
              * @description Action to classify on `/plan`, one of `select_program`, `select_preview`,
-             *     `cut`, `auto`, `set_transition`; the action is part of the same
-             *     validated request.
+             *     `cut`, `auto`, `set_transition`, `keyer_cut`, `keyer_auto`, `keyer_tie`,
+             *     `keyer_set`, `arm`; the action is part of the same validated request.
              */
             action: string;
             /**
              * Format: int32
              * @description AUTO duration at the output's exact cadence; no floating milliseconds.
+             *     For `keyer_auto`, an optional rate override in 1..=300 frames.
              */
             duration_frames?: number | null;
             /**
@@ -9639,12 +9898,45 @@ export interface components {
         };
         /** @description Engine-owned bus selection and current tick, never guessed from request. */
         SwitcherStateResponse: {
+            /**
+             * @description The next-transition set (`arm`, K3): the background flag and the
+             *     armed upstream keyer ids the caller may read.
+             */
+            armed: components["schemas"]["ArmedView"];
+            /**
+             * Format: int32
+             * @description Output canvas height in pixels.
+             */
+            canvas_height: number;
+            /**
+             * Format: int32
+             * @description Output canvas width in pixels (the `fly` coordinate space).
+             */
+            canvas_width: number;
+            /**
+             * Format: int64
+             * @description Exact output cadence denominator.
+             */
+            fps_den: number;
+            /**
+             * Format: int64
+             * @description Exact output cadence numerator: `tick` advances `fps_num / fps_den`
+             *     times a second (clients extrapolate a keyer ramp from it).
+             */
+            fps_num: number;
             /** @description Active AUTO status. */
             in_flight: boolean;
+            /**
+             * @description Downstream keyer rows the caller may read (keyer object id), with
+             *     unreadable source ids `"redacted"`; changes only on state changes.
+             */
+            keyers: components["schemas"]["KeyerRow"][];
             /** @description Actual PVW source id. */
             preview_source: string;
             /** @description Actual PGM source id. */
             program_source: string;
+            /** @description Engine tally resolved to source ids; unreadable ids are dropped. */
+            tally: components["schemas"]["TallyView"];
             /**
              * Format: int64
              * @description Applied output tick.
@@ -9782,6 +10074,13 @@ export interface components {
             kind: "element";
             /** @description Element name. */
             name: string;
+        };
+        /** @description The engine tally resolved to source ids (unreadable ids dropped). */
+        TallyView: {
+            /** @description Sources on Preview and keys going on next. */
+            preview: string[];
+            /** @description Sources contributing to Program. */
+            program: string[];
         };
         /**
          * @description `OpenAPI` mirror of [`multiview_core::stream::TcSourceKind`].
@@ -20951,8 +21250,12 @@ export interface operations {
     submit_switcher: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Required; a replay answers the first 202. */
+                "Idempotency-Key": string;
+            };
             path: {
+                /** @description The verb; must equal `action`. */
                 kind: string;
             };
             cookie?: never;
@@ -20963,6 +21266,7 @@ export interface operations {
             };
         };
         responses: {
+            /** @description Queued; the outcome arrives as `switcher.operation` at the engine tick. Keyer verbs also emit `switcher.keyer` on a committed state change. */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -20971,7 +21275,7 @@ export interface operations {
                     "application/json": components["schemas"]["SwitcherAccepted"];
                 };
             };
-            /** @description Not authorized for the M/E, Program scope, a referenced object, or (a `layout` select, or a CUT/AUTO whose Preview is `layout:<id>`) every source the stored layout binds; one generic refusal. */
+            /** @description Not authorized for the M/E, the Program scope, a referenced object, the keyer object id or a named fill/key source, or (a `layout` select, or a CUT/AUTO whose Preview is `layout:<id>`) every source the stored layout binds; one generic refusal; the key is not burned. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -20980,7 +21284,16 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Switcher unavailable; `capacity` (a fifth stored layout as an M/E source, or a source it shows cannot be leased; key released); `layout-changed` (the stored layout was edited or deleted while this request was in flight; key released, retry); no source lease. */
+            /** @description `unknown-keyer`. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `capacity` (keyer budget, generic for scoped callers; or a fifth stored layout as an M/E source, or a source it shows cannot be leased), `layout-changed` (the stored layout was edited or deleted while this request was in flight; retry), `on-air-protected` (a fill/key change of a keyer on air without `on_air = "allow"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyer-in-transition`, `in-flight` (`arm` during a transition), `arm-hidden-keys` (`arm` while the armed set holds a key the caller may not see: it replaces the whole set, so it would silently disarm it; generic, never naming it), `keyers-unavailable`, `source-unavailable` (a selected source that cannot be leased for the bus, or a `media_player` source whose player has no channel; the detail says why); nothing is enqueued and every lease and key taken is released. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -20998,7 +21311,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `engine-busy`: the mailbox is full, a stored layout could not be read now, or the output clock did not adopt a newly registered layout within 1 s (key released). */
+            /** @description `engine-busy`: the 64-slot mailbox is full, a stored layout could not be read now, or the output clock did not adopt a newly registered layout within 1 s (key and leases released); or `idempotency-capacity`. */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -21022,15 +21335,26 @@ export interface operations {
             };
         };
         responses: {
+            /** @description `SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set`/`arm` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`, `keyer-in-transition` (a USK `keyer_cut` during a transition), `in-flight` (`arm` during a transition), `arm-hidden-keys` (`arm` while the armed set holds a key the caller may not see; generic, never naming it)). */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["SwitcherPlan"];
+                    "application/json": components["schemas"]["SwitcherPlanResponseDoc"];
                 };
             };
+            /** @description Not authorized for the M/E, the Program scope, the keyer object id (`<program>/<id>` for a DSK, `<me>/<id>` for a USK; for `arm` every armed key) or a named fill/key source (for `arm` the fill and key of every armed key) (checked before any existence answer); a keyer verb also needs the command role (Operator), so a Viewer or ReadOnly key cannot plan one. */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `unknown-keyer` (a keyer the caller may read is not defined). */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -21046,6 +21370,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description Invalid verb fields; `keyer-source-not-a-source` (a fill or key naming a mixer input `in:<n>`); `keyer-rate`. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -21067,6 +21392,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
+            /** @description Engine-owned state. `keyers[]` lists only the downstream keyer rows whose object id (`<program>/<keyer>`) the caller may read, with unreadable fill/key source ids replaced by `"redacted"`; `tally` drops unreadable ids (ADR-0113 §8). */
             200: {
                 headers: {
                     [name: string]: unknown;

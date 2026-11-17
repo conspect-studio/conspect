@@ -1622,6 +1622,11 @@ pub(crate) struct AudioIngestPlan {
     /// master, else the master the video rail resolved, else one resolve of
     /// its own; with none of them this connection is skipped (backoff).
     pub(crate) youtube: bool,
+    /// The `YouTube` source's own resolve address family (issue #498); `None`
+    /// uses the run default. Unused for every other kind.
+    #[cfg_attr(not(feature = "youtube"), allow(dead_code))]
+    // reason: read only by the `youtube` resolve path.
+    pub(crate) youtube_family: Option<multiview_config::YoutubeAddressFamily>,
 }
 
 /// The HLS master the audio rail of a `YouTube` source opens when the video
@@ -1634,7 +1639,7 @@ fn youtube_audio_master(
     plan: &AudioIngestPlan,
     stop: &AtomicBool,
     use_cached: bool,
-) -> Option<String> {
+) -> Option<crate::youtube_status::ResolvedMaster> {
     if stop.load(Ordering::Acquire) {
         return None;
     }
@@ -1644,7 +1649,12 @@ fn youtube_audio_master(
         return Some(master);
     }
     let path = crate::youtube_status::resolver_path();
-    match crate::pipeline::resolve_youtube_master(&plan.location, path.as_deref(), Some(stop)) {
+    match crate::pipeline::resolve_youtube_master(
+        &plan.location,
+        path.as_deref(),
+        plan.youtube_family,
+        Some(stop),
+    ) {
         Ok(master) => Some(master),
         Err(reason) => {
             tracing::info!(source = %plan.id, %reason, "youtube audio: resolve failed; retrying after backoff");
@@ -1658,8 +1668,17 @@ fn youtube_audio_master(
     _plan: &AudioIngestPlan,
     _stop: &AtomicBool,
     _use_cached: bool,
-) -> Option<String> {
+) -> Option<YoutubeMasterStub> {
     None
+}
+
+/// Without the `youtube` feature no master is ever resolved; this only gives
+/// the shared code path a type with the same two fields.
+#[cfg(not(feature = "youtube"))]
+#[derive(Clone)]
+struct YoutubeMasterStub {
+    url: String,
+    pin: crate::hls_fetch::IpPin,
 }
 
 /// The audio location as logged: scheme and host only (see
@@ -1884,8 +1903,20 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
         } else {
             None
         };
-        let skip_connection = plan.youtube && shared.is_none() && youtube_master.is_none();
-        let origin = youtube_master.as_deref().unwrap_or(&plan.location);
+        let mut skip_connection = plan.youtube && shared.is_none() && youtube_master.is_none();
+        let origin = youtube_master
+            .as_ref()
+            .map_or(plan.location.as_str(), |m| m.url.as_str());
+        // Issue #498: a `YouTube` master is signed for one address family; every
+        // request this rail makes for it (master, audio playlist, segments) uses
+        // that family.
+        let ip_pin = youtube_master
+            .as_ref()
+            .map_or(crate::hls_fetch::IpPin::Any, |m| m.pin);
+        // A family-pinned rail with no video fetcher to share reads through a
+        // private fetcher of its own, held for this connection: libav cannot be
+        // pinned and would fetch the segments over the refused family.
+        let mut private_fetch: Option<crate::hls_fetch::HlsFetcher> = None;
         let pinned = if shared.is_some() {
             shared
         } else if plan.live && is_hls && !skip_connection && plan.youtube {
@@ -1893,11 +1924,35 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
             // abandons it at once (the helper ends within its own timeout).
             let origin = origin.to_owned();
             let headers = plan.http_headers.clone();
-            match run_until_stop(stop, move || {
-                crate::pipeline::resolve_hls_audio_url_with_headers(&origin, &headers)
+            let audio_url = match run_until_stop(stop, move || {
+                crate::pipeline::resolve_hls_audio_url_pinned(&origin, &headers, ip_pin)
             }) {
-                Some(pin) => pin.or_else(|| youtube_master.clone()),
+                Some(pin) => pin.or_else(|| youtube_master.as_ref().map(|m| m.url.clone())),
                 None => return,
+            };
+            match audio_url {
+                Some(url) if ip_pin != crate::hls_fetch::IpPin::Any => {
+                    let request = crate::hls_fetch::RequestHeaders::new(
+                        plan.http_headers.user_agent(),
+                        plan.http_headers.referer(),
+                    )
+                    .with_ip(ip_pin);
+                    match crate::hls_fetch::HlsFetcher::start_private(
+                        &plan.id, &url, &request, stop,
+                    ) {
+                        Ok(fetcher) => {
+                            let local = fetcher.local_url().to_owned();
+                            private_fetch = Some(fetcher);
+                            Some(local)
+                        }
+                        Err(reason) => {
+                            tracing::info!(source = %plan.id, %reason, family = ip_pin.label(), "youtube audio: pinned fetch failed; retrying after backoff");
+                            skip_connection = true;
+                            None
+                        }
+                    }
+                }
+                other => other,
             }
         } else if plan.live && is_hls && !skip_connection {
             crate::pipeline::resolve_hls_audio_url_with_headers(origin, &plan.http_headers)
@@ -1918,7 +1973,7 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
         let pinned = pinned.or_else(|| srt_reader.as_ref().map(|r| r.url().to_owned()));
         // The shared copy is served from loopback memory: no origin request, so
         // no origin headers. Otherwise libav opens the origin and carries them.
-        let open_headers = if shared_fetch {
+        let open_headers = if shared_fetch || private_fetch.is_some() {
             multiview_ffmpeg::HttpHeaders::default()
         } else {
             plan.http_headers.clone()

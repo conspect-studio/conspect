@@ -646,9 +646,60 @@ impl HlsFetcher {
             retire_observer(old);
         }
         let st = stats_for(source_id, generation).ok_or("source replaced before fetch start")?;
-        if st.bypass_next.swap(false, Ordering::AcqRel) {
+        // A family-pinned source never bypasses: libav cannot hold the pin
+        // across its own segment requests (issue #498), so its direct open
+        // would only fetch from the refused family.
+        if st.bypass_next.swap(false, Ordering::AcqRel) && headers.ip == IpPin::Any {
             return Err("bypassed after the fetcher gave up on this origin".to_owned());
         }
+        Self::launch(
+            source_id,
+            playlist_url,
+            headers,
+            stop,
+            Some((generation, st)),
+            has_observer,
+            observation_active,
+        )
+    }
+
+    /// A fetcher no other rail shares: it registers no URL and keeps its own
+    /// statistics. For the audio rail of a family-pinned `YouTube` source that
+    /// has no video fetcher to share (issue #498): libav would fetch its
+    /// segments over the system's default family.
+    pub(crate) fn start_private(
+        source_id: &str,
+        playlist_url: &str,
+        headers: &RequestHeaders,
+        stop: &AtomicBool,
+    ) -> Result<Self, String> {
+        Self::launch(
+            source_id,
+            playlist_url,
+            headers,
+            stop,
+            None,
+            false,
+            Arc::new(Mutex::new(None)),
+        )
+    }
+
+    /// Probe, spawn and wait for the first segment. `registered` is the
+    /// lifecycle generation and its shared statistics; `None` runs a private
+    /// fetcher (fresh statistics, no URL publication).
+    fn launch(
+        source_id: &str,
+        playlist_url: &str,
+        headers: &RequestHeaders,
+        stop: &AtomicBool,
+        registered: Option<(u64, Arc<FetchStats>)>,
+        has_observer: bool,
+        observation_active: Arc<ObservationGate>,
+    ) -> Result<Self, String> {
+        let (generation, st) = match registered {
+            Some((generation, st)) => (Some(generation), st),
+            None => (None, Arc::new(FetchStats::default())),
+        };
         let base = url::Url::parse(playlist_url).map_err(|e| format!("playlist url: {e}"))?;
         let agent = agent_with(headers);
         // Probe the playlist once synchronously so an unsupported one falls back
@@ -691,7 +742,7 @@ impl HlsFetcher {
             shared,
             source_id: source_id.to_owned(),
             local_url,
-            generation,
+            generation: generation.unwrap_or(0),
             observation_gate,
         };
         // Wait for the first segment (stop-responsive).
@@ -717,7 +768,9 @@ impl HlsFetcher {
                 .0;
         }
         drop(w);
-        publish_url(source_id, generation, &fetcher.local_url)?;
+        if let Some(generation) = generation {
+            publish_url(source_id, generation, &fetcher.local_url)?;
+        }
         Ok(fetcher)
     }
 
@@ -727,17 +780,67 @@ impl HlsFetcher {
     }
 }
 
-/// Operator-set request headers (`user_agent` / `referrer`) for one source.
+/// The address family every origin request of a source is pinned to (issue
+/// #498). A `YouTube` master is signed for the client address that resolved it
+/// (`/ip/<addr>/`), and googlevideo answers 403 to a segment fetched from the
+/// other family, so such a source's playlist and segment requests connect only
+/// to that family's addresses of the origin host.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IpPin {
+    /// No pin: every resolved address, system order.
+    #[default]
+    Any,
+    /// IPv4 addresses only.
+    V4,
+    /// IPv6 addresses only.
+    V6,
+}
+
+impl IpPin {
+    /// The pin for a `YouTube` master's media family (issue #498).
+    #[cfg(feature = "youtube")]
+    #[must_use]
+    pub fn from_media(family: multiview_input::youtube::MediaFamily) -> Self {
+        match family {
+            multiview_input::youtube::MediaFamily::V4 => Self::V4,
+            multiview_input::youtube::MediaFamily::V6 => Self::V6,
+            _ => Self::Any,
+        }
+    }
+
+    /// The operator-facing name (`IPv4` / `IPv6` / `any`).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::V4 => "IPv4",
+            Self::V6 => "IPv6",
+        }
+    }
+
+    fn ureq(self) -> ureq::config::IpFamily {
+        match self {
+            Self::Any => ureq::config::IpFamily::Any,
+            Self::V4 => ureq::config::IpFamily::Ipv4Only,
+            Self::V6 => ureq::config::IpFamily::Ipv6Only,
+        }
+    }
+}
+
+/// Operator-set request headers (`user_agent` / `referrer`) for one source,
+/// and the source's address-family pin.
 ///
-/// Only these two are ever sent; values containing CR, LF or any other control
-/// character are dropped (header-injection guard, mirroring the config
+/// Only these two headers are ever sent; values containing CR, LF or any other
+/// control character are dropped (header-injection guard, mirroring the config
 /// validator). There is no origin policy: as with libav before the fetcher
 /// existed, the headers go on every request of the source (playlist, segments,
-/// redirect hops and segment hosts).
+/// redirect hops and segment hosts). The [`IpPin`] applies to every one of
+/// those connections too.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RequestHeaders {
     user_agent: Option<String>,
     referer: Option<String>,
+    ip: IpPin,
 }
 
 impl RequestHeaders {
@@ -749,7 +852,15 @@ impl RequestHeaders {
         Self {
             user_agent: clean(user_agent),
             referer: clean(referer),
+            ip: IpPin::Any,
         }
+    }
+
+    /// The same headers with every connection pinned to `ip`.
+    #[must_use]
+    pub(crate) fn with_ip(mut self, ip: IpPin) -> Self {
+        self.ip = ip;
+        self
     }
 }
 
@@ -777,6 +888,7 @@ fn agent_with(headers: &RequestHeaders) -> ureq::Agent {
     }
     let config = builder
         .http_status_as_error(false)
+        .ip_family(headers.ip.ureq())
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_global(Some(CALL_TIMEOUT))
         .max_idle_connections_per_host(RANGE_PARTS_USIZE * IN_FLIGHT + 2)
@@ -2682,7 +2794,14 @@ mod tests {
     /// request's lower-cased header block keyed by path.
     #[allow(clippy::type_complexity)] // test helper: (port, recorded (path, headers))
     fn recording_origin() -> (u16, Arc<Mutex<Vec<(String, String)>>>) {
-        let listener = TcpListener::bind("[::1]:0").expect("bind");
+        recording_origin_on("[::1]:0")
+    }
+
+    /// [`recording_origin`] on one loopback family only (`127.0.0.1:0` or
+    /// `[::1]:0`).
+    #[allow(clippy::type_complexity)] // test helper: (port, recorded (path, headers))
+    fn recording_origin_on(bind: &str) -> (u16, Arc<Mutex<Vec<(String, String)>>>) {
+        let listener = TcpListener::bind(bind).expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let log = Arc::clone(&seen);
@@ -2770,6 +2889,183 @@ mod tests {
                 "{want}: {h}"
             );
         }
+    }
+
+    /// `localhost` resolves to both loopback families here; `None` when it
+    /// does not (a single-stack host cannot exercise the pin).
+    fn dual_stack_localhost() -> bool {
+        use std::net::ToSocketAddrs as _;
+        let addrs: Vec<_> = ("localhost", 80)
+            .to_socket_addrs()
+            .map(Iterator::collect)
+            .unwrap_or_default();
+        addrs.iter().any(std::net::SocketAddr::is_ipv4)
+            && addrs.iter().any(std::net::SocketAddr::is_ipv6)
+    }
+
+    /// Issue #498: a master signed for IPv4 is fetched over IPv4 only. The
+    /// origin listens on 127.0.0.1 only and is addressed by a dual-stack name;
+    /// the IPv4 pin reaches it for master, playlist and segment, and the IPv6
+    /// pin never does (the fetcher does not fall back to the other family).
+    #[test]
+    fn a_family_pin_keeps_every_request_on_that_family() {
+        if !dual_stack_localhost() {
+            eprintln!("skipped: localhost is not dual-stack on this host");
+            return;
+        }
+        let (port, seen) = recording_origin_on("127.0.0.1:0");
+        let v4 = RequestHeaders::default().with_ip(IpPin::V4);
+        let (_, body) = fetch_text(
+            &v4,
+            &format!("http://localhost:{port}/master.m3u8"),
+            1 << 20,
+        )
+        .expect("v4-pinned master fetch reaches the v4-only origin");
+        assert!(body.starts_with("#EXTM3U"));
+        let id = "hls-family-pin-test";
+        let generation = begin_generation(id);
+        let stop = AtomicBool::new(false);
+        let fetcher = HlsFetcher::start(
+            id,
+            &format!("http://localhost:{port}/live.m3u8"),
+            &v4,
+            &stop,
+            generation,
+        )
+        .expect("v4-pinned fetcher reaches the v4-only origin");
+        drop(fetcher);
+        let paths: Vec<String> = seen
+            .lock()
+            .expect("log")
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect();
+        for want in ["/master.m3u8", "/live.m3u8", "/seg5.ts"] {
+            assert!(paths.iter().any(|p| p == want), "no {want}: {paths:?}");
+        }
+        let before = paths.len();
+        let v6 = RequestHeaders::default().with_ip(IpPin::V6);
+        assert!(
+            fetch_text(
+                &v6,
+                &format!("http://localhost:{port}/master.m3u8"),
+                1 << 20
+            )
+            .is_err(),
+            "a v6 pin must not reach a v4-only origin"
+        );
+        assert_eq!(seen.lock().expect("log").len(), before);
+
+        // And the other way round: a v6-only origin, a v4 pin never reaches it.
+        let (port6, seen6) = recording_origin_on("[::1]:0");
+        assert!(fetch_text(&v4, &format!("http://localhost:{port6}/m.m3u8"), 1 << 20).is_err());
+        assert!(seen6.lock().expect("log").is_empty());
+        fetch_text(&v6, &format!("http://localhost:{port6}/m.m3u8"), 1 << 20)
+            .expect("v6 pin reaches the v6-only origin");
+    }
+
+    /// Issue #498 end to end: a fake `yt-dlp` that is bot-checked over the
+    /// default family and answers over `-4` with a master signed for
+    /// `/ip/127.0.0.1/`. The engine's resolve (default `auto` family) retries
+    /// over IPv4, records the IPv4 pin, and the fetcher, given only that pin
+    /// and a dual-stack host name, reaches the IPv4-only origin.
+    #[cfg(all(feature = "youtube", unix))]
+    #[test]
+    fn a_resolve_signed_for_v4_pins_the_fetch_to_v4() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if !dual_stack_localhost() {
+            eprintln!("skipped: localhost is not dual-stack on this host");
+            return;
+        }
+        let (port, seen) = recording_origin_on("127.0.0.1:0");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("yt-dlp");
+        let master =
+            format!("http://localhost:{port}/api/manifest/hls_variant/ip/127.0.0.1/live.m3u8");
+        let json = format!(
+            r#"{{"live_status":"is_live","formats":[{{"protocol":"m3u8_native","manifest_url":"{master}"}}]}}"#
+        );
+        let script = format!(
+            "#!/bin/sh\ncase \" $* \" in *' -4 '*) echo '{json}' ;; *) echo \"ERROR: [youtube] x: Sign in to confirm you're not a bot\" >&2; exit 1 ;; esac\n"
+        );
+        std::fs::write(&bin, script).expect("write fake yt-dlp");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let resolved = crate::pipeline::resolve_youtube_master(
+            "https://www.youtube.com/watch?v=x",
+            bin.to_str(),
+            None,
+            None,
+        )
+        .expect("auto resolve retries over IPv4");
+        assert_eq!(resolved.url, master);
+        assert_eq!(resolved.pin, IpPin::V4);
+        let id = "hls-youtube-v4-e2e";
+        let generation = begin_generation(id);
+        let stop = AtomicBool::new(false);
+        let fetcher = HlsFetcher::start(
+            id,
+            &resolved.url,
+            &RequestHeaders::default().with_ip(resolved.pin),
+            &stop,
+            generation,
+        )
+        .expect("the v4-pinned fetch reaches the v4-only origin");
+        drop(fetcher);
+        assert!(seen
+            .lock()
+            .expect("log")
+            .iter()
+            .any(|(p, _)| p.ends_with("seg5.ts")));
+        forget_source(id, generation);
+    }
+
+    /// Issue #498: a pinned fetcher never takes the `bypass_next` exit (that
+    /// lets libav open the origin unpinned); an unpinned one still does.
+    #[test]
+    fn a_pinned_source_ignores_the_libav_bypass() {
+        let (port, _seen) = recording_origin();
+        let id = "hls-family-bypass-test";
+        let generation = begin_generation(id);
+        let stats = stats_for(id, generation).expect("stats");
+        let stop = AtomicBool::new(false);
+        let url = format!("http://[::1]:{port}/live.m3u8");
+        stats.bypass_next.store(true, Ordering::Release);
+        let pinned = RequestHeaders::default().with_ip(IpPin::V6);
+        let fetcher = HlsFetcher::start(id, &url, &pinned, &stop, generation)
+            .expect("a pinned source keeps its fetcher");
+        drop(fetcher);
+        stats.bypass_next.store(true, Ordering::Release);
+        let err = HlsFetcher::start(id, &url, &RequestHeaders::default(), &stop, generation)
+            .err()
+            .expect("an unpinned source bypasses once");
+        assert!(err.contains("bypassed"), "{err}");
+        forget_source(id, generation);
+    }
+
+    /// The audio rail's private fetcher serves the origin over loopback but
+    /// never publishes a shared URL (the video rail owns that slot).
+    #[test]
+    fn a_private_fetcher_serves_without_publishing() {
+        let (port, seen) = recording_origin();
+        let id = "hls-private-fetch-test";
+        let generation = begin_generation(id);
+        let stop = AtomicBool::new(false);
+        let fetcher = HlsFetcher::start_private(
+            id,
+            &format!("http://[::1]:{port}/live.m3u8"),
+            &RequestHeaders::default().with_ip(IpPin::V6),
+            &stop,
+        )
+        .expect("private fetcher");
+        assert!(fetcher.local_url().starts_with("http://[::1]:"));
+        assert_eq!(shared_url(id, generation), None, "nothing published");
+        drop(fetcher);
+        assert!(seen
+            .lock()
+            .expect("log")
+            .iter()
+            .any(|(p, _)| p == "/seg5.ts"));
+        forget_source(id, generation);
     }
 
     #[test]

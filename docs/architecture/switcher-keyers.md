@@ -1463,3 +1463,58 @@ merge (see "K1 GPU key path as built", wipe masks).
   `keyer_set` also refuses `color` on `family = "usk"` as a DSK-only field (`keyer-usk`), so
   the colour is never silently dropped. Tests: the `multiview-config` USK test and
   `switcher_keyers_usk::usk_keyer_set_cut_and_persistence`.
+
+### K5 (#390): desk, and the small API additions it needed
+
+- **`keyers[]` carries the committed parameters.** Each row adds `clip`, `gain`, `invert`,
+  `max_source` and `loss_trigger` beside `type`, `fly`, `mask`, `rate` and `loss`, so the
+  panel shows real values and never submits invented defaults. Parameters are not source
+  ids: a row the caller may read carries them as-is; the row filter and the source-id
+  redaction are unchanged (tested for scoped principals). `ramp` is now a typed
+  `KeyerRampView {start_tick, rate, to_on}`.
+- **Canvas and cadence on the GET.** `canvas_width`, `canvas_height`, `fps_num`, `fps_den`
+  come from the provider status (not secret). The desk lays out fly presets on the real
+  canvas and extrapolates a ramp from `tick` at the exact cadence between snapshots.
+- **Clearing `mask` and `fly`.** `keyer_set` distinguishes an omitted `mask`/`fly` (keep)
+  from JSON `null` (clear: no mask, full canvas), like `key: ""` clears the key. `mask`,
+  `fly` and `max_source` are typed in OpenAPI (`KeyerRectDoc`, `KeyerSizeDoc`).
+- **Desk.** One submission gate covers every switcher and keyer control from plan to 202.
+  The panel sends only edited fields, reconciles untouched fields with each new snapshot,
+  separates Review (plan, class and cost shown) from Apply (bound to the reviewed draft),
+  and turns a command-time `on-air-protected` 409 into a fresh plan plus an explicit allow
+  confirmation. `switcher.keyer` events and operation outcomes refresh the snapshot; a
+  stale indicator shows while the realtime stream is not open.
+- **`keyers[]` × K3/K7 (merge with main after PR #507/#512).** A row carries K3's `family`
+  and `armed`, K7's chroma `color` (a colour, never redacted; `null` for other types) and the
+  K5 params; the row filter and source-id redaction are unchanged and cover the colour
+  (`get_rows_carry_committed_params_and_the_canvas_with_the_same_redaction`).
+- **Desk × K3/K7.** The panel offers `chroma` on a DSK only, with a `#RRGGBB` colour picker
+  and clip/gain; choosing chroma clears a key source (`chroma-key-source`) and leaving it
+  clears the colour (`chroma-color-without-chroma`); a hidden key source blocks the switch.
+  USK rows get a strip with CUT only (disabled during a background transition, as the engine
+  refuses `keyer-in-transition`), no TIE/rate/AUTO, an Armed badge, and a panel without
+  chroma that sends `family = "usk"`. The BKGD / KEY 1-4 arm strip lights only from the GET
+  `armed` view; a toggle plans then commands `arm {background, keys}` (the whole next set)
+  behind the shared submission gate. The last lit toggle cannot clear the set (an empty arm
+  is 422); a key whose fill or key is redacted is shown with its lamp but not toggleable, and
+  an armed one blocks every toggle (the set is replaced whole and needs Read on it). Plan
+  refusals and the engine's `take-held` / `unknown-keyer` outcomes are shown with their
+  reasons. Keyer verbs and `arm` are tracked as correlated `switcher.operation` kinds. The
+  background CUT is not gated on PGM == PVW, so a key-only CUT stays available.
+- **Review round 2 (K5-R2).** *Hidden armed keys (R2-01).* `arm` replaces the whole set,
+  but the GET `armed` view drops keys the caller may not read, so a scoped caller toggling a
+  readable key would have disarmed a hidden one. The server refuses it: plan reports and the
+  command answers 409 `arm-hidden-keys` (generic: it never names or counts the hidden key)
+  when the committed set holds a USK whose keyer object the caller may not read, and `arm` is
+  now bound to the `arm_version` it was checked against, so an arm that lands first is never
+  overwritten (`arm-changed`). `ArmedView.complete` is a non-identifying boolean; the strip is
+  read-only with a reason while it is `false`
+  (`arm_refuses_to_drop_an_armed_key_the_caller_cannot_see`,
+  `an_arm_admitted_against_a_stale_set_is_refused`). *Stale snapshot (R2-02).* After an
+  outcome every keyer and arm control stays gated until a GET started after the outcome
+  succeeds (the engine publishes the snapshot before the tick's outcomes, so that GET reads
+  a state at or after the terminal tick); a failed refresh keeps them disabled with a reason
+  until a later snapshot arrives. *Overlapping ids (R2-03).* DSK and USK ids are separate
+  namespaces, so React keys and DOM ids (label targets, `aria-describedby`) use
+  `keyerDomKey` (`dsk-<id>` / `usk-<id>`), and a USK's panel and strip are named "Upstream
+  keyer <id>".

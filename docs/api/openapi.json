@@ -12828,7 +12828,7 @@
             }
           },
           "409": {
-            "description": "`capacity` (keyer budget, generic for scoped callers; or a fifth stored layout as an M/E source, or a source it shows cannot be leased), `layout-changed` (the stored layout was edited or deleted while this request was in flight; retry), `on-air-protected` (a fill/key change of a keyer on air without `on_air = \"allow\"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyer-in-transition`, `in-flight` (`arm` during a transition), `keyers-unavailable`, `source-unavailable` (a selected source that cannot be leased for the bus, or a `media_player` source whose player has no channel; the detail says why); nothing is enqueued and every lease and key taken is released.",
+            "description": "`capacity` (keyer budget, generic for scoped callers; or a fifth stored layout as an M/E source, or a source it shows cannot be leased), `layout-changed` (the stored layout was edited or deleted while this request was in flight; retry), `on-air-protected` (a fill/key change of a keyer on air without `on_air = \"allow\"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyer-in-transition`, `in-flight` (`arm` during a transition), `arm-hidden-keys` (`arm` while the armed set holds a key the caller may not see: it replaces the whole set, so it would silently disarm it; generic, never naming it), `keyers-unavailable`, `source-unavailable` (a selected source that cannot be leased for the bus, or a `media_player` source whose player has no channel; the detail says why); nothing is enqueued and every lease and key taken is released.",
             "content": {
               "application/json": {
                 "schema": {
@@ -12879,7 +12879,7 @@
         },
         "responses": {
           "200": {
-            "description": "`SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set`/`arm` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`, `keyer-in-transition` (a USK `keyer_cut` during a transition), `in-flight` (`arm` during a transition)).",
+            "description": "`SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set`/`arm` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`, `keyer-in-transition` (a USK `keyer_cut` during a transition), `in-flight` (`arm` during a transition), `arm-hidden-keys` (`arm` while the armed set holds a key the caller may not see; generic, never naming it)).",
             "content": {
               "application/json": {
                 "schema": {
@@ -15451,12 +15451,17 @@
         "description": "The next-transition set (`arm`, K3) as the caller may see it.",
         "required": [
           "background",
-          "keys"
+          "keys",
+          "complete"
         ],
         "properties": {
           "background": {
             "type": "boolean",
             "description": "The background moves with the next transition."
+          },
+          "complete": {
+            "type": "boolean",
+            "description": "`false` when an armed key is hidden from the caller (review\nK5-R2-01): `keys` is then not the whole set, and `arm` (which\nreplaces the set) is refused with 409 `arm-hidden-keys`. A boolean\nonly: it never names or counts the hidden keys."
           },
           "keys": {
             "type": "array",
@@ -19687,11 +19692,15 @@
             "description": "`keyer_set`: fill source id (a source; `in:<n>` is refused)."
           },
           "fly": {
-            "type": [
-              "object",
-              "null"
-            ],
-            "description": "`keyer_set`: destination rectangle in canvas pixels."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyerRectDoc",
+                "description": "`keyer_set`: destination rectangle in canvas pixels. Omitted keeps\nthe current fly; JSON `null` clears it (the full canvas)."
+              }
+            ]
           },
           "gain": {
             "type": [
@@ -19747,18 +19756,26 @@
             "description": "`keyer_set`: `stale`, `reconnecting` or `no_signal`."
           },
           "mask": {
-            "type": [
-              "object",
-              "null"
-            ],
-            "description": "`keyer_set`: mask in fill-source pixels."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyerRectDoc",
+                "description": "`keyer_set`: mask in fill-source pixels. Omitted keeps the current\nmask; JSON `null` clears it (no mask = the whole fill)."
+              }
+            ]
           },
           "max_source": {
-            "type": [
-              "object",
-              "null"
-            ],
-            "description": "`keyer_set`: admitted source envelope `{w, h}`."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyerSizeDoc",
+                "description": "`keyer_set`: admitted source envelope `{w, h}`."
+              }
+            ]
           },
           "on": {
             "type": [
@@ -19876,6 +19893,70 @@
           }
         }
       },
+      "KeyerRampView": {
+        "type": "object",
+        "description": "An in-flight keyer AUTO: the weight at output tick `t` is\n`clamp((t - start_tick) / rate, 0, 1)`, reversed when `to_on` is false.",
+        "required": [
+          "start_tick",
+          "rate",
+          "to_on"
+        ],
+        "properties": {
+          "rate": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Duration in output frames.",
+            "minimum": 0
+          },
+          "start_tick": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Output tick the ramp started on.",
+            "minimum": 0
+          },
+          "to_on": {
+            "type": "boolean",
+            "description": "Ramping on (`true`) or off."
+          }
+        }
+      },
+      "KeyerRectDoc": {
+        "type": "object",
+        "description": "A keyer rectangle in pixels (`fly` in canvas pixels, `mask` in\nfill-source pixels); mirrors `multiview_config::KeyerRect`.",
+        "required": [
+          "x",
+          "y",
+          "w",
+          "h"
+        ],
+        "properties": {
+          "h": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Height.",
+            "minimum": 0
+          },
+          "w": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Width.",
+            "minimum": 0
+          },
+          "x": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Left column.",
+            "minimum": 0
+          },
+          "y": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Top row.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "KeyerRow": {
         "type": "object",
         "description": "One `keyers[]` row of `GET /api/v1/switcher/{me}` (design note §8).",
@@ -19885,10 +19966,14 @@
           "armed",
           "fill",
           "type",
+          "clip",
+          "gain",
+          "invert",
           "on_air",
           "tie",
           "rate",
           "loss",
+          "loss_trigger",
           "stale",
           "pending"
         ],
@@ -19896,6 +19981,18 @@
           "armed": {
             "type": "boolean",
             "description": "USK: armed to toggle with the next transition (K3); always `false`\nfor a DSK (its next-transition flag is `tie`)."
+          },
+          "clip": {
+            "type": "number",
+            "format": "float",
+            "description": "Luma clip, `[0, 1]` (the committed value; meaningful for `luma`)."
+          },
+          "color": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Chroma reference `#RRGGBB` / `#RGB` (K7), `null` for other types.\nA colour, not a source id: never redacted."
           },
           "family": {
             "type": "string",
@@ -19906,15 +20003,28 @@
             "description": "Fill source id, or `\"redacted\"`."
           },
           "fly": {
-            "type": [
-              "object",
-              "null"
-            ],
-            "description": "Destination rectangle, `null` = full canvas."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyerRectDoc",
+                "description": "Destination rectangle, `null` = full canvas."
+              }
+            ]
+          },
+          "gain": {
+            "type": "number",
+            "format": "float",
+            "description": "Luma gain (the committed value; meaningful for `luma`)."
           },
           "id": {
             "type": "string",
             "description": "Keyer id within the program (DSK) or the M/E (USK)."
+          },
+          "invert": {
+            "type": "boolean",
+            "description": "Matte inverted."
           },
           "key": {
             "type": [
@@ -19927,12 +20037,31 @@
             "type": "string",
             "description": "`drop_to_off_air` or `hold_last_good`."
           },
+          "loss_trigger": {
+            "type": "string",
+            "description": "`stale`, `reconnecting` or `no_signal`."
+          },
           "mask": {
-            "type": [
-              "object",
-              "null"
-            ],
-            "description": "Mask in fill-source pixels."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyerRectDoc",
+                "description": "Mask in fill-source pixels, `null` = no mask."
+              }
+            ]
+          },
+          "max_source": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyerSizeDoc",
+                "description": "Admitted source envelope, `null` = the canvas size."
+              }
+            ]
           },
           "on_air": {
             "type": "boolean",
@@ -19943,11 +20072,15 @@
             "description": "An operator command is held waiting for fresh sources."
           },
           "ramp": {
-            "type": [
-              "object",
-              "null"
-            ],
-            "description": "`{start_tick, rate, to_on}` while ramping; clients compute the weight."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyerRampView",
+                "description": "Present while ramping; clients compute the weight from the tick."
+              }
+            ]
           },
           "rate": {
             "type": "integer",
@@ -19968,6 +20101,29 @@
             "description": "`linear`, `luma` or `chroma`."
           }
         }
+      },
+      "KeyerSizeDoc": {
+        "type": "object",
+        "description": "A picture size in pixels; mirrors `multiview_config::KeyerSize`.",
+        "required": [
+          "w",
+          "h"
+        ],
+        "properties": {
+          "h": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Height.",
+            "minimum": 0
+          },
+          "w": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Width.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
       },
       "LadderStateDoc": {
         "type": "string",
@@ -26258,6 +26414,17 @@
               "kind"
             ],
             "properties": {
+              "address_family": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/YoutubeAddressFamilyDoc",
+                    "description": "Address family of the `yt-dlp` resolve (issue #498). Absent ⇒\n`[system.youtube] address_family`, else `auto`."
+                  }
+                ]
+              },
               "kind": {
                 "type": "string",
                 "enum": [
@@ -27388,6 +27555,10 @@
           "program_source",
           "preview_source",
           "in_flight",
+          "canvas_width",
+          "canvas_height",
+          "fps_num",
+          "fps_den",
           "keyers",
           "tally",
           "armed",
@@ -27397,6 +27568,28 @@
           "armed": {
             "$ref": "#/components/schemas/ArmedView",
             "description": "The next-transition set (`arm`, K3): the background flag and the\narmed upstream keyer ids the caller may read."
+          },
+          "canvas_height": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Output canvas height in pixels.",
+            "minimum": 0
+          },
+          "canvas_width": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Output canvas width in pixels (the `fly` coordinate space).",
+            "minimum": 0
+          },
+          "fps_den": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Exact output cadence denominator."
+          },
+          "fps_num": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Exact output cadence numerator: `tick` advances `fps_num / fps_den`\ntimes a second (clients extrapolate a keyer ramp from it)."
           },
           "in_flight": {
             "type": "boolean",
@@ -29354,6 +29547,15 @@
             "description": "The opaque single-use ticket. Present it once as `?ticket=` within\n`expires_in_secs`; it is consumed on the first WS/SSE upgrade."
           }
         }
+      },
+      "YoutubeAddressFamilyDoc": {
+        "type": "string",
+        "description": "`OpenAPI` mirror of [`multiview_config::YoutubeAddressFamily`].",
+        "enum": [
+          "auto",
+          "v4",
+          "v6"
+        ]
       },
       "YoutubeCapability": {
         "type": "object",

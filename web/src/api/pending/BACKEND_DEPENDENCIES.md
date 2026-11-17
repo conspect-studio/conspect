@@ -12,13 +12,17 @@ Resource-level 404s carrying an RFC 9457 problem body (journal, output link, eve
 normal meaning on a deployed backend. Contract source for every row: the integration branch
 `ui-design/approved-broadcast-desk` (`docs/api/openapi.json`, `docs/api/asyncapi.json`), copied to `web/scripts/pending-*.superset.json`.
 
-## Routes (55)
+## Routes (52)
+
+Group A (switcher: `GET /api/v1/switcher/{me}`, `POST /api/v1/switcher/plan`,
+`POST /api/v1/switcher/commands/{kind}`) is now fully served by main (K4, #389)
+— `keyers`/`tally` and the keyer verbs landed in `docs/api/openapi.json` and
+`src/api/schema.ts`. The pending shadow is removed (K5, #390); callers use
+`src/api/switcher.ts` and `src/api/keyers.ts` against the generated client
+directly.
 
 | Group | Method | Path | Feature / screen | UI on 404/405/501 |
 |---|---|---|---|---|
-| A. switcher | GET | `/api/v1/switcher/{me}` | Production desk, Switcher page, Routing PGM readout | "Switcher unavailable: … backend not deployed"; controls disabled, PGM Unknown |
-| A. switcher | POST | `/api/v1/switcher/commands/{kind}` | Production desk, Switcher page, Routing PGM readout | "Switcher unavailable: … backend not deployed"; controls disabled, PGM Unknown |
-| A. switcher | POST | `/api/v1/switcher/plan` | Production desk, Switcher page, Routing PGM readout | "Switcher unavailable: … backend not deployed"; controls disabled, PGM Unknown |
 | B. sources lifecycle/status/network + M3U import | GET | `/api/v1/sources/status` | Sources page lifecycle badge/Start/Stop, M3U import dialog, network report | No status badge (idle assumed unknown); Start/Stop surface typed unavailable error; M3U import shows unavailable |
 | B. sources lifecycle/status/network + M3U import | GET | `/api/v1/sources/{id}/status` | Sources page lifecycle badge/Start/Stop, M3U import dialog, network report | No status badge (idle assumed unknown); Start/Stop surface typed unavailable error; M3U import shows unavailable |
 | B. sources lifecycle/status/network + M3U import | POST | `/api/v1/sources/import/m3u` | Sources page lifecycle badge/Start/Stop, M3U import dialog, network report | No status badge (idle assumed unknown); Start/Stop surface typed unavailable error; M3U import shows unavailable |
@@ -74,13 +78,12 @@ normal meaning on a deployed backend. Contract source for every row: the integra
 
 ## Suggested minimal backend PRs
 
-1. **A. Switcher** - `GET /switcher/{me}` (me1 state), `POST /switcher/plan`, `POST /switcher/commands/{kind}` (cut, select_preview, ...), plus `switcher.operation` event; preview still if needed.
-2. **B. Sources lifecycle** - `GET /sources/status`, `GET /sources/{id}/status`, `POST /sources/{id}/start|stop|network`, `POST /sources/import/m3u`; `input.lifecycle` event; `SourceBodyDoc.activation`; `SystemCapabilities.youtube`.
-3. **C. Outputs** - `GET /outputs/{id}/link`, `GET /outputs/{id}/playback`; `OutputRunState` gains `idle`; `AudioRoutingStateDoc.outputs_updated`.
-4. **D. Graphics** - all `/graphics/*` routes + `graphics.channel_state` event.
-5. **E. IPTV-ORG catalogue** - `/catalogues/iptv-org/*`, `/iptv`; `catalogue.link_status` event, `catalogue-link-attention` warning code.
-6. **F. Weather** - `/weather/locations*`; `SourceKindDoc` weather variant.
-7. **G. Event journal/automation** - `/inputs/{id}/events/{journal,journal.jsonl,automation*,test}`, `/events/journal.jsonl`; `SourceEventsDto.markers/source_clock`.
+1. **B. Sources lifecycle** - `GET /sources/status`, `GET /sources/{id}/status`, `POST /sources/{id}/start|stop|network`, `POST /sources/import/m3u`; `input.lifecycle` event; `SourceBodyDoc.activation`; `SystemCapabilities.youtube`.
+2. **C. Outputs** - `GET /outputs/{id}/link`, `GET /outputs/{id}/playback`; `OutputRunState` gains `idle`; `AudioRoutingStateDoc.outputs_updated`.
+3. **D. Graphics** - all `/graphics/*` routes + `graphics.channel_state` event.
+4. **E. IPTV-ORG catalogue** - `/catalogues/iptv-org/*`, `/iptv`; `catalogue.link_status` event, `catalogue-link-attention` warning code.
+5. **F. Weather** - `/weather/locations*`; `SourceKindDoc` weather variant.
+6. **G. Event journal/automation** - `/inputs/{id}/events/{journal,journal.jsonl,automation*,test}`, `/events/journal.jsonl`; `SourceEventsDto.markers/source_clock`.
 
 ## Realtime (asyncapi) pending declarations
 

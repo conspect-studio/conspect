@@ -455,7 +455,7 @@ async fn arm_then_cut_puts_a_key_on_air_with_an_outcome_and_replays() {
     let get_full = body_json(send(&rig.router, get("/api/v1/switcher/me1", FULL)).await).await;
     assert_eq!(
         get_full["armed"],
-        json!({ "background": false, "keys": ["usk2"] })
+        json!({ "background": false, "keys": ["usk2"], "complete": true })
     );
     let rows = get_full["keyers"].as_array().unwrap();
     let usk2 = rows.iter().find(|r| r["id"] == "usk2").unwrap();
@@ -1002,4 +1002,117 @@ async fn a_key_only_take_ignores_the_preview_layout() {
     let outcome = outcomes.try_recv().unwrap().event;
     assert!(outcome.completed, "{outcome:?}");
     assert!(on_air(&rig, 2));
+}
+
+/// Review K5-R2-01: `arm` replaces the whole set, but a scoped caller's GET
+/// `armed` view drops keys it may not read. With usk1 (hidden from `NO_USK1`)
+/// armed, `NO_USK1` arming usk2 would silently disarm usk1: the plan reports
+/// and the command answers a typed 409 `arm-hidden-keys` whose detail does
+/// not name the hidden key, nothing is enqueued, and GET says the view is
+/// incomplete (a boolean only). A caller who sees every armed key is
+/// unaffected, and with nothing hidden armed `NO_USK1` may arm as before.
+#[tokio::test]
+async fn arm_refuses_to_drop_an_armed_key_the_caller_cannot_see() {
+    let (_dir, path) = temp_boot(DOC);
+    let mut rig = build(&path, DOC);
+    let mut outcomes = rig.handle.outcomes();
+    let get_armed = |token: &'static str| {
+        let router = rig.router.clone();
+        async move {
+            body_json(send(&router, get("/api/v1/switcher/me1", token)).await).await["armed"]
+                .clone()
+        }
+    };
+    assert_eq!(get_armed(NO_USK1).await["complete"], json!(true));
+    let usk2 = body("arm", json!({ "background": true, "keys": ["usk2"] }));
+    // Nothing hidden armed: NO_USK1 may arm.
+    assert_eq!(plan(&rig, NO_USK1, &usk2).await.status(), StatusCode::OK);
+    let both = body("arm", json!({ "background": true, "keys": ["usk1"] }));
+    assert_eq!(
+        command(&rig, ADMIN, "arm-usk1", &both).await.status(),
+        StatusCode::ACCEPTED
+    );
+    tick(&mut rig.driver, 1);
+    assert!(outcomes.try_recv().unwrap().event.completed);
+    let view = get_armed(NO_USK1).await;
+    assert_eq!(
+        view,
+        json!({ "background": true, "keys": [], "complete": false })
+    );
+    assert_eq!(get_armed(FULL).await["complete"], json!(true));
+    let planned = body_json(plan(&rig, NO_USK1, &usk2).await).await;
+    assert_eq!(planned["can_take"], json!(false), "{planned}");
+    assert_eq!(planned["refusal"]["type"], json!("arm-hidden-keys"));
+    let response = command(&rig, NO_USK1, "arm-hidden", &usk2).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let problem = body_json(response).await;
+    assert!(problem["type"]
+        .as_str()
+        .unwrap()
+        .ends_with("arm-hidden-keys"));
+    assert!(!problem.to_string().contains("usk1"), "{problem}");
+    tick(&mut rig.driver, 2);
+    assert!(outcomes.try_recv().is_err(), "nothing was enqueued");
+    assert_eq!(
+        get_armed(FULL).await["keys"],
+        json!(["usk1"]),
+        "the hidden key stays armed"
+    );
+    // FULL sees every armed key and may replace the set.
+    assert_eq!(
+        command(&rig, FULL, "arm-full", &usk2).await.status(),
+        StatusCode::ACCEPTED
+    );
+    tick(&mut rig.driver, 3);
+    assert!(outcomes.try_recv().unwrap().event.completed);
+    assert_eq!(get_armed(NO_USK1).await["complete"], json!(true));
+}
+
+/// Review K5-R2-01 (binding): the hidden-key check is against the committed
+/// set; an `arm` admitted against arm version N is refused at the tick
+/// (`arm-changed`) when another arm (here one that arms a key the caller
+/// cannot see) landed first, never applied over it.
+#[tokio::test]
+async fn an_arm_admitted_against_a_stale_set_is_refused() {
+    let (_dir, path) = temp_boot(DOC);
+    let mut rig = build(&path, DOC);
+    let mut outcomes = rig.handle.outcomes();
+    rig.handle
+        .try_send(multiview_engine::switcher_control::SwitcherCommand {
+            operation_id: "rearm".into(),
+            scene_version: 1,
+            verb: multiview_engine::switcher_control::SwitcherVerb::Arm(Arc::new(
+                multiview_core::switcher::ArmedSet::default()
+                    .with_background()
+                    .with_key(1),
+            )),
+            expect: None,
+        })
+        .unwrap();
+    let usk2 = body("arm", json!({ "background": true, "keys": ["usk2"] }));
+    let accepted = command(&rig, NO_USK1, "arm-stale", &usk2).await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let op = body_json(accepted).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    tick(&mut rig.driver, 1);
+    let mut refused = None;
+    while let Ok(item) = outcomes.try_recv() {
+        if item.event.operation_id == op {
+            refused = Some(item.event.clone());
+        }
+    }
+    let refused = refused.expect("the arm has a terminal outcome");
+    assert!(!refused.completed);
+    assert_eq!(
+        refused.error.as_deref(),
+        Some(multiview_engine::switcher_control::REFUSE_ARM_CHANGED)
+    );
+    assert!(rig
+        .handle
+        .snapshot()
+        .unwrap()
+        .next
+        .key_armed(usk_slot(1).unwrap()));
 }

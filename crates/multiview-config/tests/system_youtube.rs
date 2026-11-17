@@ -143,3 +143,21 @@ fn an_empty_system_youtube_table_constructs_via_default() {
     let youtube = YoutubeSystemConfig::default();
     assert!(youtube.yt_dlp_path.is_none());
 }
+
+#[test]
+fn a_system_address_family_loads_validates_and_defaults_to_auto() {
+    use multiview_config::YoutubeAddressFamily;
+    let doc = format!("{BASE}\n[system.youtube]\naddress_family = \"v6\"\n");
+    let cfg = MultiviewConfig::load_from_toml(&doc).expect("loads");
+    cfg.validate().expect("validates");
+    let youtube = cfg
+        .system
+        .as_ref()
+        .and_then(|s| s.youtube.as_ref())
+        .expect("system.youtube present");
+    assert_eq!(youtube.address_family, Some(YoutubeAddressFamily::V6));
+    assert!(YoutubeSystemConfig::default().address_family.is_none());
+    assert_eq!(YoutubeAddressFamily::default(), YoutubeAddressFamily::Auto);
+    let bad = format!("{BASE}\n[system.youtube]\naddress_family = \"ipv9\"\n");
+    assert!(MultiviewConfig::load_from_toml(&bad).is_err());
+}
