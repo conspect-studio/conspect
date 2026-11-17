@@ -1130,6 +1130,94 @@ rung only after it.
 | 9 | Google Play listing and publishing the Cast application, if casting to unregistered Android TV devices is wanted | general availability of the SRT rung | after slice 7 |
 | 10 | Licence notices for the app (libsrt MPL-2.0 source offer, Apache-2.0 notices): legal text is not written as engineering work | distributing the APK beyond test devices | before step 9 |
 
+### 10. Slice 2 notes (design note, as built)
+
+Slice 2 was split. This part (the ladder endpoint, the probe, the clock and latency measurement) is built and
+merged; the per-component identity, the attachment fences and the decision 5.4 test table are the next part of
+the same slice and are not built here. Where this part differs from the text above, this section is what runs.
+
+**One admission function.** `cast_streams::reauth::admit(state, token)` is the token check of every
+`/cast/<token>/…` route: it finds the token in constant time, runs the re-authorization barrier (`on_media`) on
+its output, and admits only a live token armed at the output's current generation, returning stream, output and
+generation (`cast_streams::Admitted`). The media route (before the file opens and again after), the report route
+and the ladder route all call it; nothing else admits a token. The push rungs extend this function with their
+identity clearance; they do not add a check of their own.
+
+**The ladder route.** `POST /cast/<token>/ladder`: shared check, then the per-token rate (burst 4, one more per
+second) charged before the body is read, so an invalid call costs its sender the same as a valid one; then the
+body (at most 2 KiB, else `413`), strict validation (`400` for a wrong type or a bound: `ua` over 200
+characters, more than 8 H.264 profiles, an unknown `failed.rung`, a `failed.stage` outside
+`connect|first-frame|stall|latency|hook`; unknown fields ignored); then the
+shared check again, because the body was awaited. The answer is `no-store` with the report route's CORS. A
+dead, revoked, expired or unknown token gets the same `404` body as the media route. `attach` is always
+`{"rung":"hls"}` and `then` is `[]`. The selection (`cast_streams::ladder::offer`) already applies the order
+of "What the engine leaves out" to every rung name: not served by the build, not enabled, no presented-frame
+counter (`caps.frames` absent or `null`: no MoQ, no WebRTC), in `skip`; HLS is never left out. Its tests run it
+against a build that served every rung, so the later slices add a rung to `SERVED_RUNGS` and nothing else.
+`[cast] ladder` (multiview-config, default `["hls"]`) lists the enabled
+rungs and refuses the names of rungs this build cannot serve, so the knob cannot promise a rung. The answer's
+`clock` also echoes the receiver's `t0` as `t0_unix_us` (a convenience for logs; the receiver keeps its own).
+
+**The clock readback.** `CastEngine::clock(id, wall_now)` is a new method of the existing engine seam
+(`cast_engine.rs`); the engine implements it over the run's `SharedEpoch`, the cell the timing sampler writes at
+about 1 Hz and the cast packager reads for `EXT-X-PROGRAM-DATE-TIME`. The cast output's entry in the cast-outputs
+slot now carries that cell. The route never takes the cell's `RwLock` (which the sampler writes and the sink
+threads read): every publish also stores the value in a lock-free mirror (`SharedEpoch::snapshot`, a `SwapCell`),
+and the ladder reads only that, so a client cannot hold or contend for the lock the sinks use. No data-plane
+thread takes part. `media_us` is the epoch's media time at the request's `t1`, truncated to whole
+microseconds, and `wall_unix_us` that media time's wall time by the same map, so the pair is exact. No epoch yet:
+`clock` is `null`. The `arrival` source is not produced by this slice.
+
+**Liveness.** A ladder call or a report counts as a playlist fetch only while the stream has a push attachment
+(`CastStreams::attach_push` / `detach_push`). No rung of this build attaches, so on HLS the token's expiry is
+exactly as before: 60 s after the last playlist fetch.
+
+**What is stored and shown.** Per stream, fixed size: the last probe (replaced by the next), the playing rung and
+since when, at most 8 fallbacks (oldest forgotten), and the receiver's last `transport` figures. They are shown as
+`receiver` and `transport` in `GET /api/v1/cast/streams/{id}`, under that route's existing rule (owner or Admin;
+anyone else the same `404`).
+
+**Latency travels in the report.** Section 8 says ladder data travels on the ladder route, not in the report. The
+receiver's figures (`first_frame_ms`, `latency_ms`, `method`, resets, `stalled`) are steady-state numbers sent
+every 5 s, which is the report's cadence, so they travel as a `transport` object inside the existing report and
+the 2 KiB cap is kept. The engine parses that object leniently (a malformed one is ignored, the report still
+stored) and never shows a latency figure with `method` `unavailable`. The probe and `failed` travel on the ladder
+route, as written.
+
+**The receiver.** `probe.js` is a new ES5 file served at `/cast/receiver/probe.js` (same CSP) and loaded by
+`index.html` before `receiver.js`. It only defines `window.ConspectProbe`; `receiver.js` calls it at three places
+(after the first `master.m3u8` answers 200, on a stop, on a dead token) and adds its `transport` to the report.
+If `probe.js` fails to load, `receiver.js` plays HLS as before. **Deviation from the HLS row of the table in
+decision 2:** `playerManager.getAbsoluteTimeForMediaTime` is not the playlist's date-time mapping. Measured in the
+harness (CAF 3.x, Shaka 4.15.56): for one playhead it answered a wall time 6.9 s away from Shaka's own
+`getPlayheadTimeAsDate()`, so a latency built on it was 1.8 s where the stream was 8.6 s behind. The receiver
+therefore takes the frame's engine wall time from Shaka's `getPlayheadTimeAsDate()` (the playhead's
+`EXT-X-PROGRAM-DATE-TIME` mapping), moved by the frame's distance from the playhead: `date(playhead) -
+(currentTime - mediaTime)`. Shaka's `getPresentationStartTimeAsDate()` gave the same wrong base as CAF's call. The
+display time moves onto the engine clock with the offset. The method is `frame` with `requestVideoFrameCallback`,
+`playhead` without it, `unavailable` without that mapping or a usable clock. The harness check compares the
+reported median with Shaka's view of the playhead (within 1 s). Unverified on a device: that CAF on the operator's
+Chromecast exposes `getShakaPlayer()` and the same mapping; without it the method is `unavailable`, by rule. The frame watchdog (`FrameWatchdog`) counts `requestVideoFrameCallback`
+callbacks, else `totalVideoFrames - droppedVideoFrames`; it starts from zero for each load and a lower value
+starts a new count, as "Cast media status" rule 1 says. On HLS it reports `stalled` and does nothing else:
+there is no rung below HLS.
+
+**Invariants #1 and #10.** No ladder or probe work reaches a data-plane thread: the route touches the registry
+(one short lock, never held across an `.await`) and the epoch cell. The chaos test
+`l_a_ladder_flood_costs_the_clock_zero_ticks_and_the_hls_output_zero_packets` floods the real control plane with
+ladder calls (valid, invalid, oversized, unknown tokens, over the rate) on a live cast of the real pipeline and
+while a writer publishes the real epoch cell at 50 Hz (a step every 10th publish) and asserts that every answer
+carried the clock pair, the live token stayed admitted, and the cast packager kept publishing; plus the same
+isolation as the ADR-0111 chaos tests: every tick emitted, the HLS binding's video PTS
+contiguous, its audio count equal to the control run's, no hot-queue shed, tick progress at the clock's cadence
+during the flood. The existing negative controls (`n_…`) prove those assertions see a stall of the shared path.
+
+**Open questions moved, not closed, by this part.** Whether a `cast` output enters the effective-output registry
+with the no-reorder proof, and where the identity change list attaches to packets, move to the identity part of
+slice 2 (they matter only to push rungs). Review note R2-N2 (the app's behaviour when rapid SRT reconnects meet
+the ladder rate) moves to slice 6: the rate here is per token, burst 4, and a refused call answers `429` with
+`Retry-After: 1`.
+
 ## Rationale
 
 - **Why a ladder decided by the receiver's report, not by the sender.** The sender cannot see what the device's
@@ -1190,7 +1278,7 @@ rung only after it.
 
 | Question | Closed by |
 | --- | --- |
-| Chrome version, `WebTransport`, WebCodecs, `RTCPeerConnection` and MSE support on the operator's Chromecast and on a Google TV device's Web Receiver | slice 2 (probe stored on the first cast) |
+| Chrome version, `WebTransport`, WebCodecs, `RTCPeerConnection` and MSE support on the operator's Chromecast and on a Google TV device's Web Receiver | slice 2 (probe stored on the first cast; built, see section 10; needs a device cast) |
 | Delay of the shared encoder from tick to packet | slice 1 |
 | Whether CAF gives senders a correct media session for a picture it did not load | Closed in the harness by slice 3: yes, by the two methods of decision 3; no, by an interceptor that returns `null` |
 | Whether a device's CAF plays a `blob:` `contentUrl` in the page's own media element, and whether the WebRTC element hook takes there | first device step of slices 4 and 5 |

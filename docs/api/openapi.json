@@ -16369,11 +16369,33 @@
             "type": "boolean",
             "description": "A receiver can start now."
           },
+          "receiver": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReceiverProbe",
+                "description": "The receiver's last capability probe (`POST /cast/<token>/ladder`,\nADR-0114): device claims, shown as received. Owner and Admin only,\nlike the rest of this document."
+              }
+            ]
+          },
           "segments": {
             "type": "integer",
             "format": "int64",
             "description": "Video segments published (Google's Default Media Receiver starts\nslowly on a young playlist: wait for 8).",
             "minimum": 0
+          },
+          "transport": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Transport",
+                "description": "The rung the receiver plays and how it fares (ADR-0114)."
+              }
+            ]
           }
         }
       },
@@ -17789,6 +17811,40 @@
           }
         }
       },
+      "Fallback": {
+        "type": "object",
+        "description": "One step down the ladder, as the receiver reported it in `failed`.",
+        "required": [
+          "rung",
+          "stage",
+          "at_unix_ms"
+        ],
+        "properties": {
+          "at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was reported (Unix ms).",
+            "minimum": 0
+          },
+          "ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The receiver's figure for it (ms), if any.",
+            "minimum": 0
+          },
+          "rung": {
+            "type": "string",
+            "description": "The rung that failed."
+          },
+          "stage": {
+            "type": "string",
+            "description": "`connect`, `first-frame`, `stall`, `latency` or `hook` (the WebRTC\nmedia-element hook did not take)."
+          }
+        }
+      },
       "FeedStatus": {
         "type": "object",
         "description": "One feed's operator-visible status.",
@@ -17901,6 +17957,14 @@
             "minimum": 0
           }
         }
+      },
+      "FrameCounter": {
+        "type": "string",
+        "description": "Which presented-frame counter the receiver's stall watchdog uses.",
+        "enum": [
+          "rvfc",
+          "quality"
+        ]
       },
       "FreshnessDoc": {
         "type": "object",
@@ -19016,7 +19080,14 @@
               "null"
             ],
             "format": "float",
-            "description": "`keyer_set`: luma clip, `[0, 1]`."
+            "description": "`keyer_set`: luma clip on Y, or chroma clip on the linear-RGB\ndistance, `[0, 1]`."
+          },
+          "color": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`keyer_set`: chroma reference colour `#RRGGBB` (`type = chroma`\nonly); `\"\"` clears it."
           },
           "fill": {
             "type": [
@@ -19038,7 +19109,7 @@
               "null"
             ],
             "format": "float",
-            "description": "`keyer_set`: luma gain, finite and `>= 0`."
+            "description": "`keyer_set`: luma or chroma gain, finite and `>= 0`."
           },
           "invert": {
             "type": [
@@ -19135,7 +19206,7 @@
               "string",
               "null"
             ],
-            "description": "`keyer_set`: `linear` or `luma` (`chroma` is refused until K7)."
+            "description": "`keyer_set`: `linear`, `luma` or `chroma` (K7; needs `color`, refuses\na `key` source)."
           },
           "z": {
             "type": [
@@ -19289,7 +19360,7 @@
           },
           "type": {
             "type": "string",
-            "description": "`linear` or `luma`."
+            "description": "`linear`, `luma` or `chroma`."
           }
         }
       },
@@ -19305,6 +19376,58 @@
           "class_mismatch",
           "over_gpu"
         ]
+      },
+      "LatencyMethod": {
+        "type": "string",
+        "description": "How a latency figure was obtained (decision 2, \"When there is no\ntrustworthy mapping\").",
+        "enum": [
+          "frame",
+          "playhead",
+          "unavailable"
+        ]
+      },
+      "LatencyStats": {
+        "type": "object",
+        "description": "Steady-state tick-to-present latency over the receiver's last window.",
+        "required": [
+          "median",
+          "p95",
+          "samples",
+          "method"
+        ],
+        "properties": {
+          "clock_error_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The clock offset's error bound (ms).",
+            "minimum": 0
+          },
+          "median": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Median (ms).",
+            "minimum": 0
+          },
+          "method": {
+            "$ref": "#/components/schemas/LatencyMethod",
+            "description": "`frame` or `playhead`."
+          },
+          "p95": {
+            "type": "integer",
+            "format": "int64",
+            "description": "95th percentile (ms).",
+            "minimum": 0
+          },
+          "samples": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Valid samples in the window.",
+            "minimum": 0
+          }
+        }
       },
       "Layout": {
         "type": "object",
@@ -23161,6 +23284,104 @@
         ],
         "description": "An IS-04 **Receiver**: an ingress flow (a Conspect input)."
       },
+      "ReceiverCaps": {
+        "type": "object",
+        "description": "What the receiver says it can do (`caps` of the probe).",
+        "required": [
+          "rtc_h264"
+        ],
+        "properties": {
+          "adec": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Support",
+                "description": "`AudioDecoder.isConfigSupported` for the stream."
+              }
+            ]
+          },
+          "frames": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FrameCounter",
+                "description": "The presented-frame counter (`null`: none)."
+              }
+            ]
+          },
+          "mse": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Media Source Extensions accept the stream's codec strings."
+          },
+          "rtc": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`RTCPeerConnection` exists."
+          },
+          "rtc_h264": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "H.264 `profile-level-id` values the receiver can take (at most 8)."
+          },
+          "rtc_opus": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Opus receive."
+          },
+          "rvfc": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`requestVideoFrameCallback` exists."
+          },
+          "srt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The libsrt version an Android TV app loaded (`null` on the web)."
+          },
+          "vdec": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Support",
+                "description": "`VideoDecoder.isConfigSupported` for the stream."
+              }
+            ]
+          },
+          "vdec_hw": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "The same with `prefer-hardware`."
+          },
+          "wt": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`WebTransport` exists."
+          }
+        }
+      },
       "ReceiverFetch": {
         "type": "object",
         "description": "The last fetch of the receiver app (no IP).",
@@ -23185,6 +23406,80 @@
               "null"
             ],
             "description": "The fetcher's `User-Agent` (at most 160 characters)."
+          }
+        }
+      },
+      "ReceiverNeed": {
+        "type": "object",
+        "description": "What the session must carry (`need` of the probe).",
+        "properties": {
+          "audio": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The audio track required, if any."
+          },
+          "subtitles": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Subtitles are required."
+          }
+        }
+      },
+      "ReceiverProbe": {
+        "type": "object",
+        "description": "The last capability probe of a stream's receiver.",
+        "required": [
+          "caps",
+          "need",
+          "skip",
+          "received_unix_ms"
+        ],
+        "properties": {
+          "build": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The receiver build (a sha256 prefix of its script)."
+          },
+          "caps": {
+            "$ref": "#/components/schemas/ReceiverCaps",
+            "description": "What it can do."
+          },
+          "kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`web` or `android-tv` (as claimed)."
+          },
+          "need": {
+            "$ref": "#/components/schemas/ReceiverNeed",
+            "description": "What it must carry."
+          },
+          "received_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the probe arrived (Unix ms).",
+            "minimum": 0
+          },
+          "skip": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SkipEntry"
+            },
+            "description": "Rungs in its failure memory (at most 4)."
+          },
+          "ua": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The receiver's user agent (at most 200 characters)."
           }
         }
       },
@@ -23373,6 +23668,35 @@
           "body": {
             "type": "string",
             "description": "The reply text to append to the thread."
+          }
+        }
+      },
+      "Resets": {
+        "type": "object",
+        "description": "Player resets inside the attachment.",
+        "required": [
+          "soft",
+          "hard"
+        ],
+        "properties": {
+          "hard": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Hard resets.",
+            "minimum": 0
+          },
+          "last": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The last cause."
+          },
+          "soft": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Soft resets.",
+            "minimum": 0
           }
         }
       },
@@ -24386,6 +24710,26 @@
             "format": "password",
             "description": "The one-time setup code (8 words) printed on the host.",
             "writeOnly": true
+          }
+        }
+      },
+      "SkipEntry": {
+        "type": "object",
+        "description": "A rung in the device's failure memory.",
+        "required": [
+          "rung",
+          "seconds"
+        ],
+        "properties": {
+          "rung": {
+            "type": "string",
+            "description": "The rung."
+          },
+          "seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds left.",
+            "minimum": 0
           }
         }
       },
@@ -26178,6 +26522,15 @@
           }
         }
       },
+      "Support": {
+        "type": "string",
+        "description": "A decoder check result (`isConfigSupported`).",
+        "enum": [
+          "supported",
+          "unsupported",
+          "absent"
+        ]
+      },
       "SupportEntitlement": {
         "type": "object",
         "description": "The full entitlement-routing answer the `GET /support/entitlement` endpoint\nreturns: whether the machine is eligible for entitled support, the route, and\nthe SLA token (a quiet line for the free tier).",
@@ -27570,6 +27923,88 @@
           "kind": {
             "type": "string",
             "description": "`cut` or `mix`."
+          }
+        }
+      },
+      "Transport": {
+        "type": "object",
+        "description": "The transport a stream's receiver plays on and how it fares.",
+        "required": [
+          "fallbacks",
+          "resets",
+          "stalled"
+        ],
+        "properties": {
+          "fallbacks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Fallback"
+            },
+            "description": "The last steps down (at most 8, oldest first)."
+          },
+          "first_frame_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "From the start of the attempt to the first presented frame (ms).",
+            "minimum": 0
+          },
+          "latency_method": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LatencyMethod",
+                "description": "How the latency is measured (`unavailable`: no figure, by rule)."
+              }
+            ]
+          },
+          "latency_ms": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LatencyStats",
+                "description": "Steady-state latency; `null` when unavailable or not yet measured."
+              }
+            ]
+          },
+          "reported_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the receiver last reported these figures (Unix ms).",
+            "minimum": 0
+          },
+          "resets": {
+            "$ref": "#/components/schemas/Resets",
+            "description": "Player resets."
+          },
+          "rung": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The rung the engine last offered (`hls` in this build)."
+          },
+          "since_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Since when it plays that rung (Unix ms).",
+            "minimum": 0
+          },
+          "stalled": {
+            "type": "boolean",
+            "description": "The receiver's frame watchdog says no frame was presented for 2 s."
           }
         }
       },
