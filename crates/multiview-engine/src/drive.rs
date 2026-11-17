@@ -346,6 +346,10 @@ pub struct CompositorDrive<T> {
     /// later frame only under the same epoch (issue #415 review MC-1), so a
     /// scene a hook staged and then rolled back never reaches the output.
     scene_epoch: u64,
+    /// Bumped only by [`Self::insert_store`] / [`Self::remove_store`], so a
+    /// frame hook can tell in one integer compare that the store set changed
+    /// (issue #464: a live-added source joins the M/E's prime set).
+    stores_generation: u64,
 }
 
 impl<T> CompositorDrive<T> {
@@ -387,6 +391,7 @@ impl<T> CompositorDrive<T> {
             stinger_clip: None,
             keyers: Box::new([const { None }; MAX_DSK]),
             scene_epoch: 0,
+            stores_generation: 0,
         })
     }
 
@@ -738,6 +743,20 @@ impl<T> CompositorDrive<T> {
     pub fn insert_store(&mut self, source_id: impl Into<String>, store: Arc<TileStore<T>>) {
         self.stores.insert(source_id.into(), store);
         self.scene_epoch = self.scene_epoch.wrapping_add(1);
+        self.stores_generation = self.stores_generation.wrapping_add(1);
+    }
+
+    /// The registered store set's generation: changes exactly when
+    /// [`Self::insert_store`] or [`Self::remove_store`] ran.
+    #[must_use]
+    pub const fn stores_generation(&self) -> u64 {
+        self.stores_generation
+    }
+
+    /// The registered per-source stores, keyed by source id.
+    #[must_use]
+    pub const fn stores(&self) -> &HashMap<String, Arc<TileStore<T>>> {
+        &self.stores
     }
 
     /// The registered frame store for `source_id`, if any.
@@ -761,6 +780,7 @@ impl<T> CompositorDrive<T> {
     /// boundary; the producer teardown happens off the clock thread.
     pub fn remove_store(&mut self, source_id: &str) -> bool {
         self.scene_epoch = self.scene_epoch.wrapping_add(1);
+        self.stores_generation = self.stores_generation.wrapping_add(1);
         self.stores.remove(source_id).is_some()
     }
 

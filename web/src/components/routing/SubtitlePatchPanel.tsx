@@ -21,7 +21,7 @@ import {
   subtitleSlotSource,
   takePatch,
 } from '../../api/patch';
-import type { PatchOutputView, PatchSubtitleSlot } from '../../api/patch';
+import type { OutputPatchView, PatchSubtitleSlot } from '../../api/patch';
 import { OperationApiError } from '../../api/operations';
 import { subscribeRealtime } from '../../realtime/shared';
 import { useOutputs, useSources } from '../../resources/queries';
@@ -49,7 +49,7 @@ interface Column {
   readonly slots: readonly PatchSubtitleSlot[];
 }
 
-function columnsOf(outputs: readonly PatchOutputView[], names: ReadonlyMap<string, string>): readonly Column[] {
+function columnsOf(outputs: readonly OutputPatchView[], names: ReadonlyMap<string, string>): readonly Column[] {
   return outputs
     .filter((o) => o.subtitle.length > 0)
     .map((o) => ({ output: o.output, name: names.get(o.output) ?? o.output, slots: o.subtitle }));
