@@ -404,15 +404,26 @@ mod tests {
     }
 
     #[test]
-    fn alpha_is_rejected() {
-        let error = validate_alpha("yuva420p", true).expect_err("alpha is refused");
+    fn supported_alpha_is_accepted_and_unsupported_alpha_is_refused() {
+        // K6 (#391): alpha the NV12+A decode carries is accepted and reported.
+        assert_eq!(
+            validate_alpha("yuva444p10le", PixelAlpha::Supported, None),
+            Ok(true)
+        );
+        assert_eq!(validate_alpha("yuv420p", PixelAlpha::Opaque, None), Ok(false));
+        // Alpha the layout map cannot carry is refused, with a remediation.
+        let error = validate_alpha("pal8", PixelAlpha::Unsupported, None)
+            .expect_err("unmappable alpha is refused");
         assert_eq!(
             error,
             ProbeError::Alpha {
-                pix_fmt: "yuva420p".to_owned(),
+                pix_fmt: "pal8".to_owned(),
             }
         );
-        assert!(validate_alpha("yuv420p", false).is_ok());
+        let message = error.to_string();
+        assert!(message.contains("pal8"), "{message}");
+        assert!(message.contains("ProRes 4444"), "{message}");
+        assert!(message.contains("PNG sequence"), "{message}");
     }
 
     #[test]
