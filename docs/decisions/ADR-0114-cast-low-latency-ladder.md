@@ -1161,8 +1161,10 @@ rungs and refuses the names of rungs this build cannot serve, so the knob cannot
 **The clock readback.** `CastEngine::clock(id, wall_now)` is a new method of the existing engine seam
 (`cast_engine.rs`); the engine implements it over the run's `SharedEpoch`, the cell the timing sampler writes at
 about 1 Hz and the cast packager reads for `EXT-X-PROGRAM-DATE-TIME`. The cast output's entry in the cast-outputs
-slot now carries that cell. The read is one `RwLock` read of a `Copy` value held for nanoseconds by its writer;
-no data-plane thread takes part. `media_us` is the epoch's media time at the request's `t1`, truncated to whole
+slot now carries that cell. The route never takes the cell's `RwLock` (which the sampler writes and the sink
+threads read): every publish also stores the value in a lock-free mirror (`SharedEpoch::snapshot`, a `SwapCell`),
+and the ladder reads only that, so a client cannot hold or contend for the lock the sinks use. No data-plane
+thread takes part. `media_us` is the epoch's media time at the request's `t1`, truncated to whole
 microseconds, and `wall_unix_us` that media time's wall time by the same map, so the pair is exact. No epoch yet:
 `clock` is `null`. The `arrival` source is not produced by this slice.
 
@@ -1204,7 +1206,9 @@ there is no rung below HLS.
 (one short lock, never held across an `.await`) and the epoch cell. The chaos test
 `l_a_ladder_flood_costs_the_clock_zero_ticks_and_the_hls_output_zero_packets` floods the real control plane with
 ladder calls (valid, invalid, oversized, unknown tokens, over the rate) on a live cast of the real pipeline and
-asserts the same isolation as the ADR-0111 chaos tests: every tick emitted, the HLS binding's video PTS
+while a writer publishes the real epoch cell at 50 Hz (a step every 10th publish) and asserts that every answer
+carried the clock pair, the live token stayed admitted, and the cast packager kept publishing; plus the same
+isolation as the ADR-0111 chaos tests: every tick emitted, the HLS binding's video PTS
 contiguous, its audio count equal to the control run's, no hot-queue shed, tick progress at the clock's cadence
 during the flood. The existing negative controls (`n_…`) prove those assertions see a stall of the shared path.
 
