@@ -305,8 +305,13 @@ own output (the NVDEC fused resize, else the stream's coded size) is at least th
 axes. It counts actual decoders, including a retained one after a failed downsize and a software
 decode at native size, not the host tile size; transient replacement sessions are not counted.
 
-M/E layout sources (`layout:<id>`, #307 part 2) are sized by the routed-layout cells once that
-registry publishes its bodies into aux sizing (follow-up to #469 after #436).
+M/E layout sources (`layout:<id>`, #307 part 2; #485): the adapter (`me_layouts.rs`) publishes the
+cells of every registered body into its own sizing slot (a sibling of aux sizing) on register,
+body change and unregister — change-only, never per tick — and every decode follows it
+(`DisplayFollow::with_me_layout_sizing`). All registered bodies are sized, on a bus or not, since
+each composes on the aux thread. A layout on PGM/PVW names `layout:<id>` in bus sizing; that
+full-canvas cell binds no decoder, so the layout's own cells (drawn at the Program canvas) size
+its sources. Unregistered, the sizes return after the usual settle.
 
 The resize uses the existing make-before-break handover (`crates/multiview-cli/src/display_size.rs:1-17`):
 
@@ -473,7 +478,7 @@ source as before; removing the source on Program still slates the Program cell (
 *As built (#307 PR 2): a stored layout as an M/E source.* Scope: `layout:<id>` on PVW/PGM and on
 numbered mixer inputs, taken with CUT/AUTO/DIP through the unchanged engine path. Not in this PR:
 `bus:program`/`bus:preview` cells and the feed-cycle check (PR 3), audio-follow-video for a layout
-source (PR 4), the UI (PR 5), and the overlay bake on layout sources (lane layout-overlays).
+source (PR 4) and the UI (PR 5).
 
 - **API.** `select_preview`/`select_program` take exactly one of `source`/`input`/`layout`
   (`source: "layout:<id>"` is the same request); `layout` on `cut`/`auto` and `output` stay 422.
@@ -567,6 +572,13 @@ source (PR 4), the UI (PR 5), and the overlay bake on layout sources (lane layou
   into the `layout:<id>` store. The clock offers ticks while a routed feed **or** an M/E layout is
   active (second gate flag, `AuxTickSender::me_layout_flag`, owned by the registry). The halved-
   cadence back-off applies unchanged. Latency is one tick, as above.
+- **Overlay bake (overlay builds).** An M/E layout source carries the same per-cell overlay bake as
+  a routed layout (its own layers: labels, meters, flags, tally, clock, safe area): the composed
+  picture joins the tick's parallel bakes and the baked frame is published into its store at
+  `T.pts` (a failed bake publishes the clean picture; every layer off publishes the clean compose
+  at once). Per-cell chrome is inside the picture; Program's own chrome draws over it. Its bound
+  sources join `wanted_sources` (≤ 4 M/E bakes of ≤ 64 cells, total capped as before), and the
+  bake consumer publishes signals while the M/E layout flag ticks the aux thread.
 - **Routed Preview of a layout (review M2).** The routing-aux store lookup falls back to the M/E
   layout compose set (`routing_aux::with_me_layouts`: one `SwapCell` load, linear find over ≤ 4,
   only for an unknown `layout:*` id), so a routed Preview feed — and any routed `src:` lookup —
