@@ -110,6 +110,8 @@ export function KeyerPanel({ row, sources, disabledReason, canvas, onPlan, onApp
   const keyRedacted = keyerKeyRedacted(row);
   const edit = (next: Partial<Edits>): void => {
     setEdits({ ...edits, ...next });
+    // Every edit invalidates the review (review K5-R2-01).
+    setReview(undefined);
     setConfirmAllow(false);
     setError(undefined);
   };
@@ -128,7 +130,10 @@ export function KeyerPanel({ row, sources, disabledReason, canvas, onPlan, onApp
 
   const draft = keyerSetFields(row, edits);
   const json = JSON.stringify(draft.fields);
-  const reviewed = review?.json === json ? review : undefined;
+  // A review is actionable only while the draft is valid AND unchanged: an
+  // invalid edit is omitted from `fields`, so JSON equality alone would keep
+  // an earlier review live (review K5-R2-01).
+  const reviewed = draft.invalid === undefined && review?.json === json ? review : undefined;
   const changesSources = (reviewed?.fields ?? draft.fields).fill !== undefined || (reviewed?.fields ?? draft.fields).key !== undefined;
 
   const invalidReason = draft.invalid === 'clip' ? t`Clip must be a number from 0 to 1`
@@ -162,7 +167,7 @@ export function KeyerPanel({ row, sources, disabledReason, canvas, onPlan, onApp
   };
 
   const apply = async (allow: boolean): Promise<void> => {
-    if (reviewed === undefined) return;
+    if (reviewed === undefined || draft.invalid !== undefined) return;
     setError(undefined);
     try {
       await onApply(reviewed.fields, allow);

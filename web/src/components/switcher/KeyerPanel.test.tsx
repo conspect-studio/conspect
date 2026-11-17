@@ -161,6 +161,24 @@ describe('KeyerPanel', () => {
     expect(p.onApply).not.toHaveBeenCalled();
   });
 
+  it('K5-R2-01: an invalid edit after review makes Apply unavailable until corrected and re-reviewed', async () => {
+    const p = panel({ row: LUMA_ROW });
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Invert matte' }));
+    await userEvent.click(review());
+    expect(apply()).toHaveProperty('disabled', false);
+    // The invalid clip is omitted from the fields, so the JSON equals the
+    // reviewed draft; Apply must still be unavailable.
+    await userEvent.clear(screen.getByLabelText('Clip'));
+    expect(apply()).toHaveProperty('disabled', true);
+    await userEvent.click(apply());
+    expect(p.onApply).not.toHaveBeenCalled();
+    await userEvent.type(screen.getByLabelText('Clip'), '0.3');
+    expect(apply()).toHaveProperty('disabled', true);
+    await userEvent.click(review());
+    await userEvent.click(apply());
+    expect(p.onApply).toHaveBeenCalledWith({ keyer: 'dsk1', invert: false }, false);
+  });
+
   it('K5-07: a plan refusal shows the detail and Apply stays disabled', async () => {
     const plan: KeyerPlan = { can_take: false, class: 'class1', keyer: 'main/dsk1', on_air: false, cost: { delta: 1.5, fits: false }, refusal: { type: 'capacity', detail: 'DSK budget exceeded' } };
     const p = panel({ onPlan: vi.fn().mockResolvedValue(plan) });

@@ -149,7 +149,7 @@ msgid "{0} failed before save; original slot remains attached."
 msgstr "{0} failed before save; original slot remains attached."
 
 #. placeholder {0}: row.id
-#: src/components/switcher/KeyerPanel.tsx:318
+#: src/components/switcher/KeyerPanel.tsx:323
 msgid "{0} is on air: this fill/key change needs explicit confirmation to allow it."
 msgstr "{0} is on air: this fill/key change needs explicit confirmation to allow it."
 
@@ -1295,7 +1295,7 @@ msgstr "Allow a confirmed down/up-mix to the pinned layout"
 msgid "Allow a private/LAN address"
 msgstr "Allow a private/LAN address"
 
-#: src/components/switcher/KeyerPanel.tsx:319
+#: src/components/switcher/KeyerPanel.tsx:324
 msgid "Allow on-air change"
 msgstr "Allow on-air change"
 
@@ -1497,7 +1497,7 @@ msgstr "Applied as {0}. Operation {1}."
 msgid "Applies on the next restart."
 msgstr "Applies on the next restart."
 
-#: src/components/switcher/KeyerPanel.tsx:302
+#: src/components/switcher/KeyerPanel.tsx:307
 #: src/iptv/SourceLinks.tsx:359
 #: src/pages/LayoutsPage.tsx:153
 msgid "Apply"
@@ -1963,7 +1963,7 @@ msgstr "Bit→colour rules"
 msgid "Bitrate"
 msgstr "Bitrate"
 
-#: src/components/switcher/KeyerPanel.tsx:187
+#: src/components/switcher/KeyerPanel.tsx:192
 msgid "BL"
 msgstr "BL"
 
@@ -2046,7 +2046,7 @@ msgstr "Bounded skew: the decoder runs its own clock, so its presentation drifts
 msgid "Box wipe"
 msgstr "Box wipe"
 
-#: src/components/switcher/KeyerPanel.tsx:187
+#: src/components/switcher/KeyerPanel.tsx:192
 msgid "BR"
 msgstr "BR"
 
@@ -2167,7 +2167,7 @@ msgstr "Can take."
 
 #: src/components/broadcast/BroadcastShell.tsx:46
 #: src/components/broadcast/ProductionDesk.tsx:343
-#: src/components/switcher/KeyerPanel.tsx:320
+#: src/components/switcher/KeyerPanel.tsx:325
 #: src/components/switcher/MixerInputBank.tsx:75
 #: src/events/AutomationPanel.tsx:135
 #: src/iptv/AddSourceDialog.tsx:79
@@ -2507,7 +2507,7 @@ msgstr "Cells (accessible)"
 msgid "Cells (optional, comma-separated)"
 msgstr "Cells (optional, comma-separated)"
 
-#: src/components/switcher/KeyerPanel.tsx:187
+#: src/components/switcher/KeyerPanel.tsx:192
 msgid "Centre"
 msgstr "Centre"
 
@@ -2638,7 +2638,7 @@ msgstr "Choose a salvo first"
 msgid "Choose a salvo…"
 msgstr "Choose a salvo…"
 
-#: src/components/switcher/KeyerPanel.tsx:208
+#: src/components/switcher/KeyerPanel.tsx:213
 #: src/pages/SwitcherPage.tsx:213
 msgid "Choose a source"
 msgstr "Choose a source"
@@ -2735,11 +2735,11 @@ msgstr "Class"
 msgid "class {0} · +{1} encoder{2} · {3}"
 msgstr "class {0} · +{1} encoder{2} · {3}"
 
-#: src/components/switcher/KeyerPanel.tsx:306
+#: src/components/switcher/KeyerPanel.tsx:311
 msgid "Class 1 (seamless, one tick)"
 msgstr "Class 1 (seamless, one tick)"
 
-#: src/components/switcher/KeyerPanel.tsx:306
+#: src/components/switcher/KeyerPanel.tsx:311
 msgid "Class 2 (controlled reset)"
 msgstr "Class 2 (controlled reset)"
 
@@ -2833,7 +2833,7 @@ msgid "Cleared only"
 msgstr "Cleared only"
 
 #: src/components/broadcast/library/Chips.tsx:139
-#: src/components/switcher/KeyerPanel.tsx:233
+#: src/components/switcher/KeyerPanel.tsx:238
 #: src/pages/AudioPage.tsx:195
 #: src/pages/ProgramMeters.tsx:85
 msgid "Clip"
@@ -2844,7 +2844,7 @@ msgstr "Clip"
 msgid "Clip library"
 msgstr "Clip library"
 
-#: src/components/switcher/KeyerPanel.tsx:134
+#: src/components/switcher/KeyerPanel.tsx:139
 msgid "Clip must be a number from 0 to 1"
 msgstr "Clip must be a number from 0 to 1"
 
@@ -3127,7 +3127,7 @@ msgstr "Confirm a program-affecting take?"
 msgid "Confirm a take on a Program output?"
 msgstr "Confirm a take on a Program output?"
 
-#: src/components/switcher/KeyerPanel.tsx:317
+#: src/components/switcher/KeyerPanel.tsx:322
 msgid "Confirm on-air keyer change"
 msgstr "Confirm on-air keyer change"
 
@@ -3376,12 +3376,12 @@ msgid "Correlation"
 msgstr "Correlation"
 
 #. placeholder {0}: reviewed.plan.cost.delta.toFixed(2)
-#: src/components/switcher/KeyerPanel.tsx:309
+#: src/components/switcher/KeyerPanel.tsx:314
 msgid "cost delta {0} canvas folds, exceeds the budget"
 msgstr "cost delta {0} canvas folds, exceeds the budget"
 
 #. placeholder {0}: reviewed.plan.cost.delta.toFixed(2)
-#: src/components/switcher/KeyerPanel.tsx:308
+#: src/components/switcher/KeyerPanel.tsx:313
 msgid "cost delta {0} canvas folds, fits the budget"
 msgstr "cost delta {0} canvas folds, fits the budget"
 
@@ -4648,7 +4648,7 @@ msgstr "Drivers are compiled in; each maps its device family onto the same capab
 msgid "Drop the lease file into the machine's configured licence directory; it is picked up on the next start."
 msgstr "Drop the lease file into the machine's configured licence directory; it is picked up on the next start."
 
-#: src/components/switcher/KeyerPanel.tsx:296
+#: src/components/switcher/KeyerPanel.tsx:301
 msgid "Drop to off air"
 msgstr "Drop to off air"
 
@@ -4958,7 +4958,7 @@ msgstr "Element name"
 msgid "Embedded CEA-608 (CC1–CC4 only)"
 msgstr "Embedded CEA-608 (CC1–CC4 only)"
 
-#: src/components/switcher/KeyerPanel.tsx:274
+#: src/components/switcher/KeyerPanel.tsx:279
 msgid "Enable mask"
 msgstr "Enable mask"
 
@@ -5366,7 +5366,7 @@ msgstr "File path"
 msgid "Files and synthetic sources"
 msgstr "Files and synthetic sources"
 
-#: src/components/switcher/KeyerPanel.tsx:203
+#: src/components/switcher/KeyerPanel.tsx:208
 msgid "Fill"
 msgstr "Fill"
 
@@ -5446,40 +5446,40 @@ msgstr "Flags"
 
 #. placeholder {0}: canvas.w
 #. placeholder {1}: canvas.h
-#: src/components/switcher/KeyerPanel.tsx:244
+#: src/components/switcher/KeyerPanel.tsx:249
 msgid "Fly (canvas {0}×{1})"
 msgstr "Fly (canvas {0}×{1})"
 
 #. placeholder {0}: axisLabel(axis)
-#: src/components/switcher/KeyerPanel.tsx:261
+#: src/components/switcher/KeyerPanel.tsx:266
 msgid "Fly {0}"
 msgstr "Fly {0}"
 
-#: src/components/switcher/KeyerPanel.tsx:245
+#: src/components/switcher/KeyerPanel.tsx:250
 msgid "Fly preset"
 msgstr "Fly preset"
 
-#: src/components/switcher/KeyerPanel.tsx:189
+#: src/components/switcher/KeyerPanel.tsx:194
 msgid "Fly to the bottom left corner"
 msgstr "Fly to the bottom left corner"
 
-#: src/components/switcher/KeyerPanel.tsx:190
+#: src/components/switcher/KeyerPanel.tsx:195
 msgid "Fly to the bottom right corner"
 msgstr "Fly to the bottom right corner"
 
-#: src/components/switcher/KeyerPanel.tsx:190
+#: src/components/switcher/KeyerPanel.tsx:195
 msgid "Fly to the centre"
 msgstr "Fly to the centre"
 
-#: src/components/switcher/KeyerPanel.tsx:188
+#: src/components/switcher/KeyerPanel.tsx:193
 msgid "Fly to the top left corner"
 msgstr "Fly to the top left corner"
 
-#: src/components/switcher/KeyerPanel.tsx:189
+#: src/components/switcher/KeyerPanel.tsx:194
 msgid "Fly to the top right corner"
 msgstr "Fly to the top right corner"
 
-#: src/components/switcher/KeyerPanel.tsx:136
+#: src/components/switcher/KeyerPanel.tsx:141
 msgid "Fly x/y must be whole numbers of 0 or more and width/height at least 1"
 msgstr "Fly x/y must be whole numbers of 0 or more and width/height at least 1"
 
@@ -5619,15 +5619,15 @@ msgstr "Frozen / stale"
 msgid "Frozen picture"
 msgstr "Frozen picture"
 
-#: src/components/switcher/KeyerPanel.tsx:187
+#: src/components/switcher/KeyerPanel.tsx:192
 msgid "Full"
 msgstr "Full"
 
-#: src/components/switcher/KeyerPanel.tsx:286
+#: src/components/switcher/KeyerPanel.tsx:291
 msgid "Full (clear mask)"
 msgstr "Full (clear mask)"
 
-#: src/components/switcher/KeyerPanel.tsx:190
+#: src/components/switcher/KeyerPanel.tsx:195
 msgid "Full canvas (no fly)"
 msgstr "Full canvas (no fly)"
 
@@ -5639,7 +5639,7 @@ msgstr "Full content interpreted as limited: shadows <0>crush to solid black</0>
 msgid "Fully deterministic"
 msgstr "Fully deterministic"
 
-#: src/components/switcher/KeyerPanel.tsx:235
+#: src/components/switcher/KeyerPanel.tsx:240
 msgid "Gain"
 msgstr "Gain"
 
@@ -5647,7 +5647,7 @@ msgstr "Gain"
 msgid "Gain in dB (route {row})"
 msgstr "Gain in dB (route {row})"
 
-#: src/components/switcher/KeyerPanel.tsx:135
+#: src/components/switcher/KeyerPanel.tsx:140
 msgid "Gain must be a number of 0 or more"
 msgstr "Gain must be a number of 0 or more"
 
@@ -5944,7 +5944,7 @@ msgstr "Healthcheck"
 msgid "healthy"
 msgstr "healthy"
 
-#: src/components/switcher/KeyerPanel.tsx:191
+#: src/components/switcher/KeyerPanel.tsx:196
 msgid "Height"
 msgstr "Height"
 
@@ -6048,7 +6048,7 @@ msgstr "Hold at 00:00:00"
 msgid "Hold cue"
 msgstr "Hold cue"
 
-#: src/components/switcher/KeyerPanel.tsx:296
+#: src/components/switcher/KeyerPanel.tsx:301
 msgid "Hold last good"
 msgstr "Hold last good"
 
@@ -6439,7 +6439,7 @@ msgstr "invalid gain; edit exact gain in Details"
 msgid "Invalid source"
 msgstr "Invalid source"
 
-#: src/components/switcher/KeyerPanel.tsx:241
+#: src/components/switcher/KeyerPanel.tsx:246
 msgid "Invert matte"
 msgstr "Invert matte"
 
@@ -6509,12 +6509,12 @@ msgstr "Jitter buffer"
 msgid "Journal"
 msgstr "Journal"
 
-#: src/components/switcher/KeyerPanel.tsx:213
+#: src/components/switcher/KeyerPanel.tsx:218
 msgid "Key"
 msgstr "Key"
 
 #. placeholder {0}: row.id
-#: src/components/switcher/KeyerPanel.tsx:198
+#: src/components/switcher/KeyerPanel.tsx:203
 msgid "Keyer {0} panel"
 msgstr "Keyer {0} panel"
 
@@ -6863,7 +6863,7 @@ msgstr "Limited content interpreted as full: blacks turn grey, the picture looks
 msgid "Limited vs full range"
 msgstr "Limited vs full range"
 
-#: src/components/switcher/KeyerPanel.tsx:226
+#: src/components/switcher/KeyerPanel.tsx:231
 msgid "Linear"
 msgstr "Linear"
 
@@ -7284,7 +7284,7 @@ msgstr "Loop"
 msgid "Loop default"
 msgstr "Loop default"
 
-#: src/components/switcher/KeyerPanel.tsx:293
+#: src/components/switcher/KeyerPanel.tsx:298
 msgid "Loss policy"
 msgstr "Loss policy"
 
@@ -7312,7 +7312,7 @@ msgstr "Low-latency HLS, adding <0>part_target_ms</0> and <1>gop_ms</1> tuning."
 msgid "Low–medium (window-tuned)"
 msgstr "Low–medium (window-tuned)"
 
-#: src/components/switcher/KeyerPanel.tsx:227
+#: src/components/switcher/KeyerPanel.tsx:232
 msgid "Luma"
 msgstr "Luma"
 
@@ -7427,16 +7427,16 @@ msgstr "Map rendering by <0>MapLibre GL JS</0> (BSD-3-Clause). No map tiles are 
 msgid "Marker type"
 msgstr "Marker type"
 
-#: src/components/switcher/KeyerPanel.tsx:270
+#: src/components/switcher/KeyerPanel.tsx:275
 msgid "Mask"
 msgstr "Mask"
 
 #. placeholder {0}: axisLabel(axis)
-#: src/components/switcher/KeyerPanel.tsx:280
+#: src/components/switcher/KeyerPanel.tsx:285
 msgid "Mask {0}"
 msgstr "Mask {0}"
 
-#: src/components/switcher/KeyerPanel.tsx:137
+#: src/components/switcher/KeyerPanel.tsx:142
 msgid "Mask x/y must be whole numbers of 0 or more and width/height at least 1"
 msgstr "Mask x/y must be whole numbers of 0 or more and width/height at least 1"
 
@@ -8101,7 +8101,7 @@ msgstr "No cast sessions are running."
 msgid "No cells yet. Add one to start composing the multiview."
 msgstr "No cells yet. Add one to start composing the multiview."
 
-#: src/components/switcher/KeyerPanel.tsx:139
+#: src/components/switcher/KeyerPanel.tsx:144
 msgid "No changes to review"
 msgstr "No changes to review"
 
@@ -10160,8 +10160,8 @@ msgid "Red = on Program, green = on Preview."
 msgstr "Red = on Program, green = on Preview."
 
 #: src/components/routing/SubtitlePatchPanel.tsx:252
-#: src/components/switcher/KeyerPanel.tsx:205
-#: src/components/switcher/KeyerPanel.tsx:215
+#: src/components/switcher/KeyerPanel.tsx:210
+#: src/components/switcher/KeyerPanel.tsx:220
 msgid "redacted"
 msgstr "redacted"
 
@@ -10578,7 +10578,7 @@ msgstr "Reveal {label}"
 msgid "Reverse"
 msgstr "Reverse"
 
-#: src/components/switcher/KeyerPanel.tsx:300
+#: src/components/switcher/KeyerPanel.tsx:305
 msgid "Review"
 msgstr "Review"
 
@@ -10594,7 +10594,7 @@ msgstr "Review changes"
 msgid "Review changes: {sourceName}"
 msgstr "Review changes: {sourceName}"
 
-#: src/components/switcher/KeyerPanel.tsx:140
+#: src/components/switcher/KeyerPanel.tsx:145
 msgid "Review this change first"
 msgstr "Review this change first"
 
@@ -11168,7 +11168,7 @@ msgstr "Selected:"
 msgid "Selection unavailable"
 msgstr "Selection unavailable"
 
-#: src/components/switcher/KeyerPanel.tsx:218
+#: src/components/switcher/KeyerPanel.tsx:223
 msgid "Self key (fill alpha)"
 msgstr "Self key (fill alpha)"
 
@@ -12649,7 +12649,7 @@ msgstr "The keyer command was not accepted"
 msgid "The keyer plan failed"
 msgstr "The keyer plan failed"
 
-#: src/components/switcher/KeyerPanel.tsx:178
+#: src/components/switcher/KeyerPanel.tsx:183
 msgid "The keyer state changed; review the new plan before applying"
 msgstr "The keyer state changed; review the new plan before applying"
 
@@ -12847,7 +12847,7 @@ msgstr "The requested screen does not exist."
 msgid "The REST base, long-running operations, ETags, the WebSocket and SSE streams, and the live API playground."
 msgstr "The REST base, long-running operations, ETags, the WebSocket and SSE streams, and the live API playground."
 
-#: src/components/switcher/KeyerPanel.tsx:140
+#: src/components/switcher/KeyerPanel.tsx:145
 msgid "The reviewed change was refused"
 msgstr "The reviewed change was refused"
 
@@ -13368,7 +13368,7 @@ msgstr "Timing & sync"
 msgid "Tip: the Program and Preview monitors on the desk have their own Cast buttons."
 msgstr "Tip: the Program and Preview monitors on the desk have their own Cast buttons."
 
-#: src/components/switcher/KeyerPanel.tsx:186
+#: src/components/switcher/KeyerPanel.tsx:191
 msgid "TL"
 msgstr "TL"
 
@@ -13408,7 +13408,7 @@ msgstr "Too many unresolved commands. Wait for an outcome or resolve an unknown 
 msgid "Top (%)"
 msgstr "Top (%)"
 
-#: src/components/switcher/KeyerPanel.tsx:186
+#: src/components/switcher/KeyerPanel.tsx:191
 msgid "TR"
 msgstr "TR"
 
@@ -13574,7 +13574,7 @@ msgstr "tvg-id"
 msgid "Two image families are published. The default image is LGPL-clean and software-only; the NVIDIA image adds CUDA-based decode, encode, and compositing."
 msgstr "Two image families are published. The default image is LGPL-clean and software-only; the NVIDIA image adds CUDA-based decode, encode, and compositing."
 
-#: src/components/switcher/KeyerPanel.tsx:223
+#: src/components/switcher/KeyerPanel.tsx:228
 msgid "Type"
 msgstr "Type"
 
@@ -14367,7 +14367,7 @@ msgstr "Why the output clock never depends on inputs"
 msgid "Wide distribution, browser viewing"
 msgstr "Wide distribution, browser viewing"
 
-#: src/components/switcher/KeyerPanel.tsx:191
+#: src/components/switcher/KeyerPanel.tsx:196
 msgid "Width"
 msgstr "Width"
 
@@ -14431,7 +14431,7 @@ msgstr "would cycle"
 msgid "Writes an HLS playlist and segments to <0>path</0> with a <1>codec</1> and a <2>segment_ms</2> duration."
 msgstr "Writes an HLS playlist and segments to <0>path</0> with a <1>codec</1> and a <2>segment_ms</2> duration."
 
-#: src/components/switcher/KeyerPanel.tsx:191
+#: src/components/switcher/KeyerPanel.tsx:196
 msgid "X"
 msgstr "X"
 
@@ -14439,7 +14439,7 @@ msgstr "X"
 msgid "XMLTV guide URL"
 msgstr "XMLTV guide URL"
 
-#: src/components/switcher/KeyerPanel.tsx:191
+#: src/components/switcher/KeyerPanel.tsx:196
 msgid "Y"
 msgstr "Y"
 
