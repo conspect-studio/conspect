@@ -794,7 +794,7 @@ async fn a_reserved_store_key_is_refused_as_fill_or_key_even_when_configured() {
         "fixture carries the colliding id"
     );
     let (_dir, path) = temp_boot(&doc);
-    let rig = rig(&path);
+    let rig = build(&path, &doc, false);
     for extra in [
         json!({"keyer":"dsk1","fill":"layout:wall"}),
         json!({"keyer":"dsk1","fill":"gfx","key":"bus:program"}),
