@@ -186,6 +186,9 @@ pub enum SubmitError {
     ShuttingDown,
     /// The durable journal could not record the reservation.
     Persistence,
+    /// The fill already has an active job for a DIFFERENT request (e.g. public
+    /// vs Premium, other view); it is never coalesced onto that job.
+    Incompatible,
 }
 impl std::fmt::Display for SubmitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -194,6 +197,7 @@ impl std::fmt::Display for SubmitError {
             Self::Invalid => "invalid capture request",
             Self::ShuttingDown => "capture service shutting down",
             Self::Persistence => "capture journal unavailable",
+            Self::Incompatible => "fill busy with a different capture request",
         })
     }
 }
@@ -353,6 +357,9 @@ struct Entry {
     resource: Option<ResourceSample>,
     meta: Option<FetchMeta>,
     correlation: Option<String>,
+    /// Credential-free digest of the queued request; only an identical request
+    /// may coalesce onto this job (a public job never answers a Premium one).
+    digest: Option<String>,
 }
 struct Good {
     artifact: ArtifactId,
@@ -444,6 +451,28 @@ pub struct Service {
 
 fn bad_name(s: &str) -> bool {
     s.is_empty() || s.len() > 128 || s.contains("://")
+}
+
+/// SHA-256 over the request with any resolved credential removed (the auth
+/// MODE `require_premium` stays in). `None` never matches anything.
+fn request_digest(request: &Payload) -> Option<String> {
+    let mut value = match request {
+        Payload::Capture(r) => {
+            serde_json::json!({"capture": serde_json::to_value(&r.capture).ok()?})
+        }
+        Payload::Fetch(r) => serde_json::json!({"fetch": serde_json::to_value(&r.fetch).ok()?}),
+    };
+    if let Some(view) = value
+        .pointer_mut("/capture/windy")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        view.remove("credentials");
+    }
+    let bytes = serde_json::to_vec(&value).ok()?;
+    Some(format!(
+        "{:x}",
+        <sha2::Sha256 as sha2::Digest>::digest(bytes)
+    ))
 }
 
 impl Service {
@@ -790,6 +819,7 @@ impl Service {
             return Err(SubmitError::Invalid);
         }
         let (req_owner, req_fill) = (request.owner().to_owned(), request.fill().to_owned());
+        let digest = request_digest(&request);
         let _gate = self
             .inner
             .gate
@@ -826,13 +856,17 @@ impl Service {
                 return Ok(Submitted::Coalesced(id));
             }
         }
-        if let Some((id, _)) = shared.jobs.iter().find(|(_, e)| {
+        if let Some((id, entry)) = shared.jobs.iter().find(|(_, e)| {
             e.owner == req_owner
                 && e.fill == req_fill
                 && !e.cancelling
                 && matches!(e.state, State::Queued | State::Running)
         }) {
-            return Ok(Submitted::Coalesced(*id));
+            return if digest.is_some() && entry.digest == digest {
+                Ok(Submitted::Coalesced(*id))
+            } else {
+                Err(SubmitError::Incompatible)
+            };
         }
         let key = (req_owner.clone(), req_fill.clone());
         if shared.queue.len() >= self.inner.config.queue_capacity {
@@ -903,6 +937,7 @@ impl Service {
                 resource: None,
                 meta: None,
                 correlation,
+                digest,
             },
         );
         shared.queue.push_back(id);
@@ -1567,6 +1602,7 @@ fn recover(
                 resource: None,
                 meta: None,
                 correlation: j.correlation.clone(),
+                digest: None,
             },
         );
         shared.finished.push_back(JobId(j.id));
@@ -1624,5 +1660,51 @@ mod pin_deadline_tests {
         assert!(reply.is_err());
         drop(reply);
         assert!(dropped.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod digest_tests {
+    use super::{request_digest, Payload, Request};
+    use crate::capture::{Background, Capture, CaptureOptions, WindyCredentials, WindyView};
+    use std::time::Duration;
+    fn windy(premium: bool, password: Option<&str>) -> Payload {
+        Payload::Capture(Request {
+            owner: "o".into(),
+            fill: "f".into(),
+            capture: Capture {
+                width: 1280,
+                height: 720,
+                fps: 2,
+                frames: 2,
+                document: String::new(),
+                background: Background::Opaque,
+                windy: Some(WindyView {
+                    lat: 1.0,
+                    lon: 2.0,
+                    zoom: 5,
+                    overlay: "wind".into(),
+                    terms_accepted: true,
+                    require_premium: premium,
+                    credentials: password.map(|p| WindyCredentials {
+                        username: "u@example.com".into(),
+                        password: p.into(),
+                    }),
+                }),
+                capture: CaptureOptions::default(),
+                output_cadence: None,
+            },
+            maximum_bytes: 1,
+            timeout: Duration::from_secs(1),
+        })
+    }
+    #[test]
+    fn digest_keeps_the_auth_mode_and_drops_the_credential() {
+        let public = request_digest(&windy(false, None)).unwrap();
+        let premium_a = request_digest(&windy(true, Some("pw-a"))).unwrap();
+        let premium_b = request_digest(&windy(true, Some("pw-b"))).unwrap();
+        assert_ne!(public, premium_a);
+        assert_eq!(premium_a, premium_b);
+        assert!(!premium_a.contains("pw-a"));
     }
 }

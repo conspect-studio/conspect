@@ -231,6 +231,169 @@ pub(crate) async fn artifact(
         .map_err(|_| ControlError::Repository("artifact response failed".into()))
 }
 
+/// Constant, secret-free 422 for any malformed Windy credential body.
+fn malformed_credential() -> Response {
+    use axum::response::IntoResponse;
+    ControlError::Validation(
+        "body must be a JSON object with exactly the string fields `email` and `password`".into(),
+    )
+    .into_response()
+}
+/// `no-store`: account status is never cached by a browser or proxy.
+fn no_store<T: serde::Serialize>(value: T) -> Response {
+    use axum::response::IntoResponse;
+    ([(header::CACHE_CONTROL, "no-store")], Json(value)).into_response()
+}
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        get,
+        path = "/api/v1/integrations/windy",
+        operation_id = "get_windy_account",
+        tag = "integrations",
+        responses(
+            (status = 200, description = "Secret-free Windy account status (credential is write-only).", body = crate::web_capture::WindyAccountView),
+            (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
+            (status = 403, description = "Admin role and an unscoped key are required.", body = crate::problem::Problem),
+            (status = 409, description = "Account store not configured.", body = crate::problem::Problem),
+        ),
+    )
+)]
+pub(crate) async fn windy_account(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> ControlResult<Response> {
+    Ok(no_store(state.web_capture.windy_account(&principal)?))
+}
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        put,
+        path = "/api/v1/integrations/windy",
+        operation_id = "set_windy_account",
+        tag = "integrations",
+        request_body = crate::web_capture::WindyAccountBody,
+        responses(
+            (status = 200, description = "Stored encrypted; Premium resets until the next passing login check.", body = crate::web_capture::WindyAccountView),
+            (status = 403, description = "Admin role and an unscoped key are required.", body = crate::problem::Problem),
+            (status = 409, description = "Account store not configured.", body = crate::problem::Problem),
+            (status = 422, description = "Invalid email or password.", body = crate::problem::Problem),
+        ),
+    )
+)]
+pub(crate) async fn set_windy_account(
+    State(state): State<AppState>,
+    principal: Principal,
+    raw: axum::body::Bytes,
+) -> Response {
+    use axum::response::IntoResponse;
+    let mut response = put_windy_account(state, principal, raw)
+        .await
+        .unwrap_or_else(IntoResponse::into_response);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+async fn put_windy_account(
+    state: AppState,
+    principal: Principal,
+    raw: axum::body::Bytes,
+) -> ControlResult<Response> {
+    principal.role.require(Action::Administer)?;
+    // Parsed by hand: axum's `Json` rejection echoes serde diagnostics, which
+    // can quote credential material (e.g. an unquoted numeric password or an
+    // unknown field's value). Every malformed body gets one constant answer.
+    let Ok(body) = serde_json::from_slice::<crate::web_capture::WindyAccountBody>(&raw) else {
+        drop(raw);
+        return Ok(malformed_credential());
+    };
+    drop(raw);
+    let provider = state.web_capture.clone();
+    let actor = principal.clone();
+    let view = tokio::task::spawn_blocking(move || {
+        provider.set_windy_account(&actor, &body.email, &body.password)
+    })
+    .await
+    .map_err(|_| ControlError::Repository("Windy account worker failed".into()))??;
+    // Audit detail never carries the email or password.
+    state.audit(
+        &principal.key_id,
+        crate::audit::AuditAction::Update,
+        "integration",
+        "windy",
+        Some(serde_json::json!({"set": true})),
+    );
+    Ok(no_store(view))
+}
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        delete,
+        path = "/api/v1/integrations/windy",
+        operation_id = "clear_windy_account",
+        tag = "integrations",
+        responses(
+            (status = 200, description = "Credential removed; Premium disabled.", body = crate::web_capture::WindyAccountView),
+            (status = 403, description = "Admin role and an unscoped key are required.", body = crate::problem::Problem),
+            (status = 409, description = "Account store not configured.", body = crate::problem::Problem),
+        ),
+    )
+)]
+pub(crate) async fn clear_windy_account(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> ControlResult<Response> {
+    principal.role.require(Action::Administer)?;
+    let provider = state.web_capture.clone();
+    let actor = principal.clone();
+    let view = tokio::task::spawn_blocking(move || provider.clear_windy_account(&actor))
+        .await
+        .map_err(|_| ControlError::Repository("Windy account worker failed".into()))??;
+    state.audit(
+        &principal.key_id,
+        crate::audit::AuditAction::Delete,
+        "integration",
+        "windy",
+        None,
+    );
+    Ok(no_store(view))
+}
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        post,
+        path = "/api/v1/integrations/windy/verify",
+        operation_id = "verify_windy_account",
+        tag = "integrations",
+        responses(
+            (status = 200, description = "Bounded login check ran; `result` is premium, rejected (wrong email/password), not_premium or unavailable.", body = crate::web_capture::WindyVerifyResult),
+            (status = 403, description = "Admin role and an unscoped key are required.", body = crate::problem::Problem),
+            (status = 409, description = "No account set, store not configured, or a check is already running.", body = crate::problem::Problem),
+        ),
+    )
+)]
+pub(crate) async fn verify_windy_account(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> ControlResult<Response> {
+    principal.role.require(Action::Administer)?;
+    let provider = state.web_capture.clone();
+    let actor = principal.clone();
+    let result = tokio::task::spawn_blocking(move || provider.verify_windy_account(&actor))
+        .await
+        .map_err(|_| ControlError::Repository("Windy verify worker failed".into()))??;
+    state.audit(
+        &principal.key_id,
+        crate::audit::AuditAction::Command,
+        "integration",
+        "windy",
+        Some(serde_json::json!({"verify": result.result})),
+    );
+    Ok(no_store(result))
+}
+
 async fn send_chunk(
     tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
     chunk: Result<Vec<u8>, std::io::Error>,

@@ -3,7 +3,10 @@
 //! `openat`-pinned files, so it is not built here. The HTTP surface stays the
 //! same and reports capture as unavailable: capabilities say so, and every job
 //! operation answers as an unconfigured provider does on unix.
-use super::{Admission, CancelResult, CaptureBody, JobView, ARTIFACT_STREAMS, WINDY_TERMS_VERSION};
+use super::{
+    Admission, CancelResult, CaptureBody, JobView, WindyAccountView, WindyVerifyResult,
+    ARTIFACT_STREAMS, WINDY_TERMS_VERSION,
+};
 use crate::{
     auth::{authorize_object, Action, Principal},
     error::{ControlError, ControlResult},
@@ -51,6 +54,46 @@ impl Provider {
         serde_json::json!({"capture_available":false,"capture_unavailable_reason":"browser capture is not supported on this platform","premium_available":false,"url_fetch_available":false,"url_fetch_reason":"enforced download boundary not provisioned","accounting":"unavailable","kernel_limits":false})
     }
 
+    fn windy_unavailable(p: &Principal) -> ControlResult<()> {
+        p.role.require(Action::Administer)?;
+        crate::routes::require_unscoped_for_whole_system(p)?;
+        Err(ControlError::Conflict(
+            "the Windy account store is not configured on this server".into(),
+        ))
+    }
+    /// Admin only; no account store on this platform.
+    /// # Errors
+    /// Always.
+    pub fn windy_account(&self, p: &Principal) -> ControlResult<WindyAccountView> {
+        Self::windy_unavailable(p).map(|()| unreachable_view())
+    }
+    /// Admin only; no account store on this platform.
+    /// # Errors
+    /// Always.
+    pub fn set_windy_account(
+        &self,
+        p: &Principal,
+        _email: &str,
+        _password: &str,
+    ) -> ControlResult<WindyAccountView> {
+        Self::windy_unavailable(p).map(|()| unreachable_view())
+    }
+    /// Admin only; no account store on this platform.
+    /// # Errors
+    /// Always.
+    pub fn clear_windy_account(&self, p: &Principal) -> ControlResult<WindyAccountView> {
+        Self::windy_unavailable(p).map(|()| unreachable_view())
+    }
+    /// Admin only; no account store on this platform.
+    /// # Errors
+    /// Always.
+    pub fn verify_windy_account(&self, p: &Principal) -> ControlResult<WindyVerifyResult> {
+        Self::windy_unavailable(p).map(|()| WindyVerifyResult {
+            result: super::WindyVerdict::Unavailable,
+            account: unreachable_view(),
+        })
+    }
+
     /// Authorize, then refuse: no capture service on this platform.
     /// # Errors
     /// Unauthorized objects, or [`ControlError::EngineBusy`].
@@ -73,7 +116,7 @@ impl Provider {
             ));
         }
         if !body.view.public {
-            return Err(ControlError::Conflict("authenticated Windy capture is unavailable until the account resolver is configured".into()));
+            return Err(ControlError::Conflict("Windy Premium is not available: set and verify the Windy account (Settings → Integrations → Windy)".into()));
         }
         let capture = Capture {
             width: body.view.width,
@@ -141,5 +184,15 @@ impl Provider {
         p.role.require(Action::Write)?;
         let _ = self.status(p, id)?;
         Err(ControlError::EngineBusy)
+    }
+}
+
+fn unreachable_view() -> WindyAccountView {
+    WindyAccountView {
+        set: false,
+        last_verified_at: None,
+        result: None,
+        premium_available: false,
+        verifying: false,
     }
 }

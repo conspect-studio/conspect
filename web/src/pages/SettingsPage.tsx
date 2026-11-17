@@ -4,7 +4,7 @@
 import { useMemo, useState } from "react";
 import type { JSX } from "react";
 import { Trans, useLingui } from "@lingui/react/macro";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { createApiClient } from "../api/client";
 import { getStoredToken, setStoredToken } from "../api/token";
@@ -26,6 +26,15 @@ import { Label } from "../components/ui/label";
 import { toast } from "../components/ui/use-toast";
 import { useActiveLocale } from "../i18n/I18nProvider";
 import { formatDateTime } from "../i18n/format";
+import {
+  clearWindyAccount,
+  getWindyAccount,
+  setWindyAccount,
+  verifyWindyAccount,
+} from "../api/windy-account";
+import type { WindyAccountView, WindyVerdict } from "../api/windy-account";
+import { OperationApiError } from "../api/operations";
+import { captureCapabilitiesKey } from "../api/web-captureQueries";
 
 /**
  * The "Configuration file" card (ADR-W020): whether the boot config file is
@@ -123,6 +132,201 @@ function ConfigWatchCard(): JSX.Element {
 }
 
 /** The settings page. */
+
+const WINDY_ACCOUNT_KEY = ["integrations", "windy"] as const;
+
+/**
+ * Settings → Integrations → Windy (issue #470). Admin only: a non-admin gets
+ * 403 and the card says so. The password is write-only — the server never
+ * returns it, and the field is cleared after every save.
+ */
+function WindyIntegrationCard(): JSX.Element {
+  const { t } = useLingui();
+  const locale = useActiveLocale();
+  const queryClient = useQueryClient();
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const account = useQuery({
+    queryKey: WINDY_ACCOUNT_KEY,
+    queryFn: () => getWindyAccount(),
+    retry: false,
+  });
+  const apply = (view: WindyAccountView): void => {
+    queryClient.setQueryData(WINDY_ACCOUNT_KEY, view);
+    void queryClient.invalidateQueries({ queryKey: captureCapabilitiesKey });
+  };
+  const verdictText = (verdict: WindyVerdict): string => {
+    switch (verdict) {
+      case "premium":
+        return t`Login OK — Premium active`;
+      case "rejected":
+        return t`Login failed: wrong email or password`;
+      case "not_premium":
+        return t`Logged in, but the account has no Premium subscription`;
+      case "unavailable":
+        return t`Login check could not complete (network or site change); try again`;
+    }
+  };
+  const save = useMutation({
+    mutationFn: () => setWindyAccount(email, password),
+    onSuccess: (view) => {
+      setPassword("");
+      apply(view);
+      toast({ title: t`Windy account saved`, description: t`Run "Test login" to enable Premium capture.` });
+    },
+    onError: (error: Error) => {
+      toast({ title: t`Windy account not saved`, description: error.message, variant: "destructive" });
+    },
+  });
+  const clear = useMutation({
+    mutationFn: () => clearWindyAccount(),
+    onSuccess: (view) => {
+      apply(view);
+      toast({ title: t`Windy account removed` });
+    },
+  });
+  const verify = useMutation({
+    mutationFn: () => verifyWindyAccount(),
+    onSuccess: (result) => {
+      apply(result.account);
+      toast({
+        title: verdictText(result.result),
+        ...(result.result === "premium" ? {} : { variant: "destructive" as const }),
+      });
+    },
+    onError: (error: Error) => {
+      toast({ title: t`Login check failed`, description: error.message, variant: "destructive" });
+    },
+  });
+  const forbidden = account.error instanceof OperationApiError && account.error.status === 403;
+  const unconfigured = account.error instanceof OperationApiError && account.error.status === 409;
+  const view = account.data;
+  const busy = save.isPending || clear.isPending || verify.isPending;
+
+  return (
+    <Card className="lg:col-span-2">
+      <CardHeader>
+        <CardTitle>
+          <Trans>Integrations — Windy</Trans>
+        </CardTitle>
+        <CardDescription>
+          <Trans>
+            The Windy account used for Premium captures. Stored encrypted on the
+            server and never shown again; only administrators can change it.
+          </Trans>
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        {forbidden ? (
+          <p className="text-sm text-muted-foreground">
+            <Trans>Only an administrator can view or change the Windy account.</Trans>
+          </p>
+        ) : unconfigured ? (
+          <p className="text-sm text-muted-foreground">
+            <Trans>
+              The Windy account store is not configured on this server
+              (CONSPECT_WINDY_MASTER_KEY_FILE).
+            </Trans>
+          </p>
+        ) : (
+          <>
+            <div className="flex flex-wrap items-center gap-2" data-testid="windy-account-status">
+              {view?.set === true ? (
+                <Badge variant="secondary">
+                  <Trans>Account set</Trans>
+                </Badge>
+              ) : (
+                <Badge variant="outline">
+                  <Trans>No account</Trans>
+                </Badge>
+              )}
+              {view?.premium_available === true ? (
+                <Badge>
+                  <Trans>Premium available</Trans>
+                </Badge>
+              ) : null}
+              {view?.result != null ? (
+                <span className="text-sm">{verdictText(view.result)}</span>
+              ) : view?.set === true ? (
+                <span className="text-sm text-muted-foreground">
+                  <Trans>Not tested yet</Trans>
+                </span>
+              ) : null}
+              {view?.last_verified_at != null ? (
+                <span className="text-xs text-muted-foreground">
+                  <Trans>Last tested {formatDateTime(locale, new Date(view.last_verified_at))}</Trans>
+                </span>
+              ) : null}
+            </div>
+            <form
+              className="flex flex-col gap-3 sm:flex-row sm:items-end"
+              onSubmit={(event): void => {
+                event.preventDefault();
+                save.mutate();
+              }}
+            >
+              <div className="flex flex-1 flex-col gap-1.5">
+                <Label htmlFor="windy-email">
+                  <Trans>Windy email</Trans>
+                </Label>
+                <Input
+                  id="windy-email"
+                  type="email"
+                  autoComplete="off"
+                  value={email}
+                  onChange={(event): void => {
+                    setEmail(event.target.value);
+                  }}
+                />
+              </div>
+              <div className="flex flex-1 flex-col gap-1.5">
+                <Label htmlFor="windy-password">
+                  <Trans>Windy password</Trans>
+                </Label>
+                <Input
+                  id="windy-password"
+                  type="password"
+                  autoComplete="new-password"
+                  placeholder={view?.set === true ? t`(unchanged)` : ""}
+                  value={password}
+                  onChange={(event): void => {
+                    setPassword(event.target.value);
+                  }}
+                />
+              </div>
+              <div className="flex gap-2">
+                <Button type="submit" disabled={busy || email === "" || password === ""}>
+                  <Trans>Save Windy account</Trans>
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={busy || view?.set !== true}
+                  onClick={(): void => {
+                    verify.mutate();
+                  }}
+                >
+                  {verify.isPending ? <Trans>Testing…</Trans> : <Trans>Test login</Trans>}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={busy || view?.set !== true}
+                  onClick={(): void => {
+                    clear.mutate();
+                  }}
+                >
+                  <Trans>Remove</Trans>
+                </Button>
+              </div>
+            </form>
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 export function SettingsPage(): JSX.Element {
   const { t } = useLingui();
   const queryClient = useQueryClient();
@@ -233,6 +437,8 @@ export function SettingsPage(): JSX.Element {
         </Card>
 
         <ConfigWatchCard />
+
+        <WindyIntegrationCard />
 
         <Card className="lg:col-span-2">
           <CardHeader>

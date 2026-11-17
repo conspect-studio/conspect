@@ -179,6 +179,7 @@ impl ManagedCloudflare {
                 email: email.clone(),
                 key: key.clone(),
             },
+            multiview_credentials::Credential::Password { .. } => return Err("credential"),
         };
         let client = Client::new(r.account_id.clone(), credential).map_err(|_| "account")?;
         #[cfg(test)]
