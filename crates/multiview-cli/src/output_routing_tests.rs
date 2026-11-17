@@ -424,7 +424,11 @@ fn settle_workers(r: &OutputRouter, bound: std::time::Duration) {
 
 /// The calling thread's cumulative time runnable but waiting for a CPU
 /// (preempted), from `/proc/thread-self/schedstat` (Linux; field 2, ns).
-/// `None` elsewhere, so a caller then counts the whole wall time.
+/// `None` elsewhere, so a caller then counts the whole wall time (strict, not
+/// preemption-corrected: the CI routing steps run on Linux, where
+/// [`a_slow_close_never_blocks_the_consumer`] requires this to be readable).
+/// Field 2 is `sched_info` run delay, kept whether or not the
+/// `kernel.sched_schedstats` sysctl is on.
 ///
 /// A router call's wall time minus this is time it spent on a CPU or
 /// sleeping/blocked: a wait, timed join, sleep or spin is all still counted;
@@ -639,14 +643,18 @@ impl Harness {
         self.clean.push((t, clean));
         // The baked Program picture, for a reformatted output's key (#342 B3).
         self.r.publish_program(t, &canvas());
-        let queued = runqueue_wait();
+        // The wall interval encloses both runqueue reads, so only preemption
+        // inside the measured interval is subtracted, and the reads' own cost
+        // counts against the router (#501 review R3).
         let started = Instant::now();
+        let queued = runqueue_wait();
         self.r
             .on_tick(t, pts(t), &mut self.d, &mut self.rec)
             .unwrap();
+        let requeued = runqueue_wait();
         let took = started.elapsed();
         self.max_router = self.max_router.max(took);
-        let preempted = runqueue_wait()
+        let preempted = requeued
             .zip(queued)
             .map_or(std::time::Duration::ZERO, |(after, before)| {
                 after.saturating_sub(before)
@@ -1132,6 +1140,13 @@ fn a_slow_close_never_blocks_the_consumer() {
     const SLOW_FINISH_TICKS: u64 = 16;
     /// Independent slow closes.
     const SLOW_CLOSES: usize = 5;
+    // Preemption correction is required where CI runs this test, never
+    // silently absent there.
+    #[cfg(target_os = "linux")]
+    assert!(
+        runqueue_wait().is_some(),
+        "/proc/thread-self/schedstat is unreadable: the router bound would measure the host"
+    );
     let encoded = Arc::new(AtomicUsize::new(0));
     let held: Arc<std::sync::Mutex<Vec<HeldClose>>> = Arc::default();
     let (enc, opened) = (Arc::clone(&encoded), Arc::clone(&held));
