@@ -305,6 +305,11 @@ pub fn scope_permits(scopes: &AuthzScopes<'_>, scope: AuthzScope<'_>) -> bool {
             allowlist_permits(scopes.objects, Some(object))
                 && output_scope_permits(scopes.outputs, output)
         }
+        AuthzScope::Keyer { me, program, keyer } => {
+            allowlist_permits(scopes.objects, Some(me))
+                && program_scope_permits(scopes.outputs, program)
+                && allowlist_permits(scopes.objects, Some(keyer))
+        }
     }
 }
 

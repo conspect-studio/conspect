@@ -267,6 +267,9 @@
                   "$ref": "#/components/schemas/SwitcherOperation"
                 },
                 {
+                  "$ref": "#/components/schemas/SwitcherKeyer"
+                },
+                {
                   "$ref": "#/components/schemas/MediaPlayerEvent"
                 },
                 {
@@ -530,6 +533,16 @@
         },
         "summary": "Client requests subscription to one or more topics.",
         "title": "$subscribe control frame (client to server)"
+      },
+      "SwitcherKeyer": {
+        "contentType": "application/json",
+        "description": "Emitted on topic `switcher` with envelope `id` = keyer object id (`<program>/<keyer>`), only on committed state changes, never per ramp tick (ADR-0113 §8). Lossless. Delivered only to principals with the M/E object, the `program:<id>` grant and the keyer object; a fill or key source the principal cannot read is `\"redacted\"`, exactly as `GET /api/v1/switcher/{me}`.",
+        "name": "SwitcherKeyer",
+        "payload": {
+          "$ref": "#/components/schemas/SwitcherKeyer"
+        },
+        "summary": "A downstream keyer went on or off air, turned stale, or was redefined (switcher.keyer on topic `switcher`).",
+        "title": "Downstream keyer state change"
       },
       "SwitcherOperation": {
         "contentType": "application/json",
@@ -2114,6 +2127,61 @@
           "topic",
           "effective_rate_hz",
           "snapshot_seq"
+        ],
+        "type": "object"
+      },
+      "SwitcherKeyer": {
+        "description": "A committed downstream keyer change; envelope id equals the keyer object id.",
+        "properties": {
+          "fill": {
+            "description": "Fill source id, or `redacted`.",
+            "type": "string"
+          },
+          "key": {
+            "description": "Key source id, or `redacted`; absent for a self key.",
+            "type": "string"
+          },
+          "keyer": {
+            "description": "Keyer object id, `<program>/<keyer>`.",
+            "type": "string"
+          },
+          "me": {
+            "type": "string"
+          },
+          "on_air": {
+            "type": "boolean"
+          },
+          "program": {
+            "type": "string"
+          },
+          "reason": {
+            "enum": [
+              "operator",
+              "tie",
+              "on-at-start",
+              "source-lost",
+              "source-recovered",
+              "definition"
+            ],
+            "type": "string"
+          },
+          "stale": {
+            "type": "boolean"
+          },
+          "tick": {
+            "format": "uint64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "me",
+          "program",
+          "keyer",
+          "tick",
+          "on_air",
+          "stale",
+          "reason",
+          "fill"
         ],
         "type": "object"
       },
