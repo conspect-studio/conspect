@@ -1692,6 +1692,7 @@ mod digest_tests {
                     }),
                 }),
                 capture: CaptureOptions::default(),
+                output_cadence: None,
             },
             maximum_bytes: 1,
             timeout: Duration::from_secs(1),

@@ -113,6 +113,13 @@ async function main() {
       || req.frames < 2 || req.frames > 600 || !Number.isSafeInteger(req.fps)
       || req.fps < 1 || req.fps > 30) throw new Error('invalid capture limits');
   if (!req.browser || !req.ffmpeg) throw new Error('tool missing');
+  // Optional exact CFR output cadence (num/den, never a float): mirrors
+  // OutputCadence::validate in capture.rs.
+  const conform = req.output_cadence ?? null;
+  if (conform !== null && (typeof conform !== 'object' || !Number.isSafeInteger(conform.num)
+      || !Number.isSafeInteger(conform.den) || conform.num < 1 || conform.num > 240000
+      || conform.den < 1 || conform.den > 1001 || conform.num < conform.den
+      || conform.num > 120 * conform.den)) throw new Error('invalid capture limits');
   if (!Object.hasOwn(GL_FLAGS, req.gl ?? 'default')) throw new Error('invalid capture limits');
   if (req.capture !== 'steps' && req.capture !== 'realtime') throw new Error('invalid capture limits');
   const steps = req.capture === 'steps';
@@ -223,12 +230,7 @@ async function main() {
   const pixFmt = alpha ? 'yuva420p' : 'yuv420p';
   const spool = path.join(profile, 'mv-spool.mov');
   const SPOOL_MAX = 512 * 1024 * 1024;
-  const encoder = launch(req.ffmpeg, ['-nostdin', '-hide_banner', '-loglevel', 'error',
-    '-f', 'image2pipe', '-framerate', String(req.fps), '-vcodec', 'png', '-i', 'pipe:0',
-    '-an', '-vf', 'scale=in_range=full:out_color_matrix=bt709:out_range=tv,format=' + pixFmt + ',setparams=range=limited:color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709',
-    '-c:v', 'ffv1', '-threads', '2', '-pix_fmt', pixFmt,
-    '-color_primaries', 'bt709', '-color_trc', 'iec61966-2-1', '-colorspace', 'bt709', '-color_range', 'tv',
-    '-fs', String(SPOOL_MAX), '-y', '-f', 'mov', spool],
+  const encoder = launch(req.ffmpeg, encoderArgs(req.fps, conform, pixFmt, SPOOL_MAX, spool),
     {stdio: ['pipe', 'ignore', 'ignore']});
   const encoderExit = new Promise((resolve, reject) => {
     encoder.on('error', () => reject(new Error('encoder launch failed')));
@@ -353,9 +355,12 @@ async function main() {
   // Opaque output decodes plane 0 as gray; transparent output extracts the alpha plane,
   // which fails outright when the encoder stripped it.
   const vf = alpha ? 'alphaextract,format=gray' : 'format=gray';
+  // A conformed encode carries exactly the frame count the fps filter yields
+  // for `written` input frames (conformedFrames); otherwise exactly `written`.
+  const expected = conform === null ? written : conformedFrames(written, req.fps, conform);
   const decoded = await runFfmpeg(req.ffmpeg, ['-nostdin', '-hide_banner', '-loglevel', 'error', '-f', 'mov', '-protocol_whitelist', 'file', '-enable_drefs', '0', '-i', spool,
-    '-map', '0:v:0', '-vf', vf, '-f', 'rawvideo', 'pipe:1'], planeBytes * written + 1);
-  if (decoded.code !== 0 || decoded.bytes !== planeBytes * written) throw new Error('encoded frame count mismatch');
+    '-map', '0:v:0', '-vf', vf, '-f', 'rawvideo', 'pipe:1'], planeBytes * expected + 1);
+  if (decoded.code !== 0 || decoded.bytes !== planeBytes * expected) throw new Error('encoded frame count mismatch');
   await new Promise((resolve, reject) => {
     const rs = fs.createReadStream(spool);
     process.stdout.once('error', reject);
@@ -364,9 +369,34 @@ async function main() {
     rs.pipe(process.stdout, {end: false});
   });
   try { fs.unlinkSync(spool); } catch {}
-  process.stderr.write(JSON.stringify({event: 'capture_complete', frames: written, ...report,
+  process.stderr.write(JSON.stringify({event: 'capture_complete', frames: written, output_frames: expected,
+    ...(conform === null ? {} : {output_cadence: conform}), ...report,
     fps: req.fps, width: req.width, height: req.height, codec: 'ffv1', alpha,
     pix_fmt: pixFmt, color: 'bt709/srgb/limited'}) + '\n');
+}
+// The spool encoder's argv. `-framerate fps` stamps the PNG input stream; with
+// a conform cadence the `fps=num/den` filter resamples it to an exact CFR
+// output and `-r num/den` sets the stream rate, so r_frame_rate and
+// avg_frame_rate both equal num/den (the media player's exact cadence check).
+function encoderArgs(fps, conform, pixFmt, spoolMax, spool) {
+  const rate = conform === null ? null : conform.num + '/' + conform.den;
+  return ['-nostdin', '-hide_banner', '-loglevel', 'error',
+    '-f', 'image2pipe', '-framerate', String(fps), '-vcodec', 'png', '-i', 'pipe:0',
+    '-an', '-vf', 'scale=in_range=full:out_color_matrix=bt709:out_range=tv,format=' + pixFmt + ',setparams=range=limited:color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709'
+      + (rate === null ? '' : ',fps=' + rate),
+    ...(rate === null ? [] : ['-r', rate]),
+    '-c:v', 'ffv1', '-threads', '2', '-pix_fmt', pixFmt,
+    '-color_primaries', 'bt709', '-color_trc', 'iec61966-2-1', '-colorspace', 'bt709', '-color_range', 'tv',
+    '-fs', String(spoolMax), '-y', '-f', 'mov', spool];
+}
+// Frames ffmpeg's fps filter (round=near, eof_action=round) emits for `input`
+// frames at integer `fps`: the input lasts input/fps s, rounded to the nearest
+// output frame with ties up: floor(input*num/(fps*den) + 1/2). BigInt keeps it
+// exact. Mirrors OutputCadence::conformed_frames (capture.rs).
+function conformedFrames(input, fps, conform) {
+  const numer = BigInt(input) * BigInt(conform.num);
+  const denom = BigInt(fps) * BigInt(conform.den);
+  return Number((2n * numer + denom) / (2n * denom));
 }
 // Submit the Windy login form over the private CDP pipe. The credential arrives
 // only on this process's stdin; it is never logged or written to disk by us.

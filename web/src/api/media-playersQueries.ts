@@ -39,7 +39,15 @@ import type {
   RequestOptions,
 } from './media-players';
 
-export type { MediaPlayer, ArtifactRef, LoadOperation, LoadResponse, LoadThen, NativeLoadAck } from './media-players';
+export type {
+  MediaPlayer,
+  ArtifactRef,
+  LoadFailureCode,
+  LoadOperation,
+  LoadResponse,
+  LoadThen,
+  NativeLoadAck,
+} from './media-players';
 export { isTerminalLoadOperationState } from './media-players';
 export type { LoadOperationState } from './media-players';
 export { OperationApiError } from './operations';

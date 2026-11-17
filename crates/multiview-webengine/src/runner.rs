@@ -491,6 +491,7 @@ fn run_host(
         "capture": capture.effective_capture(),
         "timing": capture.capture.timing, "frame_ms": capture.capture.frame_ms,
         "end_hold_ms": capture.capture.end_hold_ms, "max_steps": capture.capture.max_steps,
+        "output_cadence": capture.output_cadence,
         "verify": verify,
     }))?;
     let mut command = Command::new(&tools.node);
@@ -594,6 +595,8 @@ pub fn verify_premium(
             mode: Some(crate::capture::CaptureMode::Realtime),
             ..crate::capture::CaptureOptions::default()
         },
+        // A login check produces no artifact: nothing to conform.
+        output_cadence: None,
     };
     capture.validate()?;
     tools.validate()?;
@@ -702,6 +705,23 @@ pub fn run_capture_observed(
         .ok_or_else(|| io::Error::other("capture completion missing"))?;
     let marker: serde_json::Value = serde_json::from_slice(&line)
         .map_err(|_| io::Error::other("capture completion missing"))?;
+    if !completion_valid(capture, &marker) {
+        return Err(io::Error::other("capture completion invalid"));
+    }
+    control.check()?;
+    // With no byte written `complete` refuses before touching storage, so only
+    // a commit that had content can be uncertain.
+    pending.complete().map_err(|e| {
+        if wrote {
+            io::Error::new(e.kind(), CommitUncertain)
+        } else {
+            e
+        }
+    })
+}
+
+/// Whether the producer's `capture_complete` record matches the request.
+fn completion_valid(capture: &crate::capture::Capture, marker: &serde_json::Value) -> bool {
     // Realtime writes exactly `frames`; steps writes a producer-derived count
     // that is still bounded by the frame cap and reports at least two kept steps.
     let frames = marker.get("frames").and_then(serde_json::Value::as_u64);
@@ -715,23 +735,21 @@ pub fn run_capture_observed(
                     .is_some_and(|k| k >= 2)
         }
     };
-    if marker.get("event").and_then(serde_json::Value::as_str) != Some("capture_complete")
-        || !frames_ok
-        || (capture.background == crate::capture::Background::Transparent
-            && marker.get("alpha").and_then(serde_json::Value::as_bool) != Some(true))
-    {
-        return Err(io::Error::other("capture completion invalid"));
-    }
-    control.check()?;
-    // With no byte written `complete` refuses before touching storage, so only
-    // a commit that had content can be uncertain.
-    pending.complete().map_err(|e| {
-        if wrote {
-            io::Error::new(e.kind(), CommitUncertain)
-        } else {
-            e
-        }
-    })
+    // A conformed MOV must carry exactly the frame count the `fps` filter
+    // yields for the written input (see `OutputCadence::conformed_frames`).
+    let conform_ok = capture.output_cadence.is_none_or(|cadence| {
+        frames.is_some_and(|f| {
+            marker
+                .get("output_frames")
+                .and_then(serde_json::Value::as_u64)
+                == Some(cadence.conformed_frames(f, capture.fps))
+        })
+    });
+    marker.get("event").and_then(serde_json::Value::as_str) == Some("capture_complete")
+        && frames_ok
+        && conform_ok
+        && (capture.background != crate::capture::Background::Transparent
+            || marker.get("alpha").and_then(serde_json::Value::as_bool) == Some(true))
 }
 
 #[cfg(test)]

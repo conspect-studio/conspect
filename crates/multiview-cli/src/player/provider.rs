@@ -5,7 +5,10 @@ use super::{Generation, PlayerRuntime};
 use multiview_control::{
     auth::Principal,
     error::{ControlError, ControlResult},
-    player_load::{ArtifactRef, LoadOperation, LoadThen, PlayerLoadProvider},
+    player_load::{
+        ArtifactRef, LoadFailureCode, LoadOperation, LoadThen, PlayerLoadProvider,
+        MAX_LOAD_DETAIL_BYTES,
+    },
 };
 use std::{
     collections::HashMap,
@@ -142,12 +145,23 @@ impl RuntimeProvider {
         }
         Ok(())
     }
+    /// Management-plane only (never the tick path): latch the first terminal
+    /// view and log a failed one exactly once, at that latch.
     fn reconcile(record: &mut Record, runtime: &PlayerRuntime) -> LoadOperation {
         if let Some(view) = &record.terminal {
             return view.clone();
         }
         let view = Self::view(runtime, record.generation);
         if view.state != "pending" {
+            if view.state == "failed" {
+                tracing::warn!(
+                    player = %record.player,
+                    operation = view.operation,
+                    reason = ?view.reason,
+                    detail = view.detail.as_deref().unwrap_or(""),
+                    "media player load failed"
+                );
+            }
             record.terminal = Some(view.clone());
         }
         view
@@ -155,28 +169,33 @@ impl RuntimeProvider {
     fn view(runtime: &PlayerRuntime, generation: Generation) -> LoadOperation {
         let native = runtime.native.load();
         let ack = native.as_ref().filter(|a| a.generation == generation.0);
-        let fault_refused = matches!(
-            runtime.status.load().fault,
-            Some(
-                super::PlayerFault::AudioUnavailable { generation: g }
-                | super::PlayerFault::LoadJournalFailed { generation: g }
-                | super::PlayerFault::LoadReferenceMissing { generation: g }
-            ) if g == generation.0
-        );
-        let state = classify(Facts {
+        let fault = runtime
+            .status
+            .load()
+            .fault
+            .and_then(|fault| fault_code(fault, generation));
+        let opener_failure = runtime
+            .opener
+            .status()
+            .last_failure
+            .filter(|f| f.generation == generation);
+        let audio_closed = runtime.audio_commit.is_closed();
+        let facts = Facts {
             acked: ack.is_some(),
             ack_has_audio: ack.is_some_and(|a| a.has_audio),
             adopted: runtime.audio_commit.has_adopted(generation),
-            audio_closed: runtime.audio_commit.is_closed(),
-            fault_refused,
-            opener_failed: runtime
-                .opener
-                .status()
-                .last_failure
-                .is_some_and(|f| f.generation == generation),
+            audio_closed,
+            fault_refused: fault.is_some(),
+            opener_failed: opener_failure.is_some(),
             superseded: runtime.coordinator.is_superseded(generation),
-        });
+        };
+        let state = classify(facts);
         let completed = state == "completed";
+        let (reason, detail) = if state == "failed" {
+            failure_reason(facts, fault, opener_failure.as_ref())
+        } else {
+            (None, None)
+        };
         LoadOperation {
             operation: generation.0,
             state,
@@ -185,8 +204,117 @@ impl RuntimeProvider {
             } else {
                 None
             },
+            reason,
+            detail,
         }
     }
+}
+
+/// The engine fault recorded against exactly `generation`, as a wire code.
+fn fault_code(fault: super::PlayerFault, generation: Generation) -> Option<LoadFailureCode> {
+    match fault {
+        super::PlayerFault::AudioUnavailable { generation: g } if g == generation.0 => {
+            Some(LoadFailureCode::AudioUnavailable)
+        }
+        super::PlayerFault::LoadJournalFailed { generation: g } if g == generation.0 => {
+            Some(LoadFailureCode::JournalFailed)
+        }
+        super::PlayerFault::LoadReferenceMissing { generation: g } if g == generation.0 => {
+            Some(LoadFailureCode::ReferenceMissing)
+        }
+        _ => None,
+    }
+}
+
+/// The opener's classified reason as its stable wire code.
+fn opener_code(reason: super::LoadFailureReason) -> LoadFailureCode {
+    use super::LoadFailureReason as R;
+    match reason {
+        R::NotFound => LoadFailureCode::NotFound,
+        R::InvalidData => LoadFailureCode::InvalidData,
+        R::Timeout => LoadFailureCode::Timeout,
+        R::WrongCadence => LoadFailureCode::WrongCadence,
+        R::Vfr => LoadFailureCode::Vfr,
+        R::NoCadence => LoadFailureCode::NoCadence,
+        R::Alpha => LoadFailureCode::Alpha,
+        R::NoVideoStream => LoadFailureCode::NoVideoStream,
+        R::UnknownLength => LoadFailureCode::UnknownLength,
+        R::InvalidWindow => LoadFailureCode::InvalidWindow,
+        R::DecoderOpen => LoadFailureCode::DecoderOpen,
+        R::NoFrames => LoadFailureCode::NoFrames,
+        R::Other => LoadFailureCode::Other,
+    }
+}
+
+/// A fixed, path-free explanation per code.
+const fn generic_detail(code: LoadFailureCode) -> &'static str {
+    match code {
+        LoadFailureCode::NotFound => "clip not found",
+        LoadFailureCode::InvalidData => "clip container could not be parsed",
+        LoadFailureCode::Timeout => "clip open or prime timed out",
+        LoadFailureCode::WrongCadence => "clip frame rate does not match the canvas frame rate",
+        LoadFailureCode::Vfr => "clip is variable frame rate",
+        LoadFailureCode::NoCadence => "clip declares no frame rate",
+        LoadFailureCode::Alpha => "clip carries an alpha plane",
+        LoadFailureCode::NoVideoStream => "container has no video stream",
+        LoadFailureCode::UnknownLength => "clip length is unknown",
+        LoadFailureCode::InvalidWindow => "clip playout window is invalid",
+        LoadFailureCode::DecoderOpen => "video decoder could not be opened",
+        LoadFailureCode::NoFrames => "no decodable frame at the in-point",
+        LoadFailureCode::AudioUnavailable => "clip carries audio but the audio rail is closed",
+        LoadFailureCode::JournalFailed => "durable binding journal refused the load",
+        LoadFailureCode::ReferenceMissing => "load has no resolvable durable identity",
+        LoadFailureCode::Other => "load failed",
+    }
+}
+
+/// Redacted operator detail. Only reasons produced by the pure probe/geometry
+/// checks (whose messages name rates, frame counts and byte bounds, never a
+/// path) carry the opener's own text; every libav-derived reason, whose error
+/// text can embed the input path, gets a fixed message. Truncated on a char
+/// boundary to [`MAX_LOAD_DETAIL_BYTES`].
+fn redacted_detail(code: LoadFailureCode, detail: &str) -> String {
+    let pure = matches!(
+        code,
+        LoadFailureCode::WrongCadence
+            | LoadFailureCode::Vfr
+            | LoadFailureCode::NoCadence
+            | LoadFailureCode::Alpha
+            | LoadFailureCode::NoVideoStream
+            | LoadFailureCode::UnknownLength
+            | LoadFailureCode::InvalidWindow
+            | LoadFailureCode::NoFrames
+    );
+    let text = if pure && !detail.is_empty() {
+        detail
+    } else {
+        generic_detail(code)
+    };
+    let mut end = text.len().min(MAX_LOAD_DETAIL_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
+/// The typed reason for a `failed` view, in the same precedence as
+/// [`classify`]: an engine refusal, then the opener's failure, then a stranded
+/// audio-bearing ACK on a closed rail.
+fn failure_reason(
+    facts: Facts,
+    fault: Option<LoadFailureCode>,
+    opener: Option<&super::LoadFailure>,
+) -> (Option<LoadFailureCode>, Option<String>) {
+    let (code, detail) = if let Some(code) = fault {
+        (code, String::new())
+    } else if let Some(failure) = opener {
+        (opener_code(failure.reason), failure.detail.clone())
+    } else if facts.acked && facts.ack_has_audio && facts.audio_closed {
+        (LoadFailureCode::AudioUnavailable, String::new())
+    } else {
+        (LoadFailureCode::Other, String::new())
+    };
+    (Some(code), Some(redacted_detail(code, &detail)))
 }
 impl PlayerLoadProvider for RuntimeProvider {
     fn load(
@@ -379,6 +507,138 @@ mod tests {
         );
         assert_eq!(classify(BASE), "pending");
     }
+    #[test]
+    fn wrong_cadence_failure_carries_typed_reason_and_rates_detail() {
+        let detail = crate::player::ProbeError::Cadence {
+            want_num: 30000,
+            want_den: 1001,
+            got_num: 25,
+            got_den: 1,
+        }
+        .to_string();
+        let failure = super::super::LoadFailure {
+            generation: Generation(3),
+            reason: super::super::LoadFailureReason::WrongCadence,
+            detail,
+        };
+        let facts = Facts {
+            opener_failed: true,
+            ..BASE
+        };
+        assert_eq!(classify(facts), "failed");
+        let (reason, detail) = failure_reason(facts, None, Some(&failure));
+        assert_eq!(reason, Some(LoadFailureCode::WrongCadence));
+        assert_eq!(
+            detail.as_deref(),
+            Some("clip frame rate 25/1 does not match the canvas frame rate 30000/1001")
+        );
+        let wire = serde_json::to_value(LoadFailureCode::WrongCadence).unwrap();
+        assert_eq!(wire, "wrong_cadence");
+    }
+    #[test]
+    fn libav_derived_details_never_leak_paths() {
+        for (reason, code) in [
+            (
+                super::super::LoadFailureReason::NotFound,
+                LoadFailureCode::NotFound,
+            ),
+            (
+                super::super::LoadFailureReason::InvalidData,
+                LoadFailureCode::InvalidData,
+            ),
+            (
+                super::super::LoadFailureReason::Timeout,
+                LoadFailureCode::Timeout,
+            ),
+            (
+                super::super::LoadFailureReason::DecoderOpen,
+                LoadFailureCode::DecoderOpen,
+            ),
+            (
+                super::super::LoadFailureReason::Other,
+                LoadFailureCode::Other,
+            ),
+        ] {
+            let failure = super::super::LoadFailure {
+                generation: Generation(1),
+                reason,
+                detail: "failed to open input \"/srv/state/artifacts/secret.mov\": EIO".into(),
+            };
+            let (got, detail) = failure_reason(
+                Facts {
+                    opener_failed: true,
+                    ..BASE
+                },
+                None,
+                Some(&failure),
+            );
+            assert_eq!(got, Some(code));
+            let detail = detail.unwrap();
+            assert!(!detail.contains('/'), "{detail}");
+            assert_eq!(detail, generic_detail(code));
+        }
+    }
+    #[test]
+    fn engine_faults_and_stranded_audio_map_to_their_codes() {
+        let g = Generation(9);
+        assert_eq!(
+            fault_code(
+                super::super::PlayerFault::LoadJournalFailed { generation: 9 },
+                g
+            ),
+            Some(LoadFailureCode::JournalFailed)
+        );
+        assert_eq!(
+            fault_code(
+                super::super::PlayerFault::AudioUnavailable { generation: 9 },
+                g
+            ),
+            Some(LoadFailureCode::AudioUnavailable)
+        );
+        assert_eq!(
+            fault_code(
+                super::super::PlayerFault::LoadReferenceMissing { generation: 9 },
+                g
+            ),
+            Some(LoadFailureCode::ReferenceMissing)
+        );
+        assert_eq!(
+            fault_code(
+                super::super::PlayerFault::LoadJournalFailed { generation: 8 },
+                g
+            ),
+            None,
+            "a fault on another generation is not this operation's reason"
+        );
+        // The engine refusal wins over a concurrent opener record.
+        let (reason, _) = failure_reason(
+            Facts {
+                fault_refused: true,
+                ..BASE
+            },
+            Some(LoadFailureCode::JournalFailed),
+            None,
+        );
+        assert_eq!(reason, Some(LoadFailureCode::JournalFailed));
+        let stranded = Facts {
+            acked: true,
+            ack_has_audio: true,
+            audio_closed: true,
+            ..BASE
+        };
+        assert_eq!(classify(stranded), "failed");
+        assert_eq!(
+            failure_reason(stranded, None, None).0,
+            Some(LoadFailureCode::AudioUnavailable)
+        );
+    }
+    #[test]
+    fn detail_is_bounded_on_a_char_boundary() {
+        let long = "é".repeat(MAX_LOAD_DETAIL_BYTES);
+        let out = redacted_detail(LoadFailureCode::InvalidWindow, &long);
+        assert!(out.len() <= MAX_LOAD_DETAIL_BYTES);
+        assert!(out.chars().all(|c| c == 'é'));
+    }
     fn rec(player: &str, n: u64, terminal: bool) -> Record {
         Record {
             player: player.into(),
@@ -394,6 +654,8 @@ mod tests {
                 operation: n,
                 state: "completed",
                 native: None,
+                reason: None,
+                detail: None,
             }),
         }
     }

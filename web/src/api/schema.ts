@@ -6294,14 +6294,25 @@ export interface components {
             /** @description Whether the engine should stamp a corner watermark (derived, S3). */
             watermark: boolean;
         };
+        /**
+         * @description Typed reason a load operation ended `failed`. Stable wire codes.
+         * @enum {string}
+         */
+        LoadFailureCode: "not_found" | "invalid_data" | "timeout" | "wrong_cadence" | "vfr" | "no_cadence" | "alpha" | "no_video_stream" | "unknown_length" | "invalid_window" | "decoder_open" | "no_frames" | "audio_unavailable" | "journal_failed" | "reference_missing" | "other";
         /** @description Bounded operation view; completion needs native video and audio adoption. */
         LoadOperation: {
+            /**
+             * @description Short operator-facing explanation of `reason`. Redacted: never carries
+             *     a filesystem path, URL or credential; at most 256 bytes.
+             */
+            detail?: string | null;
             native?: null | components["schemas"]["NativeLoadAck"];
             /**
              * Format: int64
              * @description Operation id.
              */
             operation: number;
+            reason?: null | components["schemas"]["LoadFailureCode"];
             /** @description Lifecycle state name. */
             state: string;
         };

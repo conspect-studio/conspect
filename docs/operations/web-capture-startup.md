@@ -16,6 +16,20 @@ CONSPECT_WEB_BROWSER=/opt/chromium/chrome-headless-shell
 CONSPECT_WEB_FFMPEG=/opt/multiview-ffmpeg/bin/ffmpeg
 ```
 
+### Values deployed on mda001
+
+These are the values the live host runs with (issue #474). Each path is a real executable, not a wrapper or symlink; startup refuses symlinks.
+
+```ini
+CONSPECT_WEB_BROWSER=/usr/lib/chromium/chromium-headless-shell
+CONSPECT_WEB_FFMPEG=/usr/bin/ffmpeg
+CONSPECT_WEB_BROWSER_GL=egl
+```
+
+- Browser: the Debian `chromium-headless-shell` package binary under `/usr/lib/chromium/`. `/usr/bin/chromium*` are `sh` wrapper scripts and are not usable as the producer browser.
+- FFmpeg: the distribution `/usr/bin/ffmpeg` 7.1.5. The pinned `/opt/multiview-ffmpeg` build lacks the PNG decoder and the `image2pipe` demuxer the producer needs, so it cannot encode a capture.
+- GL: `egl` (ANGLE `gl-egl`) on the NVIDIA GPU. The host has no `/dev/dri` render node, so the browser default cannot reach the GPU; without `egl` Windy radar renders empty.
+
 Optional `CONSPECT_WEB_BROWSER_GL` selects the browser GL backend (deployment-only, never from HTTP; any other value aborts startup):
 
 | Value | Flags | Use |
@@ -47,6 +61,41 @@ Artifact transfer has a five-second send idle timeout and a thirty-second absolu
 A `202` response means a job was accepted. Follow the returned `status_url`. Only `state = succeeded` plus an immutable `artifact_id` means media was committed. `failed`, `cancelled` and `uncertain` are not success. A job failure must retain the previous good artifact.
 
 `GET /api/v1/media/captures/{id}/artifact` checks the owning actor and fill before pinning and streaming the immutable file. The stream uses bounded chunks and must release its lease if the client disconnects. It never resolves an API-supplied local file path.
+
+### Canvas cadence conform
+
+A media player accepts only a clip whose frame rate equals the canvas rate exactly (a `30000/1001` canvas refuses a `25/1` clip with `wrong_cadence`). The control plane therefore conforms every capture to the running canvas cadence: the request's `fps` still paces the screenshots (`-framerate fps` on the PNG input), and the encoder adds `fps=num/den` to the filter chain and `-r num/den` on the output, so the MOV is constant frame rate with `r_frame_rate = avg_frame_rate = num/den` (exact rational, never a float). The frame count becomes `floor(written * num / (fps * den) + 1/2)` — the clip duration rounded to the nearest canvas frame, exactly as ffmpeg's `fps` filter (default `round=near`) emits it. The producer validates the decoded count against that number and reports it as `output_frames` in `capture_complete`; any mismatch fails the job. A `target_player` capture on a run whose canvas cadence is unknown is refused with `409` rather than producing an unloadable artifact.
+
+### Load failure reasons
+
+`GET /api/v1/media/players/{id}/load-operations/{operation}` reports, for `state = failed`, a typed `reason` and a short `detail`:
+
+| `reason` | Meaning |
+|---|---|
+| `wrong_cadence` | clip frame rate ≠ canvas frame rate (detail names both, e.g. `clip frame rate 25/1 does not match the canvas frame rate 30000/1001`) |
+| `vfr`, `no_cadence` | variable or missing frame rate |
+| `alpha` | clip carries an alpha plane |
+| `not_found`, `invalid_data`, `no_video_stream`, `decoder_open`, `no_frames` | the artifact could not be opened, parsed or decoded |
+| `timeout` | open/prime deadline expired |
+| `unknown_length`, `invalid_window` | playout window could not be resolved or exceeds a bound |
+| `audio_unavailable` | the clip has audio but the player's audio rail is closed |
+| `journal_failed`, `reference_missing` | the durable player binding refused the load |
+| `other` | anything else |
+
+`detail` is redacted: libav-derived failures carry a fixed message, never a filesystem path. The engine logs one `WARN media player load failed` line per failed operation (player, operation, reason) when the operation is first read as terminal; the output clock never logs it. The Windy fill dialog shows the reason next to the failed load.
+
+### Putting a VT player on the desk
+
+A declared `[[media_players]]` channel is only addressable by transport verbs. To route it to cells, switcher buses or routing crosspoints, declare a source that binds it:
+
+```toml
+[[sources]]
+id = "vt-a"
+kind = "media_player"
+player = "vt-1"
+```
+
+The source opens nothing: its id resolves to the player channel's frame store (the player boot owns the decode thread), and its audio stays on the program bus once, under the player id; switcher audio-follow resolves `vt-a` to that channel. The source id must differ from every other player's id; reusing the bound player's own id (`id = "vt-1"`, `player = "vt-1"`) is allowed and names the channel itself. If the player could not boot (for example its journal is owned by another engine) the source reads no-signal and the engine still starts. Adding, editing or removing such a source on a running engine applies live (it is a binding change, not a producer start): the alias's video store and its program-audio channel move together at the same frame boundary, including a repoint to another player and a removal. An `[[audio.routes]]` entry may name the alias (`input_id = "vt-a"`); it gains the player's single channel (a player is never mixed twice), as do discrete tracks and routed `audio = source:vt-a` feeds. Changing the source to another kind gives it its own store; the player's channel is never shared with a producer, and no producer may take a player's id. Creating or editing a `media_player` source requires object authorization for the referenced player (and, on a repoint, the player it leaves).
 
 A target-player name in a request does not mean playback has occurred. Library promotion and the player load acknowledgement must be verified separately. Do not label the workflow "VT ready" until that acknowledgement exists.
 

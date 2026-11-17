@@ -149,6 +149,61 @@ pub struct Capture {
     /// Capture mode and step-loop options; omitted means defaults.
     #[serde(default)]
     pub capture: CaptureOptions,
+    /// Exact constant output cadence of the encoded MOV. When present the
+    /// producer conforms the `fps` screenshot stream to it (ffmpeg `fps`
+    /// filter) so the artifact is CFR at exactly the canvas rate and a media
+    /// player accepts it. Omitted means the MOV runs at `fps`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_cadence: Option<OutputCadence>,
+}
+
+/// An exact rational output frame rate (`num/den` frames per second); never a
+/// float, so 30000/1001 stays exact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputCadence {
+    /// Numerator, 1 through 240000.
+    pub num: u32,
+    /// Denominator, 1 through 1001.
+    pub den: u32,
+}
+
+/// Largest conformed output frame count the producer will encode/validate:
+/// the longest capture ([`MAX_FRAMES`] at 1 fps, 600 s) at 60 fps. The 512 MiB
+/// spool cap still bounds the encoded bytes.
+pub const MAX_CONFORMED_FRAMES: u64 = 36_000;
+
+impl OutputCadence {
+    /// Validate bounds: 1..=120 fps, integer num/den, den at most 1001.
+    /// # Errors
+    /// A zero, oversized or out-of-range rate.
+    pub fn validate(&self) -> std::io::Result<()> {
+        let ok = (1..=240_000).contains(&self.num)
+            && (1..=1001).contains(&self.den)
+            // 1 <= num/den <= 120, in integer math.
+            && u64::from(self.num) >= u64::from(self.den)
+            && u64::from(self.num) <= 120 * u64::from(self.den);
+        if ok {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("invalid output cadence"))
+        }
+    }
+
+    /// Frames ffmpeg's `fps` filter (default `round=near`, EOF handling
+    /// `round`) emits for `input` frames at integer `input_fps`:
+    /// `floor(input * num / (input_fps * den) + 1/2)` — the input duration
+    /// `input / input_fps` seconds, rounded to the nearest output frame with
+    /// ties rounding up. Exact integer math.
+    #[must_use]
+    pub fn conformed_frames(&self, input: u64, input_fps: u32) -> u64 {
+        let numer = u128::from(input) * u128::from(self.num);
+        let denom = u128::from(input_fps) * u128::from(self.den);
+        if denom == 0 {
+            return 0;
+        }
+        u64::try_from((2 * numer + denom) / (2 * denom)).unwrap_or(u64::MAX)
+    }
 }
 
 /// Capture mode plus the step-loop knobs (ignored in realtime mode).
@@ -207,6 +262,19 @@ impl Capture {
             || self.document.len() > 128 * 1024
         {
             return Err(std::io::Error::other("invalid capture limits"));
+        }
+        if let Some(cadence) = &self.output_cadence {
+            cadence.validate()?;
+            // Bound the conformed encode/validation work by the largest input
+            // the mode may write: realtime writes exactly `frames`, steps at
+            // most MAX_FRAMES.
+            let input = u64::from(match self.effective_capture() {
+                CaptureMode::Realtime => self.frames,
+                CaptureMode::Steps => MAX_FRAMES,
+            });
+            if cadence.conformed_frames(input, self.fps) > MAX_CONFORMED_FRAMES {
+                return Err(std::io::Error::other("invalid output cadence"));
+            }
         }
         if let Some(view) = &self.windy {
             if !self.document.is_empty()
