@@ -118,6 +118,12 @@ pub type SelectionSlot = Arc<SwapCell<Option<Arc<str>>>>;
 /// Clean (the pre-bake Program); PVW is also the incoming source of a
 /// transition in flight. Each is drawn full-canvas, so a selected source
 /// decodes at the canvas whether or not a cell of the live layout binds it.
+///
+/// A stored layout on a bus is named `layout:<id>` (#307): its full-canvas
+/// cell binds no decoder (harmless). Its bound sources are sized by the
+/// layout's own cells instead, published by the M/E layout registry into
+/// [`DisplayFollow::with_me_layout_sizing`] (#485); they are drawn at the
+/// layout canvas, which is the Program canvas whenever the layout composes.
 #[derive(Clone)]
 pub struct BusSizing {
     /// The PGM (and Clean) source.
@@ -184,18 +190,26 @@ pub fn aux_sizing_slot() -> AuxSizingSlot {
 /// `layout` itself when there are none (no allocation).
 #[must_use]
 pub fn sizing_layout(layout: &Arc<Layout>, extra: &[Cell]) -> Arc<Layout> {
-    sizing_layout_with(layout, extra, &[None, None])
+    sizing_layout_with(layout, extra, &[], &[None, None])
 }
 
-/// [`sizing_layout`] plus one full-canvas cell per selected M/E bus source
-/// (#469). `layout` itself when there is nothing to add (no allocation).
+/// [`sizing_layout`] plus the M/E layout sources' cells `me` (#485) and one
+/// full-canvas cell per selected M/E bus source (#469). `layout` itself
+/// when there is nothing to add (no allocation).
 #[must_use]
-fn sizing_layout_with(layout: &Arc<Layout>, extra: &[Cell], buses: &Buses) -> Arc<Layout> {
-    if extra.is_empty() && buses.iter().all(Option::is_none) {
+fn sizing_layout_with(
+    layout: &Arc<Layout>,
+    extra: &[Cell],
+    me: &[Cell],
+    buses: &Buses,
+) -> Arc<Layout> {
+    if extra.is_empty() && me.is_empty() && buses.iter().all(Option::is_none) {
         return Arc::clone(layout);
     }
     let mut sizing = Layout::clone(layout);
+    sizing.cells.reserve(extra.len() + me.len() + 2);
     sizing.cells.extend_from_slice(extra);
+    sizing.cells.extend_from_slice(me);
     sizing
         .cells
         .extend(buses.iter().flatten().map(|source| bus_cell(source)));
@@ -285,6 +299,7 @@ pub fn frac_to_px(frac: f32, extent: u32) -> u32 {
 pub struct DisplayFollow {
     layout: DisplayLayoutSlot,
     aux: Option<AuxSizingSlot>,
+    me_layouts: Option<AuxSizingSlot>,
     routes: Option<SourceSizingSlot>,
     buses: Option<BusSizing>,
     full_canvas: Option<FullCanvasGauge>,
@@ -313,6 +328,7 @@ impl DisplayFollow {
         Self {
             layout,
             aux: None,
+            me_layouts: None,
             routes: None,
             buses: None,
             full_canvas: None,
@@ -326,6 +342,14 @@ impl DisplayFollow {
     #[must_use]
     pub fn with_aux_sizing(mut self, aux: AuxSizingSlot) -> Self {
         self.aux = Some(aux);
+        self
+    }
+
+    /// Also size for the cells of the stored layouts registered as M/E
+    /// sources in `slot` (#485; written by the M/E layout registry).
+    #[must_use]
+    pub fn with_me_layout_sizing(mut self, slot: AuxSizingSlot) -> Self {
+        self.me_layouts = Some(slot);
         self
     }
 
@@ -366,17 +390,24 @@ impl DisplayFollow {
 
     /// The routed cells now (empty without aux sizing).
     fn aux_cells(&self) -> Arc<Vec<Cell>> {
-        static NONE: std::sync::OnceLock<Arc<Vec<Cell>>> = std::sync::OnceLock::new();
-        self.aux.as_ref().map_or_else(
-            || Arc::clone(NONE.get_or_init(|| Arc::new(Vec::new()))),
-            |slot| slot.load(),
-        )
+        load_cells(self.aux.as_ref())
+    }
+
+    /// The M/E layout sources' cells now (empty without M/E layout sizing).
+    fn me_cells(&self) -> Arc<Vec<Cell>> {
+        load_cells(self.me_layouts.as_ref())
     }
 
     /// The layout every size decision uses: the live layout plus the routed
-    /// cells plus a full-canvas cell per selected M/E bus source.
+    /// cells plus the M/E layout sources' cells plus a full-canvas cell per
+    /// selected M/E bus source.
     fn sizing(&self) -> Arc<Layout> {
-        sizing_layout_with(&self.layout.load(), &self.aux_cells(), &self.buses())
+        sizing_layout_with(
+            &self.layout.load(),
+            &self.aux_cells(),
+            &self.me_cells(),
+            &self.buses(),
+        )
     }
 
     /// Treat this decode as NVDEC, with software replacements, counting into
@@ -455,6 +486,15 @@ impl DisplayFollow {
             );
         }
     }
+}
+
+/// The cells in `slot` now, or a shared empty list without one.
+fn load_cells(slot: Option<&AuxSizingSlot>) -> Arc<Vec<Cell>> {
+    static NONE: std::sync::OnceLock<Arc<Vec<Cell>>> = std::sync::OnceLock::new();
+    slot.map_or_else(
+        || Arc::clone(NONE.get_or_init(|| Arc::new(Vec::new()))),
+        |slot| slot.load(),
+    )
 }
 
 /// Debounce for one decoder: reports a wanted size only once it has held for
@@ -562,6 +602,7 @@ pub struct DisplayFollower {
     id: String,
     seen: Arc<Layout>,
     seen_aux: Arc<Vec<Cell>>,
+    seen_me: Arc<Vec<Cell>>,
     seen_routes: SourceRoutes,
     seen_buses: Buses,
     desired: (u32, u32),
@@ -574,10 +615,11 @@ impl DisplayFollower {
     pub fn new(follow: DisplayFollow, id: &str, applied: (u32, u32)) -> Self {
         let seen = follow.layout.load();
         let seen_aux = follow.aux_cells();
+        let seen_me = follow.me_cells();
         let seen_routes = follow.routes();
         let seen_buses = follow.buses();
         let desired = routed_display_size(
-            &sizing_layout_with(&seen, &seen_aux, &seen_buses),
+            &sizing_layout_with(&seen, &seen_aux, &seen_me, &seen_buses),
             &seen_routes,
             id,
         );
@@ -586,6 +628,7 @@ impl DisplayFollower {
             id: id.to_owned(),
             seen,
             seen_aux,
+            seen_me,
             seen_routes,
             seen_buses,
             desired,
@@ -598,20 +641,23 @@ impl DisplayFollower {
     pub fn due(&mut self, now: Instant) -> Option<(u32, u32)> {
         let live = self.follow.layout.load();
         let live_aux = self.follow.aux_cells();
+        let live_me = self.follow.me_cells();
         let live_routes = self.follow.routes();
         let live_buses = self.follow.buses();
         if !Arc::ptr_eq(&live, &self.seen)
             || !Arc::ptr_eq(&live_aux, &self.seen_aux)
+            || !Arc::ptr_eq(&live_me, &self.seen_me)
             || !Arc::ptr_eq(&live_routes, &self.seen_routes)
             || !same_buses(&live_buses, &self.seen_buses)
         {
             self.desired = routed_display_size(
-                &sizing_layout_with(&live, &live_aux, &live_buses),
+                &sizing_layout_with(&live, &live_aux, &live_me, &live_buses),
                 &live_routes,
                 &self.id,
             );
             self.seen = live;
             self.seen_aux = live_aux;
+            self.seen_me = live_me;
             self.seen_routes = live_routes;
             self.seen_buses = live_buses;
         }
@@ -1813,6 +1859,77 @@ mod tests {
             follower.due(t0 + DISPLAY_SETTLE),
             Some(UNBOUND_DISPLAY_SIZE)
         );
+    }
+
+    /// #485: a source bound only in a cell (w = h = 0.5) of a stored layout
+    /// registered as an M/E source decodes at half the canvas; with the
+    /// slot empty the sizing layout is Program's own (same `Arc`).
+    #[test]
+    fn an_me_layout_cell_sizes_its_source() {
+        let program = layout(1920, 1080, vec![cell(Some("pip"), 0.25, 0.25)]);
+        let slot: DisplayLayoutSlot = Arc::new(SwapCell::new(Arc::new(program)));
+        let me = aux_sizing_slot();
+        let follow =
+            DisplayFollow::new(Arc::clone(&slot), None).with_me_layout_sizing(Arc::clone(&me));
+        let base = slot.load();
+        assert!(
+            Arc::ptr_eq(&follow.sizing(), &base),
+            "empty slot: Program's layout itself, no allocation"
+        );
+        assert_eq!(follow.size_for("cam"), UNBOUND_DISPLAY_SIZE);
+        me.store(Arc::new(vec![cell(Some("cam"), 0.5, 0.5)]));
+        assert_eq!(follow.size_for("cam"), (960, 540), "half the canvas");
+        assert_eq!(follow.size_for("pip"), (480, 270), "Program's cell kept");
+        // Removed: the size returns, after the settle, through the follower.
+        let mut follower = DisplayFollower::new(follow.clone(), "cam", (960, 540));
+        let t0 = Instant::now();
+        assert_eq!(follower.due(t0), None);
+        me.store(Arc::new(Vec::new()));
+        assert_eq!(follower.due(t0), None, "debounced");
+        assert_eq!(
+            follower.due(t0 + DISPLAY_SETTLE),
+            Some(UNBOUND_DISPLAY_SIZE)
+        );
+    }
+
+    /// #485 end to end: a stored layout taken to PGM names `layout:<id>` on
+    /// the bus (a full-canvas cell that binds no decoder), and the registry
+    /// publishes its body: the inner source reaches its cell size; after the
+    /// layout is unregistered and leaves PGM, the size returns.
+    #[test]
+    fn a_source_in_a_layout_on_program_reaches_its_cell_size() {
+        use multiview_control::me_layouts::MeLayoutSources;
+        let program = layout(1920, 1080, vec![cell(Some("pip"), 0.25, 0.25)]);
+        let slot: DisplayLayoutSlot = Arc::new(SwapCell::new(Arc::new(program)));
+        let adapter = crate::me_layouts::MeLayoutAdapter::new();
+        let buses = BusSizing::new();
+        let follow = DisplayFollow::new(Arc::clone(&slot), None)
+            .with_bus_sizing(buses.clone())
+            .with_me_layout_sizing(adapter.sizing_slot());
+        assert_eq!(follow.size_for("cam"), UNBOUND_DISPLAY_SIZE);
+        let body = multiview_control::output_routing::RoutedLayout {
+            id: "wall".to_owned(),
+            layout: layout(1920, 1080, vec![cell(Some("cam"), 0.5, 0.5)]),
+            slates: vec![multiview_config::FailoverSlate::Black],
+            audio: multiview_config::LayoutAudio::default(),
+            overlays: multiview_config::LayoutOverlays::none(),
+            revision: 1,
+        };
+        adapter
+            .register(multiview_control::output_routing::LayoutBody(Arc::new(
+                body,
+            )))
+            .unwrap();
+        buses.program.store(Some(Arc::from("layout:wall")));
+        assert_eq!(follow.size_for("cam"), (960, 540), "its cell size");
+        assert_eq!(
+            follow.size_for("layout:wall"),
+            (1920, 1080),
+            "the bus key is full canvas but binds no decoder"
+        );
+        buses.program.store(Some(Arc::from("pip")));
+        assert!(adapter.unregister("wall"));
+        assert_eq!(follow.size_for("cam"), UNBOUND_DISPLAY_SIZE, "returned");
     }
 
     /// A driver for "a" counting into `gauge`.
