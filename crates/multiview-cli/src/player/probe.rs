@@ -410,7 +410,10 @@ mod tests {
             validate_alpha("yuva444p10le", PixelAlpha::Supported, None),
             Ok(true)
         );
-        assert_eq!(validate_alpha("yuv420p", PixelAlpha::Opaque, None), Ok(false));
+        assert_eq!(
+            validate_alpha("yuv420p", PixelAlpha::Opaque, None),
+            Ok(false)
+        );
         // Alpha the layout map cannot carry is refused, with a remediation.
         let error = validate_alpha("pal8", PixelAlpha::Unsupported, None)
             .expect_err("unmappable alpha is refused");
@@ -424,6 +427,71 @@ mod tests {
         assert!(message.contains("pal8"), "{message}");
         assert!(message.contains("ProRes 4444"), "{message}");
         assert!(message.contains("PNG sequence"), "{message}");
+    }
+
+    /// A VPS NAL with `vps_max_layers_minus1 = layers - 1` (H.265 §7.3.2.1:
+    /// header `40 01`, then id/base flags `0x0C` and the 6-bit layer field
+    /// straddling bytes 0-1), followed by an SPS to prove the scan picks the
+    /// VPS.
+    fn vps(layers: u8) -> Vec<u8> {
+        let m = layers - 1;
+        vec![
+            0x40,
+            0x01,
+            0x0C | (m >> 4),
+            (m & 0x0F) << 4 | 0x01,
+            0xFF,
+            0xFF,
+        ]
+    }
+
+    fn hvcc(vps: &[u8]) -> Vec<u8> {
+        let mut record = vec![1_u8];
+        record.extend_from_slice(&[0; 21]);
+        record.push(2); // numOfArrays
+                        // An SPS array first, so the walk must skip it.
+        let sps = [0x42_u8, 0x01, 0x01, 0x60];
+        record.extend_from_slice(&[33, 0, 1, 0, u8::try_from(sps.len()).unwrap()]);
+        record.extend_from_slice(&sps);
+        record.extend_from_slice(&[0x80 | 32, 0, 1, 0, u8::try_from(vps.len()).unwrap()]);
+        record.extend_from_slice(vps);
+        record
+    }
+
+    #[test]
+    fn hevc_layer_count_is_read_from_hvcc_and_annex_b() {
+        for layers in [1_u8, 2, 3] {
+            assert_eq!(hevc_vps_max_layers(&hvcc(&vps(layers))), Some(layers));
+            let mut annex_b = vec![0, 0, 0, 1];
+            annex_b.extend_from_slice(&vps(layers));
+            annex_b.extend_from_slice(&[0, 0, 1, 0x42, 0x01, 0x01]);
+            assert_eq!(hevc_vps_max_layers(&annex_b), Some(layers));
+        }
+        // Malformed or VPS-free extradata yields no count (never a panic).
+        assert_eq!(hevc_vps_max_layers(&[]), None);
+        assert_eq!(hevc_vps_max_layers(&[1, 2, 3]), None);
+        let mut truncated = hvcc(&vps(2));
+        truncated.truncate(30);
+        assert_eq!(hevc_vps_max_layers(&truncated), None);
+        assert_eq!(hevc_vps_max_layers(&[0, 0, 1, 0x42, 0x01]), None);
+    }
+
+    #[test]
+    fn hevc_alpha_is_refused_with_a_remediation() {
+        // HEVC alpha's auxiliary layer decodes opaque (ADR-0058 §3): a
+        // multi-layer HEVC stream is refused even though its base-layer
+        // pixel format is opaque.
+        let error = validate_alpha("yuv420p", PixelAlpha::Opaque, Some(2))
+            .expect_err("multi-layer HEVC is refused");
+        assert_eq!(error, ProbeError::HevcAlpha { layers: 2 });
+        let message = error.to_string();
+        assert!(message.contains("HEVC alpha decodes opaque"), "{message}");
+        assert!(message.contains("ProRes 4444"), "{message}");
+        // Ordinary single-layer HEVC plays.
+        assert_eq!(
+            validate_alpha("yuv420p", PixelAlpha::Opaque, Some(1)),
+            Ok(false)
+        );
     }
 
     #[test]

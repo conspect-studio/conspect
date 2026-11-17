@@ -1181,12 +1181,12 @@ mod tests {
 
     impl Fixture {
         fn new(canvas: Rational) -> Self {
+            Self::with_config(OpenerConfig::new(canvas))
+        }
+
+        fn with_config(config: OpenerConfig) -> Self {
             let coordinator = Arc::new(LoadCoordinator::new());
-            let opener = PlayerOpener::new(
-                "player-1",
-                Arc::clone(&coordinator),
-                OpenerConfig::new(canvas),
-            );
+            let opener = PlayerOpener::new("player-1", Arc::clone(&coordinator), config);
             opener.start().expect("spawn opener off ingest");
             Self {
                 opener,
@@ -1307,6 +1307,8 @@ mod tests {
         assert_eq!(clip.probed.frames, Some(4));
         assert!(!clip.probed.has_audio);
         assert!(!clip.probed.has_alpha);
+        assert!(clip.alpha.is_none(), "an opaque clip builds no alpha path");
+        assert!(clip.first_image.alpha_plane().is_none());
         assert_eq!(clip.stream_index, 0);
         assert_eq!(clip.geometry.in_point(), 0);
         assert_eq!(clip.geometry.out_point(), 4);
@@ -1340,6 +1342,104 @@ mod tests {
         assert!(charged > 0);
         drop(staged);
         assert_eq!(player_audio_budget().used(), before);
+        fixture.finish();
+    }
+
+    /// Encode a 32x16, 25 fps, 5-frame white clip whose alpha is four 8-px
+    /// bands `[0, 85, 170, 255]` with the local `ffmpeg` CLI (as the #451
+    /// player alpha tests do), or `false` when the encoder is unavailable.
+    fn alpha_clip(path: &std::path::Path, codec: &[&str]) -> bool {
+        let source = "color=c=white:s=32x16:r=25:d=0.2,format=rgba,\
+                      geq=r=255:g=255:b=255:a='if(lt(X,8),0,if(lt(X,16),85,if(lt(X,24),170,255)))'";
+        std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg(source)
+            .args(codec)
+            .arg(path)
+            .status()
+            .is_ok_and(|s| s.success())
+            && path.exists()
+    }
+
+    /// K6 (#391): a supported alpha clip passes the load gate (it was refused
+    /// before), and the opener's primed tile image already carries the
+    /// straight alpha plane through the shared NV12+A attach.
+    #[test]
+    fn supported_alpha_clip_stages_with_its_alpha_plane() {
+        let fixture = Fixture::with_config(OpenerConfig::new(CADENCE).with_tile(
+            32,
+            16,
+            CanvasColor::default(),
+        ));
+        let path = fixture.dir.path().join("alpha_qtrle.mov");
+        if !alpha_clip(&path, &["-c:v", "qtrle", "-pix_fmt", "argb"]) {
+            println!("SKIP: ffmpeg cannot encode qtrle argb");
+            fixture.finish();
+            return;
+        }
+        let generation = fixture
+            .opener
+            .request(ClipSpec::new(&path, LoadThen::Cue))
+            .unwrap();
+        fixture.wait_finished(generation);
+        assert_eq!(fixture.opener.status().last_failure, None);
+        let clip = fixture.take_newest().clip;
+        assert!(clip.probed.has_alpha);
+        assert_eq!(clip.probed.pix_fmt, "argb");
+        assert!(
+            clip.alpha.is_some(),
+            "the alpha path moves with the decoder"
+        );
+        let alpha = clip
+            .first_image
+            .alpha_plane()
+            .expect("the primed image carries alpha");
+        for row in [1_usize, 8, 14] {
+            for (band, want) in [0_u8, 85, 170, 255].into_iter().enumerate() {
+                assert_eq!(
+                    alpha[row * 32 + band * 8 + 4],
+                    want,
+                    "row {row} band {band}"
+                );
+            }
+        }
+        drop(clip);
+        fixture.finish();
+    }
+
+    /// K6 (#391): alpha the layout map cannot carry (paletted PNG) is refused
+    /// with the typed reason and a remediation, never played opaque.
+    #[test]
+    fn unsupported_alpha_clip_is_refused_with_a_remediation() {
+        let fixture = Fixture::new(CADENCE);
+        let path = fixture.dir.path().join("alpha_pal8.mov");
+        if !alpha_clip(&path, &["-c:v", "png", "-pix_fmt", "pal8"]) {
+            println!("SKIP: ffmpeg cannot encode pal8 png");
+            fixture.finish();
+            return;
+        }
+        let generation = fixture
+            .opener
+            .request(ClipSpec::new(&path, LoadThen::Cue))
+            .unwrap();
+        fixture.wait_finished(generation);
+        let failure = fixture
+            .opener
+            .status()
+            .last_failure
+            .expect("pal8 alpha is refused");
+        assert_eq!(failure.reason, LoadFailureReason::Alpha);
+        assert!(failure.detail.contains("pal8"), "{}", failure.detail);
+        assert!(failure.detail.contains("ProRes 4444"), "{}", failure.detail);
+        assert!(fixture.coordinator.try_take(&fixture.audio).is_none());
         fixture.finish();
     }
 
