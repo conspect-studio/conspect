@@ -45,14 +45,17 @@ pub mod reresolve;
 pub mod resolve;
 
 pub use process::{
-    find_node, find_on_path, probe_version, resolve as resolve_url, resolve_args, ResolverConfig,
-    FALLBACK_PLAYER_CLIENTS,
+    find_node, find_on_path, is_bot_check, probe_version, resolve as resolve_url, resolve_args,
+    resolve_args_with_family, ResolverConfig, FALLBACK_PLAYER_CLIENTS,
 };
 pub use reresolve::{
-    ingest_url, run_reresolve_loop, ManualClock, ProcessResolver, ReresolveConfig,
-    ReresolveOutcome, ReresolveSchedule, Resolver, SystemUnixClock, UnixClock,
+    ingest_url, run_reresolve_loop, run_reresolve_loop_resolved, ManualClock, ProcessResolver,
+    ReresolveConfig, ReresolveOutcome, ReresolveSchedule, Resolver, SystemUnixClock, UnixClock,
 };
-pub use resolve::{parse_expire, parse_info_dict, LiveStatus, ResolvedHls};
+pub use resolve::{
+    media_family, parse_expire, parse_info_dict, parse_signed_ip, LiveStatus, MediaFamily,
+    ResolveFamily, ResolvedHls,
+};
 
 /// Errors raised by the `YouTube` resolver.
 ///

@@ -254,6 +254,31 @@ actively changes the player surface and adds anti-automation friction.
   cookies. Support an optional `youtube.cookies_ref` resolved from the **secret store** (never
   inlined; [ADR-M006](../decisions/ADR-M006.md)) and passed to `yt-dlp --cookies`. Cookies are
   sensitive credentials — handle them as secrets and scope them tightly.
+- **The bot check is per client address, and the signed URL is bound to it (issue #498).**
+  YouTube can answer "Sign in to confirm you're not a bot" to one address family of a host and not
+  the other (mda001, Nov 2026: its IPv6 /64 was bot-checked, its IPv4 was not). googlevideo signs
+  the manifest for the address that resolved it (`/ip/<addr>/` in the path, or `ip=` in the query)
+  and answers **403** to a segment fetched from the other family. Conspect therefore:
+  - resolves with `[system.youtube] address_family` (or the source's own `address_family`):
+    `auto` (default) runs `yt-dlp` with the system default and repeats a bot-checked invocation once
+    with `-4`; `v4` / `v6` always pass `-4` / `-6`;
+  - pins **every** media request of the source — the variant-pin master fetch, the segment fetcher
+    the video and audio rails share, and the audio rail's own fetch when it has no shared copy — to
+    the family the resolved URL is signed for (else the forced resolve family, else no pin). A
+    re-resolve that comes back over the other family moves the pin with the URL;
+  - never lets libav open a pinned master directly (libav cannot be pinned), so with the fetcher
+    disabled (`MULTIVIEW_DISABLE_HLS_FETCH`) a pinned source fails its connection and retries.
+
+  ```toml
+  [system.youtube]
+  address_family = "auto"   # auto | v4 | v6
+
+  [[sources]]
+  id = "times-square"
+  kind = "youtube"
+  url = "https://www.youtube.com/watch?v=…"
+  address_family = "v4"     # optional per-source override
+  ```
 - **Implication for Conspect's resilience contract:** because extraction is best-effort, the resolver
   is treated as a **fallible supervised subtask**. Its failure is *expected and handled*: the tile
   degrades, an operator-visible alarm fires, and the output never falters. The resolver must have a

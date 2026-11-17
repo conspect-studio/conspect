@@ -61,24 +61,47 @@ pub fn last_errors() -> HashMap<String, String> {
 /// reads it so audio opens the SAME master as video without a second `yt-dlp`
 /// run. Keyed by the watch URL too, so an edit to a new URL never hands audio
 /// the previous stream's master.
-fn masters() -> &'static Mutex<HashMap<String, (String, String)>> {
-    static MASTERS: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
+fn masters() -> &'static Mutex<HashMap<String, (String, ResolvedMaster)>> {
+    static MASTERS: OnceLock<Mutex<HashMap<String, (String, ResolvedMaster)>>> = OnceLock::new();
     MASTERS.get_or_init(Default::default)
+}
+
+/// A resolved `YouTube` HLS master and the address family every request for it
+/// must use (issue #498): googlevideo signs the master for the client address
+/// that resolved it and refuses segments fetched from the other family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedMaster {
+    /// The `*.googlevideo.com` HLS master URL.
+    pub url: String,
+    /// The family pin for the master, its variants and its segments.
+    pub pin: crate::hls_fetch::IpPin,
+}
+
+impl ResolvedMaster {
+    /// The master and pin of one resolve: the family the URL is signed for,
+    /// else the family the resolve was forced to, else no pin.
+    #[must_use]
+    pub fn from_resolved(resolved: &multiview_input::youtube::ResolvedHls) -> Self {
+        Self {
+            url: multiview_input::youtube::ingest_url(resolved).to_owned(),
+            pin: crate::hls_fetch::IpPin::from_media(resolved.media_family()),
+        }
+    }
 }
 
 /// Record `master` as the current resolved HLS master of source `id`, resolved
 /// from `watch_url`.
-pub fn record_master(id: &str, watch_url: &str, master: &str) {
+pub fn record_master(id: &str, watch_url: &str, master: &ResolvedMaster) {
     masters()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .insert(id.to_owned(), (watch_url.to_owned(), master.to_owned()));
+        .insert(id.to_owned(), (watch_url.to_owned(), master.clone()));
 }
 
 /// The current resolved master of source `id`, only when it was resolved from
 /// `watch_url`.
 #[must_use]
-pub fn master(id: &str, watch_url: &str) -> Option<String> {
+pub fn master(id: &str, watch_url: &str) -> Option<ResolvedMaster> {
     masters()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -120,6 +143,50 @@ pub fn resolver_path() -> Option<String> {
         .clone()
 }
 
+/// The run's default resolve address family (`[system.youtube]
+/// address_family`, issue #498), for sources without their own.
+fn resolver_family_slot() -> &'static Mutex<multiview_input::youtube::ResolveFamily> {
+    static FAMILY: OnceLock<Mutex<multiview_input::youtube::ResolveFamily>> = OnceLock::new();
+    FAMILY.get_or_init(Default::default)
+}
+
+/// Set the run's default resolve address family.
+pub fn set_resolver_family(family: multiview_input::youtube::ResolveFamily) {
+    *resolver_family_slot()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = family;
+}
+
+/// The run's default resolve address family (`auto` unless configured).
+#[must_use]
+pub fn resolver_family() -> multiview_input::youtube::ResolveFamily {
+    *resolver_family_slot()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The resolve family of one source: its own setting, else the run default.
+#[must_use]
+pub fn effective_family(
+    own: Option<multiview_input::youtube::ResolveFamily>,
+) -> multiview_input::youtube::ResolveFamily {
+    own.unwrap_or_else(resolver_family)
+}
+
+/// Map the config spelling onto the resolver's family.
+#[must_use]
+pub fn family_from_config(
+    family: multiview_config::YoutubeAddressFamily,
+) -> multiview_input::youtube::ResolveFamily {
+    use multiview_config::YoutubeAddressFamily as Config;
+    use multiview_input::youtube::ResolveFamily as Resolve;
+    match family {
+        Config::Auto => Resolve::Auto,
+        Config::V4 => Resolve::V4,
+        Config::V6 => Resolve::V6,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,16 +213,65 @@ mod tests {
     #[test]
     fn a_master_is_only_handed_out_for_the_watch_url_it_came_from() {
         let id = "youtube-status-test-master";
-        record_master(id, "https://youtu.be/a", "https://g.test/a.m3u8");
-        assert_eq!(
-            master(id, "https://youtu.be/a"),
-            Some("https://g.test/a.m3u8".to_owned())
-        );
+        let a = ResolvedMaster {
+            url: "https://g.test/a.m3u8".to_owned(),
+            pin: crate::hls_fetch::IpPin::V4,
+        };
+        record_master(id, "https://youtu.be/a", &a);
+        assert_eq!(master(id, "https://youtu.be/a"), Some(a));
         assert_eq!(master(id, "https://youtu.be/b"), None);
         record(id, Some("failed"));
         forget(id);
         assert_eq!(master(id, "https://youtu.be/a"), None);
         assert_eq!(last_error(id), None);
+    }
+
+    #[test]
+    fn a_resolved_master_carries_the_family_its_url_is_signed_for() {
+        use multiview_input::youtube::{LiveStatus, ResolveFamily, ResolvedHls};
+        let v4 = ResolvedHls::new(
+            "https://m.googlevideo.com/api/manifest/hls_variant/ip/103.135.99.52/x.m3u8",
+            LiveStatus::Live,
+            None,
+        );
+        assert_eq!(
+            ResolvedMaster::from_resolved(&v4).pin,
+            crate::hls_fetch::IpPin::V4
+        );
+        let v6 = ResolvedHls::new(
+            "https://m.googlevideo.com/api/manifest/hls_variant/ip/2404%3A79c0%3A%3A1/x.m3u8",
+            LiveStatus::Live,
+            None,
+        )
+        .with_resolved_over(ResolveFamily::V4);
+        assert_eq!(
+            ResolvedMaster::from_resolved(&v6).pin,
+            crate::hls_fetch::IpPin::V6,
+            "the signed address wins over the resolve family"
+        );
+        let unsigned = ResolvedHls::new("https://h/x.m3u8", LiveStatus::Live, None);
+        assert_eq!(
+            ResolvedMaster::from_resolved(&unsigned).pin,
+            crate::hls_fetch::IpPin::Any
+        );
+        assert_eq!(
+            ResolvedMaster::from_resolved(&unsigned.with_resolved_over(ResolveFamily::V6)).pin,
+            crate::hls_fetch::IpPin::V6
+        );
+    }
+
+    #[test]
+    fn a_source_family_overrides_the_run_default() {
+        use multiview_input::youtube::ResolveFamily;
+        assert_eq!(effective_family(Some(ResolveFamily::V6)), ResolveFamily::V6);
+        assert_eq!(
+            family_from_config(multiview_config::YoutubeAddressFamily::V4),
+            ResolveFamily::V4
+        );
+        assert_eq!(
+            family_from_config(multiview_config::YoutubeAddressFamily::default()),
+            ResolveFamily::Auto
+        );
     }
 
     #[test]

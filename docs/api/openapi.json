@@ -26258,6 +26258,17 @@
               "kind"
             ],
             "properties": {
+              "address_family": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/YoutubeAddressFamilyDoc",
+                    "description": "Address family of the `yt-dlp` resolve (issue #498). Absent ⇒\n`[system.youtube] address_family`, else `auto`."
+                  }
+                ]
+              },
               "kind": {
                 "type": "string",
                 "enum": [
@@ -29350,6 +29361,15 @@
             "description": "The opaque single-use ticket. Present it once as `?ticket=` within\n`expires_in_secs`; it is consumed on the first WS/SSE upgrade."
           }
         }
+      },
+      "YoutubeAddressFamilyDoc": {
+        "type": "string",
+        "description": "`OpenAPI` mirror of [`multiview_config::YoutubeAddressFamily`].",
+        "enum": [
+          "auto",
+          "v4",
+          "v6"
+        ]
       },
       "YoutubeCapability": {
         "type": "object",

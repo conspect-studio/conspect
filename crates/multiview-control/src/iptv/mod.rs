@@ -170,7 +170,7 @@ fn source_url(kind: &SourceKind) -> Option<&str> {
     match kind {
         SourceKind::Rtsp { url }
         | SourceKind::Hls { url, .. }
-        | SourceKind::Youtube { url }
+        | SourceKind::Youtube { url, .. }
         | SourceKind::Ts { url }
         | SourceKind::Rtmp { url }
         | SourceKind::Srt { url, .. }

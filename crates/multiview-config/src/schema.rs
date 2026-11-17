@@ -758,6 +758,12 @@ pub enum SourceKind {
     Youtube {
         /// `YouTube` watch/live/channel URL (e.g. `https://www.youtube.com/watch?v=…`).
         url: String,
+        /// The address family this source's `yt-dlp` resolve runs over (issue
+        /// #498): `auto` (default), `v4` or `v6`. Absent ⇒ `[system.youtube]
+        /// address_family`. The media fetch follows the family the resolved URL
+        /// is signed for.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        address_family: Option<crate::YoutubeAddressFamily>,
     },
     /// MPEG-TS input.
     Ts {
