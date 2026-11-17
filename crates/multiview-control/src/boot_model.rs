@@ -325,6 +325,11 @@ async fn write_desired(state: &AppState, desired: DesiredState) -> ControlResult
                         AtomicWriteError::BeforeRename(std::io::Error::other(SHUTTING_DOWN))
                     })??;
             }
+            if model.take_dir_sync_fault() {
+                return Err(AtomicWriteError::AfterRename(std::io::Error::other(
+                    "injected directory sync fault",
+                )));
+            }
             sync_parent_directory(&target_dir(&target)).map_err(AtomicWriteError::AfterRename)
         }
     })
@@ -530,6 +535,33 @@ pub async fn commit_resource(
     replacement: Option<serde_json::Value>,
     name: Option<String>,
 ) -> ControlResult<()> {
+    commit_resource_by(state, key, id, replacement, name, None).await
+}
+
+/// [`commit_resource`] for an explicit delete whose caller is known: the
+/// removal is logged with `actor` once the rename is visible, including when
+/// the commit is indeterminate (issue #519), so the journal always names who
+/// removed an accepted resource even if the route returns early.
+///
+/// # Errors
+/// As [`commit_resource`].
+pub async fn delete_resource_as(
+    state: &AppState,
+    key: &str,
+    id: &str,
+    actor: &str,
+) -> ControlResult<()> {
+    commit_resource_by(state, key, id, None, None, Some(actor)).await
+}
+
+async fn commit_resource_by(
+    state: &AppState,
+    key: &str,
+    id: &str,
+    replacement: Option<serde_json::Value>,
+    name: Option<String>,
+    actor: Option<&str>,
+) -> ControlResult<()> {
     if state.boot_model.is_none() {
         return Ok(());
     }
@@ -617,7 +649,7 @@ pub async fn commit_resource(
             output_ids.retain(|existing| existing != id);
         }
     }
-    let intended = IntendedRemovals::for_resource(is_create, key, id);
+    let intended = IntendedRemovals::for_resource(is_create, key, id, actor);
     commit_desired_with_output_ids(
         state,
         config,
@@ -804,8 +836,8 @@ pub async fn commit_desired_document(
 enum IntendedRemovals<'a> {
     /// The commit names no removal (a create, an edit, a whole document).
     Nothing,
-    /// An explicit delete of exactly this `(family, id)`.
-    Resource(&'a str, &'a str),
+    /// An explicit delete of exactly this `(family, id)`, by `actor` when known.
+    Resource(&'a str, &'a str, Option<&'a str>),
     /// A section commit that owns these families outright (graphics, iptv).
     Families(&'a [&'a str]),
 }
@@ -813,18 +845,31 @@ enum IntendedRemovals<'a> {
 impl<'a> IntendedRemovals<'a> {
     /// A `commit_resource` replacement (`is_create`) names no removal; a
     /// delete names exactly `(key, id)`.
-    const fn for_resource(is_create: bool, key: &'a str, id: &'a str) -> Self {
+    const fn for_resource(
+        is_create: bool,
+        key: &'a str,
+        id: &'a str,
+        actor: Option<&'a str>,
+    ) -> Self {
         if is_create {
             Self::Nothing
         } else {
-            Self::Resource(key, id)
+            Self::Resource(key, id, actor)
+        }
+    }
+
+    /// The caller an explicit delete names, if any.
+    const fn actor(self) -> Option<&'a str> {
+        match self {
+            Self::Resource(_, _, actor) => actor,
+            Self::Nothing | Self::Families(_) => None,
         }
     }
 
     fn covers(self, key: &str, id: &str) -> bool {
         match self {
             Self::Nothing => false,
-            Self::Resource(k, i) => k == key && i == id,
+            Self::Resource(k, i, _) => k == key && i == id,
             Self::Families(keys) => keys.contains(&key),
         }
     }
@@ -906,7 +951,12 @@ fn report_removals(
 ) {
     for (key, id) in removed {
         if intended.covers(key, id) {
-            tracing::info!(family = %key, id = %id, "accepted state: resource removed by an explicit delete");
+            tracing::info!(
+                family = %key,
+                id = %id,
+                actor = intended.actor().unwrap_or("-"),
+                "accepted state: resource removed by an explicit delete"
+            );
             continue;
         }
         tracing::warn!(
@@ -950,7 +1000,16 @@ async fn commit_desired_document_named(
     // Issue #519: what this commit drops from the accepted state, against the
     // previous envelope (or, before the first one, the document the run
     // started from), so no removal is ever silent.
-    let removed = removed_by_commit(state, model, previous.as_deref(), &config, &output_ids)?;
+    // Reporting must never refuse a commit: a diff fault is itself reported.
+    let removed = removed_by_commit(state, model, previous.as_deref(), &config, &output_ids)
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                %error,
+                code = "accepted-state-implicit-removal",
+                "accepted state: removals of this commit could not be computed; any removal is unreported"
+            );
+            Vec::new()
+        });
     if previous.is_none() && !layouts.iter().any(|layout| layout.id == selected_layout_id) {
         layouts.push(crate::repository::Layout {
             id: selected_layout_id.clone(),
@@ -2004,6 +2063,10 @@ pub struct BootModel {
     /// [`crate::AppState::lock_config_mutation`], so the inner mutex is plain
     /// interior mutability (the async lock provides the ordering, not this).
     last_adopted: std::sync::Mutex<MultiviewConfig>,
+    /// Test seam (issue #519): fail the next `desired.json` directory sync
+    /// AFTER the rename, so a commit becomes indeterminate.
+    #[cfg(any(test, feature = "_test-seams"))]
+    fail_next_dir_sync: AtomicBool,
     selected_layout: std::sync::Mutex<Option<String>>,
     /// Review R3-03: the accepted envelope, held as one immutable `Arc`
     /// snapshot instead of being re-read, re-parsed and re-validated from
@@ -2060,6 +2123,27 @@ impl BootModel {
             last_adopted: std::sync::Mutex::new(running),
             selected_layout: std::sync::Mutex::new(None),
             accepted_cache: std::sync::RwLock::new(AcceptedCache::Unloaded),
+            #[cfg(any(test, feature = "_test-seams"))]
+            fail_next_dir_sync: AtomicBool::new(false),
+        }
+    }
+
+    /// Test seam: make the next accepted-state commit indeterminate (its
+    /// rename lands, the directory sync then fails).
+    #[cfg(any(test, feature = "_test-seams"))]
+    pub fn fail_next_dir_sync(&self) {
+        self.fail_next_dir_sync.store(true, Ordering::Release);
+    }
+
+    /// Whether this commit's directory sync is to fail (consumes the seam).
+    fn take_dir_sync_fault(&self) -> bool {
+        #[cfg(any(test, feature = "_test-seams"))]
+        {
+            self.fail_next_dir_sync.swap(false, Ordering::AcqRel)
+        }
+        #[cfg(not(any(test, feature = "_test-seams")))]
+        {
+            false
         }
     }
 

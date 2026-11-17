@@ -111,21 +111,21 @@ fn rig() -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("conspect.toml");
     std::fs::write(&path, DOC).unwrap();
-    let boot = path.clone();
+    let shared = Arc::new(BootModel::new(
+        path.clone(),
+        config.clone(),
+        config.clone(),
+        StartMode::Boot,
+        false,
+        None,
+    ));
     let kept = Arc::new(std::sync::Mutex::new(None));
     let slot = Arc::clone(&kept);
     let h = harness_with(move |state| {
         let state = state
             .with_seeded_resources(seeded)
             .with_base_document(serde_json::to_value(&config).unwrap())
-            .with_boot_model(Arc::new(BootModel::new(
-                boot,
-                config.clone(),
-                config,
-                StartMode::Boot,
-                false,
-                None,
-            )))
+            .with_boot_model(shared)
             .with_live_sources(multiview_control::LiveSourceCapability::synthetic_and_network());
         *slot.lock().unwrap() = Some(state.clone());
         state
