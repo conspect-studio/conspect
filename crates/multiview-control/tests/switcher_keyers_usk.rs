@@ -211,16 +211,22 @@ fn tick(driver: &mut SwitcherTickDriver, index: u64) {
 }
 
 fn build(path: &Path, doc: &str) -> Rig {
+    build_buses(path, doc, "a", "b")
+}
+
+/// [`build`] with the engine's PGM and PVW set to `program` / `preview`.
+fn build_buses(path: &Path, doc: &str, program: &str, preview: &str) -> Rig {
     let config = MultiviewConfig::load_from_toml(doc).unwrap();
     config.validate().unwrap();
     let seeded = multiview_control::seed_resources(&config).unwrap();
     let publisher = Arc::new(EnginePublisher::new(256));
     let (sender, _receiver) = command_bus(64);
     let (handle, mut driver) = SwitcherControl::new(SwitcherState::new(
-        SourceRef::new("a"),
-        SourceRef::new("b"),
+        SourceRef::new(program),
+        SourceRef::new(preview),
         vec![],
     ));
+    driver.advertise_auto();
     let stores = stores();
     driver.set_prime_stores(stores.clone());
     let switcher = config.switcher.as_ref().unwrap();
@@ -603,8 +609,10 @@ async fn usk_rows_armed_set_and_events_filter_and_redact_alike() {
         &body("arm", json!({ "keys": ["usk1", "usk2"] })),
     )
     .await;
-    command(&rig, ADMIN, "cut", &body("cut", json!({}))).await;
+    // The arm lands first: a take is authorized against the committed set.
     tick(&mut rig.driver, 1);
+    command(&rig, ADMIN, "cut", &body("cut", json!({}))).await;
+    tick(&mut rig.driver, 2);
     assert!(on_air(&rig, 1) && on_air(&rig, 2));
     // Events: usk1's event is invisible without its object; usk2's fill is
     // redacted without gfx2.
@@ -661,4 +669,212 @@ async fn usk_rows_armed_set_and_events_filter_and_redact_alike() {
         "GET equals the event"
     );
     assert_eq!(row2["on_air"], redacted.on_air);
+}
+
+/// Review MEDIA-1: a key-only CUT or AUTO (the background not armed) is
+/// admitted with PGM == PVW (it changes no bus); a background take with
+/// identical buses is still refused.
+#[tokio::test]
+async fn a_key_only_take_is_admitted_with_identical_buses() {
+    let (_dir, path) = temp_boot(DOC);
+    let mut rig = build_buses(&path, DOC, "a", "a");
+    let mut outcomes = rig.handle.outcomes();
+    let cut = body("cut", json!({}));
+    let auto = body("auto", json!({ "duration_frames": 4 }));
+    // The default arm set moves the background: refused.
+    for verb in [&cut, &auto] {
+        assert_eq!(
+            plan(&rig, ADMIN, verb).await.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "background take on identical buses: {verb}"
+        );
+    }
+    let arm = body("arm", json!({ "background": false, "keys": ["usk2"] }));
+    assert_eq!(
+        command(&rig, ADMIN, "arm", &arm).await.status(),
+        StatusCode::ACCEPTED
+    );
+    tick(&mut rig.driver, 1);
+    assert!(outcomes.try_recv().unwrap().event.completed);
+    assert_eq!(plan(&rig, ADMIN, &cut).await.status(), StatusCode::OK);
+    assert_eq!(plan(&rig, ADMIN, &auto).await.status(), StatusCode::OK);
+    assert_eq!(
+        command(&rig, ADMIN, "kcut", &cut).await.status(),
+        StatusCode::ACCEPTED
+    );
+    tick(&mut rig.driver, 2);
+    let outcome = outcomes.try_recv().unwrap().event;
+    assert!(outcome.completed, "{outcome:?}");
+    assert!(on_air(&rig, 2));
+    assert_eq!(
+        command(&rig, ADMIN, "kauto", &auto).await.status(),
+        StatusCode::ACCEPTED
+    );
+}
+
+/// Review AUTHZ-1: a CUT or AUTO toggles the armed USKs, so it needs Control
+/// on every armed keyer object and Read on their fill and key, on plan and
+/// command, before any existence answer. A principal holding the M/E and the
+/// program but not `me1/usk1` (or not `gfx2`, usk1's key) cannot take while
+/// usk1 is armed; a background-only arm needs no keyer grant.
+#[tokio::test]
+async fn a_take_is_authorized_on_every_armed_key() {
+    let (_dir, path) = temp_boot(DOC);
+    let mut rig = build(&path, DOC);
+    let mut outcomes = rig.handle.outcomes();
+    let arm = body("arm", json!({ "background": true, "keys": ["usk1"] }));
+    assert_eq!(
+        command(&rig, ADMIN, "arm", &arm).await.status(),
+        StatusCode::ACCEPTED
+    );
+    tick(&mut rig.driver, 1);
+    assert!(outcomes.try_recv().unwrap().event.completed);
+    let cut = body("cut", json!({}));
+    let auto = body("auto", json!({ "duration_frames": 4 }));
+    for verb in [&cut, &auto] {
+        for token in [NO_USK1, NO_GFX2] {
+            assert_eq!(
+                plan(&rig, token, verb).await.status(),
+                StatusCode::FORBIDDEN,
+                "{token} {verb}"
+            );
+            assert_eq!(
+                command(&rig, token, "take-bola", verb).await.status(),
+                StatusCode::FORBIDDEN,
+                "{token} {verb}"
+            );
+        }
+        assert_eq!(plan(&rig, FULL, verb).await.status(), StatusCode::OK);
+    }
+    tick(&mut rig.driver, 2);
+    assert!(outcomes.try_recv().is_err(), "nothing was enqueued");
+    assert!(!on_air(&rig, 1));
+    // Background only: the keyer grants are not needed.
+    let bg = body("arm", json!({ "background": true }));
+    assert_eq!(
+        command(&rig, ADMIN, "arm-bg", &bg).await.status(),
+        StatusCode::ACCEPTED
+    );
+    tick(&mut rig.driver, 3);
+    assert!(outcomes.try_recv().unwrap().event.completed);
+    assert_eq!(plan(&rig, NO_USK1, &cut).await.status(), StatusCode::OK);
+}
+
+/// Review AUTHZ-1 (binding): the authorization is for the arm set the
+/// caller saw. A take enqueued against arm version N is refused with a
+/// typed outcome when the set changed before the tick (here: re-armed to
+/// include usk1, which the caller may not control), and nothing toggles.
+#[tokio::test]
+async fn a_take_authorized_against_a_stale_arm_set_is_refused() {
+    let (_dir, path) = temp_boot(DOC);
+    let mut rig = build(&path, DOC);
+    let mut outcomes = rig.handle.outcomes();
+    let bg = body("arm", json!({ "background": true }));
+    assert_eq!(
+        command(&rig, ADMIN, "arm-bg", &bg).await.status(),
+        StatusCode::ACCEPTED
+    );
+    tick(&mut rig.driver, 1);
+    assert!(outcomes.try_recv().unwrap().event.completed);
+    // An admin re-arms usk1 (queued, not yet applied: the committed set
+    // NO_USK1 sees is still background-only)...
+    rig.handle
+        .try_send(multiview_engine::switcher_control::SwitcherCommand {
+            operation_id: "rearm".into(),
+            scene_version: 1,
+            verb: multiview_engine::switcher_control::SwitcherVerb::Arm(Arc::new(
+                multiview_core::switcher::ArmedSet::default()
+                    .with_background()
+                    .with_key(1),
+            )),
+        })
+        .unwrap();
+    // ...so NO_USK1 is admitted to CUT the set it saw, and the engine must
+    // refuse that take once the set changed under it.
+    let cut = body("cut", json!({}));
+    let accepted = command(&rig, NO_USK1, "cut-stale", &cut).await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let op = body_json(accepted).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    tick(&mut rig.driver, 2);
+    let mut refused = None;
+    while let Ok(item) = outcomes.try_recv() {
+        if item.event.operation_id == op {
+            refused = Some(item.event.clone());
+        }
+    }
+    let refused = refused.expect("the take has a terminal outcome");
+    assert!(!refused.completed);
+    assert_eq!(
+        refused.error.as_deref(),
+        Some(multiview_engine::switcher_control::REFUSE_ARM_CHANGED),
+        "{refused:?}"
+    );
+    assert!(!on_air(&rig, 1), "usk1 never toggled");
+    assert_eq!(rig.handle.snapshot().unwrap().program.as_str(), "a");
+}
+
+/// Review AUTHZ-2: a USK `keyer_cut` needs Read on the keyer's resolved fill
+/// and key (as `arm` does), on plan and command; and it is bound to the
+/// definition version it was authorized against.
+#[tokio::test]
+async fn usk_keyer_cut_is_authorized_on_its_sources_and_bound_to_its_definition() {
+    let (_dir, path) = temp_boot(DOC);
+    let mut rig = build(&path, DOC);
+    let mut outcomes = rig.handle.outcomes();
+    for keyer in ["usk1", "usk2"] {
+        let cut = body(
+            "keyer_cut",
+            json!({ "keyer": keyer, "family": "usk", "on": true }),
+        );
+        assert_eq!(
+            plan(&rig, NO_GFX2, &cut).await.status(),
+            StatusCode::FORBIDDEN,
+            "{keyer}"
+        );
+        assert_eq!(
+            command(&rig, NO_GFX2, "kc-bola", &cut).await.status(),
+            StatusCode::FORBIDDEN,
+            "{keyer}"
+        );
+    }
+    tick(&mut rig.driver, 1);
+    assert!(outcomes.try_recv().is_err(), "nothing was enqueued");
+    // An admin re-points usk2 to a source FULL may not read (queued, not
+    // yet applied), then FULL cuts usk2 against the definition it saw: the
+    // engine must refuse the cut once the definition changed under it.
+    let set = body(
+        "keyer_set",
+        json!({ "keyer": "usk2", "family": "usk", "fill": "secret" }),
+    );
+    assert_eq!(
+        command(&rig, ADMIN, "set-secret", &set).await.status(),
+        StatusCode::ACCEPTED
+    );
+    let cut = body(
+        "keyer_cut",
+        json!({ "keyer": "usk2", "family": "usk", "on": true }),
+    );
+    let accepted = command(&rig, FULL, "kc-stale", &cut).await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let op = body_json(accepted).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    tick(&mut rig.driver, 2);
+    let mut cut_outcome = None;
+    while let Ok(item) = outcomes.try_recv() {
+        if item.event.operation_id == op {
+            cut_outcome = Some(item.event.clone());
+        }
+    }
+    let cut_outcome = cut_outcome.expect("terminal outcome");
+    assert_eq!(
+        cut_outcome.error.as_deref(),
+        Some(multiview_engine::keyer::REFUSE_KEYER_DEFINITION_CHANGED),
+        "{cut_outcome:?}"
+    );
+    assert!(!on_air(&rig, 2));
 }

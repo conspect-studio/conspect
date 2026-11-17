@@ -423,9 +423,11 @@ fn validate_buses(
         "select_program" if selected == Some(program) => Err(ControlError::Validation(
             "source is already on program".into(),
         )),
-        "cut" | "auto" if snapshot.preview == snapshot.program => Err(ControlError::Validation(
-            multiview_engine::switcher_control::REFUSE_SAME_SOURCE.into(),
-        )),
+        // Review MEDIA-1: only a take that moves the background puts PVW on
+        // PGM; a key-only take (K3) changes no bus.
+        "cut" | "auto" if snapshot.next.background && snapshot.preview == snapshot.program => Err(
+            ControlError::Validation(multiview_engine::switcher_control::REFUSE_SAME_SOURCE.into()),
+        ),
         "auto" if snapshot.in_flight => Err(ControlError::Validation(
             "cannot start a second AUTO during an active take".into(),
         )),
@@ -565,6 +567,10 @@ pub(crate) async fn plan_switcher(
         return Ok(*response);
     }
     let handle = engine(&state)?;
+    if matches!(req.action.as_str(), "cut" | "auto") {
+        // Review AUTHZ-1: the take toggles the armed keys.
+        super::switcher_keyers::authorize_armed(&principal, &req.me, handle)?;
+    }
     if req.action == "auto" && !handle.supports_auto() {
         return Err(ControlError::Validation(
             "AUTO requires a same-epoch preview compositor and admitted transition budget".into(),
@@ -631,6 +637,13 @@ pub(crate) async fn submit_switcher(
         Err(response) => return Ok(*response),
     };
     let handle = engine(&state)?;
+    // Review AUTHZ-1: a take toggles the armed keys; it is authorized on
+    // them and bound to the arm set and definitions it was authorized for.
+    let bound = if matches!(kind.as_str(), "cut" | "auto") {
+        super::switcher_keyers::authorize_armed(&principal, &req.me, handle)?
+    } else {
+        None
+    };
     if req.action == "auto" && !handle.supports_auto() {
         return Err(ControlError::Validation(
             "AUTO requires a same-epoch preview compositor and admitted transition budget".into(),
@@ -642,6 +655,16 @@ pub(crate) async fn submit_switcher(
     };
     authorize_target(&principal, target.as_ref())?;
     let verb = verb(&req, &kind, target.as_ref(), transition)?;
+    let verb = match bound {
+        Some((arm_version, defs_version)) => {
+            SwitcherVerb::Bound(Box::new(multiview_engine::switcher_control::BoundVerb {
+                verb,
+                arm_version: Some(arm_version),
+                defs_version: Some(defs_version),
+            }))
+        }
+        None => verb,
+    };
     // P3R2-C: authorization and static validation are done; an EXISTING
     // reservation is a replay and answers its original 202 before the
     // transient admission checks (buses, an active take, the scene), which

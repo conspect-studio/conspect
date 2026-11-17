@@ -261,6 +261,38 @@ pub fn authorize(
     Ok(())
 }
 
+/// Review AUTHZ-1: a CUT or AUTO toggles every armed USK, so it needs
+/// `Control` on each armed keyer object (`<me>/<id>`) and `Read` on its
+/// fill and key, exactly as the `arm` that armed it. Returns the committed
+/// `(arm_version, defs_version)` the caller was authorized against; the
+/// command carries them ([`SwitcherVerb::Bound`]) and the engine refuses the
+/// take if either moved. `None` before the first committed snapshot or
+/// without a keyer runtime (no USK can be armed then).
+///
+/// # Errors
+/// 403 for any denied keyer object or source.
+pub fn authorize_armed(
+    principal: &Principal,
+    me: &str,
+    handle: &SwitcherControl,
+) -> ControlResult<Option<(u64, u64)>> {
+    let (Some(snapshot), Some(defs)) = (handle.snapshot(), handle.keyer_definitions()) else {
+        return Ok(None);
+    };
+    for (slot, def) in defs.defs.iter().enumerate() {
+        let Some(def) = def.as_ref() else { continue };
+        if def.family != KeyerFamily::Usk || !snapshot.next.key_armed(slot) {
+            continue;
+        }
+        authorize_object(principal, &object_id(me, &def.config.id))?;
+        authorize_object(principal, &def.fill_id)?;
+        if let Some(key) = &def.key_id {
+            authorize_object(principal, key)?;
+        }
+    }
+    Ok(Some((snapshot.arm_version, defs.version)))
+}
+
 /// `arm` (K3): `Read` on the fill and key of every armed key. Called after
 /// [`authorize`] (the caller holds every armed keyer object), so looking a
 /// key's sources up never answers existence for an object it may not see.
@@ -534,13 +566,23 @@ pub fn check(
     if kind == "keyer_set" {
         return check_set(state, principal, handle, req, &keyer, &ctx);
     }
-    let Some((index, _)) = ctx.defs.find_in(family.engine(), &keyer) else {
+    let Some((index, def)) = ctx.defs.find_in(family.engine(), &keyer) else {
         return Ok(Err(typed(
             404,
             "unknown-keyer",
             format!("no keyer {:?} is defined", ctx.object),
         )));
     };
+    // Review AUTHZ-2: a USK cut puts the keyer's own sources on air, so it
+    // needs `Read` on its resolved fill and key, as `arm` does (the caller
+    // already holds the keyer object, so this answers no existence).
+    if family == KeyerFamilyWire::Usk {
+        authorize_object(principal, &def.fill_id)?;
+        if let Some(key) = &def.key_id {
+            authorize_object(principal, key)?;
+        }
+    }
+    let defs_version = ctx.defs.version;
     let on = fields.on.unwrap_or(false);
     let verb = match kind {
         "keyer_cut" => SwitcherVerb::KeyerCut { keyer: index, on },
@@ -573,6 +615,17 @@ pub fn check(
         ))
     } else {
         None
+    };
+    // ... and is bound to the definitions it was authorized against: the
+    // engine refuses it if a `keyer_set` re-pointed the keyer meanwhile.
+    let verb = if family == KeyerFamilyWire::Usk {
+        SwitcherVerb::Bound(Box::new(multiview_engine::switcher_control::BoundVerb {
+            verb,
+            arm_version: None,
+            defs_version: Some(defs_version),
+        }))
+    } else {
+        verb
     };
     Ok(Ok(Checked {
         verb,
@@ -1694,6 +1747,7 @@ mod tests {
             transition: multiview_core::switcher::TransitionDescriptor::Cut,
             keyers: [None; MAX_KEYERS],
             next: multiview_engine::keyer::NextTake::default(),
+            arm_version: 0,
             tally: KeyerTally {
                 program: TallySet::from_roles([
                     TallyRole::Program,
