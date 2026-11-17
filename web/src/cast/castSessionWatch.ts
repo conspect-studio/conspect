@@ -23,6 +23,8 @@ import type {
 export interface WatchHandlers {
   readonly report: (report: ReceiverReport) => void;
   readonly media: (playerState: string, idleReason: string | null) => void;
+  /** The media session's tracks/active ids changed (also fired once on attach). */
+  readonly tracks: () => void;
   readonly volume: (level: number | null, muted: boolean | null) => void;
   readonly stream: (doc: CastStream) => void;
   /** The stream is gone on the server (expired or deleted elsewhere). */
@@ -100,10 +102,19 @@ export class SessionWatch {
     this.media = media;
     if (media === null) return;
     const listener = (): void => {
-      if (!this.detached) this.handlers.media(media.playerState ?? 'IDLE', media.idleReason ?? null);
+      if (this.detached) return;
+      this.handlers.media(media.playerState ?? 'IDLE', media.idleReason ?? null);
+      this.handlers.tracks();
     };
     this.mediaListener = listener;
     media.addUpdateListener(listener);
+    // The first MEDIA_STATUS may already carry tracks before any update fires.
+    this.handlers.tracks();
+  }
+
+  /** The current media session (for track derivation / `editTracksInfo`), or `null`. */
+  getMedia(): ChromeCastMedia | null {
+    return this.media;
   }
 
   private detachMedia(): void {

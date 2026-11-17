@@ -665,6 +665,7 @@ async fn readback_effective_audio_is_the_live_audio_redacted_per_object() {
         sessions_in_use: 0,
         sessions_max: 6,
         dropped_ticks: 0,
+        passthrough: multiview_control::output_routing::PassthroughTotals::default(),
     });
     let row = |body: serde_json::Value| {
         body["outputs"]

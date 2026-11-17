@@ -1,6 +1,7 @@
 // Operator wording of the browser-cast states.
 import { t } from '@lingui/core/macro';
 
+import type { OutputVideoFeed } from '../api/outputRouting';
 import type { CastSnapshot } from './castController';
 
 /** A short label of a cast status. */
@@ -38,4 +39,15 @@ export function castQualityLine(snapshot: CastSnapshot): string | null {
     parts.push(t`${seconds} s behind live`);
   }
   return parts.length === 0 ? null : parts.join(' · ');
+}
+
+/** A cast output's video picker label: its id plus what it shows now, if known (decision 2). */
+export function castOutputLabel(outputId: string, feed: OutputVideoFeed | undefined): string {
+  if (feed === undefined) return outputId;
+  if ('bus' in feed) {
+    const bus = feed.bus === 'program' ? t`Program` : feed.bus === 'preview' ? t`Preview` : t`Clean`;
+    return t`${outputId} (${bus})`;
+  }
+  if ('layout' in feed) return t`${outputId} (${feed.layout})`;
+  return t`${outputId} (${feed.source})`;
 }

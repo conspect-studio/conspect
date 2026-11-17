@@ -24,7 +24,7 @@ export const CSP = "default-src 'none'; script-src 'self' https://www.gstatic.co
   "connect-src 'self' https: ws://localhost:8008; font-src 'self' https://fonts.gstatic.com; worker-src blob:";
 
 const TYPES = {
-  '.m3u8': 'application/vnd.apple.mpegurl', '.m4s': 'video/iso.segment', '.mp4': 'video/mp4', '.ts': 'video/mp2t',
+  '.m3u8': 'application/vnd.apple.mpegurl', '.m4s': 'video/iso.segment', '.mp4': 'video/mp4', '.ts': 'video/mp2t', '.vtt': 'text/vtt; charset=utf-8',
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8'
 };
 const TOKEN_ROUTE = /^\/cast\/([A-Za-z0-9_-]{20,128})\/([A-Za-z0-9._-]+)$/;

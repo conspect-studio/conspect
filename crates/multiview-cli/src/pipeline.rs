@@ -2055,6 +2055,14 @@ enum RunnableOutput {
         default_dir: bool,
         /// The pipeline's outbound epoch (`EXT-X-PROGRAM-DATE-TIME`).
         epoch: multiview_output::SharedEpoch,
+        /// Which audio the cast stream carries (#418): the program and/or
+        /// discrete tracks, resolved like an HLS output's.
+        audio: multiview_output::AudioSelection,
+        /// Audio slot 0's language: the program rendition's `LANGUAGE` and
+        /// menu label (#418).
+        program_language: Option<String>,
+        /// The output's subtitle slots, when it declares any (#418).
+        subtitles: Option<CastSubtitles>,
     },
     /// A WebRTC program output (`webrtc` WHEP-serve / `whip_push`): a **mux-free**
     /// sink that re-stamps each coded [`EncodedPacket`] into an
@@ -2510,6 +2518,9 @@ pub struct Pipeline {
     /// Per runnable output (same order): a live format reset may reach it
     /// (#342 B3 review M-1: HLS with TS segments only).
     output_live_reset: Vec<bool>,
+    /// Per runnable output (same order): its passthrough (P0) eligibility
+    /// (#344 D2b: HLS with TS segments, slot-0 H.264/HEVC, a known format).
+    output_passthrough: Vec<crate::output_routing::PassEligibility>,
     output_audio_tracks: Vec<Vec<usize>>,
     /// Outputs that EXPLICITLY declared an audio selection (per output: the id
     /// and its full declared track list). Drives the run-time truthful binding:
@@ -2518,7 +2529,7 @@ pub struct Pipeline {
     declared_audio_outputs: Vec<(String, Vec<usize>)>,
     /// The runnable outputs declared in the config.
     outputs: Vec<RunnableOutput>,
-    /// The HLS outputs' subtitle slots (slice F #345): route tables + cue
+    /// The HLS and cast outputs' subtitle slots (slice F #345, #418): route tables + cue
     /// feeds, sampled by the bake consumer.
     subtitle_outputs: Vec<SubtitleOutputPlan>,
     /// The bake-consumer push handles for the configured AES67 outputs (#103),
@@ -3507,6 +3518,7 @@ impl Pipeline {
         let mut output_video_keys = Vec::with_capacity(outputs.len());
         let mut output_inband_sets = Vec::with_capacity(outputs.len());
         let mut output_live_reset = Vec::with_capacity(outputs.len());
+        let mut output_passthrough = Vec::with_capacity(outputs.len());
         let mut output_audio_tracks = Vec::with_capacity(outputs.len());
         let mut declared_audio_outputs: Vec<(String, Vec<usize>)> = Vec::new();
         for output in &outputs {
@@ -3572,16 +3584,24 @@ impl Pipeline {
                 .find(|item| item.id() == output.id())
                 .is_some_and(|item| matches!(item, multiview_config::Output::LlHls { .. }));
             output_inband_sets.push(!ll_hls && inband_parameter_changes_ok(output));
-            // A cast stream carries the program audio only (track 0).
-            let cast_audio = multiview_output::AudioSelection::default();
             // Only a TS-segment HLS sink rebuilds its muxer at a flagged
             // change (#342 B3 review M-1).
             output_live_reset.push(!ll_hls && matches!(output, RunnableOutput::Hls { .. }));
+            output_passthrough.push(passthrough_eligibility(
+                declared,
+                !ll_hls && matches!(output, RunnableOutput::Hls { .. }),
+                requested,
+                (width, height),
+                cfg.cadence,
+                bit_rate,
+                canvas_color.output_tag(),
+                key,
+            ));
             let audio_selection = match output {
                 RunnableOutput::File { sink, .. }
                 | RunnableOutput::Hls { sink, .. }
                 | RunnableOutput::Push { sink, .. } => Some(sink.audio_selection()),
-                RunnableOutput::Cast { .. } => Some(&cast_audio),
+                RunnableOutput::Cast { audio, .. } => Some(audio),
                 #[cfg(feature = "webrtc-native")]
                 RunnableOutput::WebRtc { .. } => None,
                 #[cfg(feature = "ndi-bindings")]
@@ -3803,6 +3823,7 @@ impl Pipeline {
             output_video_keys,
             output_inband_sets,
             output_live_reset,
+            output_passthrough,
             output_audio_tracks,
             declared_audio_outputs,
             outputs,
@@ -4198,7 +4219,18 @@ impl Pipeline {
         );
         let reformat_open =
             reformat_opener(self.encode_cfg.clone(), self.rendition_configs.clone());
-        let (mut router, handle) = crate::output_routing::OutputRouter::new_with_openers(
+        let pass_hooks = crate::output_routing::PassHooks {
+            open: passthrough_opener(
+                self.rendition_configs.clone(),
+                self.encode_cfg.cadence,
+                Arc::clone(&self.epoch_anchor),
+            ),
+            traits: Arc::new(|id: &str| {
+                crate::passthrough_tap::lookup(id)
+                    .and_then(|t| t.stream().map(|s| s.traits.clone()))
+            }),
+        };
+        let (mut router, handle) = crate::output_routing::OutputRouter::new_with_passthrough(
             crate::output_routing::RouterConfig {
                 cadence: self.encode_cfg.cadence,
                 gop: self.encode_cfg.gop.max(1),
@@ -4210,6 +4242,7 @@ impl Pipeline {
                 max_aux_canvases: self.max_aux_canvases,
                 formats: self.output_formats.clone(),
                 live_reset: self.output_live_reset.clone(),
+                passthrough: self.output_passthrough.clone(),
                 boot_retry: self.boot_retry,
             },
             crate::output_routing::AuxWiring {
@@ -4226,12 +4259,16 @@ impl Pipeline {
             },
             open,
             Some(reformat_open),
+            Some(pass_hooks),
         )
         .map_err(spawn_err)?;
         // Atomic sets (#308) pick their adoption tick after the clock's last
         // composed tick: a wait-free atomic load, never a lock on the clock.
         if let Some(control) = self.switcher_control.as_ref() {
             router.set_switcher_clock(control.applied_tick_cell());
+            // K4 (review H3): one Clean / DSK gate shared by the switcher,
+            // the routing handle (plan) and the router (drain admission).
+            router.set_clean_gate(control.clean_gate());
         }
         let run_outputs = self.run_outputs(binding_ids, audio_tracks);
         // Slice F part F2: the run's subtitle route tables, keyed by output
@@ -4254,6 +4291,12 @@ impl Pipeline {
                 .with_dsk_defined(!self.switcher_keyers.is_empty())
                 .with_subtitles(subtitle_tables, Arc::clone(&subtitle_tick)),
         );
+        // K4: the switcher's gate, so a run-time `keyer_set` defining a DSK
+        // and a Clean take are admitted against the same counted word.
+        let handle = match self.switcher_control.as_ref() {
+            Some(control) => Arc::new((*handle).clone().with_clean_gate(control.clean_gate())),
+            None => handle,
+        };
         enqueue_boot_takes(&handle, &self.boot_output_feeds, &self.boot_audio_takes);
         // Review INV-1: the run's subtitle routing ends with the run (every
         // exit path drops this guard), so a take can no longer re-point an
@@ -4480,6 +4523,15 @@ impl Pipeline {
                 &self.switcher_keyers,
             ));
             self.keyer_demand = Some(keyers);
+        }
+        // K4: a run with an M/E can define its first DSK at run time
+        // (`keyer_set`), so the switcher always gets a `keyer` demand set.
+        if self.keyer_demand.is_none() && self.switcher_me.is_some() {
+            self.keyer_demand =
+                Some(manager.consumer_set(multiview_engine::ConsumerClass::Keyer, Rails::VIDEO));
+        }
+        if let (Some(control), Some(set)) = (&self.switcher_control, &self.keyer_demand) {
+            control.set_keyer_demand(set.clone());
         }
         self.demand_sets = Some((layout, audio));
         self.demand = Some(manager.clone());
@@ -5169,6 +5221,8 @@ impl Pipeline {
                 self.output_inband_sets.insert(0, true);
                 // The internal `program.ts` anchor is a file: never reset.
                 self.output_live_reset.insert(0, false);
+                self.output_passthrough
+                    .insert(0, crate::output_routing::PassEligibility::NotSupported);
                 self.output_audio_tracks
                     .insert(0, hls_audio.unwrap_or_default());
             }
@@ -5225,6 +5279,18 @@ impl Pipeline {
     #[cfg(all(test, feature = "gpl-codecs"))]
     pub(crate) fn stall_consumer_once_for_test(&mut self, at: u64, stall: Duration) {
         self.consumer_stall_for_test = Some((at, stall));
+    }
+
+    /// The engine side of each subtitle feed (its counters included), one
+    /// per output with subtitle slots (HLS or cast), in configured order.
+    #[cfg(all(test, feature = "gpl-codecs"))]
+    pub(crate) fn subtitle_feeds_for_test(
+        &self,
+    ) -> Vec<(String, multiview_output::hls::SubtitleFeed)> {
+        self.subtitle_outputs
+            .iter()
+            .map(|plan| (plan.output_id.clone(), plan.feed.clone()))
+            .collect()
     }
 
     /// Tell the pipeline the engine's state directory: a cast output with no
@@ -8462,6 +8528,185 @@ fn reformat_opener(
     })
 }
 
+/// The passthrough (P0) eligibility of one runnable output (#344 D2b): an
+/// HLS output with TS segments whose slot-0 codec is H.264 or HEVC (HEVC has
+/// no repeat AU: an underrun bridges to the slate). The slot is the
+/// output's own format (canvas or `[outputs.format]`), the run cadence, the
+/// canvas colour, 8-bit 4:2:0 progressive, the slot-0 bit rate as ceiling,
+/// and the HLS segment length as the longest GOP. Anything else is
+/// `passthrough-not-supported-on-medium`.
+#[allow(clippy::too_many_arguments)]
+// reason: one output's already-resolved facts, called once per output at plan build.
+fn passthrough_eligibility(
+    declared: Option<&Output>,
+    ts_hls: bool,
+    codec_token: &str,
+    (width, height): (u32, u32),
+    cadence: Rational,
+    bit_rate: usize,
+    colour: multiview_core::color::ColorInfo,
+    settings: usize,
+) -> crate::output_routing::PassEligibility {
+    use multiview_config::CodecFamily;
+    use multiview_output::passthrough::match_rules::{PassCodec, Scan};
+    use multiview_output::passthrough::SlotSpec;
+    let not = crate::output_routing::PassEligibility::NotSupported;
+    let Some(Output::Hls { segment_ms, .. }) = declared else {
+        return not;
+    };
+    if !ts_hls {
+        return not;
+    }
+    let (codec, max_profile, max_level) = match CodecFamily::of(codec_token) {
+        // The slot's encoder is High at any level the encoder picks: High
+        // 5.1 is the ceiling a decoder for the slot must handle.
+        Some(CodecFamily::H264) => (PassCodec::H264, 100, 51),
+        Some(CodecFamily::Hevc) => (PassCodec::Hevc, 1, 153),
+        _ => return not,
+    };
+    let Some(colour) = slot_colour(colour) else {
+        return not;
+    };
+    // Segment length in ticks (default 2 s): a segment boundary must find
+    // an IDR within it.
+    let ms = u64::from(segment_ms.unwrap_or(2_000).max(1));
+    let num = u64::try_from(cadence.num).unwrap_or(0);
+    let den = u64::try_from(cadence.den).unwrap_or(1).max(1);
+    let max_gop_ticks = ms.saturating_mul(num) / den.saturating_mul(1_000);
+    if max_gop_ticks == 0 {
+        return not;
+    }
+    crate::output_routing::PassEligibility::Eligible {
+        slot: SlotSpec {
+            codec,
+            max_profile,
+            max_level,
+            width,
+            height,
+            fps: cadence,
+            scan: Scan::Progressive,
+            colour,
+            bit_depth: 8,
+            chroma: 1,
+            bitrate_ceiling_kbps: u64::try_from(bit_rate / 1000).unwrap_or(u64::MAX).max(1),
+            max_gop_ticks,
+            b_frames_allowed: true,
+        },
+        settings,
+    }
+}
+
+/// The ITU-T H.273 code points of the slot's colour (`None` when an axis is
+/// unspecified: an untagged slot never matches).
+fn slot_colour(
+    c: multiview_core::color::ColorInfo,
+) -> Option<multiview_output::passthrough::match_rules::ColourTags> {
+    use multiview_core::color::{
+        ColorPrimaries, ColorRange, MatrixCoefficients, TransferCharacteristic,
+    };
+    let primaries = match c.primaries {
+        ColorPrimaries::Bt709 => 1,
+        ColorPrimaries::Bt601_625 => 5,
+        ColorPrimaries::Bt601_525 => 6,
+        ColorPrimaries::Bt2020 => 9,
+        _ => return None,
+    };
+    let transfer = match c.transfer {
+        TransferCharacteristic::Bt709 => 1,
+        TransferCharacteristic::Bt601 => 6,
+        TransferCharacteristic::Bt2020 => 14,
+        TransferCharacteristic::Srgb => 13,
+        TransferCharacteristic::Pq => 16,
+        TransferCharacteristic::Hlg => 18,
+        _ => return None,
+    };
+    let matrix = match c.matrix {
+        MatrixCoefficients::Bt709 => 1,
+        MatrixCoefficients::Bt601 => 6,
+        MatrixCoefficients::Bt2020Ncl => 9,
+        MatrixCoefficients::Rgb => 0,
+        _ => return None,
+    };
+    let range = match c.range {
+        ColorRange::Limited => 0,
+        ColorRange::Full => 1,
+        _ => return None,
+    };
+    Some(multiview_output::passthrough::match_rules::ColourTags {
+        primaries: Some(primaries),
+        transfer: Some(transfer),
+        matrix: Some(matrix),
+        range: Some(range),
+    })
+}
+
+/// The passthrough key opener (#344 D2b), run on the `routing-open` thread:
+/// subscribes the source's tap, bakes the format slate with the output's
+/// own encoder settings (the encoder is dropped after the bake: no session
+/// is held) and builds the key with its own matcher. A bake failure (for
+/// example no H.264 encoder linked) is the open's error: the candidate is
+/// not opened and the readback says why.
+fn passthrough_opener(
+    configs: Vec<EncodeConfig>,
+    cadence: Rational,
+    origin: crate::timing_status::EpochAnchorSlot,
+) -> crate::output_routing::PassOpenFn {
+    use multiview_ffmpeg::idr::CodecKind;
+    Box::new(move |req| {
+        let cfg = configs
+            .get(req.settings)
+            .ok_or_else(|| "unknown rendition settings".to_owned())?;
+        let tap = crate::passthrough_tap::lookup(&req.source)
+            .ok_or_else(|| "source has no compressed tap".to_owned())?;
+        let codec = match req.slot.codec {
+            multiview_output::passthrough::match_rules::PassCodec::H264 => CodecKind::H264,
+            multiview_output::passthrough::match_rules::PassCodec::Hevc => CodecKind::Hevc,
+            _ => return Err("slot codec has no passthrough".to_owned()),
+        };
+        let black = Nv12Image::solid(
+            cfg.width,
+            cfg.height,
+            16,
+            128,
+            128,
+            multiview_core::color::ColorInfo::default(),
+        )
+        .map_err(|e| e.to_string())?;
+        let slate = crate::passthrough_live::bake_slate(cfg, &black, codec)?;
+        let reader = tap
+            .tap()
+            .subscribe()
+            .ok_or_else(|| "the source's tap has no free consumer".to_owned())?;
+        let origin = Arc::clone(&origin);
+        let now: crate::passthrough_live::NowNs = Box::new(move || {
+            origin
+                .load()
+                .and_then(|run| u64::try_from(run.time().now_nanos()).ok())
+                .unwrap_or(0)
+        });
+        let traits_tap = Arc::clone(&tap);
+        let live = crate::passthrough_live::PassthroughLive::new(
+            crate::passthrough_live::PassthroughSpec {
+                cadence,
+                codec,
+                stream_params: None,
+            },
+            reader,
+            &slate,
+            now,
+        )
+        .ok_or_else(|| "empty slate".to_owned())?
+        .with_matcher(
+            req.slot.clone(),
+            Box::new(move || traits_tap.stream().map(|s| s.traits.clone())),
+        )
+        .with_slate_move_points(false);
+        let status = live.status();
+        let live: Box<dyn crate::output_routing::LiveEncoder> = Box::new(live);
+        Ok((live, status))
+    })
+}
+
 /// The routing opener (ADR-0108, #342): opens a live encoder for a rendition
 /// settings index. A Program/Clean key at a non-canvas format converts on its
 /// own worker (never erroring: it repeats or blacks). A routed source/PVW
@@ -9345,7 +9590,7 @@ fn consumer_main<D: WindowDelivery>(
         };
         let overlaid = baker.bake(&item)?;
         router.publish_program(item.tick_index, &overlaid);
-        // Slice F (#345): sample every HLS subtitle slot at this tick, off the
+        // Slice F (#345, #418): sample every HLS/cast subtitle slot at this tick, off the
         // clock (one empty check when no output declares a subtitle slot).
         subtitles.tick(item.tick_index);
         // NO-FALTER: fill any ticks this consumer missed (a transient stall
@@ -9924,8 +10169,24 @@ fn run_one_output(
             dir,
             default_dir: _,
             epoch,
+            audio: selection,
+            program_language,
+            subtitles,
         } => Ok(run_cast_output(
-            &id, gate, &dir, epoch, &rx, params, time_base, audio,
+            CastRun {
+                id: &id,
+                gate,
+                dir: &dir,
+                epoch,
+                selection: &selection,
+                program_language,
+                subtitles,
+            },
+            &rx,
+            params,
+            time_base,
+            audio,
+            tracks,
         )),
         #[cfg(feature = "webrtc-native")]
         RunnableOutput::WebRtc { id: _, sink, label } => {
@@ -10363,24 +10624,150 @@ where
     }
 }
 
+/// What a cast output's sink needs besides the encoders' parameters.
+struct CastRun<'a> {
+    id: &'a str,
+    gate: Arc<crate::cast_output::CastGate>,
+    dir: &'a Path,
+    epoch: multiview_output::SharedEpoch,
+    selection: &'a multiview_output::AudioSelection,
+    program_language: Option<String>,
+    subtitles: Option<CastSubtitles>,
+}
+
+/// A cast output's subtitle slots for one run (#418): the renditions the
+/// master lists and the sink side of the bake consumer's cue feed, shared by
+/// every packager generation of the run.
+#[derive(Clone)]
+struct CastSubtitles {
+    renditions: Vec<multiview_output::hls::SubtitleRendition>,
+    feed: Arc<multiview_output::hls::SubtitleFeedReceiver>,
+}
+
+/// The cast packager's description of one AAC stream, from its encoder.
+/// `None` when the time base is not `1/sample_rate` (never the AAC encoder's).
+fn cast_audio_config(
+    params: &StreamCodecParameters,
+    time_base: Rational,
+) -> Option<multiview_output::hls::cast::CastAudioConfig> {
+    let sample_rate = (time_base.num == 1)
+        .then(|| u32::try_from(time_base.den).ok())
+        .flatten()?;
+    let asc = params.codec_config_bytes();
+    // AudioSpecificConfig: 5 bits object type, 4 bits rate index, 4 bits
+    // channel configuration. Stereo (the program bus) when absent.
+    let channels = asc
+        .as_deref()
+        .and_then(|bytes| bytes.get(1))
+        .map(|byte| u16::from((byte >> 3) & 0x0F))
+        .filter(|channels| *channels > 0)
+        .unwrap_or(multiview_config::output_format::SLOT_AUDIO_CHANNELS);
+    Some(multiview_output::hls::cast::CastAudioConfig {
+        time_base,
+        sample_rate,
+        channels,
+        bit_rate: params.opened_bit_rate().or_else(|| params.bit_rate()),
+        audio_specific_config: asc,
+    })
+}
+
+/// One cast audio rendition per selected stream (#418), in order: the
+/// program (when selected and encoded) then each selected discrete track;
+/// the first is `DEFAULT=YES`. Returns them with the stream → rendition map.
+fn cast_audio_renditions(
+    selection: &multiview_output::AudioSelection,
+    program_language: Option<&str>,
+    program: Option<&(StreamCodecParameters, Rational)>,
+    tracks: &[(StreamCodecParameters, Rational)],
+) -> (
+    Vec<multiview_output::hls::cast::CastAudioRendition>,
+    crate::cast_output::CastAudioRoutes,
+) {
+    use multiview_output::hls::cast::{CastAudioRendition, MAX_CAST_AUDIO_RENDITIONS};
+    // Config validation refuses exactly what the packager cannot carry.
+    const _: () = assert!(MAX_CAST_AUDIO_RENDITIONS == multiview_config::MAX_CAST_AUDIO_RENDITIONS);
+    let mut renditions: Vec<CastAudioRendition> = Vec::new();
+    let mut routes = crate::cast_output::CastAudioRoutes {
+        program: None,
+        tracks: vec![None; tracks.len()],
+    };
+    if selection.program {
+        if let Some(config) = program.and_then(|(p, tb)| cast_audio_config(p, *tb)) {
+            routes.program = Some(renditions.len());
+            renditions.push(CastAudioRendition {
+                config,
+                // The menu label stays "Program"; the language goes in LANGUAGE.
+                name: "Program".to_owned(),
+                language: program_language.map(str::to_owned),
+                default: false,
+            });
+        }
+    }
+    for track in &selection.tracks {
+        if renditions.len() >= MAX_CAST_AUDIO_RENDITIONS {
+            // Defence only: config validation refuses a cast output carrying
+            // more (#418 review INV418-1), so this never fires on a valid run.
+            tracing::warn!(
+                selected = usize::from(selection.program) + selection.tracks.len(),
+                max = MAX_CAST_AUDIO_RENDITIONS,
+                "cast: audio selection exceeds the cast rendition limit; extra tracks dropped"
+            );
+            break;
+        }
+        let index = usize::from(track.index);
+        let Some(config) = tracks
+            .get(index)
+            .and_then(|(p, tb)| cast_audio_config(p, *tb))
+        else {
+            continue;
+        };
+        if let Some(slot) = routes.tracks.get_mut(index) {
+            if slot.is_some() {
+                continue;
+            }
+            *slot = Some(renditions.len());
+        }
+        renditions.push(CastAudioRendition {
+            config,
+            name: track
+                .title
+                .clone()
+                .unwrap_or_else(|| format!("Track {}", track.index)),
+            language: track.language.clone(),
+            default: false,
+        });
+    }
+    if let Some(first) = renditions.first_mut() {
+        first.default = true;
+    }
+    (renditions, routes)
+}
+
 /// Run a cast output's sink (ADR-0111) over its fan-out channel.
 /// **Infallible**: a cast output can never fail the run.
 ///
 /// The packager's video rendition is described by the encoder that feeds
 /// this output (its real size, bit rate and parameter sets), never by the
-/// canvas: an output with its own format is encoded at that format.
-#[allow(clippy::too_many_arguments)] // Each argument is one distinct input of the sink thread.
+/// canvas: an output with its own format is encoded at that format. Each
+/// selected audio stream is one audio rendition (#418).
 fn run_cast_output(
-    id: &str,
-    gate: Arc<crate::cast_output::CastGate>,
-    dir: &Path,
-    epoch: multiview_output::SharedEpoch,
+    run: CastRun<'_>,
     rx: &Receiver<LeasedPacket>,
     params: &StreamCodecParameters,
     time_base: Rational,
     audio: Option<&(StreamCodecParameters, Rational)>,
+    tracks: &[(StreamCodecParameters, Rational)],
 ) -> SinkRunOutcome {
-    use multiview_output::hls::cast::{CastAudioConfig, CastVideoConfig};
+    use multiview_output::hls::cast::CastVideoConfig;
+    let CastRun {
+        id,
+        gate,
+        dir,
+        epoch,
+        selection,
+        program_language,
+        subtitles,
+    } = run;
     let (width, height) = params.video_dimensions().unwrap_or((0, 0));
     let video = CastVideoConfig {
         time_base,
@@ -10389,30 +10776,12 @@ fn run_cast_output(
         bit_rate: params.opened_bit_rate().or_else(|| params.bit_rate()),
         extradata: params.codec_config_bytes(),
     };
-    let audio = audio.and_then(|(audio_params, audio_tb)| {
-        // The audio time base is `1/sample_rate` (the AAC encoder's).
-        let sample_rate = (audio_tb.num == 1)
-            .then(|| u32::try_from(audio_tb.den).ok())
-            .flatten()?;
-        let asc = audio_params.codec_config_bytes();
-        // AudioSpecificConfig: 5 bits object type, 4 bits rate index, 4 bits
-        // channel configuration. Stereo (the program bus) when absent.
-        let channels = asc
-            .as_deref()
-            .and_then(|bytes| bytes.get(1))
-            .map(|byte| u16::from((byte >> 3) & 0x0F))
-            .filter(|channels| *channels > 0)
-            .unwrap_or(multiview_config::output_format::SLOT_AUDIO_CHANNELS);
-        Some(CastAudioConfig {
-            time_base: *audio_tb,
-            sample_rate,
-            channels,
-            bit_rate: audio_params
-                .opened_bit_rate()
-                .or_else(|| audio_params.bit_rate()),
-            audio_specific_config: asc,
-        })
-    });
+    let (audio, audio_routes) =
+        cast_audio_renditions(selection, program_language.as_deref(), audio, tracks);
+    let (subtitles, subtitle_feed) = subtitles.map_or_else(
+        || (Vec::new(), None),
+        |subs| (subs.renditions, Some(subs.feed)),
+    );
     let setup = crate::cast_output::CastSetup {
         id: id.to_owned(),
         dir: dir.to_path_buf(),
@@ -10420,6 +10789,9 @@ fn run_cast_output(
         epoch,
         video,
         audio,
+        audio_routes,
+        subtitles,
+        subtitle_feed,
     };
     let report =
         crate::cast_output::run_cast_sink(setup, rx, &|packet| params.is_decoder_ready_rap(packet));
@@ -13581,7 +13953,7 @@ struct BuiltOutputs {
     /// shares the existing per-sink thread + end-of-program lifecycle — but it
     /// consumes the canvas tap below, never the packets.
     packet: Vec<RunnableOutput>,
-    /// The HLS outputs' subtitle slots (slice F #345).
+    /// The HLS and cast outputs' subtitle slots (slice F #345, #418).
     subtitles: Vec<SubtitleOutputPlan>,
     /// DRM/KMS display heads, started as raw-frame sinks at stream start.
     #[cfg(feature = "display-kms")]
@@ -14215,31 +14587,10 @@ fn build_hls_output(
     // Slice F (#345): WebVTT subtitle renditions for a TS-segment HLS output
     // (config refuses them on LL-HLS), fed by the bake consumer's sampler.
     let mut plan = None;
-    if let (Output::Hls { .. }, Some(slots)) = (output, output.slots()) {
-        if !slots.subtitle.is_empty() {
-            let renditions = slots
-                .subtitle
-                .iter()
-                .enumerate()
-                .map(|(i, slot)| multiview_output::hls::SubtitleRendition {
-                    name: slot.effective_name(i),
-                    language: slot.language.clone(),
-                })
-                .collect();
-            let (feed, rx) = multiview_output::hls::subtitle_feed();
+    if matches!(output, Output::Hls { .. }) {
+        if let Some((renditions, rx, built)) = subtitle_slots_plan(output) {
             sink = sink.with_subtitles(renditions, rx);
-            plan = Some(SubtitleOutputPlan {
-                output_id: output.id(),
-                routes: crate::subtitle_slots::subtitle_routes(
-                    slots
-                        .subtitle
-                        .iter()
-                        .map(|slot| slot.source.clone())
-                        .collect(),
-                ),
-                feed,
-                slots: slots.subtitle.len(),
-            });
+            plan = Some(built);
         }
     }
     Ok((
@@ -14252,7 +14603,44 @@ fn build_hls_output(
     ))
 }
 
-/// One HLS output's subtitle slots for the run (slice F #345): its route
+/// An output's subtitle slots for the run (slice F #345; cast #418): the
+/// `WebVTT` renditions its sink lists, the sink side of the cue feed and the
+/// [`SubtitleOutputPlan`] the bake consumer's sampler (and the live re-patch,
+/// keyed by output id) drives. `None` when the output declares no slot.
+fn subtitle_slots_plan(
+    output: &Output,
+) -> Option<(
+    Vec<multiview_output::hls::SubtitleRendition>,
+    multiview_output::hls::SubtitleFeedReceiver,
+    SubtitleOutputPlan,
+)> {
+    let slots = output.slots().filter(|slots| !slots.subtitle.is_empty())?;
+    let renditions = slots
+        .subtitle
+        .iter()
+        .enumerate()
+        .map(|(i, slot)| multiview_output::hls::SubtitleRendition {
+            name: slot.effective_name(i),
+            language: slot.language.clone(),
+        })
+        .collect();
+    let (feed, rx) = multiview_output::hls::subtitle_feed();
+    let plan = SubtitleOutputPlan {
+        output_id: output.id(),
+        routes: crate::subtitle_slots::subtitle_routes(
+            slots
+                .subtitle
+                .iter()
+                .map(|slot| slot.source.clone())
+                .collect(),
+        ),
+        feed,
+        slots: slots.subtitle.len(),
+    };
+    Some((renditions, rx, plan))
+}
+
+/// One output's subtitle slots for the run (slice F #345; HLS or cast): its route
 /// table (slot → source, re-pointed live by the patch API), the engine side
 /// of its sink's cue feed and its slot count.
 #[derive(Clone)]
@@ -14460,6 +14848,17 @@ fn build_outputs(
             // while a cast stream is active.
             Output::Cast { id, dir, .. } => {
                 let default_state = multiview_control::boot_model::state_dir_for(Path::new(""));
+                let (cast_subtitles, plan) = subtitle_slots_plan(output)
+                    .map(|(renditions, feed, plan)| {
+                        (
+                            CastSubtitles {
+                                renditions,
+                                feed: Arc::new(feed),
+                            },
+                            plan,
+                        )
+                    })
+                    .unzip();
                 runnable.push(RunnableOutput::Cast {
                     id: id.clone(),
                     gate: Arc::new(crate::cast_output::CastGate::new()),
@@ -14469,7 +14868,12 @@ fn build_outputs(
                     ),
                     default_dir: dir.is_none(),
                     epoch: epoch.clone(),
+                    // Resolved by `apply_output_audio_selections`.
+                    audio: multiview_output::AudioSelection::default(),
+                    program_language: None,
+                    subtitles: cast_subtitles,
                 });
+                subtitles.extend(plan);
             }
             Output::Rtmp { url, .. } => {
                 runnable.push(build_push_output(output, PushProtocol::Rtmp, url, "rtmp"));
@@ -15116,18 +15520,12 @@ fn output_audio_selection(
     output: &Output,
     tracks: &[DeclaredTrack],
 ) -> multiview_output::AudioSelection {
-    // `slots.audio`, when declared, is the output's selection (#342).
-    let Some(selection) = output.effective_audio() else {
-        return multiview_output::AudioSelection::default();
-    };
+    // `slots.audio`, when declared, is the output's selection (#342); the
+    // resolution is shared with the control plane's cast-token authorization
+    // (#418 review ABUSE-2), so both agree on what an output carries.
+    // No selection resolves to the program only (the default).
     let names: Vec<&str> = tracks.iter().map(|t| t.name.as_str()).collect();
-    let (program, mut chosen) = selection.resolve(&names);
-    let capacity = output.audio_capability().discrete_capacity;
-    let auto_capped = selection.mode == multiview_config::OutputAudioMode::Auto
-        && capacity != multiview_config::TrackCapacity::Unlimited;
-    if auto_capped || capacity == multiview_config::TrackCapacity::AtMost(0) {
-        chosen.clear();
-    }
+    let (program, chosen) = output.carried_audio(&names);
     multiview_output::AudioSelection {
         program,
         tracks: tracks
@@ -15145,6 +15543,32 @@ fn output_audio_selection(
     }
 }
 
+/// A cast output's audio selection (#418): [`output_audio_selection`] (the
+/// HLS rules), where an audio slot's `language` wins over its track route's,
+/// plus slot 0's language (the program rendition's).
+fn cast_audio_selection(
+    output: &Output,
+    tracks: &[DeclaredTrack],
+) -> (multiview_output::AudioSelection, Option<String>) {
+    let mut selection = output_audio_selection(output, tracks);
+    let slots = output.slots().map_or(&[][..], |s| s.audio.as_slice());
+    for slot in slots.iter().skip(1) {
+        let (Some(name), Some(language)) = (slot.track.as_deref(), slot.language.as_ref()) else {
+            continue;
+        };
+        for chosen in &mut selection.tracks {
+            if tracks
+                .get(usize::from(chosen.index))
+                .is_some_and(|t| t.name == name)
+            {
+                chosen.language = Some(language.clone());
+            }
+        }
+    }
+    let program_language = slots.first().and_then(|slot| slot.language.clone());
+    (selection, program_language)
+}
+
 /// Apply each configured output's audio selection to its muxing runnable
 /// (matched by stable output id).
 fn apply_output_audio_selections(
@@ -15157,8 +15581,19 @@ fn apply_output_audio_selections(
             RunnableOutput::File { id, sink, .. }
             | RunnableOutput::Hls { id, sink, .. }
             | RunnableOutput::Push { id, sink, .. } => (id.as_str(), sink),
-            // Program audio only: nothing to select.
-            RunnableOutput::Cast { .. } => continue,
+            // #418: a cast stream carries the selection like HLS, with the
+            // audio slots' languages.
+            RunnableOutput::Cast {
+                id,
+                audio,
+                program_language,
+                ..
+            } => {
+                if let Some(output) = outputs.iter().find(|o| o.id() == *id) {
+                    (*audio, *program_language) = cast_audio_selection(output, tracks);
+                }
+                continue;
+            }
             #[cfg(feature = "webrtc-native")]
             RunnableOutput::WebRtc { .. } => continue,
             #[cfg(feature = "ndi-bindings")]
@@ -18510,7 +18945,13 @@ fn ingest_loop(plan: &IngestPlan, stop: &AtomicBool) {
     // for one (ADR-0039 decision 10, amended) — so this is unreachable there.
     #[cfg(feature = "srt-libsrt")]
     let _srt_listener = match &plan.location {
-        SourceLocation::Url(url) if multiview_output::sink::is_srt_listener_url(url) => {
+        // Below the libsrt security floor no bridge is started at all (its
+        // thread could only retry a refusal that never clears); the open below
+        // reports the reason instead.
+        SourceLocation::Url(url)
+            if multiview_output::sink::is_srt_listener_url(url)
+                && multiview_srt_sys::listener_floor_check().is_ok() =>
+        {
             crate::srt_ingest::acquire(url).ok()
         }
         _ => None,
@@ -19681,6 +20122,11 @@ fn open_and_stream(
             // is unreachable in that build and compiled out.
             #[cfg(feature = "srt-libsrt")]
             let open_url = if multiview_output::sink::is_srt_listener_url(&open_url) {
+                // Security floor (GHSA-m96h-3rc9-xx6h, ADR-0114 decision 4): on
+                // a libsrt below 1.5.7 fail this open with the
+                // `srt-libsrt-too-old` reason (both versions), which the
+                // reconnect bracket logs against the source and backs off.
+                multiview_srt_sys::listener_floor_check().map_err(|e| e.to_string())?;
                 let reader = crate::srt_ingest::acquire(&open_url)?.open_reader()?;
                 let url = reader.url().to_owned();
                 _srt_reader = Some(reader);

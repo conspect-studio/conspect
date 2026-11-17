@@ -209,10 +209,10 @@ fn gates_are_bounded_and_fail_closed_past_the_cap() {
         .claim("op", "output-x", "over", &RoutedFeed::Program, false)
         .unwrap();
     for i in 0..MAX_GATES {
-        let arm = streams.arm_snapshot(&format!("c{i}"));
+        let arm = streams.arm_snapshot(&format!("c{i}"), None);
         assert!(arm.generation > 0);
     }
-    let arm = streams.arm_snapshot("over");
+    let arm = streams.arm_snapshot("over", None);
     assert_eq!(arm.generation, 0);
     assert!(arm.needs.is_none());
     assert_eq!(streams.lock().gates.len(), MAX_GATES);
@@ -222,4 +222,204 @@ fn gates_are_bounded_and_fail_closed_past_the_cap() {
     );
     assert!(streams.serve(&claim.token).is_none());
     assert_eq!(streams.generation("over"), None);
+}
+
+/// #418 review ABUSE-HISTORY-R4: [`RETIRE_SEGMENTS`] is the packager's
+/// retention plus the segment in progress: `multiview_output::hls::cast`
+/// keeps the files of `2 * window` published segments (`retire_old_files`)
+/// and the run's window is `multiview-cli` `CAST_WINDOW` = 10, pinned by
+/// value (those live in crates this one cannot name).
+#[test]
+fn retire_segments_match_the_packager_retention() {
+    assert_eq!(CAST_WINDOW, 10);
+    assert_eq!(RETIRE_SEGMENTS, 21);
+    assert_eq!(RETIRE_SEGMENTS, 2 * CAST_WINDOW + 1);
+    // The time floor still covers 2 x window segments of the 4 s
+    // EXT-X-TARGETDURATION at the nominal cadence.
+    const { assert!(MEDIA_RETENTION_MS >= 2 * CAST_WINDOW * 4_000) };
+}
+
+fn mark(active: bool, generation: u64, video_segments: u64) -> SinkMark {
+    SinkMark {
+        active,
+        generation,
+        video_segments,
+        disabled: false,
+    }
+}
+
+/// #418 review r7: a disabled output (its purge failed: files of the old
+/// generation may be left) never proves a superseded grant set replaced,
+/// neither by a generation change nor by being inactive.
+#[test]
+fn gate_history_never_expires_through_a_disabled_output() {
+    use super::reauth::Need;
+    let need = |s: &str| Need::Object(s.to_owned());
+    let after = 1_000 + MEDIA_RETENTION_MS;
+    let disabled = |active: bool, generation: u64, segments: u64| SinkMark {
+        disabled: true,
+        ..mark(active, generation, segments)
+    };
+    for with_mark in [true, false] {
+        let mut gate = registry::Gate::default();
+        let at = mark(true, 7, 100);
+        gate.retire(Some(vec![need("s2")]), 1_000, with_mark.then_some(&at));
+        for sink in [
+            disabled(false, 9, 0),
+            disabled(true, 8, 0),
+            disabled(true, 7, 1_000),
+        ] {
+            gate.prune(after * 10, Some(&sink));
+            assert!(
+                gate.cleared_needs().unwrap().contains(&need("s2")),
+                "{sink:?}"
+            );
+        }
+        // Enabled again (a later run): replacement proves it as before.
+        gate.prune(after, Some(&mark(false, 9, 0)));
+        assert!(!gate.remembers());
+    }
+}
+
+/// ABUSE-HISTORY-R4: a superseded grant set expires only when its retention
+/// elapsed AND the sink replaced its media (new generation, inactive, or
+/// [`RETIRE_SEGMENTS`] more segments); without a sink status, never.
+#[test]
+fn gate_history_expires_only_after_retention_and_sink_replacement() {
+    use super::reauth::Need;
+    let need = |s: &str| Need::Object(s.to_owned());
+    let at = mark(true, 7, 100);
+    let mut gate = registry::Gate::default();
+    gate.replace_settled(("src:s2".to_owned(), Some(vec![need("s2")])), 0, Some(&at));
+    gate.replace_settled(
+        ("src:s1".to_owned(), Some(vec![need("s1")])),
+        1_000,
+        Some(&at),
+    );
+    let after = 1_000 + MEDIA_RETENTION_MS;
+    let holds = |gate: &mut registry::Gate, now: u64, sink: Option<&SinkMark>| {
+        gate.prune(now, sink);
+        gate.cleared_needs().unwrap().contains(&need("s2"))
+    };
+    // A stalled sink keeps it, however long.
+    assert!(holds(&mut gate, after * 1_000, Some(&at)));
+    assert!(holds(&mut gate, after, Some(&mark(true, 7, 120))));
+    // Status unavailable: kept.
+    assert!(holds(&mut gate, after, None));
+    // Replaced, but the retention not yet elapsed: kept.
+    assert!(holds(
+        &mut gate,
+        MEDIA_RETENTION_MS - 1,
+        Some(&mark(true, 8, 0))
+    ));
+    // Every file retired (100 + 21 segments): gone.
+    let mut g = gate.clone();
+    assert!(!holds(&mut g, after, Some(&mark(true, 7, 121))));
+    assert_eq!(g.cleared_needs().unwrap(), vec![need("s1")]);
+    // A new generation: gone. Inactive: gone.
+    let mut g = gate.clone();
+    assert!(!holds(&mut g, after, Some(&mark(true, 8, 0))));
+    let mut g = gate.clone();
+    assert!(!holds(&mut g, after, Some(&mark(false, 0, 0))));
+    // Superseded while the status was unavailable: only an inactive output
+    // proves it replaced.
+    let mut gate = registry::Gate::default();
+    gate.retire(Some(vec![need("s2")]), 0, None);
+    assert!(holds(&mut gate, after, Some(&mark(true, 9, 1_000))));
+    assert!(!holds(&mut gate, after, Some(&mark(false, 0, 0))));
+}
+
+/// ABUSE-HISTORY-R4: the history is bounded; an overflow merges into the
+/// oldest entry with the LATER retention and sink mark, so no need is
+/// dropped early. Undeterminable history fails closed.
+#[test]
+fn gate_history_merges_bounded_and_never_drops_a_need_early() {
+    use super::reauth::Need;
+    let need = |s: &str| Need::Object(s.to_owned());
+    let mut gate = registry::Gate::default();
+    let max = u64::try_from(MAX_HISTORY).unwrap();
+    for i in 0..max + 3 {
+        gate.retire(
+            Some(vec![need(&format!("n{i}"))]),
+            i,
+            Some(&mark(true, 7, i * 10)),
+        );
+    }
+    assert_eq!(gate.history.len(), MAX_HISTORY);
+    for i in 0..max + 3 {
+        let mut g = gate.clone();
+        g.prune(
+            i + MEDIA_RETENTION_MS - 1,
+            Some(&mark(true, 7, i * 10 + RETIRE_SEGMENTS)),
+        );
+        assert!(
+            g.cleared_needs().unwrap().contains(&need(&format!("n{i}"))),
+            "n{i}"
+        );
+        let mut g = gate.clone();
+        g.prune(
+            i + MEDIA_RETENTION_MS,
+            Some(&mark(true, 7, i * 10 + RETIRE_SEGMENTS - 1)),
+        );
+        assert!(
+            g.cleared_needs().unwrap().contains(&need(&format!("n{i}"))),
+            "n{i}"
+        );
+    }
+    gate.retire(None, 0, None);
+    assert!(gate.cleared_needs().is_none());
+}
+
+/// INV418-FINAL-1: the distinct grants retained across the whole history
+/// are bounded, overflow merges included. Past [`MAX_HISTORY_NEEDS`] the
+/// history collapses to one undeterminable entry (fails closed) that keeps
+/// the latest retention and sink mark, and still expires normally.
+#[test]
+fn gate_history_grant_storage_is_bounded_and_overflow_fails_closed() {
+    use super::reauth::Need;
+    let need = |s: String| Need::Object(s);
+    let stalled = mark(true, 7, 100);
+    let mut gate = registry::Gate::default();
+    let stored = |gate: &registry::Gate| -> usize {
+        gate.history
+            .iter()
+            .map(|h| h.needs.as_ref().map_or(0, Vec::len))
+            .sum()
+    };
+    // Below the bound: every grant is still required.
+    let per = 3;
+    let fits = MAX_HISTORY_NEEDS / per;
+    for i in 0..fits {
+        let needs = (0..per).map(|j| need(format!("n{i}-{j}"))).collect();
+        gate.retire(Some(needs), 0, Some(&stalled));
+    }
+    assert!(stored(&gate) <= MAX_HISTORY_NEEDS);
+    assert!(gate
+        .cleared_needs()
+        .unwrap()
+        .contains(&need("n0-0".to_owned())));
+    // Many more distinct grants with the sink stalled: bounded, fail closed.
+    let end = fits + 2_000;
+    // The latest retirement time (`retire` at `i` ms).
+    let last = u64::try_from(end - 1).unwrap();
+    for i in fits..end {
+        let needs = (0..per).map(|j| need(format!("n{i}-{j}"))).collect();
+        gate.retire(Some(needs), u64::try_from(i).unwrap(), Some(&stalled));
+        assert!(stored(&gate) <= MAX_HISTORY_NEEDS, "{i}");
+        assert!(gate.history.len() <= MAX_HISTORY);
+    }
+    assert!(gate.cleared_needs().is_none());
+    // A stalled sink keeps it, however long.
+    gate.prune(last * 1_000, Some(&stalled));
+    assert!(gate.remembers() && gate.cleared_needs().is_none());
+    // The retention not yet elapsed: kept even when the sink replaced it.
+    gate.prune(last + MEDIA_RETENTION_MS - 1, Some(&mark(true, 8, 0)));
+    assert!(gate.cleared_needs().is_none());
+    // Retention elapsed and every file retired: it clears.
+    gate.prune(
+        last + MEDIA_RETENTION_MS,
+        Some(&mark(true, 7, 100 + RETIRE_SEGMENTS)),
+    );
+    assert!(!gate.remembers());
+    assert_eq!(gate.cleared_needs(), Some(Vec::new()));
 }

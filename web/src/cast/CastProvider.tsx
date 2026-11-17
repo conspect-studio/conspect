@@ -98,6 +98,11 @@ const IDLE_VIEW: Omit<CastSnapshot, 'status'> = {
   volume: null,
   muted: null,
   tvUnreachable: false,
+  audioTracks: [],
+  textTracks: [],
+  activeAudioId: null,
+  activeTextId: null,
+  trackError: null,
 };
 
 /** Hooks a component's Cast button into the shared one-per-tab controller. */

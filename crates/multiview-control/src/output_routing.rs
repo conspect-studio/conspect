@@ -316,6 +316,9 @@ impl PlanCost {
 /// (ADR-0110, output-routing §12.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanPath {
+    /// Passthrough (§12.5, #344 D2b): the source's compressed video goes to
+    /// the output unchanged: 0 decode, 0 encode, 0 session.
+    P0,
     /// An encoded bus with key (picture, format, settings) is already live:
     /// +0 encoders.
     P1,
@@ -326,10 +329,11 @@ pub enum PlanPath {
 }
 
 impl PlanPath {
-    /// The wire name (`P1`, `P2`, `P3`).
+    /// The wire name (`P0`, `P1`, `P2`, `P3`).
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::P0 => "P0",
             Self::P1 => "P1",
             Self::P2 => "P2",
             Self::P3 => "P3",
@@ -338,7 +342,7 @@ impl PlanPath {
 }
 
 /// The plan of one crosspoint onto an output's video slot 0 (#342 B2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotPlan {
     /// The path (§12.4).
     pub path: PlanPath,
@@ -347,6 +351,20 @@ pub struct SlotPlan {
     /// `1` when a P3 needs a convert whose (picture, format) feed is not
     /// live yet, else `0`.
     pub converts: u8,
+    /// Why the crosspoint is not P0 (#344 D2b): the first passthrough miss
+    /// (`passthrough-not-supported-on-medium`, a §12.5 match-rule miss), or
+    /// `None` (P0, or a feed that is not a source). Never names a source.
+    pub passthrough: Option<String>,
+}
+
+/// One output's passthrough readback (#344 D2b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassthroughLive {
+    /// `opening`, `metering`, `moving`, `passthrough`, `slate`, `bridging`,
+    /// `returning`, `unavailable`.
+    pub state: String,
+    /// Why it is not passing through (never names a source).
+    pub reason: Option<String>,
 }
 
 /// The video bit rate of an output whose video slot 0 names none, kbit/s:
@@ -415,6 +433,32 @@ pub struct RoutingLive {
     pub sessions_max: usize,
     /// Clock ticks the routed-picture thread could not take.
     pub dropped_ticks: u64,
+    /// Passthrough (P0) totals (#344 D2b).
+    pub passthrough: PassthroughTotals,
+}
+
+/// Passthrough (P0) counters of the run (#344 D2b): keys open (no encoder
+/// session each) and cumulative AU / repeat / drift-drop / stall / slate /
+/// bridge counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PassthroughTotals {
+    /// Passthrough keys open.
+    pub keys: usize,
+    /// Source access units passed through.
+    pub aus: u64,
+    /// Repeat (skip) access units emitted by drift corrections.
+    pub repeats: u64,
+    /// Access units dropped by drift corrections.
+    pub drift_drops: u64,
+    /// Runs ended by a stall.
+    pub stalls: u64,
+    /// Ticks emitted from a format slate.
+    pub slate_ticks: u64,
+    /// Moves onto an on-demand picture bridge.
+    pub bridges: u64,
+    /// Bridges that found no encoder session (stayed on the slate).
+    pub bridges_refused: u64,
 }
 
 /// One terminal take outcome from the engine.
@@ -570,6 +614,11 @@ pub trait OutputRouting: Send + Sync {
         None
     }
 
+    /// The output's passthrough state (#344 D2b; `None`: no candidate).
+    fn current_passthrough(&self, _output: &str) -> Option<PassthroughLive> {
+        None
+    }
+
     /// Plan a crosspoint onto the output's video slot 0 with its §12.4 path
     /// (#342 B2). The default derives it from [`Self::plan`] alone: P1 when
     /// no encoder is needed, else P3 (an implementor that cannot tell an
@@ -587,6 +636,7 @@ pub trait OutputRouting: Send + Sync {
             },
             cost,
             converts: u8::from(cost.needs_encoder),
+            passthrough: None,
         })
     }
 

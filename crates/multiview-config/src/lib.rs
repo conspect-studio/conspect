@@ -127,8 +127,9 @@ pub use origin::{Origin, OriginParseError};
 pub use output_format::{
     is_output_rate, output_rate, validate_output_format, validate_subtitle_sources, Anchor,
     AudioSlot, CodecFamily, OutputFit, OutputFitMode, OutputFormat, OutputSlots, Scan,
-    SlotCapability, SubtitleFormat, SubtitleSlot, VideoSlot, MAX_OUTPUT_FPS, MAX_SLOT_BITRATE_KBPS,
-    MAX_SUBTITLE_SLOTS, MIN_OUTPUT_FPS, SLOT_FORMAT_UNSUPPORTED, SLOT_MEDIUM_MISMATCH,
+    SlotCapability, SubtitleFormat, SubtitleSlot, VideoSlot, MAX_CAST_AUDIO_RENDITIONS,
+    MAX_OUTPUT_FPS, MAX_SLOT_BITRATE_KBPS, MAX_SUBTITLE_SLOTS, MIN_OUTPUT_FPS,
+    SLOT_FORMAT_UNSUPPORTED, SLOT_MEDIUM_MISMATCH,
 };
 pub use placement::{DevicePin, MigrationPolicy, PinVendor, PlacementConfig, PlacementWeights};
 pub use playback::{
@@ -2023,19 +2024,6 @@ impl MultiviewConfig {
                 }
             }
             AudioFeed::Tracks(tracks) => {
-                // A cast stream has one audio rendition, the program audio
-                // (or the routed feed's own audio): no discrete track.
-                let is_cast = self
-                    .outputs
-                    .iter()
-                    .any(|o| matches!(o, Output::Cast { id, .. } if *id == xp.output));
-                if is_cast {
-                    return Err(ConfigError::Validation(format!(
-                        "output {:?}: a cast output carries the program audio only; discrete \
-                         audio tracks cannot be routed to it",
-                        xp.output
-                    )));
-                }
                 if tracks.is_empty() {
                     return Err(ConfigError::Validation(format!(
                         "output {:?}: an audio `tracks` feed needs at least one track",

@@ -424,8 +424,22 @@ pub(crate) fn switcher_bus_consumers(
     consumers
 }
 
-/// The downstream keyers the running engine admitted (the adopted config).
+/// The downstream keyers the running engine admitted: the committed runtime
+/// definitions when a keyer runtime is installed (K4 `keyer_set` changes
+/// them after boot), else the adopted config.
 fn declared_keyers(state: &AppState) -> Vec<multiview_config::DownstreamKeyerConfig> {
+    if let Some(defs) = state
+        .switcher
+        .as_ref()
+        .and_then(multiview_engine::switcher_control::SwitcherControl::keyer_definitions)
+    {
+        return defs
+            .defs
+            .iter()
+            .flatten()
+            .map(|def| (*def.config).clone())
+            .collect();
+    }
     if let Some(model) = &state.boot_model {
         return model
             .adopted_config()
