@@ -2461,6 +2461,10 @@ pub struct Pipeline {
     /// like any source's audio). Built only for media players whose default asset
     /// declares a vamp window; empty when this run did not opt into program audio.
     player_audio_ingest_plans: Vec<crate::audio::PlayerAudioPlan>,
+    /// `media_player` source id -> its player id (ADR-M012), for sources whose
+    /// id differs from the player's. The player's audio rides the bus once,
+    /// under the player id; switcher audio-follow resolves through this map.
+    player_aliases: std::collections::HashMap<String, String>,
     /// Per-source **AES67 / ST 2110-30** audio RX plans (#103, ADR-0033/T013):
     /// how to bind + receive each AES67 multicast PCM source. The drive starts one
     /// supervised RX thread per plan (a peer of the audio decode threads) that
@@ -3196,6 +3200,12 @@ impl Pipeline {
             Vec::with_capacity(config.sources.len());
 
         for source in &config.sources {
+            // ADR-M012: a `media_player` source opens nothing itself. It binds
+            // cells/buses to its player, whose boot below owns the ingest
+            // thread; the alias is resolved after that boot.
+            if matches!(source.kind, SourceKind::MediaPlayer { .. }) {
+                continue;
+            }
             let rails = wants(&source.id);
             // AES67 stays as it was: it is a local multicast join with no
             // catalogue entry, so demand does not manage it.
@@ -3400,6 +3410,9 @@ impl Pipeline {
         for (id, audio_store) in media_player_boot.audio_stores {
             audio_stores.insert(id, audio_store);
         }
+        // ADR-M012: each `media_player` source resolves to its player's store.
+        let player_aliases = media_player_source_aliases(config);
+        bind_media_player_sources(&player_aliases, &mut stores);
 
         // WHIP ingest wiring (ADR-T014, `webrtc-native`): one shared publisher
         // rendezvous registry the control plane's WhipProvider writes to and each
@@ -3700,11 +3713,15 @@ impl Pipeline {
 
         // Every configured source is catalogued, demanded or not; the stores of
         // booted sources are shared so a later lease reuses them.
+        // A `media_player` source is an alias of a player channel the player
+        // boot owns: demand never starts or stops it (no catalogue entry).
         let catalogue = crate::source_rails::catalogue(
-            config
-                .sources
-                .iter()
-                .filter(|source| !matches!(source.kind, SourceKind::Aes67 { .. })),
+            config.sources.iter().filter(|source| {
+                !matches!(
+                    source.kind,
+                    SourceKind::Aes67 { .. } | SourceKind::MediaPlayer { .. }
+                )
+            }),
             &stores,
         );
         let demand_config = crate::source_demand::demand_config(config);
@@ -3759,6 +3776,7 @@ impl Pipeline {
             #[cfg(feature = "webrtc-native")]
             egress_registry,
             audio_stores,
+            player_aliases,
             audio_routing: config.audio.clone(),
             discrete_track_inputs,
             audio_route: Arc::new(multiview_framestore::SwapCell::empty()),
@@ -5325,6 +5343,7 @@ impl Pipeline {
                     height: encode.map_or(0, |cfg| cfg.height),
                     fps: self.cadence,
                     codec: encode.map_or_else(String::new, |cfg| cfg.codec_name.clone()),
+                    epoch: self.epoch.clone(),
                 })
             })
             .collect()
@@ -5915,9 +5934,10 @@ impl Pipeline {
             // The `[audio]` routes decide membership/gain/mute (ADR-0059 §4);
             // with none declared every store rides at unity.
             let mut channels = std::collections::HashMap::new();
-            for (id, gain) in program_bus_gains(
+            for (id, gain) in program_bus_gains_aliased(
                 self.audio_stores.keys().map(String::as_str),
                 self.audio_routing.as_ref(),
+                &self.player_aliases,
             ) {
                 if let Some(store) = self.audio_stores.get(id.as_str()) {
                     let point = bus.add_source(id.clone(), Arc::clone(store), gain);
@@ -5926,6 +5946,7 @@ impl Pipeline {
             }
             self.audio_route.store(Some(Arc::new(
                 crate::audio::AudioControlHandle::from_sources(self.audio_stores.clone(), channels)
+                    .with_aliases(self.player_aliases.clone())
                     .with_sample_rate(cfg.sample_rate)
                     // Every configured source may be routed live: routing one
                     // is what makes it a consumer.
@@ -9382,6 +9403,9 @@ fn consumer_main<D: WindowDelivery>(
             encoder.codec_params().codec_config_bytes(),
             route_gain,
         );
+        if let Some(handle) = audio_route.clone() {
+            router.set_audio_aliases(Arc::new(move || handle.aliases()));
+        }
     }
     let mut audio_worker = match audio_encoder.take() {
         Some(encoder) => {
@@ -9793,7 +9817,11 @@ fn consumer_main<D: WindowDelivery>(
                     .ok_or_else(|| PipelineError::Engine("audio track bus missing".to_owned()))?;
                 #[cfg(not(feature = "overlay"))]
                 let track_bus = bus;
-                discrete_track_samples(track_bus, &selected_tracks, block.frame_count())
+                let aliases = audio_route
+                    .as_deref()
+                    .map(crate::audio::AudioControlHandle::aliases)
+                    .unwrap_or_default();
+                discrete_track_samples(track_bus, &selected_tracks, &aliases, block.frame_count())
             };
             #[cfg(test)]
             router.tap_program_audio(item.tick_index, &block);
@@ -9905,18 +9933,22 @@ fn consumer_main<D: WindowDelivery>(
 /// pre-mix block, with exactly the program block's `frames`. A source with no
 /// block this tick (or a block of another length) yields `None` = silence, so the
 /// track's clock never skips.
-fn discrete_track_samples(
+/// A track input naming a `media_player` alias (ADR-M012) carries its
+/// player's channel.
+fn discrete_track_samples<S: std::hash::BuildHasher>(
     bus: &multiview_audio::program::ProgramBus,
     track_inputs: &[String],
+    aliases: &std::collections::HashMap<String, String, S>,
     frames: usize,
 ) -> Vec<Option<Vec<f32>>> {
     let inputs = bus.input_tracks();
     track_inputs
         .iter()
         .map(|input_id| {
+            let channel = aliases.get(input_id).unwrap_or(input_id);
             inputs
                 .iter()
-                .find(|(id, _)| *id == input_id.as_str())
+                .find(|(id, _)| *id == channel.as_str())
                 .map(|(_, b)| *b)
                 .filter(|b| b.frame_count() == frames)
                 .map(|b| b.interleaved().to_vec())
@@ -16112,6 +16144,17 @@ fn ingest_plan_for(
                     .to_owned(),
             });
         }
+        // ADR-M012: a media-player source never opens anything; the build
+        // aliases it to its player's store (`bind_media_player_sources`) and the
+        // control drain does the same live. Reaching here is a wiring bug.
+        SourceKind::MediaPlayer { player } => {
+            return Err(PipelineError::Ingest {
+                id: source.id.clone(),
+                reason: format!(
+                    "media_player source aliases player {player:?}; it has no ingest of its own"
+                ),
+            });
+        }
         // `SourceKind` is `#[non_exhaustive]`; a future kind is unsupported here
         // until explicitly wired (never silently mishandled).
         _ => {
@@ -16190,6 +16233,48 @@ fn map_eof_policy(policy: multiview_config::media::EofPolicy) -> crate::player::
         // `HoldLastFrame` (the default) and any future `#[non_exhaustive]` variant
         // this build does not know about both hold the last-good frame.
         _ => P::HoldLastFrame,
+    }
+}
+
+/// `media_player` source id -> player id for every such source (ADR-M012).
+fn media_player_source_aliases(
+    config: &MultiviewConfig,
+) -> std::collections::HashMap<String, String> {
+    config
+        .sources
+        .iter()
+        .filter_map(|source| match &source.kind {
+            SourceKind::MediaPlayer { player } => Some((source.id.clone(), player.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Resolve each `media_player` source id to its player's frame store, so cells,
+/// switcher buses and routing crosspoints naming the source sample the player
+/// channel the player boot owns. Nothing is opened. A player that did not boot
+/// (journal owned elsewhere, bad cadence) gets a never-fed store: the source
+/// reads as no-signal and the build still succeeds. A source whose id equals
+/// its player's is the player's own entry (identity alias).
+fn bind_media_player_sources(
+    aliases: &std::collections::HashMap<String, String>,
+    stores: &mut HashMapStores,
+) {
+    for (source, player) in aliases {
+        if source == player && stores.contains_key(player) {
+            continue;
+        }
+        let store = stores.get(player).map_or_else(
+            || {
+                tracing::warn!(
+                    source = %source, player = %player,
+                    "media_player source bound to a player that did not boot; it reads no-signal"
+                );
+                crate::source_rails::empty_store(source)
+            },
+            Arc::clone,
+        );
+        stores.insert(source.clone(), store);
     }
 }
 
@@ -16338,7 +16423,18 @@ fn build_media_player_boot_with_state(
             }
         };
 
-        let (tile_w, tile_h) = cell_pixel_size(layout, &player.id)
+        // Cells bind the player directly or through a `media_player` source
+        // alias (ADR-M012): size to the per-axis supremum over both.
+        let (tile_w, tile_h) = config
+            .sources
+            .iter()
+            .filter(|source| {
+                matches!(&source.kind, SourceKind::MediaPlayer { player: p } if *p == player.id)
+            })
+            .map(|source| source.id.as_str())
+            .chain(std::iter::once(player.id.as_str()))
+            .filter_map(|id| cell_pixel_size(layout, id))
+            .reduce(|(aw, ah), (bw, bh)| (aw.max(bw), ah.max(bh)))
             .unwrap_or((config.canvas.width, config.canvas.height));
         let store = Arc::new(TileStore::new(
             player.id.clone(),
@@ -22296,9 +22392,23 @@ impl LiveStamper {
 /// (linear). Every other store still joins the bus at zero gain so its discrete
 /// track is metered (mute ≠ unroute; an operator routes by the meter). With no
 /// routes, every store rides at unity. Sorted by id.
+#[cfg(test)]
 pub(crate) fn program_bus_gains<'a>(
     ids: impl Iterator<Item = &'a str>,
     routing: Option<&multiview_config::AudioRouting>,
+) -> Vec<(String, f64)> {
+    program_bus_gains_aliased(ids, routing, &std::collections::HashMap::new())
+}
+
+/// [`program_bus_gains`] where a route may name a `media_player` source alias
+/// (ADR-M012): `aliases` maps alias id -> player id, and the player's single
+/// bus channel takes the first included, unmuted route naming either the
+/// player or one of its aliases (exactly the unaliased rule). One channel, one
+/// gain: a player is never mixed twice however many aliases route it.
+pub(crate) fn program_bus_gains_aliased<'a, S: std::hash::BuildHasher>(
+    ids: impl Iterator<Item = &'a str>,
+    routing: Option<&multiview_config::AudioRouting>,
+    aliases: &std::collections::HashMap<String, String, S>,
 ) -> Vec<(String, f64)> {
     let mut ids: Vec<&str> = ids.collect();
     ids.sort_unstable();
@@ -22311,9 +22421,13 @@ pub(crate) fn program_bus_gains<'a>(
             // Every input is on the bus so it is METERED (an operator picks what
             // to route by its meter), but only an included, unmuted route is
             // MIXED: everything else rides at zero program gain.
+            let names = |r: &&multiview_config::AudioRoute| {
+                r.input_id == id || aliases.get(&r.input_id).is_some_and(|p| p == id)
+            };
             let gain = routes
                 .iter()
-                .find(|r| r.input_id == id && r.include_in_program_bus && !r.mute)
+                .filter(names)
+                .find(|r| r.include_in_program_bus && !r.mute)
                 .map_or(0.0, |r| {
                     10f64.powf(f64::from(r.gain_db.clamp(-96.0, 24.0)) / 20.0)
                 });
@@ -27303,6 +27417,168 @@ loop_default = true
 /// publish + hold path must share the decoded frame by `Arc` handle, never copy
 /// the NV12 pixel planes per frame. Pure store + image logic (no libav).
 #[cfg(test)]
+/// Issue #474 / ADR-M012: a `media_player` source binds a cell (and any
+/// bus/crosspoint naming it) to its player channel, opening nothing.
+mod media_player_source_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::Pipeline;
+    use multiview_config::MultiviewConfig;
+    use std::sync::Arc;
+
+    fn config(source_id: &str) -> MultiviewConfig {
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "30000/1001"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr", "1fr"]
+rows = ["1fr"]
+areas = ["a b"]
+[[sources]]
+id = "{source_id}"
+kind = "media_player"
+player = "vt-1"
+[[sources]]
+id = "cam"
+kind = "bars"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "{source_id}"
+[[cells]]
+id = "cell_b"
+area = "b"
+[cells.source]
+input_id = "cam"
+[[media_players]]
+id = "vt-1"
+[[outputs]]
+kind = "hls"
+path = "/tmp/media-player-source.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##
+        );
+        let config = MultiviewConfig::load_from_toml(&doc).expect("parse");
+        config.validate().expect("validates");
+        config
+    }
+
+    #[test]
+    fn a_media_player_source_builds_and_its_cell_samples_the_player_store() {
+        let _budget = crate::player::budget_test_guard();
+        let pipeline = Pipeline::build(&config("vt-a")).expect("media_player source builds");
+        let alias = pipeline.stores.get("vt-a").expect("alias store registered");
+        let player = pipeline
+            .stores
+            .get("vt-1")
+            .expect("player store registered");
+        assert!(
+            Arc::ptr_eq(alias, player),
+            "the source id resolves to the player's own TileStore"
+        );
+        // Opens nothing: the only ingest plan under either id is the player's.
+        assert!(pipeline.ingest_plans.iter().all(|plan| plan.id != "vt-a"));
+        assert!(pipeline
+            .ingest_plans
+            .iter()
+            .any(|plan| plan.id == "vt-1" && plan.player.is_some()));
+        assert!(
+            !pipeline.catalogue.load().contains_key("vt-a"),
+            "demand never manages the alias"
+        );
+        // The solved layout's cell binds the source id, which the drive's
+        // store map resolves to the player's store.
+        let bound = pipeline
+            .layout
+            .cells
+            .iter()
+            .find_map(|cell| cell.source.as_deref().filter(|id| *id == "vt-a"))
+            .expect("a cell binds the media_player source");
+        assert!(Arc::ptr_eq(&pipeline.stores[bound], player));
+        assert_eq!(
+            pipeline.player_aliases.get("vt-a").map(String::as_str),
+            Some("vt-1")
+        );
+        // The player tile is sized from the alias-bound cell, not the canvas.
+        let plan = pipeline
+            .ingest_plans
+            .iter()
+            .find(|plan| plan.id == "vt-1")
+            .unwrap();
+        assert_eq!((plan.tile_w, plan.tile_h), (32, 64));
+    }
+
+    #[test]
+    fn a_source_sharing_its_player_id_is_the_player_channel() {
+        let _budget = crate::player::budget_test_guard();
+        let pipeline = Pipeline::build(&config("vt-1")).expect("own-id binding builds");
+        assert!(pipeline.stores.contains_key("vt-1"));
+        assert_eq!(
+            pipeline
+                .ingest_plans
+                .iter()
+                .filter(|plan| plan.id == "vt-1")
+                .count(),
+            1,
+            "exactly one producer: the player's"
+        );
+    }
+
+    /// Review C3: a configured route naming the alias gives the player's
+    /// channel (the only one on the bus for it) the route's gain at startup.
+    #[test]
+    fn a_configured_route_through_the_alias_gains_the_player_channel() {
+        let _budget = crate::player::budget_test_guard();
+        let mut doc = config("vt-a").to_toml().unwrap();
+        doc.push_str(
+            "\n[audio]\nsample_rate_hz = 48000\n[[audio.routes]]\ninput_id = \"vt-a\"\n\
+             channels = { kind = \"stereo\" }\ninclude_in_program_bus = true\ngain_db = -6.0\n",
+        );
+        let config = MultiviewConfig::load_from_toml(&doc).expect("parse");
+        config.validate().expect("an alias route validates");
+        let pipeline = Pipeline::build(&config).expect("builds");
+        assert!(
+            pipeline.audio_stores.contains_key("vt-1")
+                && !pipeline.audio_stores.contains_key("vt-a"),
+            "one bus channel per player, keyed by the player"
+        );
+        let gains = super::program_bus_gains_aliased(
+            pipeline.audio_stores.keys().map(String::as_str),
+            pipeline.audio_routing.as_ref(),
+            &pipeline.player_aliases,
+        );
+        let vt1 = gains
+            .iter()
+            .find(|(id, _)| id == "vt-1")
+            .expect("vt-1 on the bus")
+            .1;
+        assert!((vt1 - 10f64.powf(-6.0 / 20.0)).abs() < 1e-9, "{gains:?}");
+        assert!(
+            gains.iter().all(|(id, _)| id != "vt-a"),
+            "never mixed twice"
+        );
+    }
+
+    #[test]
+    fn a_player_that_did_not_boot_degrades_the_source_to_no_signal() {
+        let mut stores = super::HashMapStores::new();
+        let aliases = std::collections::HashMap::from([("vt-a".to_owned(), "vt-1".to_owned())]);
+        super::bind_media_player_sources(&aliases, &mut stores);
+        let store = stores.get("vt-a").expect("alias still registered");
+        assert!(!store.is_primed(), "a never-fed store reads no-signal");
+    }
+}
+
+#[cfg(test)]
 mod media_player_handle_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -30804,6 +31080,9 @@ loop_default = true
             assert_eq!(code, 202, "{raw}");
             let failed = poll(v["operation"].as_u64().unwrap()).await;
             assert_eq!(failed["state"], "failed", "{failed}");
+            // Issue #474: the failure is typed, and its detail never leaks a path.
+            assert!(failed["reason"].is_string(), "{failed}");
+            assert!(!failed["detail"].as_str().unwrap().contains('/'), "{failed}");
             assert_eq!(handle.control_bus.load().clip_epoch, epoch_a, "failed load keeps A");
             let still = match store.read_at(anchor_a) {
                 TileRead::Fresh { frame } | TileRead::Held { frame, .. } => frame.y_plane()[0],
@@ -31846,6 +32125,14 @@ loop_default = true
         let slot = Arc::clone(&rig.runtime.audio_commit);
         let closer = Arc::clone(&slot);
         slot.before_claim_for_test(Box::new(move || {
+            // The ingest claims on every poll after its PREPARE put, and the
+            // live audio thread acknowledges on its own cadence: on a loaded
+            // host the first claim can precede the ack (#478, #497). Park the
+            // ingest (bounded) until the ack lands, so the close is exactly
+            // "after the PREPARE ack, before the claim takes the gate".
+            wait("the audio rail acknowledged PREPARE", &|| {
+                closer.is_prepared(closer.pending_generation())
+            });
             assert!(
                 closer.is_prepared(closer.pending_generation()),
                 "closed after the PREPARE ack"

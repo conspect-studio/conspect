@@ -7,19 +7,23 @@
 //!   name off the allow-list, or a file outside the output's directory all
 //!   answer the SAME `404` (no oracle).
 //! * `POST /cast/{token}/report`: the receiver's state report.
-//! * `/cast/receiver/` (+ `index.html`, `receiver.js`, `receiver.css`): the
+//! * `POST /cast/{token}/ladder`: the receiver's capability probe and the
+//!   engine's transport offer and clock pair (ADR-0114 decision 3).
+//! * `/cast/receiver/` (+ `index.html`, `probe.js`, `receiver.js`,
+//!   `receiver.css`): the
 //!   custom Web Receiver, embedded, under a strict CSP. These static routes
 //!   win over the token route.
 //!
 //! Media is served only for a token armed at its output's CURRENT
 //! authorization generation (ABUSE-1, `cast_streams::reauth`), checked
 //! before the file is resolved AND again after it is open, before any byte
-//! of the response is released.
+//! of the response is released. Every token route admits through the ONE
+//! shared check, [`crate::cast_streams::reauth::admit`] (ADR-0114 5.1).
 //!
 //! The token is a path segment: it is never logged by this crate (no layer
 //! here records request paths), never audited and never published.
 
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
@@ -27,8 +31,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 
+use crate::cast_streams::ladder::{parse_request, LadderRequest, MAX_LADDER_BYTES};
 use crate::cast_streams::token::file_allowed;
-use crate::cast_streams::ReportError;
+use crate::cast_streams::{LadderError, ReportError};
 use crate::state::AppState;
 
 /// The receiver page's Content-Security-Policy (measured with the real CAF
@@ -37,6 +42,7 @@ pub const RECEIVER_CSP: &str = "default-src 'none'; script-src 'self' https://ww
 
 const INDEX_HTML: &str = include_str!("../cast_receiver/index.html");
 const RECEIVER_JS: &str = include_str!("../cast_receiver/receiver.js");
+const PROBE_JS: &str = include_str!("../cast_receiver/probe.js");
 const RECEIVER_CSS: &str = include_str!("../cast_receiver/receiver.css");
 
 const MEDIA_METHODS: HeaderValue = HeaderValue::from_static("GET, HEAD, OPTIONS");
@@ -54,6 +60,7 @@ pub fn public_router() -> Router<AppState> {
         .route("/cast/receiver/", get(receiver_index))
         .route("/cast/receiver/index.html", get(receiver_index))
         .route("/cast/receiver/receiver.js", get(receiver_js))
+        .route("/cast/receiver/probe.js", get(probe_js))
         .route("/cast/receiver/receiver.css", get(receiver_css))
         .route(
             "/cast/{token}/{file}",
@@ -112,15 +119,20 @@ fn with_cors(mut response: Response, origin: Option<&HeaderValue>) -> Response {
 }
 
 async fn preflight(
+    State(state): State<AppState>,
     headers: HeaderMap,
     path: Result<Path<(String, String)>, PathRejection>,
 ) -> Response {
-    let report = path.is_ok_and(|Path((_, file))| file == "report");
-    let methods = if report {
-        REPORT_METHODS
-    } else {
-        MEDIA_METHODS
-    };
+    // The shared token check (ADR-0114 5.1) on every token route, the
+    // preflight included: a dead token gets the generic 404, never a 204.
+    let admitted = path
+        .as_ref()
+        .is_ok_and(|Path((token, _))| crate::cast_streams::reauth::admit(&state, token).is_some());
+    if !admitted {
+        return with_cors(not_found(), headers.get(header::ORIGIN));
+    }
+    let post = path.is_ok_and(|Path((_, file))| file == "report" || file == "ladder");
+    let methods = if post { REPORT_METHODS } else { MEDIA_METHODS };
     let mut response = StatusCode::NO_CONTENT.into_response();
     let out = response.headers_mut();
     out.insert(header::ALLOW, methods.clone());
@@ -183,18 +195,19 @@ async fn serve_media(
     };
     // Token first (constant-time over every digest), then the file name, so
     // the work done does not depend on which one is wrong.
-    let stream = state.cast_streams.lookup(&token);
-    let (Some((_, config_id)), true) = (stream, file_allowed(&file)) else {
+    // ABUSE-1: the fail-closed barrier inside the shared check. A feed the
+    // engine moved the output to that its tokens were not authorized for (a
+    // fallback whose outcome is not relayed yet) re-authorizes them NOW;
+    // then only a token armed at the output's CURRENT generation is served.
+    let admitted = crate::cast_streams::reauth::admit(state, &token);
+    let (Some(admitted), true) = (admitted, file_allowed(&file)) else {
         return not_found();
     };
-    // ABUSE-1: the fail-closed barrier. A feed the engine moved the output
-    // to that its tokens were not authorized for (a fallback whose outcome
-    // is not relayed yet) re-authorizes them NOW; then only a token armed at
-    // the output's CURRENT generation is served.
-    crate::cast_streams::reauth::on_media(state, &config_id);
-    let Some((stream_id, config_id)) = state.cast_streams.serve(&token) else {
-        return not_found();
-    };
+    let crate::cast_streams::Admitted {
+        stream_id,
+        config_id,
+        ..
+    } = admitted;
     let Some(dir) = output_dir(state, &config_id, &file) else {
         return not_found();
     };
@@ -217,8 +230,8 @@ async fn serve_media(
     // same stream on the same output) AFTER the file is open and BEFORE any
     // byte is released. On failure the open handle is dropped unread and
     // the answer is the generic 404.
-    crate::cast_streams::reauth::on_media(state, &config_id);
-    if state.cast_streams.serve(&token).as_ref() != Some(&(stream_id.clone(), config_id.clone()))
+    if !crate::cast_streams::reauth::admit(state, &token)
+        .is_some_and(|again| again.stream_id == stream_id && again.config_id == config_id)
         || output_dir(state, &config_id, &file).is_none()
     {
         return not_found();
@@ -253,17 +266,24 @@ async fn take_report(
     let Ok(Path((token, file))) = path else {
         return not_found();
     };
-    let Some((_, config_id)) = state.cast_streams.lookup(&token) else {
+    let Some(admitted) = crate::cast_streams::reauth::admit(state, &token) else {
         return not_found();
     };
-    crate::cast_streams::reauth::on_media(state, &config_id);
-    if file != "report" || state.cast_streams.serve(&token).is_none() {
+    if file == "ladder" {
+        return take_ladder(state, &token, body).await;
+    }
+    if file != "report" {
         return not_found();
     }
     let limit = crate::cast_streams::MAX_REPORT_BYTES;
-    let bytes: Bytes = match axum::body::to_bytes(body, limit).await {
-        Ok(bytes) => bytes,
-        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    let read = axum::body::to_bytes(body, limit).await;
+    // The body was awaited: admit again before any answer that depends on it
+    // (a revoke, an expiry or a fallback may have landed meanwhile).
+    if !readmitted(state, &token, &admitted) {
+        return not_found();
+    }
+    let Ok(bytes) = read else {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
     let value: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(value @ serde_json::Value::Object(_)) => value,
@@ -271,15 +291,113 @@ async fn take_report(
     };
     match state.cast_streams.report(&token, value) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(ReportError::TooSoon) => {
-            let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-            response
-        }
+        Err(ReportError::TooSoon) => too_many(),
         Err(ReportError::Unknown) => not_found(),
     }
+}
+
+/// The shared check again after an `.await`: the same stream, on the same
+/// output, still admitted.
+fn readmitted(state: &AppState, token: &str, before: &crate::cast_streams::Admitted) -> bool {
+    crate::cast_streams::reauth::admit(state, token).is_some_and(|again| {
+        again.stream_id == before.stream_id && again.config_id == before.config_id
+    })
+}
+
+/// Microseconds since the Unix epoch on the system wall clock.
+fn unix_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
+}
+
+fn too_many() -> Response {
+    let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
+/// `POST /cast/<token>/ladder` (ADR-0114 decision 3), after the shared
+/// token check: rate (before the body is read, so a bad call costs the
+/// same), body at most 2 KiB, strict validation, then the answer. Only
+/// control-plane state is touched: the registry (one short lock) and the
+/// engine's epoch cell (a nanosecond read). No data-plane thread is reached.
+async fn take_ladder(state: &AppState, token: &str, body: Body) -> Response {
+    // `t1`: when the request reached the engine (before the body is read).
+    let t1 = unix_micros();
+    let Some(admitted) = crate::cast_streams::reauth::admit(state, token) else {
+        return not_found();
+    };
+    match state.cast_streams.admit_ladder(&admitted.stream_id) {
+        Ok(()) => {}
+        Err(LadderError::TooSoon) => return too_many(),
+        Err(LadderError::Unknown) => return not_found(),
+    }
+    let read = axum::body::to_bytes(body, MAX_LADDER_BYTES).await;
+    // The body was awaited: admit again (a revoke, an expiry or a take may
+    // have landed meanwhile) BEFORE any answer that depends on the body, and
+    // answer only for the same stream on the same output.
+    if !readmitted(state, token, &admitted) {
+        return not_found();
+    }
+    let again = admitted;
+    let Ok(bytes) = read else {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    };
+    let request: LadderRequest = match parse_request(&bytes, state.cast_streams.now_ms()) {
+        Ok(request) => request,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let clock = state
+        .cast_engine
+        .as_ref()
+        .and_then(|engine| engine.clock(&again.config_id, t1.saturating_mul(1000)));
+    let offer = request.full.then(|| {
+        crate::cast_streams::ladder::offer(
+            &state.cast_streams.ladder(),
+            crate::cast_streams::ladder::SERVED_RUNGS,
+            request.probe.as_ref(),
+        )
+    });
+    let (attach, then) = offer.map_or((None, Vec::new()), |(attach, then)| (Some(attach), then));
+    let full = request.full;
+    let t0 = request.t0_us;
+    if state
+        .cast_streams
+        .record_ladder(&again.stream_id, request, attach)
+        .is_err()
+    {
+        return not_found();
+    }
+    let clock = clock.map(|c| {
+        serde_json::json!({
+            "source": "epoch",
+            "epoch_generation": c.epoch_generation,
+            "media_us": c.media_us,
+            "wall_unix_us": c.wall_unix_us,
+            "t0_unix_us": t0,
+            "t1_unix_us": t1,
+            "t2_unix_us": unix_micros(),
+        })
+    });
+    let answer = if full {
+        serde_json::json!({
+            "v": 1,
+            "clock": clock,
+            "attach": attach.map(|rung| serde_json::json!({ "rung": rung })),
+            "then": then,
+            "srt": null,
+        })
+    } else {
+        serde_json::json!({ "v": 1, "clock": clock })
+    };
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        answer.to_string(),
+    )
+        .into_response()
 }
 
 async fn receiver_redirect() -> Response {
@@ -316,6 +434,10 @@ async fn receiver_index(State(state): State<AppState>, headers: HeaderMap) -> Re
 
 async fn receiver_js() -> Response {
     receiver_file("text/javascript; charset=utf-8", RECEIVER_JS)
+}
+
+async fn probe_js() -> Response {
+    receiver_file("text/javascript; charset=utf-8", PROBE_JS)
 }
 
 async fn receiver_css() -> Response {

@@ -63,7 +63,7 @@ fn tools() -> Option<Tools> {
 }
 fn capture() -> Capture {
     Capture {width:320,height:180,fps:5,frames:5,windy: None,background: Background::Opaque,
-        document:"<body style='margin:0;background:black'><canvas id='c' width='320' height='180'></canvas><script>window.mvCaptureFrame=n=>{const x=c.getContext('2d');x.fillStyle=n%2?'red':'blue';x.fillRect(0,0,320,180)}</script>".to_owned(), capture: multiview_webengine::capture::CaptureOptions::default()}
+        document:"<body style='margin:0;background:black'><canvas id='c' width='320' height='180'></canvas><script>window.mvCaptureFrame=n=>{const x=c.getContext('2d');x.fillStyle=n%2?'red':'blue';x.fillRect(0,0,320,180)}</script>".to_owned(), capture: multiview_webengine::capture::CaptureOptions::default(), output_cadence: None}
 }
 fn provenance(generation: u64) -> Provenance {
     Provenance {
@@ -179,6 +179,7 @@ fn fake_radar_steps() -> Capture {
             end_hold_ms: 300,
             max_steps: 12,
         },
+        output_cadence: None,
     }
 }
 
@@ -363,4 +364,75 @@ fn steps_capture_waits_for_tiles_that_start_after_the_timestamp_update() {
         .collect();
     // red, blue, green, red at 2 frames each plus the 3-frame hold; no white frame.
     assert_eq!(frames, "rrbbggrrrrr");
+}
+
+/// Issue #474: a capture conformed to the canvas cadence is a CFR MOV at
+/// exactly `num/den` (`r_frame_rate == avg_frame_rate`), with the frame count
+/// ffmpeg's `fps` filter yields, so the media player's exact cadence check
+/// accepts it.
+#[test]
+fn conformed_capture_is_cfr_at_exactly_the_canvas_cadence() {
+    let Some(tools) = tools() else { return };
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = ArtifactStore::open(
+        directory.path(),
+        Limits {
+            bytes: 10_000_000,
+            count: 20,
+        },
+    )
+    .unwrap();
+    let cadence = multiview_webengine::capture::OutputCadence {
+        num: 30000,
+        den: 1001,
+    };
+    let output = run_capture(
+        &mut store,
+        provenance(1),
+        5_000_000,
+        &tools,
+        &Capture {
+            output_cadence: Some(cadence),
+            ..capture()
+        },
+        Control {
+            cancelled: &AtomicBool::new(false),
+            deadline: Instant::now() + Duration::from_secs(30),
+        },
+        |_| true,
+    )
+    .unwrap();
+    let mut bytes = Vec::new();
+    store
+        .pin(&output.id, "owner", |_| true)
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    let mov = directory.path().join("conformed.mov");
+    std::fs::write(&mov, &bytes).unwrap();
+    let ffprobe = tools.ffmpeg.with_file_name("ffprobe");
+    if !ffprobe.is_file() {
+        eprintln!("SKIPPED ffprobe assertions: no ffprobe beside ffmpeg");
+        return;
+    }
+    let out = std::process::Command::new(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=r_frame_rate,avg_frame_rate,nb_read_frames",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(&mov)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    // 5 frames at 5 fps = 1 s => round(30000/1001) = 30 frames.
+    assert_eq!(text.trim(), "30000/1001,30000/1001,30");
+    assert_eq!(cadence.conformed_frames(5, 5), 30);
 }

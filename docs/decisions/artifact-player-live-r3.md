@@ -12,6 +12,8 @@ One pending latest-wins load, one staged clip, two retired native clips and one 
 
 Native success requires the first primed video image adoption plus matching audio generation adoption, or proven absent audio and explicit silence. The acknowledgement includes operation, source identity, clip generation, actual duration, rational cadence, geometry, audio presence and timeline. Admission, staging and first decode are not completion.
 
+A terminal `failed` operation carries a typed `reason` (`wrong_cadence`, `vfr`, `not_found`, `journal_failed`, …) and a short redacted `detail` (rates, frame counts, byte bounds; never a path or URL). It is computed on the management plane when the operation is read and logged once, at the moment it first becomes terminal; the output clock never formats or logs it (issue #474).
+
 Cancellation uses FFmpeg interrupt callbacks with owned deadlines and panic-contained callback boundaries. Opening and retirement deadlines fail without invalidating the last committed generation. Runtime owner flock precedes recovery claims. A pending journal record is not proof that an old native owner stopped. Native panic paths transfer owners to an isolated retirement worker; no FFI destructor may stick the output path.
 
 ## Source and proof plan

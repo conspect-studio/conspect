@@ -602,6 +602,9 @@ pub struct CastOutputEntry {
     pub fps: multiview_core::time::Rational,
     /// The encoder that feeds it (for example `libx264`).
     pub codec: String,
+    /// The run's outbound presentation epoch (`EXT-X-PROGRAM-DATE-TIME`),
+    /// read by the ladder route's clock pair (ADR-0114).
+    pub epoch: multiview_output::SharedEpoch,
 }
 
 /// The cast outputs of one run, in configured order.
@@ -699,6 +702,41 @@ impl multiview_control::cast_engine::CastEngine for CastEngineAdapter {
         self.entry(id)?.gate.deactivate();
         Ok(())
     }
+
+    fn clock(
+        &self,
+        id: &str,
+        wall_now_unix_ns: i64,
+    ) -> Option<multiview_control::cast_engine::CastClock> {
+        let outputs = self.0.load();
+        let entry = outputs.iter().find(|entry| entry.id == id)?;
+        clock_pair(&entry.epoch, wall_now_unix_ns)
+    }
+}
+
+/// One pair of `epoch` near `wall_now_unix_ns` (ADR-0114 decision 2): the
+/// engine media time the epoch maps that wall time to, truncated to whole
+/// microseconds, and that media time's own wall time by the same map. The
+/// epoch's media domain is the output PTS in nanoseconds (tick 0 = 0), the
+/// one the cast packager's `EXT-X-PROGRAM-DATE-TIME` reads. `None` before
+/// the sampler first anchored it.
+#[must_use]
+pub fn clock_pair(
+    epoch: &multiview_output::SharedEpoch,
+    wall_now_unix_ns: i64,
+) -> Option<multiview_control::cast_engine::CastClock> {
+    // The lock-free mirror: a client-driven read never takes the cell's lock.
+    let (map, generation) = epoch.snapshot()?;
+    if !map.rate.is_valid() {
+        return None;
+    }
+    let media_us = map.media_at(wall_now_unix_ns).div_euclid(1000);
+    let wall_ns = map.wall_at(media_us.saturating_mul(1000));
+    Some(multiview_control::cast_engine::CastClock {
+        epoch_generation: generation,
+        media_us,
+        wall_unix_us: wall_ns.div_euclid(1000),
+    })
 }
 
 fn installed() -> &'static Mutex<Option<CastOutputsSlot>> {

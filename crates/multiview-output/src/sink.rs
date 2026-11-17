@@ -4591,6 +4591,22 @@ mod tests {
             last_pts: None,
         };
         state.drive_from_packets(&mut first).unwrap();
+        // The scenario needs the master to be ADVERTISED before the reset: it
+        // is queued at a segment close only once every media playlist is on
+        // disk, and those land in the background (#220). On a slow disk none
+        // had landed by the last close here, so no master was ever published
+        // and the run had nothing to republish (#489). Wait (bounded) for the
+        // first run's video playlist, so the reset run's first close
+        // publishes the old master and the reset close republishes the new.
+        let video_playlist = dir.path().join("video-g0.m3u8");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !video_playlist.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first run's media playlist lands"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let mut source = Switching {
             packets: packets.into_iter().skip(6).collect::<Vec<_>>().into_iter(),
             switch_pts: 6,

@@ -175,7 +175,7 @@ fn rejected_files(path: &Path) -> Vec<PathBuf> {
 #[tokio::test]
 async fn last_good_is_written_only_after_the_first_tick() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, _) = install(dir.path()).await;
+    let (path, _) = Box::pin(install(dir.path())).await;
     let accepted = multiview_control::boot_model::load_desired(&path)
         .unwrap()
         .unwrap();
@@ -195,7 +195,7 @@ async fn last_good_is_written_only_after_the_first_tick() {
 async fn non_bootable_saved_state_with_last_good_starts_from_last_good_and_keeps_the_rejected_state(
 ) {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     make_me_with_overlays(&path);
     let rejected_bytes = std::fs::read(desired(&path)).unwrap();
@@ -253,7 +253,7 @@ async fn non_bootable_saved_state_with_last_good_starts_from_last_good_and_keeps
 #[tokio::test]
 async fn non_bootable_saved_state_without_last_good_fails_with_the_clear_error() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     make_me_with_overlays(&path);
     let before = std::fs::read(desired(&path)).unwrap();
     let error = start_ok(boot, &path).expect_err("no fallback");
@@ -273,7 +273,7 @@ async fn non_bootable_saved_state_without_last_good_fails_with_the_clear_error()
 #[tokio::test]
 async fn a_build_failure_falls_back_only_when_last_good_differs_and_builds() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     // Same state as last-good: nothing different to fall back to.
     let start = resolve_start_config(boot.clone(), BOOT.to_owned(), &path).unwrap();
@@ -331,7 +331,7 @@ async fn a_build_failure_falls_back_only_when_last_good_differs_and_builds() {
 #[tokio::test]
 async fn admission_fallback_whose_build_fails_moves_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     make_me_with_overlays(&path);
     let before = std::fs::read(desired(&path)).unwrap();
@@ -350,7 +350,7 @@ async fn admission_fallback_whose_build_fails_moves_nothing() {
 #[tokio::test]
 async fn an_unreadable_accepted_state_does_not_roll_back() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     // A directory where the file should be: read_to_string fails with an I/O
     // error that is not NotFound.
@@ -366,7 +366,7 @@ async fn an_unreadable_accepted_state_does_not_roll_back() {
 #[tokio::test]
 async fn kept_rejected_states_are_bounded() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     for round in 0..(MAX_REJECTED + 3) {
         make_me_with_overlays_variant(&path, &format!("_{round}"));
@@ -390,7 +390,7 @@ fn run_binary(path: &Path) -> std::process::Output {
 #[tokio::test]
 async fn the_real_binary_restarts_from_last_good_and_fails_clearly_without_it() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, _) = install(dir.path()).await;
+    let (path, _) = Box::pin(install(dir.path())).await;
     make_me_with_overlays(&path);
     let failed = run_binary(&path);
     let stderr = String::from_utf8_lossy(&failed.stderr);
@@ -398,7 +398,7 @@ async fn the_real_binary_restarts_from_last_good_and_fails_clearly_without_it() 
     assert!(stderr.contains(OVERLAYS_REFUSAL), "{stderr}");
 
     let dir = tempfile::tempdir().unwrap();
-    let (path, _) = install(dir.path()).await;
+    let (path, _) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     make_me_with_overlays(&path);
     let saved = std::fs::read(desired(&path)).unwrap();
@@ -454,7 +454,7 @@ fn acknowledge_binary(path: &Path) -> std::process::Output {
 #[tokio::test]
 async fn the_recorder_follows_the_engine_state_slot() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, _) = install(dir.path()).await;
+    let (path, _) = Box::pin(install(dir.path())).await;
     let accepted = multiview_control::boot_model::load_desired(&path)
         .unwrap()
         .unwrap();
@@ -497,7 +497,7 @@ fn validate(path: &Path) -> (i32, String) {
 #[tokio::test]
 async fn validate_distinguishes_fall_back_from_fail() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, _) = install(dir.path()).await;
+    let (path, _) = Box::pin(install(dir.path())).await;
     make_me_with_overlays(&path);
     let (code, text) = validate(&path);
     assert_ne!(code, 0, "{text}");
@@ -507,7 +507,7 @@ async fn validate_distinguishes_fall_back_from_fail() {
     );
 
     let dir = tempfile::tempdir().unwrap();
-    let (path, _) = install(dir.path()).await;
+    let (path, _) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     make_me_with_overlays(&path);
     let (code, text) = validate(&path);
@@ -525,7 +525,7 @@ async fn validate_distinguishes_fall_back_from_fail() {
 #[tokio::test]
 async fn validate_reports_an_unusable_last_good_as_a_failure() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, _) = install(dir.path()).await;
+    let (path, _) = Box::pin(install(dir.path())).await;
     make_me_with_overlays(&path);
     // The "last-good" copy is the same unstartable state.
     std::fs::copy(desired(&path), last_good_path_for(&path)).unwrap();
@@ -541,7 +541,7 @@ async fn validate_reports_an_unusable_last_good_as_a_failure() {
 #[tokio::test]
 async fn the_boot_model_names_the_fallback() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     make_me_with_overlays(&path);
     let start = start_ok(boot, &path).unwrap();
@@ -572,7 +572,7 @@ fn make_different_admissible(path: &Path) -> String {
 #[tokio::test]
 async fn an_environment_error_never_rolls_back_the_accepted_state() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     let text = make_different_admissible(&path);
     let start = resolve_start_config(boot, BOOT.to_owned(), &path).unwrap();
@@ -608,7 +608,7 @@ async fn an_environment_error_never_rolls_back_the_accepted_state() {
 #[tokio::test]
 async fn a_transient_environment_error_retries_and_starts_from_the_accepted_state() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     let text = make_different_admissible(&path);
     let start = resolve_start_config(boot, BOOT.to_owned(), &path).unwrap();
@@ -640,7 +640,7 @@ async fn a_transient_environment_error_retries_and_starts_from_the_accepted_stat
 #[tokio::test]
 async fn an_environment_error_on_the_last_good_build_commits_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     let text = make_different_admissible(&path);
     let start = resolve_start_config(boot, BOOT.to_owned(), &path).unwrap();
@@ -682,7 +682,7 @@ fn raised(events: &mut multiview_engine::EventSubscription<Event>) -> Option<Str
 #[tokio::test]
 async fn a_state_fault_keeps_the_saved_state_and_persists_the_warning_until_acknowledged() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     let last_good = std::fs::read_to_string(last_good_path_for(&path)).unwrap();
     make_me_with_overlays(&path);
@@ -742,7 +742,7 @@ fn enospc(_: &Path, _: &str) -> Result<(), AtomicWriteError> {
 #[tokio::test]
 async fn enospc_while_recording_the_fallback_still_starts_from_last_good() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     make_me_with_overlays(&path);
     let saved = std::fs::read(desired(&path)).unwrap();
@@ -773,7 +773,7 @@ async fn enospc_while_recording_the_fallback_still_starts_from_last_good() {
 async fn a_read_only_state_dir_still_starts_from_last_good() {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     make_me_with_overlays(&path);
     let saved = std::fs::read(desired(&path)).unwrap();
@@ -802,7 +802,7 @@ async fn a_read_only_state_dir_still_starts_from_last_good() {
 #[tokio::test]
 async fn a_crash_between_the_kept_copy_and_the_marker_converges_on_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     make_me_with_overlays(&path);
     let saved = std::fs::read_to_string(desired(&path)).unwrap();
@@ -821,7 +821,7 @@ async fn a_crash_between_the_kept_copy_and_the_marker_converges_on_restart() {
 #[tokio::test]
 async fn an_after_rename_failure_with_the_bytes_in_place_counts_as_kept() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     make_me_with_overlays(&path);
     let saved = std::fs::read(desired(&path)).unwrap();
@@ -863,7 +863,7 @@ async fn an_after_rename_failure_with_the_bytes_in_place_counts_as_kept() {
 #[tokio::test]
 async fn an_unchanged_state_that_fails_to_build_returns_the_original_error_and_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     let saved = std::fs::read(desired(&path)).unwrap();
     let start = resolve_start_config(boot, BOOT.to_owned(), &path).unwrap();
@@ -1080,7 +1080,7 @@ async fn fallen_back(dir: &Path) -> (PathBuf, MultiviewConfig, String) {
 #[tokio::test]
 async fn a_clean_start_from_the_accepted_state_clears_a_stale_marker() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     let good = std::fs::read(desired(&path)).unwrap();
     make_me_with_overlays(&path);
@@ -1106,7 +1106,7 @@ async fn a_clean_start_from_the_accepted_state_clears_a_stale_marker() {
 #[tokio::test]
 async fn a_start_without_an_accepted_state_leaves_the_marker_alone() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     make_me_with_overlays(&path);
     start_ok(boot.clone(), &path).unwrap();
@@ -1122,7 +1122,7 @@ async fn a_start_without_an_accepted_state_leaves_the_marker_alone() {
 #[tokio::test]
 async fn secrets_in_the_build_error_are_redacted_before_persisting() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     make_different_admissible(&path);
     let start = resolve_start_config(boot, BOOT.to_owned(), &path).unwrap();
@@ -1158,7 +1158,7 @@ async fn secrets_in_the_build_error_are_redacted_before_persisting() {
 #[tokio::test]
 async fn a_huge_build_error_is_bounded_in_the_marker_and_the_warning() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     make_different_admissible(&path);
     let start = resolve_start_config(boot, BOOT.to_owned(), &path).unwrap();
@@ -1193,7 +1193,7 @@ async fn a_huge_build_error_is_bounded_in_the_marker_and_the_warning() {
 #[tokio::test]
 async fn the_rejected_bound_holds_when_a_kept_copy_is_reused() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot) = install(dir.path()).await;
+    let (path, boot) = Box::pin(install(dir.path())).await;
     mark_started(&path).await;
     make_me_with_overlays(&path);
     let saved = std::fs::read(desired(&path)).unwrap();
@@ -1222,7 +1222,7 @@ async fn the_rejected_bound_holds_when_a_kept_copy_is_reused() {
 #[tokio::test]
 async fn an_unreadable_marker_is_acknowledged_and_removed() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot, text) = fallen_back(dir.path()).await;
+    let (path, boot, text) = Box::pin(fallen_back(dir.path())).await;
     let start = resolve_start_config(boot, text, &path).unwrap();
     let publisher = Arc::new(publisher());
     let (addr, stop, server, _commands) = serve(&start, &path, &publisher).await;

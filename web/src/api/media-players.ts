@@ -43,6 +43,9 @@ export type LoadThen = components['schemas']['LoadThen'];
 /** Bounded native-load operation view (`GET .../load-operations/{operation}`). */
 export type LoadOperation = components['schemas']['LoadOperation'];
 
+/** Typed reason a native load ended `failed` (issue #474). */
+export type LoadFailureCode = components['schemas']['LoadFailureCode'];
+
 /** Native commit acknowledgement (duration, geometry, audio presence). */
 export type NativeLoadAck = components['schemas']['NativeLoadAck'];
 

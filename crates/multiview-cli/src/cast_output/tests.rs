@@ -928,3 +928,44 @@ fn every_packager_start_publishes_a_fresh_generation_before_any_file() {
     assert!(gate.status().generation > *seen.last().unwrap());
     assert!(!seen.contains(&activation));
 }
+
+/// ADR-0114 decision 2: the ladder's clock pair is one point of the run's
+/// outbound epoch (the map `EXT-X-PROGRAM-DATE-TIME` is stamped from), in
+/// microseconds; `None` before the sampler anchored it, and its generation
+/// moves with a stepped epoch.
+#[test]
+fn the_ladder_clock_pair_is_a_point_of_the_outbound_epoch() {
+    let epoch = SharedEpoch::new();
+    assert_eq!(
+        super::clock_pair(&epoch, 1_000),
+        None,
+        "no epoch: nothing invented"
+    );
+    // Tick 0 (media 0 ns) was shown at wall 1_794_705_000 s.
+    let wall0 = 1_794_705_000_000_000_000_i64;
+    epoch.set(WallClockRef::new(wall0, 0, Rational::new(1_000_000_000, 1)));
+    let now = wall0 + 5_400_000_123_456; // 5400.000123456 s later
+    let pair = super::clock_pair(&epoch, now).unwrap();
+    assert_eq!(pair.epoch_generation, 0);
+    assert_eq!(
+        pair.media_us, 5_400_000_123,
+        "media time truncated to whole microseconds"
+    );
+    assert_eq!(pair.wall_unix_us, 1_794_705_000_000_000 + 5_400_000_123);
+    // The pair is exact under the map: wall(media) for that media time.
+    epoch.set_stepped(WallClockRef::new(
+        wall0 + 2_000_000_000,
+        0,
+        Rational::new(1_000_000_000, 1),
+    ));
+    let stepped = super::clock_pair(&epoch, now).unwrap();
+    assert_eq!(stepped.epoch_generation, 1, "a step moves the generation");
+    assert_eq!(stepped.media_us, 5_398_000_123);
+    assert_eq!(
+        stepped.wall_unix_us - stepped.media_us,
+        1_794_705_002_000_000
+    );
+    // A degenerate rate gives no pair.
+    epoch.set(WallClockRef::new(wall0, 0, Rational::new(0, 0)));
+    assert_eq!(super::clock_pair(&epoch, now), None);
+}

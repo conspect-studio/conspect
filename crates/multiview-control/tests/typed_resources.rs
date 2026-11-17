@@ -1202,3 +1202,95 @@ async fn an_automation_only_put_reaches_the_engine_as_a_policy_update() {
         "guide edits submit nothing"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #474 review B1 — a `media_player` source binds a player onto the desk:
+// the caller must be authorized for that player (BOLA), on create and update,
+// and for the player an update moves the binding off.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn media_player_source_requires_authorization_on_the_bound_player() {
+    use support::{get, ADMIN_TOKEN, TALLY_SCOPED_TOKEN};
+    // Scoped to ["tile:2", "main-profile", "in-cell"]: "in-cell" is the source,
+    // "main-profile" an authorized player id, "vt-1" an out-of-scope player.
+    let mut h = support::harness_with(|state| {
+        state.with_live_sources(multiview_control::LiveSourceCapability::synthetic_and_network())
+    });
+    let body = |player: &str| json!({ "name": "VT", "body": { "id": "in-cell", "kind": "media_player", "player": player } });
+
+    // Create bound to an out-of-scope player: 403, nothing persisted, no command.
+    let resp = send(
+        &h.router,
+        post_json("/api/v1/sources/in-cell", TALLY_SCOPED_TOKEN, &body("vt-1")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(h.commands.try_drain().is_empty(), "no engine command");
+    let resp = send(&h.router, get("/api/v1/sources/in-cell", ADMIN_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "nothing persisted");
+
+    // Authorized player: created and applied live.
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/sources/in-cell",
+            TALLY_SCOPED_TOKEN,
+            &body("main-profile"),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(apply_header(&resp), "live");
+    let etag = resp.headers()["etag"].to_str().unwrap().to_owned();
+    assert!(h.commands.try_drain().iter().any(|c| matches!(
+        c,
+        multiview_control::Command::UpsertSource { source, .. } if source.id == "in-cell"
+    )));
+
+    // Update repointing to an out-of-scope player: 403, unchanged, no command.
+    let resp = send(
+        &h.router,
+        put_json(
+            "/api/v1/sources/in-cell",
+            TALLY_SCOPED_TOKEN,
+            Some(&etag),
+            &body("vt-1"),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(h.commands.try_drain().is_empty(), "no engine command");
+    let resp = send(&h.router, get("/api/v1/sources/in-cell", ADMIN_TOKEN)).await;
+    assert_eq!(body_json(resp).await["body"]["player"], "main-profile");
+
+    // An admin moves it onto vt-1; the scoped caller may not move it OFF the
+    // out-of-scope player either, even onto one it may see.
+    let resp = send(&h.router, get("/api/v1/sources/in-cell", ADMIN_TOKEN)).await;
+    let etag = resp.headers()["etag"].to_str().unwrap().to_owned();
+    let resp = send(
+        &h.router,
+        put_json(
+            "/api/v1/sources/in-cell",
+            ADMIN_TOKEN,
+            Some(&etag),
+            &body("vt-1"),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let etag = resp.headers()["etag"].to_str().unwrap().to_owned();
+    let _ = h.commands.try_drain();
+    let resp = send(
+        &h.router,
+        put_json(
+            "/api/v1/sources/in-cell",
+            TALLY_SCOPED_TOKEN,
+            Some(&etag),
+            &body("main-profile"),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(h.commands.try_drain().is_empty(), "no engine command");
+}

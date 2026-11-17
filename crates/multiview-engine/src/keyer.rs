@@ -297,7 +297,8 @@ impl KeyerDef {
     ///
     /// # Errors
     /// A fill or key with no frame store in this run, a refused-by-name
-    /// feature (`chroma`, `premultiplied`) or a zero rate. A validated
+    /// feature (`premultiplied`), a chroma key without a parseable colour or
+    /// a zero rate. A validated
     /// document only fails on a missing store.
     pub fn from_config<S: std::hash::BuildHasher>(
         cfg: &DownstreamKeyerConfig,
@@ -312,6 +313,20 @@ impl KeyerDef {
                 clip: cfg.clip,
                 gain: cfg.gain,
             },
+            KeyerType::Chroma => {
+                let reference = cfg
+                    .color
+                    .as_deref()
+                    .and_then(multiview_config::parse_hex_color)
+                    .ok_or_else(|| {
+                        format!("downstream keyer {name}: a chroma key needs a #RRGGBB color")
+                    })?;
+                KeyKind::Chroma {
+                    reference: [reference.0, reference.1, reference.2],
+                    clip: cfg.clip,
+                    gain: cfg.gain,
+                }
+            }
             _ => {
                 return Err(format!(
                     "downstream keyer {name}: this key type is not supported"
@@ -2240,5 +2255,61 @@ mod tests {
         assert!(admit(Vec::new(), 64, 64, 3.0).unwrap().is_empty());
         let err = admit(Vec::new(), 64, 64, f32::NAN).unwrap_err();
         assert!(err.contains("finite"), "{err}");
+    }
+
+    #[test]
+    fn a_chroma_config_resolves_to_a_chroma_key_kind() {
+        use multiview_core::time::MediaTime;
+        use multiview_framestore::{NoSignalPolicy, TileThresholds};
+        let t = |n| MediaTime::from_nanos(n);
+        let thresholds = TileThresholds::new(t(1), t(2), t(3)).unwrap();
+        let mut stores = std::collections::HashMap::new();
+        stores.insert(
+            "gfx".to_owned(),
+            Arc::new(TileStore::new("gfx", thresholds, NoSignalPolicy::Slate)),
+        );
+        let cfg = DownstreamKeyerConfig {
+            id: "dsk1".into(),
+            program: "main".into(),
+            fill: "gfx".into(),
+            key: None,
+            key_type: KeyerType::Chroma,
+            clip: 0.05,
+            gain: 8.0,
+            color: Some("#00b140".into()),
+            invert: true,
+            mask: None,
+            fly: None,
+            max_source: None,
+            rate: 15,
+            tie: false,
+            on_at_start: false,
+            z: 1,
+            loss: KeyerLossPolicy::default(),
+            loss_trigger: KeyerLossTrigger::default(),
+            premultiplied: false,
+        };
+        let def = KeyerDef::from_config(&cfg, &stores, 64, 64).unwrap();
+        assert_eq!(
+            def.params.kind,
+            KeyKind::Chroma {
+                reference: [0x00, 0xb1, 0x40],
+                clip: 0.05,
+                gain: 8.0,
+            }
+        );
+        assert!(def.params.invert);
+        // Same cost as a linear self key: chroma adds no admission cost.
+        let linear = DownstreamKeyerConfig {
+            key_type: KeyerType::Linear,
+            color: None,
+            ..cfg.clone()
+        };
+        let lin = KeyerDef::from_config(&linear, &stores, 64, 64).unwrap();
+        assert!((def.cost - lin.cost).abs() < 1e-12);
+        // An unvalidated chroma entry without a colour is a typed error.
+        let bare = DownstreamKeyerConfig { color: None, ..cfg };
+        let err = KeyerDef::from_config(&bare, &stores, 64, 64).unwrap_err();
+        assert!(err.contains("#RRGGBB"), "{err}");
     }
 }
