@@ -1590,6 +1590,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/integrations/windy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_windy_account"];
+        put: operations["set_windy_account"];
+        post?: never;
+        delete: operations["clear_windy_account"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/integrations/windy/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["verify_windy_account"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/iptv": {
         parameters: {
             query?: never;
@@ -4638,7 +4670,7 @@ export interface components {
             /** @description Filesystem path to the sidecar. */
             path: string;
         };
-        /** @description One authorized, bounded public Windy view. Premium needs a configured secret resolver. */
+        /** @description One authorized, bounded Windy view. Premium needs a verified Windy account. */
         CaptureBody: {
             /** @description Fill authorization object. */
             fill_id: string;
@@ -10465,6 +10497,37 @@ export interface components {
          * @enum {string}
          */
         WeatherTemplateDoc: "seven_day" | "today";
+        /** @description Write-only Windy account input; never echoed, logged or audited. */
+        WindyAccountBody: {
+            /** @description Windy account email. */
+            email: string;
+            /** @description Windy account password. */
+            password: string;
+        };
+        /** @description Secret-free Windy account status. The email and password are write-only. */
+        WindyAccountView: {
+            /** @description RFC 3339 time of the last login check of the current credential. */
+            last_verified_at?: string | null;
+            /** @description Premium capture is enabled (the current credential passed its check). */
+            premium_available: boolean;
+            result?: null | components["schemas"]["WindyVerdict"];
+            /** @description A credential is stored (encrypted at rest). */
+            set: boolean;
+            /** @description A login check is running. */
+            verifying: boolean;
+        };
+        /**
+         * @description Last Windy Premium login-check verdict.
+         * @enum {string}
+         */
+        WindyVerdict: "premium" | "rejected" | "not_premium" | "unavailable";
+        /** @description Result of `POST /integrations/windy/verify`. */
+        WindyVerifyResult: {
+            /** @description Status after the check. */
+            account: components["schemas"]["WindyAccountView"];
+            /** @description This check's verdict. */
+            result: components["schemas"]["WindyVerdict"];
+        };
         /**
          * @description `OpenAPI` mirror of [`multiview_core::switcher::WipePattern`] (ADR-0112 §3).
          * @enum {string}
@@ -14812,6 +14875,180 @@ export interface operations {
                 };
             };
             /** @description Not probed yet: the input is idle (nothing consumes it) or still starting. Its streams are read when a consumer starts it; preview it to start it. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_windy_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Secret-free Windy account status (credential is write-only). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WindyAccountView"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Admin role and an unscoped key are required. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Account store not configured. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    set_windy_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WindyAccountBody"];
+            };
+        };
+        responses: {
+            /** @description Stored encrypted; Premium resets until the next passing login check. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WindyAccountView"];
+                };
+            };
+            /** @description Admin role and an unscoped key are required. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Account store not configured. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid email or password. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    clear_windy_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Credential removed; Premium disabled. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WindyAccountView"];
+                };
+            };
+            /** @description Admin role and an unscoped key are required. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Account store not configured. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    verify_windy_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Bounded login check ran; `result` is premium, rejected (wrong email/password), not_premium or unavailable. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WindyVerifyResult"];
+                };
+            };
+            /** @description Admin role and an unscoped key are required. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No account set, store not configured, or a check is already running. */
             409: {
                 headers: {
                     [name: string]: unknown;

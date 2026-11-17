@@ -1614,7 +1614,12 @@ fn pack_params(
             }
             None => None,
         };
-        key_params.push(KeyParams::build(tile, key_layer, mattes)?);
+        key_params.push(KeyParams::build(
+            tile,
+            key_layer,
+            mattes,
+            (canvas_w, canvas_h),
+        )?);
         tile_params.push(params);
     }
     Ok(())

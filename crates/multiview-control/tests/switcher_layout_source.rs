@@ -1299,3 +1299,34 @@ async fn a_patch_of_a_layout_edited_after_authorization_is_refused() {
     let input = table.inputs.iter().find(|i| i.number == 3).unwrap();
     assert_eq!(input.source.as_ref().unwrap().as_str(), "layout:wall");
 }
+
+/// Review R3-IDEMP-1: a CUT replay answers its first 202 even after another
+/// operator put a layout the caller cannot read on Preview. The current
+/// Preview is engine state, not part of the request: it is authorized only
+/// for a NEW take.
+#[tokio::test]
+async fn a_cut_replay_answers_its_first_202_after_an_unreadable_preview_layout() {
+    let mut rig = Rig::new(false);
+    let cut = json!({"me": "me1", "program": "main", "action": "cut"});
+    let first = submit(&rig, LIMITED, "cut-1", cut.clone()).await;
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    let op = accepted_op(first).await;
+    rig.tick();
+    // Another operator selects a layout LIMITED cannot read onto Preview.
+    let response = submit(
+        &rig,
+        OPERATOR_TOKEN,
+        "pv",
+        select("select_preview", "secret-wall"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    rig.tick();
+    // The replay is the first 202, not a 403 against the new Preview ...
+    let replay = submit(&rig, LIMITED, "cut-1", cut.clone()).await;
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    assert_eq!(accepted_op(replay).await, op);
+    // ... while a NEW take is still authorized against it.
+    let fresh = submit(&rig, LIMITED, "cut-2", cut).await;
+    assert_eq!(fresh.status(), StatusCode::FORBIDDEN);
+}
