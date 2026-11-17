@@ -440,3 +440,193 @@ fn a_shed_readd_never_overwrites_the_pending_unbind_of_the_accepted_alias() {
     assert_eq!(r.drain.admitted_sources(), base, "x no longer counts");
     r.hub.shutdown();
 }
+
+/// Round 4: aliases configured at BOOT are catalogued (and previewed) by the
+/// pipeline before any command. A real `Pipeline`, its real hub + ingest
+/// spawner and a drain wired with the demand seam, as the binary wires them.
+#[cfg(feature = "ffmpeg")]
+struct BootRig {
+    _pipeline: multiview_cli::pipeline::Pipeline,
+    demand: multiview_engine::DemandManager<Nv12Image>,
+    catalogue: multiview_cli::source_rails::Catalogue,
+    preview: SharedStores,
+    hub: LiveSourceHub,
+    fault: SubmitFault,
+    sender: multiview_control::CommandSender,
+    drain: CommandDrain,
+    drive: CompositorDrive<Nv12Image>,
+}
+
+#[cfg(feature = "ffmpeg")]
+impl BootRig {
+    fn new() -> Self {
+        let config = MultiviewConfig::load_from_toml(&toml_with_boot_aliases()).expect("parse");
+        config.validate().expect("validates");
+        let mut pipeline = multiview_cli::pipeline::Pipeline::build(&config).expect("builds");
+        let demand = pipeline.demand();
+        let catalogue = pipeline.catalogue();
+        let preview = shared_stores(pipeline.preview_stores());
+        for id in ["vt-boot", "vt-boot2"] {
+            assert!(catalogue.load().get(id).is_some_and(|e| e.is_alias()));
+            assert!(preview.load().contains_key(id), "{id} previewed at boot");
+        }
+        let hub = LiveSourceHub::start_with_ingest(
+            pipeline.stop_registry(),
+            Arc::clone(&preview),
+            Some(pipeline.live_ingest_spawner()),
+        );
+        let fault = SubmitFault::default();
+        let (sender, rx) = command_bus(16);
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+        let drain = CommandDrain::new(rx, config.clone(), publisher)
+            .with_live_sources(hub.handle().with_fault(fault.clone()))
+            .with_demand(pipeline.drain_demand());
+        let canvas = CanvasColor::default();
+        let drive = CompositorDrive::new(
+            Arc::new(config.solve_layout().unwrap()),
+            pipeline.preview_stores(),
+            Nv12Image::solid(64, 64, 16, 128, 128, canvas.output_tag()).unwrap(),
+            canvas,
+            LinearRgba::opaque(0.0, 0.0, 0.0),
+        )
+        .unwrap();
+        Self {
+            _pipeline: pipeline,
+            demand,
+            catalogue,
+            preview,
+            hub,
+            fault,
+            sender,
+            drain,
+            drive,
+        }
+    }
+    fn submit(&mut self, command: Option<Command>) {
+        if let Some(command) = command {
+            self.sender.try_submit(command).unwrap();
+        }
+        self.drain.apply(&mut self.drive);
+    }
+    fn remove(&mut self, id: &str) {
+        self.submit(Some(Command::RemoveSource {
+            op: OperationId::new(),
+            id: id.to_owned(),
+        }));
+    }
+    /// The hub withdrew `id`'s catalogue entry (with its pins) and preview.
+    fn assert_withdrawn(&self, id: &str) {
+        let gone = wait(|| {
+            !self.catalogue.load().contains_key(id) && !self.preview.load().contains_key(id)
+        });
+        assert!(
+            gone,
+            "{id}: catalogue {} preview {}",
+            self.catalogue.load().contains_key(id),
+            self.preview.load().contains_key(id)
+        );
+        assert!(
+            self.demand.status(id).consumers.is_empty(),
+            "{id}: its standing pins were dropped"
+        );
+        assert!(self.preview.load().contains_key("vt-1"), "the player stays");
+    }
+    fn finish(self) {
+        self.hub.shutdown();
+        self.demand.shutdown();
+    }
+}
+
+/// Round 4 (a): a boot alias removed before any live upsert is withdrawn
+/// from the hub, and the cap is back to baseline.
+#[cfg(feature = "ffmpeg")]
+#[test]
+fn removing_a_boot_alias_withdraws_its_boot_binding() {
+    let mut r = BootRig::new();
+    let base = r.drain.admitted_sources();
+    r.remove("vt-boot");
+    r.assert_withdrawn("vt-boot");
+    assert_eq!(
+        r.drain.admitted_sources(),
+        base - 1,
+        "vt-boot no longer counts"
+    );
+    r.finish();
+}
+
+/// Round 4 (b): a boot alias repointed while the queue is full (the hub
+/// never sees it) and removed while full: on recovery the BOOT binding is
+/// withdrawn (never the drive's unaccepted repoint), cap back to baseline.
+#[cfg(feature = "ffmpeg")]
+#[test]
+fn a_shed_repoint_of_a_boot_alias_then_removal_withdraws_the_boot_binding() {
+    let mut r = BootRig::new();
+    let base = r.drain.admitted_sources();
+    r.fault.full();
+    r.submit(Some(Command::UpsertSource {
+        op: OperationId::new(),
+        source: Box::new(
+            serde_json::from_value(
+                serde_json::json!({"id": "vt-boot2", "kind": "media_player", "player": "vt-9"}),
+            )
+            .unwrap(),
+        ),
+    }));
+    r.remove("vt-boot2");
+    r.fault.clear();
+    for _ in 0..8 {
+        r.submit(None);
+    }
+    r.assert_withdrawn("vt-boot2");
+    assert_eq!(
+        r.drain.admitted_sources(),
+        base - 1,
+        "vt-boot2 no longer counts; nothing left pending"
+    );
+    r.finish();
+}
+
+#[cfg(feature = "ffmpeg")]
+fn toml_with_boot_aliases() -> String {
+    r##"schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "30000/1001"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "cam"
+kind = "bars"
+[[sources]]
+id = "vt-boot"
+kind = "media_player"
+player = "vt-1"
+[[sources]]
+id = "vt-boot2"
+kind = "media_player"
+player = "vt-1"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "cam"
+[[media_players]]
+id = "vt-1"
+[[media_players]]
+id = "vt-9"
+[[outputs]]
+kind = "hls"
+path = "/tmp/live-media-player-boot-alias.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##
+    .to_owned()
+}

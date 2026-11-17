@@ -2585,9 +2585,24 @@ impl CommandDrain {
     /// leases (new before old).
     #[cfg(feature = "ffmpeg")]
     #[must_use]
-    fn with_demand(mut self, demand: Option<crate::source_demand::DrainDemand<Nv12Image>>) -> Self {
+    #[doc(hidden)]
+    pub fn with_demand(
+        mut self,
+        demand: Option<crate::source_demand::DrainDemand<Nv12Image>>,
+    ) -> Self {
         if let Some(demand) = &demand {
             self.booted_players = Some(Arc::clone(&demand.booted_players));
+            // Boot already catalogued every configured `media_player` alias
+            // (and put its store in the preview map): that is what the hub
+            // holds for it, so a removal before any live upsert withdraws
+            // exactly that binding (review ship-1111 round 4).
+            for (id, entry) in demand.catalogue.load().iter() {
+                if entry.is_alias() {
+                    self.hub_aliases
+                        .entry(id.clone())
+                        .or_insert_with(|| Arc::clone(entry.store()));
+                }
+            }
         }
         self.demand = demand;
         self
