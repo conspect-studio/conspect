@@ -150,6 +150,8 @@ pub struct KeyerFields {
 
 /// Distinguish an omitted field (`None`, keep) from JSON `null`
 /// (`Some(None)`, clear) — the same keep/clear split `key: ""` gives the key.
+#[allow(clippy::option_option)]
+// reason: the three wire states (omitted / null / value) are the contract.
 fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,

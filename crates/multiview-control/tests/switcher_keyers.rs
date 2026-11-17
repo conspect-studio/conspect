@@ -1442,7 +1442,7 @@ async fn keyer_set_repointing_a_fill_moves_the_media_edit_guard_to_the_new_fill(
 }
 
 /// K5-01/K5-04: `keyers[]` exposes the committed parameters (type, clip,
-/// gain, invert, mask, fly, max_source, loss, loss_trigger) and the GET
+/// gain, invert, mask, fly, `max_source`, loss, `loss_trigger`) and the GET
 /// carries the canvas and cadence. Parameters are not source ids, so a row
 /// the caller may read carries them unredacted, while the source ids stay
 /// redacted and an unreadable keyer row is still filtered (parity with the
