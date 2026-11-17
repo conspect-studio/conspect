@@ -2322,9 +2322,10 @@ export interface paths {
         put?: never;
         /**
          * Plan 1..64 crosspoints: mixer inputs (path, on-air flag, refusals), the
-         *     slots of one output (§12.4 path P1/P2/P3 and cost), or an atomic set
-         *     over many destinations (#308: every member planned, `can_take` only when
-         *     all can and the set's new encoders fit the caller's caps); no change.
+         *     slots of one output (§12.4 path P0/P1/P2/P3, cost and the first
+         *     passthrough miss), or an atomic set over many destinations (#308: every
+         *     member planned, `can_take` only when all can and the set's new encoders
+         *     fit the caller's caps); no change.
          */
         post: operations["plan_patch"];
         delete?: never;
@@ -4760,12 +4761,14 @@ export interface components {
             path?: string | null;
             /** @description A receiver can start now. */
             ready: boolean;
+            receiver?: null | components["schemas"]["ReceiverProbe"];
             /**
              * Format: int64
              * @description Video segments published (Google's Default Media Receiver starts
              *     slowly on a young playlist: wait for 8).
              */
             segments: number;
+            transport?: null | components["schemas"]["Transport"];
         };
         /** @description The `POST /api/v1/cast/sessions/{id}/volume` request body. */
         CastVolumeRequest: {
@@ -5474,6 +5477,26 @@ export interface components {
             /** @description Optional `http://` hook that receives a `POST` on break start/end. */
             webhook_url?: string | null;
         };
+        /** @description One step down the ladder, as the receiver reported it in `failed`. */
+        Fallback: {
+            /**
+             * Format: int64
+             * @description When it was reported (Unix ms).
+             */
+            at_unix_ms: number;
+            /**
+             * Format: int64
+             * @description The receiver's figure for it (ms), if any.
+             */
+            ms?: number | null;
+            /** @description The rung that failed. */
+            rung: string;
+            /**
+             * @description `connect`, `first-frame`, `stall`, `latency` or `hook` (the WebRTC
+             *     media-element hook did not take).
+             */
+            stage: string;
+        };
         /** @description One feed's operator-visible status. */
         FeedStatus: {
             /** @description Channels kept from this feed. */
@@ -5538,6 +5561,11 @@ export interface components {
              */
             max_per_scope: number;
         };
+        /**
+         * @description Which presented-frame counter the receiver's stall watchdog uses.
+         * @enum {string}
+         */
+        FrameCounter: "rvfc" | "quality";
         /** @description Fetch freshness of one product. */
         FreshnessDoc: {
             /** @description Last attempt, good or bad (RFC 3339 UTC). */
@@ -6098,6 +6126,37 @@ export interface components {
          * @enum {string}
          */
         LadderStateDoc: "compliant" | "grace" | "lapsed_soft" | "lapsed_hard" | "evaluation" | "class_mismatch" | "over_gpu";
+        /**
+         * @description How a latency figure was obtained (decision 2, "When there is no
+         *     trustworthy mapping").
+         * @enum {string}
+         */
+        LatencyMethod: "frame" | "playhead" | "unavailable";
+        /** @description Steady-state tick-to-present latency over the receiver's last window. */
+        LatencyStats: {
+            /**
+             * Format: int64
+             * @description The clock offset's error bound (ms).
+             */
+            clock_error_ms?: number | null;
+            /**
+             * Format: int64
+             * @description Median (ms).
+             */
+            median: number;
+            /** @description `frame` or `playhead`. */
+            method: components["schemas"]["LatencyMethod"];
+            /**
+             * Format: int64
+             * @description 95th percentile (ms).
+             */
+            p95: number;
+            /**
+             * Format: int64
+             * @description Valid samples in the window.
+             */
+            samples: number;
+        };
         /**
          * @description A persisted layout resource.
          *
@@ -7349,6 +7408,50 @@ export interface components {
             target: components["schemas"]["TallyTargetDoc"];
         };
         /**
+         * @description Passthrough (P0) counters of the run (#344 D2b): keys open (no encoder
+         *     session each) and cumulative AU / repeat / drift-drop / stall / slate /
+         *     bridge counts.
+         */
+        PassthroughTotals: {
+            /**
+             * Format: int64
+             * @description Source access units passed through.
+             */
+            aus: number;
+            /**
+             * Format: int64
+             * @description Moves onto an on-demand picture bridge.
+             */
+            bridges: number;
+            /**
+             * Format: int64
+             * @description Bridges that found no encoder session (stayed on the slate).
+             */
+            bridges_refused: number;
+            /**
+             * Format: int64
+             * @description Access units dropped by drift corrections.
+             */
+            drift_drops: number;
+            /** @description Passthrough keys open. */
+            keys: number;
+            /**
+             * Format: int64
+             * @description Repeat (skip) access units emitted by drift corrections.
+             */
+            repeats: number;
+            /**
+             * Format: int64
+             * @description Ticks emitted from a format slate.
+             */
+            slate_ticks: number;
+            /**
+             * Format: int64
+             * @description Runs ended by a stall.
+             */
+            stalls: number;
+        };
+        /**
          * @description `POST /patch/take` 202 answer. The outcome arrives as `switcher.operation`
          *     (mixer inputs), `route.output` (one output) or, for a set of two or more
          *     destinations, `patch.take` (#308).
@@ -7561,7 +7664,13 @@ export interface components {
             /** @description Whether the destination input is on Program now (mixer inputs). */
             on_air: boolean;
             /**
-             * @description The path this crosspoint takes: `mixer-input`, `P1`, `P2`, `P3`
+             * @description For an output video slot fed by a source that is not P0: the first
+             *     passthrough miss (#344 D2b), e.g. `passthrough-not-supported-on-medium`
+             *     or `not-enough-history`. Never names a source.
+             */
+            passthrough?: string | null;
+            /**
+             * @description The path this crosspoint takes: `mixer-input`, `P0`, `P1`, `P2`, `P3`
              *     (§12.4), `follow` (an audio slot riding the video take) or
              *     `subtitle` (a subtitle slot's route-table re-point).
              */
@@ -7914,6 +8023,28 @@ export interface components {
             /** @description The transport URN. */
             transport: string;
         };
+        /** @description What the receiver says it can do (`caps` of the probe). */
+        ReceiverCaps: {
+            adec?: null | components["schemas"]["Support"];
+            frames?: null | components["schemas"]["FrameCounter"];
+            /** @description Media Source Extensions accept the stream's codec strings. */
+            mse?: boolean | null;
+            /** @description `RTCPeerConnection` exists. */
+            rtc?: boolean | null;
+            /** @description H.264 `profile-level-id` values the receiver can take (at most 8). */
+            rtc_h264: string[];
+            /** @description Opus receive. */
+            rtc_opus?: boolean | null;
+            /** @description `requestVideoFrameCallback` exists. */
+            rvfc?: boolean | null;
+            /** @description The libsrt version an Android TV app loaded (`null` on the web). */
+            srt?: string | null;
+            vdec?: null | components["schemas"]["Support"];
+            /** @description The same with `prefer-hardware`. */
+            vdec_hw?: boolean | null;
+            /** @description `WebTransport` exists. */
+            wt?: boolean | null;
+        };
         /** @description The last fetch of the receiver app (no IP). */
         ReceiverFetch: {
             /** @description The fetcher was a Cast device (`User-Agent` contains `CrKey`). */
@@ -7925,6 +8056,33 @@ export interface components {
             unix_ms: number;
             /** @description The fetcher's `User-Agent` (at most 160 characters). */
             user_agent?: string | null;
+        };
+        /** @description What the session must carry (`need` of the probe). */
+        ReceiverNeed: {
+            /** @description The audio track required, if any. */
+            audio?: string | null;
+            /** @description Subtitles are required. */
+            subtitles?: boolean | null;
+        };
+        /** @description The last capability probe of a stream's receiver. */
+        ReceiverProbe: {
+            /** @description The receiver build (a sha256 prefix of its script). */
+            build?: string | null;
+            /** @description What it can do. */
+            caps: components["schemas"]["ReceiverCaps"];
+            /** @description `web` or `android-tv` (as claimed). */
+            kind?: string | null;
+            /** @description What it must carry. */
+            need: components["schemas"]["ReceiverNeed"];
+            /**
+             * Format: int64
+             * @description When the probe arrived (Unix ms).
+             */
+            received_unix_ms: number;
+            /** @description Rungs in its failure memory (at most 4). */
+            skip: components["schemas"]["SkipEntry"][];
+            /** @description The receiver's user agent (at most 200 characters). */
+            ua?: string | null;
         };
         /** @description The last receiver report of a stream, as received. */
         ReceiverReport: {
@@ -8035,6 +8193,21 @@ export interface components {
         ReplyRequest: {
             /** @description The reply text to append to the thread. */
             body: string;
+        };
+        /** @description Player resets inside the attachment. */
+        Resets: {
+            /**
+             * Format: int64
+             * @description Hard resets.
+             */
+            hard: number;
+            /** @description The last cause. */
+            last?: string | null;
+            /**
+             * Format: int64
+             * @description Soft resets.
+             */
+            soft: number;
         };
         /** @description One published playlist entry, resolved against the current configuration. */
         ResolvedEntry: {
@@ -8318,6 +8491,7 @@ export interface components {
             encoder_sessions?: string | null;
             /** @description Video encoders running. */
             encoders: number;
+            passthrough?: null | components["schemas"]["PassthroughTotals"];
         };
         /** @description A crosspoint plan, or an output plan when `target.kind` is `output`. */
         RoutingPlanRequestDoc: components["schemas"]["RouteTakeRequest"] | components["schemas"]["OutputRouteRequest"];
@@ -8517,6 +8691,16 @@ export interface components {
              * @description The one-time setup code (8 words) printed on the host.
              */
             code: string;
+        };
+        /** @description A rung in the device's failure memory. */
+        SkipEntry: {
+            /** @description The rung. */
+            rung: string;
+            /**
+             * Format: int64
+             * @description Seconds left.
+             */
+            seconds: number;
         };
         /** @description The cost of an output-slot crosspoint (§12.4, §12.10). */
         SlotCost: {
@@ -9197,6 +9381,11 @@ export interface components {
             theme?: string | null;
         };
         /**
+         * @description A decoder check result (`isConfigSupported`).
+         * @enum {string}
+         */
+        Support: "supported" | "unsupported" | "absent";
+        /**
          * @description The full entitlement-routing answer the `GET /support/entitlement` endpoint
          *     returns: whether the machine is eligible for entitled support, the route, and
          *     the SLA token (a quiet line for the free tier).
@@ -9833,6 +10022,34 @@ export interface components {
             frames: number;
             /** @description `cut` or `mix`. */
             kind: string;
+        };
+        /** @description The transport a stream's receiver plays on and how it fares. */
+        Transport: {
+            /** @description The last steps down (at most 8, oldest first). */
+            fallbacks: components["schemas"]["Fallback"][];
+            /**
+             * Format: int64
+             * @description From the start of the attempt to the first presented frame (ms).
+             */
+            first_frame_ms?: number | null;
+            latency_method?: null | components["schemas"]["LatencyMethod"];
+            latency_ms?: null | components["schemas"]["LatencyStats"];
+            /**
+             * Format: int64
+             * @description When the receiver last reported these figures (Unix ms).
+             */
+            reported_unix_ms?: number | null;
+            /** @description Player resets. */
+            resets: components["schemas"]["Resets"];
+            /** @description The rung the engine last offered (`hls` in this build). */
+            rung?: string | null;
+            /**
+             * Format: int64
+             * @description Since when it plays that rung (Unix ms).
+             */
+            since_unix_ms?: number | null;
+            /** @description The receiver's frame watchdog says no frame was presented for 2 s. */
+            stalled: boolean;
         };
         /**
          * @description The optional JSON body a transport verb may carry: an `asset` (for `load`)
@@ -16887,7 +17104,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description `{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, live, source: {source}|{bus}|{layout}|{redacted:true}|null, path: P1|P2|P3|null, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ], subtitle: [ { slot, format, language, name, live, source: {source}|{redacted:true}|null } ] } ] }`. Subtitle slots come from the engine's live route table when the running engine samples that slot (`live: true`), else (no run, the run ended, the output not in this run, or a slot beyond the run's table) from the accepted config (`live: false`), per slot. Video slot 0 comes from the engine's live readback (`live: true`); `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. With no readback (no running engine, routing unavailable, or the output not in this run) `live` is false and `source` and `path` are null: the live state is unknown, never reported as Program. Audio slot 0's `source` is the output's accepted audio feed (`"follow"` by default, else `"program"`, `"none"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{"redacted": true}`. */
+            /** @description `{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, live, source: {source}|{bus}|{layout}|{redacted:true}|null, path: P0|P1|P2|P3|null, passthrough: {state, reason}|null, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ], subtitle: [ { slot, format, language, name, live, source: {source}|{redacted:true}|null } ] } ] }`. Subtitle slots come from the engine's live route table when the running engine samples that slot (`live: true`), else (no run, the run ended, the output not in this run, or a slot beyond the run's table) from the accepted config (`live: false`), per slot. Video slot 0 comes from the engine's live readback (`live: true`); `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. `path` is P0 while the output passes its source's compressed video through (#344: 0 decode, 0 encode); `passthrough` is that output's passthrough state (`metering`, `moving`, `passthrough`, `slate`, `bridging`, `returning`, `unavailable`, …) and its reason (a match-rule miss, a bridge reason, or `bridging on slate: no encoder session`), null when the output has no passthrough candidate; a reason never names a source. With no readback (no running engine, routing unavailable, or the output not in this run) `live` is false and `source` and `path` are null: the live state is unknown, never reported as Program. Audio slot 0's `source` is the output's accepted audio feed (`"follow"` by default, else `"program"`, `"none"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{"redacted": true}`. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -19297,6 +19514,15 @@ export interface operations {
             };
             /** @description No source with that id. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description On a switcher run: a media edit of a source on a bus (Program, Preview, or a downstream keyer's fill/key) is refused before it is stored; the detail names every such consumer. Take it off the bus first; policy-only edits apply live (issue #464). */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

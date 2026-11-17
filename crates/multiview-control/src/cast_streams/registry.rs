@@ -40,6 +40,8 @@ pub(super) struct Entry {
     /// (ABUSE-1); `None` until it is armed. Media is served only while it
     /// equals its output's [`Gate::generation`].
     pub generation: Option<u64>,
+    /// The ladder call's state: rate, last probe, transport (ADR-0114).
+    pub ladder: super::ladder::LadderState,
 }
 
 impl Entry {
@@ -430,6 +432,31 @@ pub struct StreamView {
     pub fetches: CastFetches,
     /// The last receiver report.
     pub last_report: Option<ReceiverReport>,
+    /// The receiver's last capability probe (ADR-0114).
+    pub probe: Option<super::ladder::ReceiverProbe>,
+    /// The rung it plays and how it fares (ADR-0114).
+    pub transport: Option<super::ladder::Transport>,
+}
+
+/// What the shared token check admits (ADR-0114 decision 5.1): a live token
+/// armed at its output's CURRENT authorization generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Admitted {
+    /// The stream id.
+    pub stream_id: String,
+    /// The cast output's config id.
+    pub config_id: String,
+    /// The authorization generation it is armed at.
+    pub generation: u64,
+}
+
+/// Why a ladder call was not taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LadderError {
+    /// No live stream for this token.
+    Unknown,
+    /// Over the per-token rate.
+    TooSoon,
 }
 
 #[derive(Debug)]
@@ -559,6 +586,8 @@ impl Registry {
             live: entry.last_playlist_ms.is_some(),
             fetches: entry.fetches.clone(),
             last_report: entry.last_report.clone(),
+            probe: entry.ladder.probe.clone(),
+            transport: entry.ladder.transport_view(),
         }
     }
 

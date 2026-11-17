@@ -404,6 +404,8 @@ where
     // wins over `[control] cast_app_id`; an invalid value is a warning and
     // no custom receiver (the sender then uses the Default Media Receiver).
     state = state.with_cast_app_id(cast_app_id(config));
+    // `[cast] ladder` (ADR-0114): the rungs the ladder route may offer.
+    state = state.with_cast_ladder(config.cast.ladder.clone());
     // The running engine's cast outputs (ADR-0111): activation gates behind
     // a lock-free slot, so the control plane never waits on the engine.
     #[cfg(feature = "ffmpeg")]
