@@ -7,6 +7,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use multiview_core::switcher::{FrameCount, SourceRef, TransitionDescriptor};
+use multiview_engine::switcher_control::SwitcherSnapshot;
 use multiview_engine::switcher_control::{
     SelectionGuard, SwitcherCommand, SwitcherControl, SwitcherVerb,
 };
@@ -51,15 +52,17 @@ pub struct SwitcherRequest {
     pub output: Option<String>,
     /// Action to classify on `/plan`, one of `select_program`, `select_preview`,
     /// `cut`, `auto`, `set_transition`, `keyer_cut`, `keyer_auto`, `keyer_tie`,
-    /// `keyer_set`; the action is part of the same validated request.
+    /// `keyer_set`, `arm`; the action is part of the same validated request.
     pub action: String,
     /// AUTO duration at the output's exact cadence; no floating milliseconds.
     /// For `keyer_auto`, an optional rate override in 1..=300 frames.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_frames: Option<u32>,
-    /// Downstream keyer fields (ADR-0113 §8, K4): `keyer` names the keyer
-    /// (object id `<program>/<keyer>`); `on`, `tie` and the `keyer_set`
-    /// definition fields. Fill and key name sources only (`in:<n>` is 422).
+    /// Keyer fields (ADR-0113 §8, K4/K3): `keyer` names the keyer (object id
+    /// `<program>/<keyer>`, or `<me>/<keyer>` with `family = "usk"`); `on`,
+    /// `tie` and the `keyer_set` definition fields; `arm` takes `background`
+    /// and `keys` (upstream keyer ids). Fill and key name sources only
+    /// (`in:<n>` is 422).
     #[serde(flatten)]
     pub keyer: super::switcher_keyers::KeyerFields,
     /// The transition `set_transition` selects for the next AUTO (ADR-0112
@@ -129,6 +132,9 @@ pub struct SwitcherStateResponse {
     pub keyers: Vec<super::switcher_keyers::KeyerRow>,
     /// Engine tally resolved to source ids; unreadable ids are dropped.
     pub tally: super::switcher_keyers::TallyView,
+    /// The next-transition set (`arm`, K3): the background flag and the
+    /// armed upstream keyer ids the caller may read.
+    pub armed: super::switcher_keyers::ArmedView,
     /// The operator's selected transition, as the engine applied it
     /// (ADR-0112 §4); an AUTO's own rate never replaces it. Same shape as
     /// the request's `transition`.
@@ -461,18 +467,27 @@ fn authorize_target(
 /// unauthorized source. When that Preview is `layout:<id>` the caller needs
 /// Read on the layout and on every source its registered body binds (one
 /// generic 403). `None` for any other verb, or before the first snapshot.
+///
+/// A key-only take (K3: the arm set excludes the background) moves neither
+/// bus, so it neither authorizes nor guards Preview (review R3-KEYONLY-1).
+/// The decision reads the same `snapshot` whose `arm_version` the take is
+/// bound to, so an arm change that adds the background makes the engine
+/// refuse the take (`arm-changed`) instead of taking an unguarded Preview.
 fn authorize_take_of_layout(
     state: &AppState,
     principal: &Principal,
-    handle: &SwitcherControl,
+    snapshot: Option<&SwitcherSnapshot>,
     req: &SwitcherRequest,
 ) -> ControlResult<Option<SelectionGuard>> {
     if !matches!(req.action.as_str(), "cut" | "auto") {
         return Ok(None);
     }
-    let Some(snapshot) = handle.snapshot() else {
+    let Some(snapshot) = snapshot else {
         return Ok(None);
     };
+    if !snapshot.next.background {
+        return Ok(None);
+    }
     let layout_revision = match snapshot.preview.as_str().strip_prefix("layout:") {
         Some(id) => Some(authorize_registered_layout(state, principal, id)?),
         None => None,
@@ -543,9 +558,11 @@ fn validate_buses(
         "select_program" if selected == Some(program) => Err(ControlError::Validation(
             "source is already on program".into(),
         )),
-        "cut" | "auto" if snapshot.preview == snapshot.program => Err(ControlError::Validation(
-            multiview_engine::switcher_control::REFUSE_SAME_SOURCE.into(),
-        )),
+        // Review MEDIA-1: only a take that moves the background puts PVW on
+        // PGM; a key-only take (K3) changes no bus.
+        "cut" | "auto" if snapshot.next.background && snapshot.preview == snapshot.program => Err(
+            ControlError::Validation(multiview_engine::switcher_control::REFUSE_SAME_SOURCE.into()),
+        ),
         "auto" if snapshot.in_flight => Err(ControlError::Validation(
             "cannot start a second AUTO during an active take".into(),
         )),
@@ -588,6 +605,7 @@ pub(crate) async fn get_switcher(
             in_flight: snapshot.in_flight,
             keyers: super::switcher_keyers::rows(&principal, defs.as_deref(), &snapshot),
             tally: super::switcher_keyers::tally(&principal, defs.as_deref(), &snapshot),
+            armed: super::switcher_keyers::armed(&principal, defs.as_deref(), &snapshot),
             transition: snapshot.transition.clone(),
         }),
     )
@@ -656,7 +674,7 @@ fn transition_error(bytes: &[u8]) -> Option<String> {
 }
 
 /// Dry-run command admission, including BOLA on every referenced object.
-#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/plan", tag = "switcher", request_body = SwitcherRequest, responses((status = 200, description = "`SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`).", body = SwitcherPlanResponseDoc), (status = 403, description = "Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source (checked before any existence answer); a keyer verb also needs the command role (Operator), so a Viewer or ReadOnly key cannot plan one.", body = crate::problem::Problem), (status = 404, description = "`unknown-keyer` (a keyer the caller may read is not defined).", body = crate::problem::Problem), (status = 409, body = crate::problem::Problem), (status = 422, description = "Invalid verb fields; `keyer-source-not-a-source` (a fill or key naming a mixer input `in:<n>`); `keyer-rate`.", body = crate::problem::Problem))))]
+#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/plan", tag = "switcher", request_body = SwitcherRequest, responses((status = 200, description = "`SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set`/`arm` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`, `keyer-in-transition` (a USK `keyer_cut` during a transition), `in-flight` (`arm` during a transition)).", body = SwitcherPlanResponseDoc), (status = 403, description = "Not authorized for the M/E, the Program scope, the keyer object id (`<program>/<id>` for a DSK, `<me>/<id>` for a USK; for `arm` every armed key) or a named fill/key source (for `arm` the fill and key of every armed key) (checked before any existence answer); a keyer verb also needs the command role (Operator), so a Viewer or ReadOnly key cannot plan one.", body = crate::problem::Problem), (status = 404, description = "`unknown-keyer` (a keyer the caller may read is not defined).", body = crate::problem::Problem), (status = 409, body = crate::problem::Problem), (status = 422, description = "Invalid verb fields; `keyer-source-not-a-source` (a fill or key naming a mixer input `in:<n>`); `keyer-rate`.", body = crate::problem::Problem))))]
 pub(crate) async fn plan_switcher(
     State(state): State<AppState>,
     principal: Principal,
@@ -686,6 +704,10 @@ pub(crate) async fn plan_switcher(
         return Ok(*response);
     }
     let handle = engine(&state)?;
+    if matches!(req.action.as_str(), "cut" | "auto") {
+        // Review AUTHZ-1: the take toggles the armed keys.
+        super::switcher_keyers::authorize_armed(&principal, &req.me, handle)?;
+    }
     if req.action == "auto" && !handle.supports_auto() {
         return Err(ControlError::Validation(
             "AUTO requires a same-epoch preview compositor and admitted transition budget".into(),
@@ -696,7 +718,10 @@ pub(crate) async fn plan_switcher(
     if let Some(Err(response)) = resolve_layout_select(&state, &principal, &req).await? {
         return Ok(response);
     }
-    authorize_take_of_layout(&state, &principal, handle, &req)?;
+    // One snapshot for the take's Preview authorization and its armed-set
+    // binding (review R3-KEYONLY-1).
+    let take_snapshot = handle.snapshot();
+    authorize_take_of_layout(&state, &principal, take_snapshot.as_deref(), &req)?;
     let target = match resolve_target(handle, &req) {
         Ok(target) => target,
         Err(response) => return Ok(*response),
@@ -718,7 +743,7 @@ pub(crate) async fn plan_switcher(
 }
 
 /// Enqueue a checked verb; a 202 never asserts frame application.
-#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/commands/{kind}", tag = "switcher", params(("kind" = String, Path, description = "The verb; must equal `action`."), ("Idempotency-Key" = String, Header, description = "Required; a replay answers the first 202.")), request_body = SwitcherRequest, responses((status = 202, description = "Queued; the outcome arrives as `switcher.operation` at the engine tick. Keyer verbs also emit `switcher.keyer` on a committed state change.", body = SwitcherAccepted), (status = 403, description = "Not authorized for the M/E, the Program scope, a referenced object, the keyer object id or a named fill/key source, or (a `layout` select, or a CUT/AUTO whose Preview is `layout:<id>`) every source the stored layout binds; one generic refusal; the key is not burned.", body = crate::problem::Problem), (status = 404, description = "`unknown-keyer`.", body = crate::problem::Problem), (status = 409, description = "`capacity` (keyer budget, generic for scoped callers; or a fifth stored layout as an M/E source, or a source it shows cannot be leased), `layout-changed` (the stored layout was edited or deleted while this request was in flight; retry), `on-air-protected` (a fill/key change of a keyer on air without `on_air = \"allow\"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyers-unavailable`; nothing is enqueued and every lease and key taken is released.", body = crate::problem::Problem), (status = 422, description = "Invalid verb or references (exactly one of `source`/`input`/`layout` on a select; none on cut/auto), `not-on-an-input`, `unknown-slot`, `unknown-source` (no such stored layout), `layout-not-admissible` (another canvas, a translucent cell, or a nested layout/bus cell).", body = crate::problem::Problem), (status = 503, description = "`engine-busy`: the 64-slot mailbox is full, a stored layout could not be read now, or the output clock did not adopt a newly registered layout within 1 s (key and leases released); or `idempotency-capacity`.", body = crate::problem::Problem))))]
+#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/commands/{kind}", tag = "switcher", params(("kind" = String, Path, description = "The verb; must equal `action`."), ("Idempotency-Key" = String, Header, description = "Required; a replay answers the first 202.")), request_body = SwitcherRequest, responses((status = 202, description = "Queued; the outcome arrives as `switcher.operation` at the engine tick. Keyer verbs also emit `switcher.keyer` on a committed state change.", body = SwitcherAccepted), (status = 403, description = "Not authorized for the M/E, the Program scope, a referenced object, the keyer object id or a named fill/key source, or (a `layout` select, or a CUT/AUTO whose Preview is `layout:<id>`) every source the stored layout binds; one generic refusal; the key is not burned.", body = crate::problem::Problem), (status = 404, description = "`unknown-keyer`.", body = crate::problem::Problem), (status = 409, description = "`capacity` (keyer budget, generic for scoped callers; or a fifth stored layout as an M/E source, or a source it shows cannot be leased), `layout-changed` (the stored layout was edited or deleted while this request was in flight; retry), `on-air-protected` (a fill/key change of a keyer on air without `on_air = \"allow\"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyer-in-transition`, `in-flight` (`arm` during a transition), `keyers-unavailable`; nothing is enqueued and every lease and key taken is released.", body = crate::problem::Problem), (status = 422, description = "Invalid verb or references (exactly one of `source`/`input`/`layout` on a select; none on cut/auto), `not-on-an-input`, `unknown-slot`, `unknown-source` (no such stored layout), `layout-not-admissible` (another canvas, a translucent cell, or a nested layout/bus cell).", body = crate::problem::Problem), (status = 503, description = "`engine-busy`: the 64-slot mailbox is full, a stored layout could not be read now, or the output clock did not adopt a newly registered layout within 1 s (key and leases released); or `idempotency-capacity`.", body = crate::problem::Problem))))]
 #[allow(clippy::too_many_lines)]
 // reason: one linear admission sequence (authz → resolve input → buses → key →
 // lease → enqueue); the input resolution added the lines, not new branches.
@@ -778,18 +803,19 @@ pub(crate) async fn submit_switcher(
         }
         (_, registry) => registry,
     };
-    let take_guard = authorize_take_of_layout(&state, &principal, handle, &req)?;
     let target = match resolve_target(handle, &req) {
         Ok(target) => target,
         Err(response) => return Ok(*response),
     };
-    let mut expect = authorize_target(&state, &principal, &req, target.as_ref())?.or(take_guard);
+    let target_guard = authorize_target(&state, &principal, &req, target.as_ref())?;
     let verb = verb(&req, &kind, target.as_ref(), transition)?;
-    // P3R2-C: authorization and static validation are done; an EXISTING
-    // reservation is a replay and answers its original 202 before the
-    // transient admission checks (buses, an active take, the scene), which
-    // describe the engine now rather than the request. `peek` never reserves;
-    // a fresh key still passes every check below before `reserve`.
+    // P3R2-C: authorization of every EXPLICIT request field and static
+    // validation are done; an EXISTING reservation is a replay and answers
+    // its original 202 before the transient admission checks (buses, an
+    // active take, the scene), which describe the engine now rather than the
+    // request. `peek` never reserves; a fresh key still passes every check
+    // below before `reserve`. The key is scoped per principal and path, so
+    // this never answers another principal's operation.
     if let Some(op) = idem
         .0
         .as_deref()
@@ -798,6 +824,40 @@ pub(crate) async fn submit_switcher(
     {
         return Ok(accepted(&op, kind));
     }
+    // Review AUTHZ-1: a NEW take toggles the armed keys; it is authorized
+    // on them and bound to the arm set and definitions it was authorized
+    // for. Review round 2 IDEMP-1: the armed set is engine state, not part
+    // of the request, so a replay (above) is not re-authorized against a set
+    // another operator armed since; the original op already carries the
+    // versions it was bound to.
+    //
+    // Review R3-IDEMP-1: the current Preview of a CUT/AUTO is engine state
+    // too, so its layout authorization and guard also run only for a NEW
+    // take, after the replay above, from the same snapshot the armed-set
+    // binding reads (a key-only take guards no Preview: R3-KEYONLY-1).
+    let take_snapshot = handle.snapshot();
+    let take_guard = authorize_take_of_layout(&state, &principal, take_snapshot.as_deref(), &req)?;
+    let mut expect = target_guard.or(take_guard);
+    let bound = if matches!(kind.as_str(), "cut" | "auto") {
+        super::switcher_keyers::authorize_armed_at(
+            &principal,
+            &req.me,
+            take_snapshot.as_deref(),
+            handle,
+        )?
+    } else {
+        None
+    };
+    let verb = match bound {
+        Some((arm_version, defs_version)) => {
+            SwitcherVerb::Bound(Box::new(multiview_engine::switcher_control::BoundVerb {
+                verb,
+                arm_version: Some(arm_version),
+                defs_version: Some(defs_version),
+            }))
+        }
+        None => verb,
+    };
     validate_buses(handle, &req, target.as_ref())?;
     let scene_version = handle
         .scene_version()

@@ -583,3 +583,198 @@ fn a_step_matte_at_the_clip_keys_exactly_like_the_oracle() {
     }
     println!("step minimum: SSIM={:.5} PSNR={:.2}dB", floor.0, floor.1);
 }
+
+/// K3 (#388, design note §3.2): the WIPE scene merge `lerp(out, in, m(x, y))`
+/// and a tile drawn through a complemented mask (`1 − m`, a tied DSK going
+/// off) match the CPU oracle on the GPU for every shape, reverse, soft and
+/// hard edges, the endpoints, a border-expanded mask and a mask of another
+/// canvas (merges as the outgoing scene). Each fixture must change the
+/// picture versus its plain MIX/unmasked twin, so a shader ignoring the wipe
+/// or the complement could not pass. On the GPU backend none of these falls
+/// back to the CPU.
+#[test]
+fn k3_wipe_merges_and_complemented_masks_match_the_cpu_oracle() {
+    use multiview_compositor::mask::{MaskShape, WipeMask};
+    let Some(gpu) = try_gpu() else { return };
+    let limited = ColorRange::Limited;
+    let a = gradient(W, H, limited, 3);
+    let b = gradient(W, H, limited, 40);
+    let k = gradient(32, 24, limited, 11);
+    let canvas = CanvasColor::default();
+    let bg = LinearRgba::opaque(0.02, 0.05, 0.1);
+    let mut floor = (f64::INFINITY, f64::INFINITY);
+    let shapes = [
+        MaskShape::Horizontal,
+        MaskShape::Vertical,
+        MaskShape::Diagonal,
+        MaskShape::Box,
+        MaskShape::Circle,
+    ];
+    let mut masks = Vec::new();
+    for (i, shape) in shapes.into_iter().enumerate() {
+        for (p, reverse, soft) in [
+            (0.35, false, 0.0),
+            (0.6, true, 0.2),
+            (0.0, false, 0.1),
+            (1.0, true, 0.0),
+        ] {
+            masks.push((
+                format!("{shape:?} p={p} rev={reverse} soft={soft}"),
+                WipeMask::new(
+                    shape,
+                    p,
+                    W,
+                    H,
+                    [0.3 + 0.1 * i as f32, 0.6],
+                    reverse,
+                    soft,
+                    0.0,
+                ),
+            ));
+        }
+    }
+    let grown =
+        WipeMask::new(MaskShape::Circle, 0.5, W, H, [0.5, 0.5], false, 0.1, 0.05).expanded(0.05);
+    masks.push(("expanded circle".to_owned(), grown));
+    masks.push((
+        "foreign canvas".to_owned(),
+        WipeMask::new(
+            MaskShape::Horizontal,
+            0.5,
+            W * 2,
+            H,
+            [0.5, 0.5],
+            false,
+            0.0,
+            0.0,
+        ),
+    ));
+    for (name, mask) in &masks {
+        for complement in [false, true] {
+            let mask = if complement {
+                mask.complemented()
+            } else {
+                *mask
+            };
+            let merge = SceneMerge::Wipe { mask };
+            let grouped = [
+                Tile::placed(&a, 0, 0, 1.0).in_group(TileGroup::Scene {
+                    member: SceneMember::Out,
+                    merge,
+                }),
+                Tile::placed(&b, 0, 0, 1.0).in_group(TileGroup::Scene {
+                    member: SceneMember::In,
+                    merge,
+                }),
+                Tile::placed(&k, 16, 12, 1.0)
+                    .with_key(TileKey::luma(0.2, 3.0))
+                    .in_group(TileGroup::Scene {
+                        member: SceneMember::In,
+                        merge,
+                    }),
+            ];
+            let (s, p) = gate(&gpu, &format!("merge {name} c={complement}"), &grouped);
+            floor = (floor.0.min(s), floor.1.min(p));
+            let through = [
+                Tile::placed(&a, 0, 0, 1.0),
+                Tile::placed(&b, 0, 0, 1.0)
+                    .with_key(TileKey::linear())
+                    .with_mask(mask),
+            ];
+            let (s, p) = gate(&gpu, &format!("tile {name} c={complement}"), &through);
+            floor = (floor.0.min(s), floor.1.min(p));
+        }
+    }
+    // The fixtures are not vacuous: a mid wipe differs from a half MIX, and
+    // a complemented tile from the plain one.
+    let mid = WipeMask::new(
+        MaskShape::Horizontal,
+        0.5,
+        W,
+        H,
+        [0.5, 0.5],
+        false,
+        0.0,
+        0.0,
+    );
+    let scene = |merge| {
+        [
+            Tile::placed(&a, 0, 0, 1.0).in_group(TileGroup::Scene {
+                member: SceneMember::Out,
+                merge,
+            }),
+            Tile::placed(&b, 0, 0, 1.0).in_group(TileGroup::Scene {
+                member: SceneMember::In,
+                merge,
+            }),
+        ]
+    };
+    let wipe = cpu_composite(W, H, canvas, bg, &scene(SceneMerge::Wipe { mask: mid })).unwrap();
+    let mix = cpu_composite(W, H, canvas, bg, &scene(SceneMerge::Mix { p: 0.5 })).unwrap();
+    let changed = wipe
+        .y_plane()
+        .iter()
+        .zip(mix.y_plane())
+        .filter(|(x, y)| x.abs_diff(**y) > 8)
+        .count();
+    assert!(changed >= 64, "a wipe merge is not a MIX ({changed} px)");
+    let plain = cpu_composite(
+        W,
+        H,
+        canvas,
+        bg,
+        &[
+            Tile::placed(&a, 0, 0, 1.0),
+            Tile::placed(&b, 0, 0, 1.0).with_mask(mid),
+        ],
+    )
+    .unwrap();
+    let comp = cpu_composite(
+        W,
+        H,
+        canvas,
+        bg,
+        &[
+            Tile::placed(&a, 0, 0, 1.0),
+            Tile::placed(&b, 0, 0, 1.0).with_mask(mid.complemented()),
+        ],
+    )
+    .unwrap();
+    let changed = plain
+        .y_plane()
+        .iter()
+        .zip(comp.y_plane())
+        .filter(|(x, y)| x.abs_diff(**y) > 8)
+        .count();
+    assert!(
+        changed >= 64,
+        "the complement changes the picture ({changed} px)"
+    );
+    println!("K3 floor: SSIM {:.5}, PSNR {:.2} dB", floor.0, floor.1);
+
+    // On the GPU backend a WIPE-merged and a complemented frame never take
+    // the CPU fallback.
+    let backend = RunBackend::select(Some(GpuTarget::none()));
+    if backend.kind() == RunBackendKind::Gpu {
+        drop(
+            backend
+                .composite(W, H, canvas, bg, &scene(SceneMerge::Wipe { mask: mid }))
+                .unwrap(),
+        );
+        drop(
+            backend
+                .composite(
+                    W,
+                    H,
+                    canvas,
+                    bg,
+                    &[
+                        Tile::placed(&a, 0, 0, 1.0),
+                        Tile::placed(&b, 0, 0, 1.0).with_mask(mid.complemented()),
+                    ],
+                )
+                .unwrap(),
+        );
+        assert_eq!(backend.gpu_cpu_fallback_frames(), 0, "drawn on the GPU");
+    }
+}

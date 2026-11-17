@@ -26,11 +26,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use multiview_compositor::key::{KeyKind, KeyMask};
+use multiview_compositor::mask::WipeMask;
 use multiview_compositor::pipeline::Nv12Image;
 use multiview_config::{
     DownstreamKeyerConfig, KeyerLossPolicy, KeyerLossTrigger, KeyerType, MAX_KEYER_RATE,
 };
-use multiview_core::switcher::{kernel, FrameCount, Progress};
+use multiview_core::switcher::{kernel, ArmedSet, FrameCount, Progress};
 use multiview_core::traits::SourceState;
 use multiview_framestore::{TileRead, TileStore};
 
@@ -40,6 +41,12 @@ use crate::switcher_control::{SwitcherOutcome, SwitcherVerb, TAKE_PRIME_DEADLINE
 
 /// Downstream keyers per program (ADR-0113 §9 hard limit).
 pub const MAX_DSK: usize = 2;
+/// Upstream keyers per M/E (ADR-0113 §7 hard limit, slice K3).
+pub const MAX_USK: usize = crate::switcher::MAX_KEYS;
+/// Keyer slots of one runtime: DSKs at `0..MAX_DSK`, then USKs at
+/// `MAX_DSK..MAX_KEYERS` (USK key index `k`, 1-based, is slot
+/// `MAX_DSK + k − 1`).
+pub const MAX_KEYERS: usize = MAX_DSK + MAX_USK;
 /// Keyer events queued per tick before a commit; more are counted as dropped.
 pub const MAX_QUEUED_KEYER_EVENTS: usize = 8;
 /// Entries of one tally set (design note §9: room for 6 keyers × 2 + 2 buses).
@@ -101,6 +108,73 @@ pub const REFUSE_KEYER_SET_DEADLINE: &str =
 /// Typed refusal: a held keyer command expired while Program repeated.
 pub const REFUSE_KEYER_REPEAT_DEADLINE: &str =
     "keyer take deadline expired while program repeated last-good";
+/// Typed refusal: `keyer_auto` / `keyer_tie` on an upstream keyer (a USK
+/// changes state through `arm` and a background CUT or AUTO, K3).
+pub const REFUSE_KEYER_USK_VERB: &str =
+    "keyer-usk: an upstream keyer changes through arm and a CUT or AUTO; keyer_auto and keyer_tie are for downstream keyers";
+/// Typed refusal: a keyer verb authorized against keyer definitions that
+/// changed before its tick (review AUTHZ-2). Nothing changes; re-plan.
+pub const REFUSE_KEYER_DEFINITION_CHANGED: &str =
+    "keyer-definitions-changed: the keyer definitions changed since this command was authorized; re-plan it";
+/// Typed refusal: `keyer_cut` on an upstream keyer during a background
+/// transition (design note §8: a USK outside a transition only).
+pub const REFUSE_KEYER_IN_TRANSITION: &str =
+    "keyer-in-transition: an upstream keyer cannot be cut during a background transition";
+
+/// Which family a keyer belongs to (ADR-0113 §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyerFamily {
+    /// Downstream keyer: belongs to the program, stays through transitions.
+    Dsk,
+    /// Upstream keyer: belongs to the M/E scene (slice K3).
+    Usk,
+}
+
+impl KeyerFamily {
+    /// The slot range of this family in a runtime.
+    #[must_use]
+    pub const fn slots(self) -> std::ops::Range<usize> {
+        match self {
+            Self::Dsk => 0..MAX_DSK,
+            Self::Usk => MAX_DSK..MAX_KEYERS,
+        }
+    }
+
+    /// The family of slot `index`.
+    #[must_use]
+    pub const fn of_slot(index: usize) -> Self {
+        if index < MAX_DSK {
+            Self::Dsk
+        } else {
+            Self::Usk
+        }
+    }
+
+    /// The wire token (`"dsk"`, `"usk"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dsk => "dsk",
+            Self::Usk => "usk",
+        }
+    }
+}
+
+/// The 1-based USK key index of slot `index` (`None` for a DSK slot).
+#[must_use]
+pub fn usk_key_index(index: usize) -> Option<u32> {
+    index
+        .checked_sub(MAX_DSK)
+        .filter(|&k| k < MAX_USK)
+        .and_then(|k| u32::try_from(k + 1).ok())
+}
+
+/// The slot of 1-based USK key index `key`.
+#[must_use]
+pub fn usk_slot(key: u32) -> Option<usize> {
+    let k = usize::try_from(key.checked_sub(1)?).ok()?;
+    (k < MAX_USK).then_some(MAX_DSK + k)
+}
 
 /// Slack when comparing a summed cost with the budget (shared with config).
 const BUDGET_EPSILON: f64 = 1e-9;
@@ -178,10 +252,15 @@ fn rank(state: SourceState) -> u8 {
 /// a tick never looks a source up by id.
 #[derive(Debug, Clone)]
 pub struct KeyerDef {
+    /// DSK or USK.
+    pub family: KeyerFamily,
     /// The accepted definition this keyer was resolved from (the readback
-    /// the control plane serves and persists after `applied`, K4).
+    /// the control plane serves and persists after `applied`, K4). A USK
+    /// carries its shared per-definition view
+    /// ([`multiview_config::UpstreamKeyerConfig::as_definition`]).
     pub config: Arc<DownstreamKeyerConfig>,
-    /// Authorizable object id, `<program>/<id>` (e.g. `main/dsk1`).
+    /// Authorizable object id: `<program>/<id>` for a DSK (e.g. `main/dsk1`),
+    /// `<me>/<id>` for a USK (e.g. `me1/usk1`).
     pub object_id: Arc<str>,
     /// Fill source id (for the control plane's tally resolution and demand).
     pub fill_id: Arc<str>,
@@ -275,6 +354,7 @@ impl KeyerDef {
             .map_err(|_| format!("downstream keyer {name}: rate must be at least one frame"))?;
         let source = cfg.max_source_or_canvas(canvas_w, canvas_h);
         Ok(Self {
+            family: KeyerFamily::Dsk,
             config: Arc::new(cfg.clone()),
             object_id: Arc::from(name.as_str()),
             fill_id: Arc::from(cfg.fill.as_str()),
@@ -314,23 +394,51 @@ impl KeyerDef {
             cost: cfg.cost(canvas_w, canvas_h),
         })
     }
+
+    /// Resolve a validated upstream keyer of M/E `me` on `program` (slice
+    /// K3): the object id is `<me>/<id>` and the cost uses the USK fold.
+    ///
+    /// # Errors
+    /// As [`Self::from_config`].
+    pub fn from_usk<S: std::hash::BuildHasher>(
+        cfg: &multiview_config::UpstreamKeyerConfig,
+        me: &str,
+        program: &str,
+        stores: &std::collections::HashMap<String, Arc<TileStore<Nv12Image>>, S>,
+        canvas_w: u32,
+        canvas_h: u32,
+    ) -> Result<Self, String> {
+        let view = cfg.as_definition(program);
+        let mut def = Self::from_config(&view, stores, canvas_w, canvas_h)
+            .map_err(|e| e.replacen("downstream keyer", "upstream keyer", 1))?;
+        def.family = KeyerFamily::Usk;
+        def.object_id = Arc::from(format!("{me}/{}", cfg.id).as_str());
+        def.cost = cfg.cost(canvas_w, canvas_h);
+        Ok(def)
+    }
 }
 
 /// Reserve the defined keyers against `budget` at definition (ADR-0113 §9)
 /// and build their runtime. Called at boot in K2 (and by `keyer_set` in K4),
-/// never on the clock.
+/// never on the clock. DSKs take slots `0..MAX_DSK` and USKs (K3) slots
+/// `MAX_DSK..`, each family in the order given (a USK's key index is its
+/// position among the USKs, 1-based).
 ///
 /// # Errors
-/// More than [`MAX_DSK`] keyers, a non-finite budget, or a summed cost over
-/// the budget.
+/// More than [`MAX_DSK`] DSKs or [`MAX_USK`] USKs, a non-finite budget, or a
+/// summed cost over the budget.
 pub fn admit(
     defs: Vec<KeyerDef>,
     canvas_w: u32,
     canvas_h: u32,
     budget: f32,
 ) -> Result<KeyerRuntime, String> {
-    if defs.len() > MAX_DSK {
+    let dsks = defs.iter().filter(|d| d.family == KeyerFamily::Dsk).count();
+    if dsks > MAX_DSK {
         return Err(format!("a program has at most {MAX_DSK} downstream keyers"));
+    }
+    if defs.len() - dsks > MAX_USK {
+        return Err(format!("an M/E has at most {MAX_USK} upstream keyers"));
     }
     if !budget.is_finite() || budget < 0.0 {
         return Err(format!("keyer budget {budget} must be finite and >= 0"));
@@ -338,7 +446,7 @@ pub fn admit(
     let total: f64 = defs.iter().map(|d| d.cost).sum();
     if total > f64::from(budget) + BUDGET_EPSILON {
         return Err(format!(
-            "downstream keyers cost {total:.3} canvas folds, over the keyer budget {budget}"
+            "keyers cost {total:.3} canvas folds, over the keyer budget {budget}"
         ));
     }
     let mut runtime = KeyerRuntime {
@@ -347,10 +455,17 @@ pub fn admit(
         budget,
         ..KeyerRuntime::default()
     };
-    for (index, def) in defs.into_iter().enumerate() {
+    let (mut dsk_slots, mut usk_slots) = (KeyerFamily::Dsk.slots(), KeyerFamily::Usk.slots());
+    for def in defs {
+        let index = match def.family {
+            KeyerFamily::Dsk => dsk_slots.next(),
+            KeyerFamily::Usk => usk_slots.next(),
+        }
+        .unwrap_or(MAX_KEYERS);
         let flags = KeyerFlags {
             tie: def.tie,
-            pending: def.on_at_start.then_some(Pending {
+            pending: (def.on_at_start && def.family == KeyerFamily::Dsk).then_some(Pending {
+                defs_version: None,
                 action: PendingAction::Cut,
                 deadline: None,
                 boot: true,
@@ -403,8 +518,8 @@ impl PartialEq for KeyerReadback {
 pub struct KeyerDefinitions {
     /// Bumped once per applied `keyer_set`; 0 at attach.
     pub version: u64,
-    /// The definitions by keyer index (config order at boot).
-    pub defs: [Option<Arc<KeyerDef>>; MAX_DSK],
+    /// The definitions by keyer slot (DSKs, then USKs; config order at boot).
+    pub defs: [Option<Arc<KeyerDef>>; MAX_KEYERS],
     /// Canvas the costs are computed on.
     pub canvas: (u32, u32),
     /// The keyer budget in canvas folds.
@@ -440,16 +555,47 @@ impl KeyerDefinitions {
         })
     }
 
-    /// The first free keyer index, if any.
+    /// The slot and definition of the `family` keyer whose config id is `id`.
+    #[must_use]
+    pub fn find_in(&self, family: KeyerFamily, id: &str) -> Option<(u8, &Arc<KeyerDef>)> {
+        family.slots().find_map(|index| {
+            self.defs
+                .get(index)
+                .and_then(Option::as_ref)
+                .filter(|d| d.config.id == id)
+                .map(|d| (index_u8(index), d))
+        })
+    }
+
+    /// The first free DSK slot, if any.
     #[must_use]
     pub fn free_index(&self) -> Option<u8> {
-        self.defs.iter().position(Option::is_none).map(index_u8)
+        self.free_index_of(KeyerFamily::Dsk)
+    }
+
+    /// The first free slot of `family`, if any.
+    #[must_use]
+    pub fn free_index_of(&self, family: KeyerFamily) -> Option<u8> {
+        family
+            .slots()
+            .find(|&i| self.defs.get(i).is_some_and(Option::is_none))
+            .map(index_u8)
     }
 
     /// Whether any keyer is defined.
     #[must_use]
     pub fn any(&self) -> bool {
         self.defs.iter().any(Option::is_some)
+    }
+
+    /// Whether any downstream keyer is defined (the Clean exclusion; a USK
+    /// belongs to the M/E scene, so Clean shows it).
+    #[must_use]
+    pub fn any_dsk(&self) -> bool {
+        self.defs
+            .iter()
+            .flatten()
+            .any(|d| d.family == KeyerFamily::Dsk)
     }
 }
 
@@ -482,6 +628,24 @@ pub struct Pending {
     pub deadline: Option<u64>,
     /// The op-less `on_at_start` intent (an operator command supersedes it).
     pub boot: bool,
+    /// The keyer definitions version a bound command was authorized against
+    /// (review round 2 K3-BOUND-1): when the definitions move while it is
+    /// held, it is refused (`keyer-definitions-changed`), never applied to
+    /// a re-pointed fill. `None` for an unbound (DSK) command.
+    pub defs_version: Option<u64>,
+}
+
+impl Pending {
+    /// An operator command held for a fresh fill and key, refused at
+    /// +[`TAKE_PRIME_DEADLINE_TICKS`] and bound to `defs_version`.
+    fn held(action: PendingAction, tick: Tick, defs_version: Option<u64>) -> Self {
+        Self {
+            action,
+            deadline: Some(tick.index.saturating_add(TAKE_PRIME_DEADLINE_TICKS)),
+            boot: false,
+            defs_version,
+        }
+    }
 }
 
 /// The `Copy` state of one keyer; staged per tick for reject atomicity.
@@ -529,11 +693,14 @@ impl KeyerSlot {
     /// (`flight == Some(true)`), otherwise a tied keyer that is off and not
     /// in its own AUTO. The CUT fresh gate and the Preview tally share it,
     /// so neither re-derives participation from `tie` and `on_air` mid-flight.
-    fn going_on(&self, auto_in_flight: bool) -> bool {
+    fn going_on(&self, auto_in_flight: bool, next: NextTake, index: usize) -> bool {
         if auto_in_flight {
             self.flags.flight == Some(true) && self.flags.ramp.is_none()
+        } else if self.def.family == KeyerFamily::Usk {
+            // K3: an armed USK that is off goes on with the next take.
+            next.key_armed(index) && !self.flags.on_air
         } else {
-            self.flags.tie && !self.flags.on_air && self.flags.ramp.is_none()
+            next.background && self.flags.tie && !self.flags.on_air && self.flags.ramp.is_none()
         }
     }
 
@@ -544,6 +711,9 @@ impl KeyerSlot {
         let (fill, key) = self.last_good.as_ref()?;
         Some(KeyerDraw {
             keyer,
+            family: self.def.family,
+            role: DrawRole::Top,
+            wipe: None,
             fill: Arc::clone(fill),
             key: key.clone(),
             rect: self.def.fly.unwrap_or(KeyerFly {
@@ -574,6 +744,70 @@ pub struct KeyerDraw {
     pub weight: f32,
     /// Key parameters.
     pub params: KeyerParams,
+    /// DSK or USK (draw order: USKs, then DSKs, each in ascending z).
+    pub family: KeyerFamily,
+    /// The draw's scene group (design note §3.2, slice K3): `Top` outside a
+    /// key-changing transition and for every DSK.
+    pub role: DrawRole,
+    /// A tied DSK's per-pixel WIPE envelope (design note §3.2, K3): the
+    /// transition's mask going on, its complement going off. Canvas
+    /// coordinates. `None` otherwise.
+    pub wipe: Option<WipeMask>,
+}
+
+/// The scene group of a keyer draw (design note §3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawRole {
+    /// Folded once onto the (merged) result.
+    Top,
+    /// An unarmed on-air USK below the highest changing USK: in both scenes.
+    Both,
+    /// An armed USK going off: the outgoing scene only.
+    Out,
+    /// An armed USK going on: the incoming scene only.
+    In,
+}
+
+/// What the next background take moves (the machine's armed set, copied
+/// into a fixed `Copy` value when it changes, never per tick).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NextTake {
+    /// The background is armed.
+    pub background: bool,
+    /// Armed USK keys, by 0-based key index.
+    pub keys: [bool; MAX_USK],
+}
+
+impl NextTake {
+    /// The fixed copy of `armed` (keys outside `1..=MAX_USK` are ignored;
+    /// the machine refuses them).
+    #[must_use]
+    pub fn of(armed: &ArmedSet) -> Self {
+        let mut keys = [false; MAX_USK];
+        for &key in &armed.keys {
+            if let Some(slot) = key
+                .checked_sub(1)
+                .and_then(|k| usize::try_from(k).ok())
+                .and_then(|k| keys.get_mut(k))
+            {
+                *slot = true;
+            }
+        }
+        Self {
+            background: armed.background,
+            keys,
+        }
+    }
+
+    /// Whether the USK at runtime slot `index` is armed.
+    #[must_use]
+    pub fn key_armed(&self, index: usize) -> bool {
+        index
+            .checked_sub(MAX_DSK)
+            .and_then(|k| self.keys.get(k))
+            .copied()
+            .unwrap_or(false)
+    }
 }
 
 /// Why a keyer changed state.
@@ -853,6 +1087,10 @@ pub struct TieEnvelope {
     pub going_on: f32,
     /// Weight of a tied keyer going off.
     pub going_off: f32,
+    /// WIPE (K3): the transition's mask at this step. A keyer going on is
+    /// drawn through it and one going off through its complement, at the
+    /// weights above (1 while the respective side is visible at all).
+    pub wipe: Option<WipeMask>,
 }
 
 impl TieEnvelope {
@@ -862,18 +1100,42 @@ impl TieEnvelope {
         Self {
             going_on: p,
             going_off: 1.0 - p,
+            wipe: None,
+        }
+    }
+
+    /// The WIPE envelope at progress `p` through `mask` (design note §3.2):
+    /// `m(x, y)` going on, `1 − m(x, y)` going off. The scalar weights only
+    /// say whether the side is visible (0 at the start going on, 0 at the
+    /// end going off), so the tally never names an invisible keyer.
+    #[must_use]
+    pub fn wipe(p: f32, mask: WipeMask) -> Self {
+        Self {
+            going_on: if p > 0.0 { 1.0 } else { 0.0 },
+            going_off: if p < 1.0 { 1.0 } else { 0.0 },
+            wipe: Some(mask),
         }
     }
 }
 
 /// The on-air weight for this tick (direction-aware for a tied AUTO).
-fn weight_of(flags: KeyerFlags, tick: Tick, auto_p: Option<TieEnvelope>) -> f32 {
+fn weight_of(
+    flags: KeyerFlags,
+    family: KeyerFamily,
+    tick: Tick,
+    auto_p: Option<TieEnvelope>,
+) -> f32 {
     if let Some(ramp) = flags.ramp {
         let elapsed = u32::try_from(tick.index.saturating_sub(ramp.start)).unwrap_or(u32::MAX);
         let p = kernel::opacity(Progress::new(elapsed, ramp.rate));
         return if ramp.to_on { p } else { 1.0 - p };
     }
     if let (Some(to_on), Some(envelope)) = (flags.flight, auto_p) {
+        if family == KeyerFamily::Usk {
+            // K3: a USK participant is drawn whole in its own scene; the
+            // scene merge carries the transition weight (design note §3.2).
+            return 1.0;
+        }
         // The direction fixed when the background AUTO started, never
         // re-derived from `on_air` (review F1).
         return if to_on {
@@ -893,17 +1155,41 @@ fn index_u8(index: usize) -> u8 {
     u8::try_from(index).unwrap_or(u8::MAX)
 }
 
+/// Group the unarmed on-air USKs of a key-changing transition (design note
+/// §3.2): every USK draw below the highest changing one is in both scenes;
+/// the rest stay `Top`. `draws` is in draw order (USKs first); a fixed
+/// array pass, no allocation.
+fn assign_scene_roles(draws: &mut [Option<KeyerDraw>; MAX_KEYERS]) {
+    let highest = draws.iter().rposition(|d| {
+        d.as_ref()
+            .is_some_and(|d| matches!(d.role, DrawRole::In | DrawRole::Out))
+    });
+    let Some(highest) = highest else {
+        return;
+    };
+    for draw in draws.iter_mut().take(highest).flatten() {
+        if draw.family == KeyerFamily::Usk && draw.role == DrawRole::Top {
+            draw.role = DrawRole::Both;
+        }
+    }
+}
+
 /// The keyer state the switcher tick driver owns (fixed size, attach-time).
 #[derive(Debug)]
 pub struct KeyerRuntime {
-    slots: [Option<KeyerSlot>; MAX_DSK],
-    /// Slot indices in ascending z.
-    draw_order: [usize; MAX_DSK],
+    slots: [Option<KeyerSlot>; MAX_KEYERS],
+    /// Slot indices in draw order: USKs in ascending z, then DSKs in
+    /// ascending z (design note §3), empty slots last.
+    draw_order: [usize; MAX_KEYERS],
     /// Flags at the start of this tick, restored by a rejected frame.
-    staged: [KeyerFlags; MAX_DSK],
+    staged: [KeyerFlags; MAX_KEYERS],
     /// Last-good pairs at the start of this tick (refcounts only), restored
     /// by a rejected frame (review F2).
-    staged_pairs: [Option<Pair>; MAX_DSK],
+    staged_pairs: [Option<Pair>; MAX_KEYERS],
+    /// What the next background take moves (the machine's armed set).
+    next: NextTake,
+    /// A background transition is in flight (a USK `keyer_cut` is refused).
+    in_transition: bool,
     /// The tally at the start of this tick, restored by a rejected frame.
     staged_tally: KeyerTally,
     events: [Option<KeyerEvent>; MAX_QUEUED_KEYER_EVENTS],
@@ -922,20 +1208,30 @@ pub struct KeyerRuntime {
 /// What a rejected frame restores after a `keyer_set` (Arc refcounts only).
 #[derive(Debug)]
 struct DefUndo {
-    defs: [Option<Arc<KeyerDef>>; MAX_DSK],
+    defs: [Option<Arc<KeyerDef>>; MAX_KEYERS],
     reserved_cost: f64,
-    draw_order: [usize; MAX_DSK],
+    draw_order: [usize; MAX_KEYERS],
     def_version: u64,
 }
 
-/// Slot indices in ascending z (validation made z unique per program).
-fn draw_order_of(slots: &[Option<KeyerSlot>; MAX_DSK]) -> [usize; MAX_DSK] {
-    let mut order = [0_usize, 1];
+/// Slot indices in draw order: USKs in ascending z, then DSKs in ascending z
+/// (validation made z unique per family), empty slots last. A fixed array
+/// sort (no allocation).
+fn draw_order_of(slots: &[Option<KeyerSlot>; MAX_KEYERS]) -> [usize; MAX_KEYERS] {
+    let mut order: [usize; MAX_KEYERS] = std::array::from_fn(|i| i);
     order.sort_by_key(|&i| {
         slots
             .get(i)
             .and_then(Option::as_ref)
-            .map_or(i32::MAX, |s| s.def.z)
+            .map_or((2_u8, i32::MAX), |s| {
+                (
+                    match s.def.family {
+                        KeyerFamily::Usk => 0,
+                        KeyerFamily::Dsk => 1,
+                    },
+                    s.def.z,
+                )
+            })
     });
     order
 }
@@ -945,9 +1241,11 @@ impl Default for KeyerRuntime {
     fn default() -> Self {
         Self {
             slots: Default::default(),
-            draw_order: [0, 1],
-            staged: [KeyerFlags::default(); MAX_DSK],
-            staged_pairs: [const { None }; MAX_DSK],
+            draw_order: std::array::from_fn(|i| i),
+            staged: [KeyerFlags::default(); MAX_KEYERS],
+            staged_pairs: [const { None }; MAX_KEYERS],
+            next: NextTake::default(),
+            in_transition: false,
             staged_tally: KeyerTally::default(),
             events: [None; MAX_QUEUED_KEYER_EVENTS],
             tally: KeyerTally::default(),
@@ -1003,6 +1301,33 @@ impl KeyerRuntime {
         self.counters = counters;
     }
 
+    /// Copy what the next background take moves (the machine's armed set).
+    /// Called by the driver when the armed set may have changed (attach,
+    /// `arm`, a rejected frame), never per tick.
+    pub(crate) fn set_next(&mut self, next: NextTake) {
+        self.next = next;
+    }
+
+    /// What the next background take moves.
+    #[must_use]
+    pub fn next_take(&self) -> NextTake {
+        self.next
+    }
+
+    /// Whether a background transition is in flight (the driver sets it
+    /// before each keyer command: a USK `keyer_cut` is then refused).
+    pub(crate) fn set_in_transition(&mut self, in_flight: bool) {
+        self.in_transition = in_flight;
+    }
+
+    /// The slot of the USK with 1-based key index `key`, if one is defined.
+    #[must_use]
+    pub fn usk_defined(&self, key: u32) -> bool {
+        usk_slot(key)
+            .and_then(|i| self.slots.get(i))
+            .is_some_and(Option::is_some)
+    }
+
     /// Stage the `Copy` flags, the last-good pairs (refcount increments, no
     /// allocation) and the tally a rejected frame restores. Once per tick.
     pub(crate) fn begin_tick(&mut self) {
@@ -1022,6 +1347,12 @@ impl KeyerRuntime {
 
     /// Complete ramps whose terminal tick is now and resolve held commands
     /// (fresh: apply; deadline: refuse). Runs before the mailbox drain.
+    ///
+    /// A held command bound to a definitions version that moved is refused
+    /// `keyer-definitions-changed` (review round 2 K3-BOUND-1). A held USK
+    /// cut that would land while a background transition is in flight is
+    /// refused `keyer-in-transition`, the admission rule (review round 2
+    /// MEDIA-2: never an abrupt overlay mid-transition; not deferred).
     pub(crate) fn tick_pending(&mut self, tick: Tick, sink: &mut OpSink<'_>) {
         for (index, entry) in self.slots.iter_mut().enumerate() {
             let Some(slot) = entry.as_mut() else {
@@ -1048,7 +1379,23 @@ impl KeyerRuntime {
             let Some(pending) = slot.flags.pending else {
                 continue;
             };
-            if live_now(&slot.def, tick) {
+            // Freshness is sampled ONCE per slot per tick (review K3-R3-1): a
+            // producer publishing between two reads must not let a pending
+            // USK cut skip the in-transition refusal and land mid-AUTO.
+            let live = live_now(&slot.def, tick);
+            let refusal = if pending.defs_version.is_some_and(|v| v != self.def_version) {
+                Some(REFUSE_KEYER_DEFINITION_CHANGED)
+            } else if slot.def.family == KeyerFamily::Usk && self.in_transition && live {
+                Some(REFUSE_KEYER_IN_TRANSITION)
+            } else {
+                None
+            };
+            if let Some(reason) = refusal {
+                slot.flags.pending = None;
+                if let Some(op) = slot.pending_op.take() {
+                    sink.refused(op, reason);
+                }
+            } else if live {
                 slot.flags.pending = None;
                 // A held command that lands takes the keyer out of a tied
                 // transition: the operator's verb wins.
@@ -1091,10 +1438,14 @@ impl KeyerRuntime {
 
     /// Apply one keyer verb at this tick. Never touches the background
     /// machine or the held background take (ADR-0113 §6).
+    ///
+    /// `defs_version`: the definitions version a bound command was
+    /// authorized against; a command held for a fresh fill keeps it.
     pub(crate) fn command(
         &mut self,
         keyer: u8,
         action: KeyerAction,
+        defs_version: Option<u64>,
         operation_id: String,
         tick: Tick,
         sink: &mut OpSink<'_>,
@@ -1107,6 +1458,21 @@ impl KeyerRuntime {
             sink.refused(operation_id, REFUSE_KEYER_UNKNOWN);
             return;
         };
+        if slot.def.family == KeyerFamily::Usk {
+            // K3: a USK moves with the M/E (`arm` + CUT/AUTO). Only a cut
+            // outside a background transition is allowed (design note §8).
+            match action {
+                KeyerAction::Auto(..) | KeyerAction::Tie(_) => {
+                    sink.refused(operation_id, REFUSE_KEYER_USK_VERB);
+                    return;
+                }
+                KeyerAction::Cut(_) if self.in_transition => {
+                    sink.refused(operation_id, REFUSE_KEYER_IN_TRANSITION);
+                    return;
+                }
+                KeyerAction::Cut(_) => {}
+            }
+        }
         // Review F5: the rate override is bounded like the configured rate,
         // and refused before any state changes (a `u32::MAX` ramp would hold
         // the keyer mid-AUTO for years).
@@ -1149,11 +1515,8 @@ impl KeyerRuntime {
                     // On air or mid-ramp, the keyer already holds a pair.
                     slot.flags.on_air = true;
                 } else {
-                    slot.flags.pending = Some(Pending {
-                        action: PendingAction::Cut,
-                        deadline: Some(tick.index.saturating_add(TAKE_PRIME_DEADLINE_TICKS)),
-                        boot: false,
-                    });
+                    slot.flags.pending =
+                        Some(Pending::held(PendingAction::Cut, tick, defs_version));
                     slot.pending_op = Some(operation_id);
                     return;
                 }
@@ -1181,11 +1544,8 @@ impl KeyerRuntime {
                 }
                 let rate = rate.unwrap_or(slot.def.rate);
                 if on && !live_now(&slot.def, tick) {
-                    slot.flags.pending = Some(Pending {
-                        action: PendingAction::Auto(rate),
-                        deadline: Some(tick.index.saturating_add(TAKE_PRIME_DEADLINE_TICKS)),
-                        boot: false,
-                    });
+                    slot.flags.pending =
+                        Some(Pending::held(PendingAction::Auto(rate), tick, defs_version));
                     slot.pending_op = Some(operation_id);
                     return;
                 }
@@ -1209,20 +1569,30 @@ impl KeyerRuntime {
     /// during the flight, does not move on it and is never waited for. A new
     /// take puts on every tied keyer that is off and not in its own AUTO.
     pub(crate) fn tied_going_on_fresh(&self, tick: Tick, auto_in_flight: bool) -> bool {
-        self.slots
-            .iter()
-            .flatten()
-            .filter(|s| s.going_on(auto_in_flight))
-            .all(|s| live_now(&s.def, tick))
+        let next = self.next;
+        self.slots.iter().enumerate().all(|(index, slot)| {
+            slot.as_ref()
+                .is_none_or(|s| !s.going_on(auto_in_flight, next, index) || live_now(&s.def, tick))
+        })
     }
 
     /// A background AUTO started on this tick: fix each tied keyer's
     /// participation and direction (design note §3.2, review F1). A keyer in
     /// its own AUTO does not take part.
     pub(crate) fn begin_tied_transition(&mut self) {
-        for slot in self.slots.iter_mut().flatten() {
-            slot.flags.flight =
-                (slot.flags.tie && slot.flags.ramp.is_none()).then_some(!slot.flags.on_air);
+        let next = self.next;
+        for (index, entry) in self.slots.iter_mut().enumerate() {
+            let Some(slot) = entry.as_mut() else {
+                continue;
+            };
+            let takes_part = match slot.def.family {
+                // A tied DSK rides a background take only (design note §4:
+                // a key-only transition moves no DSK).
+                KeyerFamily::Dsk => next.background && slot.flags.tie && slot.flags.ramp.is_none(),
+                // K3: an armed USK toggles with the take.
+                KeyerFamily::Usk => next.key_armed(index),
+            };
+            slot.flags.flight = takes_part.then_some(!slot.flags.on_air);
         }
     }
 
@@ -1272,8 +1642,8 @@ impl KeyerRuntime {
     /// DIP draws weight 0 past the switch point, so its committed draw is
     /// absent while it is still on air, and the cancelled transition puts it
     /// back at rest. No heap: `Arc` refcounts and a stack array only.
-    pub(crate) fn settle_draws(&self, draws: &mut [Option<KeyerDraw>; MAX_DSK]) {
-        let mut committed: [Option<KeyerDraw>; MAX_DSK] = [const { None }; MAX_DSK];
+    pub(crate) fn settle_draws(&self, draws: &mut [Option<KeyerDraw>; MAX_KEYERS]) {
+        let mut committed: [Option<KeyerDraw>; MAX_KEYERS] = [const { None }; MAX_KEYERS];
         std::mem::swap(&mut committed, draws);
         let mut next = draws.iter_mut();
         for &index in &self.draw_order {
@@ -1331,9 +1701,10 @@ impl KeyerRuntime {
         tick: Tick,
         auto_p: Option<TieEnvelope>,
         incoming_drawn: bool,
-        out: &mut [Option<KeyerDraw>; MAX_DSK],
+        out: &mut [Option<KeyerDraw>; MAX_KEYERS],
         outcomes: &EventStream<SwitcherOutcome>,
     ) {
+        let take = self.next;
         for draw in out.iter_mut() {
             *draw = None;
         }
@@ -1357,13 +1728,13 @@ impl KeyerRuntime {
             // Mid-flight, only the surviving going-on participants are
             // tallied as coming (review round 2 G2 re-scan): a keyer whose
             // participation a loss cancelled is not put on by this flight.
-            if slot.going_on(auto_p.is_some()) {
+            if slot.going_on(auto_p.is_some(), take, index) {
                 preview.insert(TallyRole::Fill(keyer));
                 if has_key {
                     preview.insert(TallyRole::Key(keyer));
                 }
             }
-            let weight = weight_of(slot.flags, tick, auto_p);
+            let weight = weight_of(slot.flags, slot.def.family, tick, auto_p);
             // A tied participant is engaged for the whole background AUTO,
             // weight 0 included (a DIP before its switch point): its loss
             // policy applies on every tick of the flight (review F1).
@@ -1414,7 +1785,7 @@ impl KeyerRuntime {
                         // never puts it back on (review F1).
                         slot.flags.flight = None;
                         slot.release();
-                        if !slot.going_on(auto_p.is_some()) {
+                        if !slot.going_on(auto_p.is_some(), take, index) {
                             // The flight no longer puts it on: not coming.
                             preview.remove(TallyRole::Fill(keyer));
                             preview.remove(TallyRole::Key(keyer));
@@ -1444,20 +1815,47 @@ impl KeyerRuntime {
             if weight <= 0.0 || weight.is_nan() {
                 continue;
             }
-            let Some(draw) = slot.draw_at(keyer, weight.min(1.0), canvas) else {
+            let Some(mut draw) = slot.draw_at(keyer, weight.min(1.0), canvas) else {
                 // No pair yet: the keyer contributes nothing (never a slate).
                 continue;
             };
+            if let (Some(to_on), Some(envelope)) = (slot.flags.flight, auto_p) {
+                match slot.def.family {
+                    // K3: an armed USK goes into its scene (design note §3.2).
+                    KeyerFamily::Usk => {
+                        draw.role = if to_on { DrawRole::In } else { DrawRole::Out };
+                    }
+                    // A tied DSK on a WIPE: the per-pixel envelope.
+                    KeyerFamily::Dsk => {
+                        draw.wipe = envelope
+                            .wipe
+                            .map(|m| if to_on { m } else { m.complemented() });
+                    }
+                }
+            }
             let Some(target) = next.next() else {
                 break;
             };
-            program.insert(TallyRole::Fill(keyer));
-            if draw.key.is_some() {
-                program.insert(TallyRole::Key(keyer));
+            // A USK in a key-changing transition is drawn whole in its
+            // scene; it contributes to Program only while its side of the
+            // merge is visible (not at MIX p = 0 going on, nor before a
+            // DIP's switch point; K3).
+            let visible = match (slot.def.family, slot.flags.flight, auto_p) {
+                (KeyerFamily::Usk, Some(to_on), Some(e)) => {
+                    (if to_on { e.going_on } else { e.going_off }) > 0.0
+                }
+                _ => true,
+            };
+            if visible {
+                program.insert(TallyRole::Fill(keyer));
+                if draw.key.is_some() {
+                    program.insert(TallyRole::Key(keyer));
+                }
             }
             *target = Some(draw);
         }
         self.tally = KeyerTally { program, preview };
+        assign_scene_roles(out);
     }
 
     /// Publish this tick's queued events (a committed frame only).
@@ -1540,7 +1938,7 @@ impl KeyerRuntime {
     /// publishes a changed version, never per tick).
     #[must_use]
     pub fn definitions(&self) -> KeyerDefinitions {
-        let mut defs: [Option<Arc<KeyerDef>>; MAX_DSK] = [const { None }; MAX_DSK];
+        let mut defs: [Option<Arc<KeyerDef>>; MAX_KEYERS] = [const { None }; MAX_KEYERS];
         for (def, slot) in defs.iter_mut().zip(self.slots.iter()) {
             *def = slot.as_ref().map(|s| Arc::clone(&s.def));
         }
@@ -1573,7 +1971,7 @@ impl KeyerRuntime {
         sink: &mut OpSink<'_>,
     ) {
         let index = usize::from(keyer);
-        if index >= MAX_DSK {
+        if index >= MAX_KEYERS || KeyerFamily::of_slot(index) != def.family {
             sink.refused(operation_id, REFUSE_KEYER_UNKNOWN);
             return;
         }
@@ -1584,10 +1982,14 @@ impl KeyerRuntime {
             sink.refused(operation_id, REFUSE_KEYER_STALE);
             return;
         }
+        // Ids and z are unique within a family (DSKs per program, USKs
+        // per M/E; their object ids never collide).
         let clash = self.slots.iter().enumerate().any(|(i, s)| {
             i != index
-                && s.as_ref()
-                    .is_some_and(|s| s.def.config.id == def.config.id || s.def.z == def.z)
+                && s.as_ref().is_some_and(|s| {
+                    s.def.family == def.family
+                        && (s.def.config.id == def.config.id || s.def.z == def.z)
+                })
         });
         let current = self.slots.get(index).and_then(Option::as_ref);
         // A slot keeps its id for life: a define racing another define for
@@ -1622,7 +2024,7 @@ impl KeyerRuntime {
             }
         }
         if self.undo.is_none() {
-            let mut defs: [Option<Arc<KeyerDef>>; MAX_DSK] = [const { None }; MAX_DSK];
+            let mut defs: [Option<Arc<KeyerDef>>; MAX_KEYERS] = [const { None }; MAX_KEYERS];
             for (d, slot) in defs.iter_mut().zip(self.slots.iter()) {
                 *d = slot.as_ref().map(|s| Arc::clone(&s.def));
             }
@@ -1703,8 +2105,8 @@ impl KeyerRuntime {
 
     /// The snapshot rows (change-only publication by the driver).
     #[must_use]
-    pub fn snapshot(&self) -> [Option<KeyerSnapshot>; MAX_DSK] {
-        let mut rows = [None; MAX_DSK];
+    pub fn snapshot(&self) -> [Option<KeyerSnapshot>; MAX_KEYERS] {
+        let mut rows = [None; MAX_KEYERS];
         for (row, slot) in rows.iter_mut().zip(self.slots.iter()) {
             *row = slot.as_ref().map(|s| KeyerSnapshot {
                 on_air: s.flags.on_air,
@@ -1719,6 +2121,16 @@ impl KeyerRuntime {
             });
         }
         rows
+    }
+
+    /// Whether any downstream keyer is defined (the Clean exclusion: Clean
+    /// is pre-DSK Program, so a USK alone never excludes it).
+    #[must_use]
+    pub fn any_dsk(&self) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|s| s.def.family == KeyerFamily::Dsk)
     }
 
     /// The tally of the last resolved tick.
@@ -1769,8 +2181,8 @@ mod tests {
                 pts: multiview_core::time::MediaTime::ZERO,
             };
             let expected = kernel::opacity(Progress::new(u32::try_from(k).unwrap(), n));
-            assert!((weight_of(on, tick, None) - expected).abs() < 1e-6);
-            assert!((weight_of(off, tick, None) - (1.0 - expected)).abs() < 1e-6);
+            assert!((weight_of(on, KeyerFamily::Dsk, tick, None) - expected).abs() < 1e-6);
+            assert!((weight_of(off, KeyerFamily::Dsk, tick, None) - (1.0 - expected)).abs() < 1e-6);
         }
         // Review F1 changed this expectation: the tied direction is the one
         // fixed when the background AUTO started (`flight`), no longer
@@ -1786,19 +2198,40 @@ mod tests {
             index: 0,
             pts: multiview_core::time::MediaTime::ZERO,
         };
-        assert!((weight_of(tied, tick, Some(TieEnvelope::mix(0.25))) - 0.25).abs() < 1e-6);
+        assert!(
+            (weight_of(tied, KeyerFamily::Dsk, tick, Some(TieEnvelope::mix(0.25))) - 0.25).abs()
+                < 1e-6
+        );
         let tied_on = KeyerFlags {
             on_air: true,
             flight: Some(false),
             ..tied
         };
-        assert!((weight_of(tied_on, tick, Some(TieEnvelope::mix(0.25))) - 0.75).abs() < 1e-6);
-        assert!((weight_of(tied_on, tick, None) - 1.0).abs() < 1e-6);
+        assert!(
+            (weight_of(
+                tied_on,
+                KeyerFamily::Dsk,
+                tick,
+                Some(TieEnvelope::mix(0.25))
+            ) - 0.75)
+                .abs()
+                < 1e-6
+        );
+        assert!((weight_of(tied_on, KeyerFamily::Dsk, tick, None) - 1.0).abs() < 1e-6);
         let cancelled = KeyerFlags {
             flight: None,
             ..tied
         };
-        assert!(weight_of(cancelled, tick, Some(TieEnvelope::mix(0.25))).abs() < 1e-6);
+        assert!(
+            weight_of(
+                cancelled,
+                KeyerFamily::Dsk,
+                tick,
+                Some(TieEnvelope::mix(0.25))
+            )
+            .abs()
+                < 1e-6
+        );
     }
 
     #[test]

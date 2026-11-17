@@ -19,8 +19,8 @@ use crate::clock::Tick;
 use crate::isolation::{event_stream, EventStream, EventSubscription, LatestState};
 use crate::keyer::{
     KeyerAction, KeyerCounters, KeyerDef, KeyerDefinition, KeyerDefinitions, KeyerDraw, KeyerEvent,
-    KeyerReadback, KeyerRuntime, KeyerSnapshot, KeyerTally, OpSink, TieEnvelope, MAX_DSK,
-    REFUSE_KEYER_CLEAN, REFUSE_KEYER_GATE_CONTENDED, REFUSE_KEYER_SET_DEADLINE,
+    KeyerReadback, KeyerRuntime, KeyerSnapshot, KeyerTally, NextTake, OpSink, TieEnvelope,
+    MAX_KEYERS, REFUSE_KEYER_CLEAN, REFUSE_KEYER_GATE_CONTENDED, REFUSE_KEYER_SET_DEADLINE,
 };
 use crate::patch_set::{ArmState, SetArm, SetRefusal, SET_ADOPT_DEADLINE_TICKS};
 use crate::switcher::{SwitcherProjection, SwitcherState};
@@ -100,6 +100,11 @@ pub const REFUSE_UNSUPPORTED_TRANSITION: &str =
 pub fn is_rendered_transition(descriptor: &TransitionDescriptor) -> bool {
     descriptor.is_rendered()
 }
+
+/// Typed refusal: an `arm` names a key that is not a defined upstream
+/// keyer of this M/E (K3).
+pub const REFUSE_ARM_UNKNOWN_KEY: &str =
+    "unknown-keyer: an armed key is not a defined upstream keyer of this M/E";
 
 /// Typed refusal: a select names an undeclared or unpatched input.
 pub const REFUSE_UNKNOWN_INPUT: &str = "unknown-slot: the input is not declared or not patched";
@@ -213,6 +218,19 @@ pub enum SwitcherVerb {
         /// ([`REFUSE_KEYER_SET_DEADLINE`]) and never applies (review H4).
         deadline: u64,
     },
+    /// Select the elements the next background transition moves (ADR-0113
+    /// §4, slice K3): `{background} ∪ {USK keys}`. Refused during a take,
+    /// for an empty set, or for a key that is not a defined upstream keyer.
+    /// Built off the clock; the tick only moves the `Arc` in.
+    Arm(Arc<multiview_core::switcher::ArmedSet>),
+    /// A verb the control plane authorized against a specific committed
+    /// arm set and keyer definitions (review AUTHZ-1/-2): drained, it is
+    /// refused ([`REFUSE_ARM_CHANGED`] / [`crate::keyer::REFUSE_KEYER_DEFINITION_CHANGED`])
+    /// when either version moved since, so a take or keyer cut never
+    /// toggles a keyer the caller was not authorized for. Built (and boxed)
+    /// off the clock; the tick only compares two integers and moves the
+    /// inner verb out.
+    Bound(Box<BoundVerb>),
     /// The mixer half of an atomic multi-crosspoint set (ADR-0110 §12.8,
     /// #308): validated and primed here, then applied only at the adoption
     /// tick the router proposes through `arm`, never on its own. Held in its
@@ -225,6 +243,29 @@ pub enum SwitcherVerb {
     },
 }
 
+/// The payload of [`SwitcherVerb::Bound`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundVerb {
+    /// The verb itself (never another `Bound`).
+    pub verb: SwitcherVerb,
+    /// The arm-set version the caller was authorized against
+    /// ([`SwitcherSnapshot::arm_version`]), or `None` when it does not
+    /// matter (a keyer verb).
+    pub arm_version: Option<u64>,
+    /// The keyer definitions version the caller was authorized against
+    /// ([`KeyerDefinitions::version`]), or `None`.
+    pub defs_version: Option<u64>,
+}
+
+/// Typed refusal: a take authorized against an arm set that changed before
+/// its tick (review AUTHZ-1). Nothing changes; the caller re-plans.
+pub const REFUSE_ARM_CHANGED: &str =
+    "arm-changed: the armed set changed since this take was authorized; re-plan it";
+/// Typed refusal: `arm` while a take is held for a fresh source (review
+/// K3-INV-1: the held take keeps the set it was admitted with).
+pub const REFUSE_ARM_TAKE_HELD: &str =
+    "take-held: a take is held waiting for a fresh frame; arm after it lands or is refused";
+
 /// Ticks past [`SET_ADOPT_DEADLINE_TICKS`] the switcher waits for a ready
 /// set's router half before it refuses the set `deadline` itself: the
 /// router admits the set later than the clock (it runs on the bake
@@ -235,6 +276,26 @@ pub const SET_SWITCHER_GRACE_TICKS: u64 = 16;
 /// Typed refusal: a second armed set while one is held.
 pub const REFUSE_SET_ARMED: &str =
     "engine-busy: a salvo is already armed on this M/E; retry when it settled";
+
+/// The arm-set and keyer-definitions versions a [`SwitcherVerb::Bound`]
+/// verb was authorized against (`None`: not bound on that axis). `Copy`, so
+/// holding it costs nothing on the clock.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Bound {
+    arm_version: Option<u64>,
+    defs_version: Option<u64>,
+}
+
+/// The single held take (a CUT/AUTO/punch/patch waiting for a fresh frame).
+/// Review round 2 (MEDIA-3, AUTHZ-3, K3-BOUND-1): it keeps the versions it
+/// was authorized against and is refused, never retargeted, when either
+/// moved before it lands.
+#[derive(Debug)]
+struct HeldTake {
+    command: SwitcherCommand,
+    deadline: u64,
+    bound: Bound,
+}
 
 /// The armed mixer half of a set (one slot, separate from the held take).
 #[derive(Debug)]
@@ -298,9 +359,14 @@ pub struct SwitcherSnapshot {
     /// this tick (ADR-0112 §4). An AUTO never changes it: the flight renders
     /// its own descriptor (the selection at the AUTO's rate).
     pub transition: TransitionDescriptor,
-    /// Downstream keyer rows, in config order (ADR-0113 §8). Ramps are
-    /// descriptors (start, rate, direction), never per-tick weights.
-    pub keyers: [Option<KeyerSnapshot>; MAX_DSK],
+    /// Keyer rows by runtime slot: DSKs, then USKs (ADR-0113 §8). Ramps
+    /// are descriptors (start, rate, direction), never per-tick weights.
+    pub keyers: [Option<KeyerSnapshot>; MAX_KEYERS],
+    /// What the next background transition moves (the `arm` set, K3).
+    pub next: NextTake,
+    /// Bumped once per applied `arm` (K3, review AUTHZ-1): a take binds to
+    /// it.
+    pub arm_version: u64,
     /// Engine tally as roles (design note §9, deviation: roles, not store
     /// indices; the control plane resolves them to source ids).
     pub tally: KeyerTally,
@@ -418,11 +484,13 @@ impl SwitcherControl {
             source_revisions: Vec::with_capacity(crate::switcher_layouts::MAX_ME_LAYOUT_SOURCES),
             live_stores: HashMap::new(),
             pending_take: None,
+            drain_bound: Bound::default(),
             armed: None,
             last_tick: 0,
             staged_success: Vec::with_capacity(MAX_COMMANDS_PER_TICK),
             spare_success: Vec::with_capacity(MAX_COMMANDS_PER_TICK),
             before_staged: None,
+            before_arm: None,
             inputs: None,
             inputs_version: 0,
             published_inputs_version: 0,
@@ -437,7 +505,10 @@ impl SwitcherControl {
             stores: handle.stores.clone(),
             clean_gate: Arc::clone(&handle.clean_gate),
             staged_dsk: None,
+            arm_version: 0,
         };
+        let mut driver = driver;
+        driver.keyers.set_next(NextTake::of(driver.machine.armed()));
         (handle, driver)
     }
 
@@ -603,6 +674,30 @@ impl SwitcherControl {
         KeyerDef::from_config(config, &stores, w, h).map(|def| KeyerDefinition(Arc::new(def)))
     }
 
+    /// Resolve an upstream keyer definition (K3) of M/E `me` on `program`
+    /// against this run's frame stores and canvas, off the clock.
+    ///
+    /// # Errors
+    /// As [`Self::resolve_keyer`].
+    pub fn resolve_usk(
+        &self,
+        config: &multiview_config::UpstreamKeyerConfig,
+        me: &str,
+        program: &str,
+    ) -> Result<KeyerDefinition, String> {
+        let defs = self
+            .keyer_defs
+            .latest()
+            .ok_or_else(|| "this run has no keyer runtime".to_owned())?;
+        let stores = self
+            .stores
+            .latest()
+            .ok_or_else(|| "this run has no frame stores attached".to_owned())?;
+        let (w, h) = defs.canvas;
+        KeyerDef::from_usk(config, me, program, &stores, w, h)
+            .map(|def| KeyerDefinition(Arc::new(def)))
+    }
+
     /// Build the [`SwitcherVerb::KeyerSet`] for `def` at `keyer`, admitted
     /// against the committed definitions `base`: prepares the readback the
     /// committing tick publishes (off the clock, review H6) and stamps the
@@ -673,13 +768,20 @@ pub struct SwitcherTickDriver {
     /// taken and monitored. Consulted before the boot map: a source removed
     /// and re-added live has a NEW store here. No shared state is read.
     live_stores: HashMap<String, Arc<TileStore<Nv12Image>>>,
-    pending_take: Option<(SwitcherCommand, u64)>,
+    pending_take: Option<HeldTake>,
+    /// The versions the command being drained was bound to (review round
+    /// 2 K3-BOUND-1): a take held by the fresh gate keeps them.
+    drain_bound: Bound,
     /// The armed mixer half of an atomic set (#308), if any.
     armed: Option<ArmedSet>,
     last_tick: u64,
     staged_success: Vec<String>,
     spare_success: Vec<String>,
     before_staged: Option<Staged>,
+    /// The arm set and version before this tick's first `arm`, when nothing
+    /// else staged the full machine (review K3-R3-2): an `arm` only moves an
+    /// `Arc`, so restoring it needs no `SwitcherState` clone on the clock.
+    before_arm: Option<(Arc<multiview_core::switcher::ArmedSet>, u64)>,
     /// Numbered mixer inputs (§12.2); `None` = PGM/PVW select sources by id.
     inputs: Option<MixerInputs>,
     inputs_version: u64,
@@ -701,6 +803,8 @@ pub struct SwitcherTickDriver {
     definition_builds: u64,
     stores: LatestState<HashMap<String, Arc<TileStore<Nv12Image>>>>,
     clean_gate: Arc<CleanDskGate>,
+    /// Bumped per applied `arm` (restored by a reject with the machine).
+    arm_version: u64,
     /// The tick backstop's DSK reservation for this tick's applied
     /// definition of a new keyer: held until the commit marks the gate
     /// defined, dropped by a reject.
@@ -717,6 +821,8 @@ struct Staged {
     /// The input table before this tick's first patch, captured lazily (only
     /// on a patch tick, so the steady state never clones the table).
     inputs: Option<(MixerInputs, u64)>,
+    /// The arm version before this tick.
+    arm_version: u64,
 }
 
 impl SwitcherTickDriver {
@@ -725,12 +831,16 @@ impl SwitcherTickDriver {
     pub fn set_keyers(&mut self, mut keyers: KeyerRuntime) {
         keyers.set_counters(Arc::clone(&self.keyer_counters));
         *self.keyers = keyers;
+        // K3: the machine holds one key per USK slot; the keyer runtime
+        // owns their on-air state and the machine mirrors it.
+        let _ = self.machine.set_key_count(crate::keyer::MAX_USK);
+        self.keyers.set_next(NextTake::of(self.machine.armed()));
         // The attach-time definitions (K4 readback); later only on a
         // committed `keyer_set` tick.
         self.keyer_defs.publish(self.keyers.definitions());
         self.definition_builds += 1;
         self.published_def_version = self.keyers.def_version();
-        if !self.keyers.is_empty() {
+        if self.keyers.any_dsk() {
             self.clean_gate.set_defined();
         }
     }
@@ -741,6 +851,12 @@ impl SwitcherTickDriver {
     #[must_use]
     pub fn definition_builds(&self) -> u64 {
         self.definition_builds
+    }
+
+    /// What the next background take moves (the machine's arm set).
+    #[must_use]
+    pub fn next_take(&self) -> NextTake {
+        NextTake::of(self.machine.armed())
     }
 
     /// The keyer runtime (read-only: flags, last-good pair, tally).
@@ -762,7 +878,7 @@ impl SwitcherTickDriver {
         tick: Tick,
         auto_p: Option<TieEnvelope>,
         incoming_drawn: bool,
-        out: &mut [Option<KeyerDraw>; MAX_DSK],
+        out: &mut [Option<KeyerDraw>; MAX_KEYERS],
     ) {
         self.keyers
             .resolve(tick, auto_p, incoming_drawn, out, &self.outcomes);
@@ -772,7 +888,7 @@ impl SwitcherTickDriver {
     /// draws as the committed resting state (an on-air keyer draws its
     /// restored last-good pair at weight 1, even where the committed tick
     /// drew it at weight 0; review round 2 G1).
-    pub fn settle_keyer_draws(&self, draws: &mut [Option<KeyerDraw>; MAX_DSK]) {
+    pub fn settle_keyer_draws(&self, draws: &mut [Option<KeyerDraw>; MAX_KEYERS]) {
         self.keyers.settle_draws(draws);
     }
 
@@ -921,10 +1037,11 @@ impl SwitcherTickDriver {
             }
             Some(false) => {
                 if !held {
-                    self.pending_take = Some((
-                        command.clone(),
-                        tick.index.saturating_add(TAKE_PRIME_DEADLINE_TICKS),
-                    ));
+                    self.pending_take = Some(HeldTake {
+                        command: command.clone(),
+                        deadline: tick.index.saturating_add(TAKE_PRIME_DEADLINE_TICKS),
+                        bound: self.drain_bound,
+                    });
                 }
                 Ok(false)
             }
@@ -1028,7 +1145,12 @@ impl SwitcherTickDriver {
             | SwitcherVerb::KeyerCut { .. }
             | SwitcherVerb::KeyerAuto { .. }
             | SwitcherVerb::KeyerTie { .. }
-            | SwitcherVerb::KeyerSet { .. } => return false,
+            | SwitcherVerb::KeyerSet { .. }
+            // `arm` (K3) names keyer slots only, and a `Bound` wrapper is
+            // unwrapped at drain before any guard check (its inner verb is
+            // what a held take keeps).
+            | SwitcherVerb::Arm(_)
+            | SwitcherVerb::Bound(_) => return false,
         };
         guard
             .layout_revision
@@ -1051,7 +1173,7 @@ impl SwitcherTickDriver {
         {
             return true;
         }
-        match self.pending_take.as_ref().map(|(command, _)| &command.verb) {
+        match self.pending_take.as_ref().map(|held| &held.command.verb) {
             Some(SwitcherVerb::SelectProgram(target) | SwitcherVerb::SelectPreview(target))
                 if self.resolve(target).as_str() == id =>
             {
@@ -1129,6 +1251,7 @@ impl SwitcherTickDriver {
                 active_auto: self.active_auto.clone(),
                 active_auto_scenes: self.active_auto_scenes.clone(),
                 inputs: None,
+                arm_version: self.arm_version,
             });
         }
     }
@@ -1199,7 +1322,9 @@ impl SwitcherTickDriver {
             | SwitcherVerb::KeyerCut { .. }
             | SwitcherVerb::KeyerAuto { .. }
             | SwitcherVerb::KeyerTie { .. }
-            | SwitcherVerb::KeyerSet { .. } => Err("not a take".into()),
+            | SwitcherVerb::KeyerSet { .. }
+            | SwitcherVerb::Arm(_)
+            | SwitcherVerb::Bound(_) => Err("not a take".into()),
         }
     }
 
@@ -1298,9 +1423,9 @@ impl SwitcherTickDriver {
         if self
             .pending_take
             .as_ref()
-            .is_some_and(|(_, deadline)| tick.index >= *deadline)
+            .is_some_and(|held| tick.index >= held.deadline)
         {
-            if let Some((command, _)) = self.pending_take.take() {
+            if let Some(HeldTake { command, .. }) = self.pending_take.take() {
                 self.publish_outcome(
                     command.operation_id,
                     tick.index,
@@ -1363,6 +1488,8 @@ impl SwitcherTickDriver {
         // Keyers: stage the Copy flags a rejected frame restores, then finish
         // ramps and resolve held keyer commands (ADR-0113 §6).
         self.keyers.begin_tick();
+        // Review round 2 (MEDIA-2): a held USK cut never lands mid-transition.
+        self.keyers.set_in_transition(self.machine.is_in_flight());
         self.keyers.tick_pending(
             tick,
             &mut OpSink {
@@ -1380,7 +1507,9 @@ impl SwitcherTickDriver {
         if let Some((start, rate)) = self.machine.auto_window() {
             let terminal = i128::from(tick.index) - start >= i128::from(rate.get());
             let (_, preview) = self.resolved_selections();
-            if terminal && self.fresh_at(preview.as_str(), tick) == Some(false) {
+            // A key-only transition (K3) puts no incoming picture on air.
+            let background = self.machine.armed().background;
+            if terminal && background && self.fresh_at(preview.as_str(), tick) == Some(false) {
                 self.machine.abort();
                 // Aborted: tied keyers keep their state.
                 self.keyers.cancel_tied();
@@ -1403,8 +1532,20 @@ impl SwitcherTickDriver {
             // is at its end value). An aborted AUTO cancelled them above.
             self.keyers.complete_tied(tick);
         }
-        if let Some((command, deadline)) = self.pending_take.take() {
-            if let SwitcherVerb::Patch(set) = &command.verb {
+        if let Some(HeldTake {
+            command,
+            deadline,
+            bound,
+        }) = self.pending_take.take()
+        {
+            if let Some(reason) = self.bound_refusal(bound) {
+                // Review round 2 (K3-BOUND-1): the arm set or a keyer
+                // definition moved while the take was held (a `keyer_set`
+                // re-pointing an armed, off-air USK is legal meanwhile): the
+                // take is refused, never applied to keys it was not
+                // authorized for.
+                self.publish_outcome(command.operation_id, tick.index, false, Some(reason.into()));
+            } else if let SwitcherVerb::Patch(set) = &command.verb {
                 // A held patch re-validates against the live table: nothing
                 // else could change it while it held the only slot. A layout
                 // body adopted while it held (#307 review A4) is a refusal.
@@ -1424,7 +1565,13 @@ impl SwitcherTickDriver {
                             false,
                             Some(REFUSE_NO_FRESH_FRAME.into()),
                         ),
-                        Ok(false) => self.pending_take = Some((command, deadline)),
+                        Ok(false) => {
+                            self.pending_take = Some(HeldTake {
+                                command,
+                                deadline,
+                                bound,
+                            });
+                        }
                         Err(err) => {
                             self.publish_outcome(
                                 command.operation_id,
@@ -1464,7 +1611,11 @@ impl SwitcherTickDriver {
                     Some(REFUSE_NO_FRESH_FRAME.into()),
                 );
             } else {
-                self.pending_take = Some((command, deadline));
+                self.pending_take = Some(HeldTake {
+                    command,
+                    deadline,
+                    bound,
+                });
             }
         }
         if projection.completed {
@@ -1476,6 +1627,49 @@ impl SwitcherTickDriver {
         for _ in 0..MAX_COMMANDS_PER_TICK {
             let Ok(command) = self.rx.try_recv() else {
                 break;
+            };
+            // Review AUTHZ-1/-2: a bound verb is applied only against the
+            // arm set and keyer definitions it was authorized for.
+            self.drain_bound = Bound::default();
+            let command = match command.verb {
+                SwitcherVerb::Bound(bound) => {
+                    let BoundVerb {
+                        verb,
+                        arm_version,
+                        defs_version,
+                    } = *bound;
+                    let versions = Bound {
+                        arm_version,
+                        defs_version,
+                    };
+                    let refusal = if let Some(reason) = self.bound_refusal(versions) {
+                        Some(reason)
+                    } else if matches!(verb, SwitcherVerb::Bound(_)) {
+                        Some("invalid: a bound verb cannot be nested")
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = refusal {
+                        self.publish_outcome(
+                            command.operation_id,
+                            tick.index,
+                            false,
+                            Some(reason.into()),
+                        );
+                        continue;
+                    }
+                    // Kept by a take or keyer cut this drain holds.
+                    self.drain_bound = versions;
+                    SwitcherCommand {
+                        operation_id: command.operation_id,
+                        scene_version: command.scene_version,
+                        verb,
+                        // The selection guard (#307) rides the outer
+                        // command and survives the unwrap.
+                        expect: command.expect,
+                    }
+                }
+                _ => command,
             };
             // Keyer verbs first: they reference no scene geometry, and a held
             // background take never blocks a DSK (ADR-0113 §6).
@@ -1503,7 +1697,10 @@ impl SwitcherTickDriver {
                 // whatever the caller did. At most `MAX_TICK_ATTEMPTS` CAS
                 // attempts, then refused as contention (review J2: never
                 // spins on the clock); no allocation.
-                let new_keyer = self.keyers.def(usize::from(keyer)).is_none();
+                // Clean is pre-DSK Program: only a new DSK excludes it (a
+                // USK belongs to the M/E scene, K3).
+                let new_keyer = self.keyers.def(usize::from(keyer)).is_none()
+                    && def.0.family == crate::keyer::KeyerFamily::Dsk;
                 let reservation = if new_keyer {
                     match self.clean_gate.tick_reserve_dsk() {
                         Ok(reservation) => Some(reservation),
@@ -1551,10 +1748,42 @@ impl SwitcherTickDriver {
                 }
                 continue;
             }
+            if let SwitcherVerb::Arm(armed) = command.verb {
+                // No scene geometry: the arm set names elements only.
+                let result = if self.pending_take.is_some() {
+                    // Review K3-INV-1: a held take keeps the set it was
+                    // admitted with; a re-arm would retarget it.
+                    Err(REFUSE_ARM_TAKE_HELD.to_owned())
+                } else if armed.keys.iter().any(|&k| !self.keyers.usk_defined(k)) {
+                    Err(REFUSE_ARM_UNKNOWN_KEY.to_owned())
+                } else {
+                    // Allocation-free staging (review K3-R3-2): a full stage
+                    // already covers the arm; otherwise keep only the
+                    // previous set (an `Arc` clone) and version.
+                    if self.before_staged.is_none() && self.before_arm.is_none() {
+                        self.before_arm =
+                            Some((Arc::clone(self.machine.armed_shared()), self.arm_version));
+                    }
+                    self.machine.arm_shared(armed).map_err(|e| e.to_string())
+                };
+                match result {
+                    Ok(()) => {
+                        self.keyers.set_next(NextTake::of(self.machine.armed()));
+                        self.arm_version = self.arm_version.wrapping_add(1);
+                        self.staged_success.push(command.operation_id);
+                    }
+                    Err(error) => {
+                        self.publish_outcome(command.operation_id, tick.index, false, Some(error));
+                    }
+                }
+                continue;
+            }
             if let Some((keyer, action)) = KeyerAction::of(&command.verb) {
+                self.keyers.set_in_transition(self.machine.is_in_flight());
                 self.keyers.command(
                     keyer,
                     action,
+                    self.drain_bound.defs_version,
                     command.operation_id,
                     tick,
                     &mut OpSink {
@@ -1642,7 +1871,9 @@ impl SwitcherTickDriver {
                 } else {
                     Err("program source is absent from the active scene".into())
                 }
-            } else if self.resolved_selections().0 == self.resolved_selections().1 {
+            } else if self.machine.armed().background
+                && self.resolved_selections().0 == self.resolved_selections().1
+            {
                 Err(REFUSE_SAME_SOURCE.into())
             } else {
                 self.gate_take(&command, scenes.as_ref(), tick)
@@ -1873,13 +2104,29 @@ impl SwitcherTickDriver {
         match self.take_fresh(&command.verb, tick) {
             Some(true) => self.apply_take(&command.verb, scenes, tick).map(Some),
             Some(false) => {
-                self.pending_take = Some((
-                    command.clone(),
-                    tick.index.saturating_add(TAKE_PRIME_DEADLINE_TICKS),
-                ));
+                self.pending_take = Some(HeldTake {
+                    command: command.clone(),
+                    deadline: tick.index.saturating_add(TAKE_PRIME_DEADLINE_TICKS),
+                    bound: self.drain_bound,
+                });
                 Ok(None)
             }
             None => Err("switcher source prime provider is unavailable".into()),
+        }
+    }
+
+    /// The typed refusal of a verb bound to versions that moved (review
+    /// AUTHZ-1/-2; round 2 K3-BOUND-1 for a held one): two integer compares.
+    fn bound_refusal(&self, bound: Bound) -> Option<&'static str> {
+        if bound.arm_version.is_some_and(|v| v != self.arm_version) {
+            Some(REFUSE_ARM_CHANGED)
+        } else if bound
+            .defs_version
+            .is_some_and(|v| v != self.keyers.def_version())
+        {
+            Some(crate::keyer::REFUSE_KEYER_DEFINITION_CHANGED)
+        } else {
+            None
         }
     }
 
@@ -1888,6 +2135,11 @@ impl SwitcherTickDriver {
     /// (ADR-0113 §6). `None` when no store map is installed.
     fn take_fresh(&self, verb: &SwitcherVerb, tick: Tick) -> Option<bool> {
         let incoming = self.fresh_at(self.incoming(verb), tick)?;
+        // A key-only CUT or AUTO (K3) puts no background on air: only its
+        // keys going on are gated.
+        let incoming = incoming
+            || (matches!(verb, SwitcherVerb::Cut | SwitcherVerb::Auto(_))
+                && !self.machine.armed().background);
         // A CUT during the background AUTO completes that flight: it puts on
         // only the flight's surviving going-on participants (review round 2
         // G2), the same set `stage_take` lands.
@@ -1909,6 +2161,7 @@ impl SwitcherTickDriver {
     /// call this; failure calls `reject_composed_tick` instead.
     pub fn commit_composed_tick(&mut self, tick: Tick) {
         self.before_staged = None;
+        self.before_arm = None;
         // The armed patch composed on this tick: the set is committed at T
         // (its outcome rides this tick's applied receipts).
         if self
@@ -1918,6 +2171,15 @@ impl SwitcherTickDriver {
         {
             if let Some(armed) = self.armed.take() {
                 self.staged_success.push(armed.operation_id);
+            }
+        }
+        // The machine mirrors the runtime's USK states (a loss or a key cut
+        // can differ from its toggle). Fixed array, no allocation.
+        for slot in crate::keyer::KeyerFamily::Usk.slots() {
+            if let (Some(key), Some(flags)) =
+                (crate::keyer::usk_key_index(slot), self.keyers.flags(slot))
+            {
+                self.machine.set_key_on_air(key, flags.on_air);
             }
         }
         self.applied_tick
@@ -1934,6 +2196,7 @@ impl SwitcherTickDriver {
         // Copy rows: no allocation unless the snapshot actually changed.
         let keyers = self.keyers.snapshot();
         let tally = self.keyers.tally();
+        let next = NextTake::of(self.machine.armed());
         let changed = self.snapshots.latest().is_none_or(|previous| {
             previous.program != *program
                 || previous.preview != *preview
@@ -1946,6 +2209,8 @@ impl SwitcherTickDriver {
                 // below, on a tick whose published state actually changed.
                 || previous.transition != *self.machine.transition()
                 || previous.keyers != keyers
+                || previous.next != next
+                || previous.arm_version != self.arm_version
                 || previous.tally != tally
         });
         if changed {
@@ -1960,6 +2225,8 @@ impl SwitcherTickDriver {
                 completion_count: self.machine.completion_count(),
                 transition: self.machine.transition().clone(),
                 keyers,
+                next,
+                arm_version: self.arm_version,
                 tally,
             });
         }
@@ -1979,7 +2246,7 @@ impl SwitcherTickDriver {
             self.published_def_version = self.keyers.def_version();
             // Before this tick's outcomes: once a caller sees `applied`, the
             // gate already refuses Clean for good.
-            if !self.keyers.is_empty() {
+            if self.keyers.any_dsk() {
                 self.clean_gate.set_defined();
             }
         }
@@ -2022,14 +2289,23 @@ impl SwitcherTickDriver {
                 let _ = armed.arm.abort_apply();
             }
         }
+        let before_arm = self.before_arm.take();
         if let Some(previous) = self.before_staged.take() {
             self.machine = previous.machine;
             self.active_auto = previous.active_auto;
             self.active_auto_scenes = previous.active_auto_scenes;
+            self.arm_version = previous.arm_version;
             if let Some((table, version)) = previous.inputs {
                 self.inputs = Some(table);
                 self.inputs_version = version;
             }
+        }
+        // An `arm` staged without a full stage (review K3-R3-2). A full stage
+        // taken later in the same tick captured the machine AFTER that arm,
+        // so the arm set and version are restored last, over it.
+        if let Some((armed, version)) = before_arm {
+            self.machine.restore_armed(armed);
+            self.arm_version = version;
         }
         // A rejected frame aborts any AUTO: Program stays on the source the
         // restored machine names, which the hook re-binds.
@@ -2039,6 +2315,8 @@ impl SwitcherTickDriver {
         // ... and with it any tied keyer participation: they keep their
         // committed state.
         self.keyers.cancel_tied();
+        // The restored machine's arm set (an `arm` this tick is undone).
+        self.keyers.set_next(NextTake::of(self.machine.armed()));
         let restored_auto = self.active_auto.take();
         self.active_auto_scenes = None;
         self.spare_success.clear();
