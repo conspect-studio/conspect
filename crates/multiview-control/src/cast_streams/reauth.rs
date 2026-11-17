@@ -241,10 +241,12 @@ fn configured_audio(state: &AppState, config_id: &str) -> Option<RoutedAudio> {
 
 /// The clearance of a new push attachment of an admitted token (decision
 /// 5.4, "Re-attachment"): the identities current at this moment, read from
-/// the engine's own labels AFTER the token was re-authorized against the
-/// engine's present state ([`admit`]). Engine-minted identities are
-/// included: the barrier just authorized the owner for what the output
-/// carries now. `None`: no labels (no run), the rung cannot attach.
+/// the engine's labels after `admit` re-authorized the token. Only
+/// control-plane identities are cleared: an engine-minted current label is
+/// content the control plane has not authorized anyone for (a fallback it
+/// may not have seen yet), so no push rung attaches until a requested change
+/// replaces it — the receiver plays HLS, where every request is checked.
+/// `None`: no labels (no run), no picture label, or an engine-minted one.
 pub(crate) fn clearance_now(
     state: &AppState,
     config_id: &str,
@@ -254,12 +256,13 @@ pub(crate) fn clearance_now(
 )> {
     let labels = labels(state, config_id)?;
     let current = labels.current();
-    // No picture label (the output is not routed by this run): no gate can
-    // judge its video, so no push rung attaches.
-    if !current
+    let has_video = current
         .iter()
-        .any(|(c, _)| *c == super::identity::Component::Video)
-    {
+        .any(|(c, _)| *c == super::identity::Component::Video);
+    let engine_minted = current
+        .iter()
+        .any(|(_, id)| id & super::identity::ENGINE_MINTED != 0);
+    if !has_video || engine_minted {
         return None;
     }
     let clearance = super::identity::Clearance::of(&current);

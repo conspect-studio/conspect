@@ -296,14 +296,18 @@ impl OutputLabels {
     }
 
     /// The label of a change to content identity `id`: `id` when the control
-    /// plane requested it, else `id` in the engine's range.
+    /// plane requested it (the request is consumed: one requested change
+    /// labels one change), else `id` in the engine's range.
     #[must_use]
     pub fn label(&self, id: u64) -> u64 {
-        if self.requested.load().contains(&id) {
-            id
-        } else {
-            engine_minted(id)
+        let requested = self.requested.load();
+        if !requested.contains(&id) {
+            return engine_minted(id);
         }
+        let mut rest = requested.as_ref().clone();
+        rest.retain(|known| *known != id);
+        self.requested.store(Arc::new(rest));
+        id
     }
 
     /// Record `(first_tick, id)` on `component` (the bake consumer only).
@@ -476,7 +480,7 @@ impl CastAttachment {
         let mut slot = self.closer.lock().unwrap_or_else(PoisonError::into_inner);
         if self.is_fenced() {
             drop(slot);
-            closer();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(closer));
             return;
         }
         *slot = Some(closer);
@@ -494,7 +498,10 @@ impl CastAttachment {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         if let Some(closer) = closer {
-            closer();
+            // The closer is the transport's; a panicking one must not unwind
+            // through the registry lock it may run under (it would poison
+            // it for every other token). The attachment is fenced already.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(closer));
         }
     }
 
@@ -703,6 +710,32 @@ mod tests {
         att.fence();
         assert_eq!(closed.load(Ordering::Acquire), 1, "the closer runs once");
         assert_eq!(att.counters(), (1, 1));
+    }
+
+    #[test]
+    fn a_panicking_closer_still_fences_and_never_unwinds() {
+        let l = labels(&[], 0);
+        let att = CastAttachment::new("s", "o", "moq", l, Clearance::default());
+        att.set_closer(Box::new(|| panic!("a broken transport")));
+        att.fence();
+        assert!(att.is_fenced());
+        assert_eq!(
+            att.admit_window([(&Component::Video, 0)]),
+            Err(GateRefusal::Fenced)
+        );
+    }
+
+    #[test]
+    fn a_requested_identity_labels_one_change() {
+        let labels = OutputLabels::new();
+        labels.expect(&[7]);
+        assert_eq!(labels.label(7), 7);
+        assert_eq!(
+            labels.label(7),
+            engine_minted(7),
+            "a second change was not requested"
+        );
+        assert_eq!(labels.label(8), engine_minted(8));
     }
 
     #[test]

@@ -626,6 +626,10 @@ pub struct CastOutputEntry {
 /// has been offered and every change it carries is recorded.
 pub(crate) struct CastLabeller {
     outputs: Vec<LabelledOutput>,
+    /// The live track-input vector last compared (pointer identity: a
+    /// re-point publishes a new vector, so an unchanged pointer means no
+    /// track moved and nothing is compared).
+    last_inputs: Option<Arc<Vec<String>>>,
 }
 
 struct LabelledOutput {
@@ -633,15 +637,19 @@ struct LabelledOutput {
     labels: Arc<multiview_control::cast_streams::identity::OutputLabels>,
     video: Option<u64>,
     audio: Option<u64>,
-    tracks: Vec<(String, String)>,
+    /// `(track name, configured input, index in the run's declared tracks)`.
+    tracks: Vec<(String, String, Option<usize>)>,
     track_inputs: Vec<Option<String>>,
     unrequested: Option<u64>,
 }
 
 impl CastLabeller {
-    /// One labeller over `entries` (empty: zero work per tick).
-    pub(crate) fn new(entries: &[CastOutputEntry]) -> Self {
+    /// One labeller over `entries` (empty: zero work per tick); `declared`:
+    /// the run's declared discrete track names, in the order of the live
+    /// track-input vector.
+    pub(crate) fn new(entries: &[CastOutputEntry], declared: &[String]) -> Self {
         Self {
+            last_inputs: None,
             outputs: entries
                 .iter()
                 .map(|e| LabelledOutput {
@@ -649,7 +657,17 @@ impl CastLabeller {
                     labels: Arc::clone(&e.labels),
                     video: None,
                     audio: None,
-                    tracks: e.tracks.clone(),
+                    tracks: e
+                        .tracks
+                        .iter()
+                        .map(|(name, input)| {
+                            (
+                                name.clone(),
+                                input.clone(),
+                                declared.iter().position(|d| d == name),
+                            )
+                        })
+                        .collect(),
                     track_inputs: Vec::new(),
                     unrequested: None,
                 })
@@ -671,8 +689,8 @@ impl CastLabeller {
         &mut self,
         router: &crate::output_routing::OutputRouter,
         tick: u64,
-        next_window: Option<i128>,
-        inputs: &dyn Fn(&str) -> Option<String>,
+        undelivered: &dyn Fn(usize) -> Option<i128>,
+        inputs: &Arc<Vec<String>>,
     ) {
         use multiview_control::cast_streams::identity::{
             engine_minted, identity, track_content, Component,
@@ -680,10 +698,21 @@ impl CastLabeller {
         if self.outputs.is_empty() {
             return;
         }
-        let next = next_window
-            .and_then(|w| u64::try_from(w).ok())
-            .unwrap_or(tick);
+        let inputs_moved = self
+            .last_inputs
+            .as_ref()
+            .is_none_or(|last| !Arc::ptr_eq(last, inputs));
+        if inputs_moved {
+            self.last_inputs = Some(Arc::clone(inputs));
+        }
         for out in &mut self.outputs {
+            // Per binding: a window held behind a dynamic stage is offered
+            // later than the global dispatch index says (PR 516 review,
+            // lens 1); the mark never passes a window not offered yet.
+            let next = undelivered(out.index)
+                .and_then(|w| u64::try_from(w).ok())
+                .unwrap_or(tick)
+                .min(tick.saturating_add(1));
             let from = out.labels.labelled_through();
             let unrequested = router.cast_unrequested(out.index);
             let forced = out.unrequested.is_some_and(|seen| seen != unrequested);
@@ -724,9 +753,18 @@ impl CastLabeller {
             if out.track_inputs.len() != out.tracks.len() {
                 out.track_inputs = vec![None; out.tracks.len()];
             }
-            for ((name, configured), seen) in out.tracks.iter().zip(out.track_inputs.iter_mut()) {
-                let input = inputs(name).unwrap_or_else(|| configured.clone());
-                if seen.as_deref() != Some(input.as_str()) {
+            let check_tracks = inputs_moved || out.track_inputs.iter().any(Option::is_none);
+            for ((name, configured, at), seen) in out
+                .tracks
+                .iter()
+                .zip(out.track_inputs.iter_mut())
+                .filter(|_| check_tracks)
+            {
+                let input = at
+                    .and_then(|at| inputs.get(at))
+                    .map_or(configured.as_str(), String::as_str);
+                if seen.as_deref() != Some(input) {
+                    let input = input.to_owned();
                     let first_seen = seen.is_none();
                     let component = Component::Track(name.clone());
                     let id = identity(&component, &track_content(&input));

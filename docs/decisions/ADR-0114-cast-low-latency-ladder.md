@@ -1236,7 +1236,8 @@ input. The control plane and the engine compute it with the same functions, so "
 identity of a change it requests" needs no token passed through the engine's take mailbox: the control plane
 computes it and registers it with the output's labels (`OutputLabels::expect`, bounded at 16) inside
 `reauth::before_change`, before the take is sent. The engine labels a change with that identity only when it is
-registered; any other change gets the same digest with bit 63 set (`ENGINE_MINTED`), a range the control plane
+registered, and a registration labels one change (it is consumed); any other change gets the same digest with bit
+63 set (`ENGINE_MINTED`), a range the control plane
 never computes. A track re-pointed through the audio-routing route is always engine-minted.
 
 **Where the change list attaches.** Not to packets. Packets carry their timestamp, and the timestamp is a function
@@ -1244,14 +1245,18 @@ of the tick (video PTS is the tick in a `1/fps` base; an audio block's samples l
 has one `OutputLabels` per run (in its `CastOutputEntry`, read by the control plane through `CastEngine::labels`):
 per component a change list of at most 16 `(first tick, identity)` entries, published through a `SwapCell`, and a
 monotonic `labelled_through` tick. The gate maps each packet of a window to `(component, tick)` with exact integer
-arithmetic and resolves it there.
+arithmetic and resolves it there. An audio packet codes a frame of samples (AAC: 1024) that can straddle a tick
+boundary, so it is resolved at the tick of its first and of its last sample, and both must be cleared.
 
 **Who writes it, and when.** `cast_output::CastLabeller`, on the bake consumer, once per iteration, after the router
 tick. Per cast output it compares two fingerprints of what the router says the output carries (picture: the bus and,
 for a layout, the identity of the resolved body; audio slot: the audio router's target) and the live input of each
-track; only on a change does it compute an identity and publish an entry. It labels a change from the previous
-`labelled_through`, that is, from the first window not yet judged, and then sets `labelled_through` to the
-dispatcher's next window index. Two facts make that sound. A requested take is processed by the router at a tick no
+track (compared only when the live track-input vector was republished; no allocation in steady state); only on a
+change does it compute an identity and publish an entry. It labels a change from the previous `labelled_through`,
+that is, from the first window not yet judged, and then sets `labelled_through` to the first window this output's
+binding has not been offered yet (`RenditionDispatcher::undelivered_window`: the head of its pending queue, which
+can lag the global dispatch index behind an incomplete dynamic stage or a group decision). Two facts make that
+sound. A requested take is processed by the router at a tick no
 later than the first tick that carries it, so its entry is never late; an engine fallback becomes visible in the
 same consumer iteration in which the dispatcher reports it, before `labelled_through` passes the window that carries
 it. So a window is never judged against a list that could still change for it, and a label is at worst a few
@@ -1262,7 +1267,10 @@ increments a per-output counter, and a labelling pass that sees it moved mints i
 
 **Clearance.** `Clearance`: per component at most 9 identities, immutable, replaced whole through a `SwapCell`.
 A new attachment is cleared for the identities current right after the shared check (`reauth::clearance_now`, read
-from the engine's labels after `admit` re-authorized the token against the present state). `CastStreams::commit`
+from the engine's labels after `admit` re-authorized the token against the present state), and only when none of
+them is engine-minted: such a label is content the control plane has not authorized anyone for yet (a fallback it may
+not have seen), so the ladder offers HLS, where every request runs the barrier. After the attachment is registered the
+barrier runs again; a moved generation or changed labels fence it before the lease is handed out. `CastStreams::commit`
 (the critical section of `before_change`) adds the identities of a requested change to every attachment of every
 token still armed at the new generation, so only tokens that passed the check for it are cleared.
 
@@ -1274,9 +1282,15 @@ refused, the attachment fenced, and its closer run. On the MoQ rung the gate is 
 the transport's fence. A refusal is terminal: the worker drops a held window, fences, revokes its subscription
 (the registry closes the peer queue) and revokes the transport fence (the session closes, not drained).
 
+**Authority of a cast lease.** A desk MoQ lease authorizes the principal against the binding's static axes (its
+config id, the run's boot program and sources). A cast lease does not: its authority is the token's (decision 5.1).
+The shared check authorized the owner for the output's live closure and the gate judges every window against the
+token's clearance; the static axes are named by config ids an owner's API-scoped grants never name.
+
 **Fences.** Each stream holds its push attachments (at most 2 per rung, 4 in all; a renewal registers the new one
 before the oldest of that rung is fenced). Revoke, remove, release and expiry fence them under the registry lock:
-one atomic store each and the transport's closer, which only flips the MoQ fence (no I/O). A MoQ lease's own
+one atomic store each and the transport's closer, which only revokes the MoQ fence (its own short sender lock, no
+I/O). A panicking closer is caught: it cannot unwind through the registry lock. A MoQ lease's own
 fence (DELETE, expiry, registry drop) fences the attachment too.
 
 **The MoQ rung.** The ladder answer walks the offer in order and admits the first rung that admits now: MoQ needs
@@ -1298,17 +1312,19 @@ registry like any configured output, and its video carries the production encode
 whether or not the output is active, so the push rung needs no packaging and starts at the next verified keyframe.
 The token's lifetime follows decision 5.5: with a live attachment, a ladder call or a report keeps it live.
 
-**Invariants #1 and #10.** The clock thread does nothing new. The bake consumer does two integer compares per cast
+**Invariants #1 and #10.** The clock thread does nothing new. The bake consumer does two fingerprint hashes and compares per cast
 output per iteration, and an allocation and one `SwapCell` publish only when what an output carries changed. The
 gate runs on the per-subscription conversion thread and takes no lock: two `SwapCell` loads and at most 512 integer
 lookups per window. A fence is an atomic store plus the transport fence's own bounded revoke. Every queue is an
 existing one: the registry's two-window hand-off and bounded batch queue per subscription, and the MoQ fence's
 4-window channel with its 8 MiB per subscription and 64 MiB global charge. The chaos test
 `m_stalled_cast_moq_viewers_cost_the_clock_zero_ticks_and_the_hls_output_zero_packets` fills all 16 subscriptions of
-a real run with cast MoQ viewers that never read, asserts that the 17th is refused, that the retained bytes stay
+a real run with cast MoQ viewers that never read, fences one whose transport closer panics and one whose closer
+wedges while the clock runs, asserts that the 17th is refused, that the retained bytes stay
 under the global ceiling, and the isolation assertions of the ADR-0111 chaos tests against a control run (every
 tick emitted, the HLS binding's video PTS contiguous, its audio count equal to the control run's, tick progress at
-the clock's cadence); the negative controls `n_…` prove those assertions see a stall of the shared path.
+the clock's cadence). Its negative control `n_a_shared_stall_fails_the_relative_isolation_predicate` shows the same
+predicate fails for a 1.2 s stall of the shared consumer.
 
 **Tests.** The decision 5.4 table runs against the real MoQ rung (`moq_outputs::factory::tests::cast_gate`: real
 registry, worker, converter and transport fence), each case failing with the gate removed (checked: 6 of the 8

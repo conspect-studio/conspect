@@ -358,6 +358,7 @@ async fn take_ladder(state: &AppState, token: &str, body: Body) -> Response {
         let failed = request.failed.as_ref().map(|f| f.rung.clone());
         Some(attach_best(
             state,
+            token,
             &again,
             request.probe.as_ref(),
             failed.as_deref(),
@@ -431,6 +432,7 @@ fn served_now(state: &AppState, config_id: &str) -> Vec<&'static str> {
 /// one is tried, never an error (review note R2-N4). HLS needs no admission.
 fn attach_best(
     state: &AppState,
+    token: &str,
     admitted: &crate::cast_streams::Admitted,
     probe: Option<&crate::cast_streams::ladder::ReceiverProbe>,
     failed: Option<&str>,
@@ -452,7 +454,7 @@ fn attach_best(
             };
         }
         if candidate == "moq" {
-            if let Some(attach) = attach_moq(state, admitted) {
+            if let Some(attach) = attach_moq(state, token, admitted) {
                 return Offered {
                     rung: "moq",
                     attach,
@@ -476,6 +478,7 @@ fn attach_best(
 /// is fenced and nothing is offered.
 fn attach_moq(
     state: &AppState,
+    token: &str,
     admitted: &crate::cast_streams::Admitted,
 ) -> Option<serde_json::Value> {
     let owner = crate::cast_streams::reauth::owner_of(state, &admitted.stream_id)?;
@@ -491,6 +494,21 @@ fn attach_moq(
     let scope = crate::preview::WhepScope::Output(admitted.config_id.clone());
     let lease = state.moq.open_cast(&owner, &scope, &attachment).ok()?;
     if !state.cast_streams.attach(&attachment, admitted.generation) {
+        attachment.fence();
+        return None;
+    }
+    // PR 516 review, lens 2: the clearance is a snapshot taken after the
+    // barrier. Run the barrier again now that the attachment is registered
+    // (from here every revoke fences it) and require the same generation and
+    // the same labels: a change in between (a requested one commits a new
+    // generation; an unrequested one is engine-minted and never cleared)
+    // fences it and the receiver plays HLS. The gate would refuse such a
+    // window anyway; this hands out no lease for it at all.
+    let same_generation = crate::cast_streams::reauth::admit(state, token)
+        .is_some_and(|again| again.generation == admitted.generation);
+    let same_labels = crate::cast_streams::reauth::clearance_now(state, &admitted.config_id)
+        .is_some_and(|(_, now)| now == *attachment.clearance());
+    if !(same_generation && same_labels) {
         attachment.fence();
         return None;
     }
