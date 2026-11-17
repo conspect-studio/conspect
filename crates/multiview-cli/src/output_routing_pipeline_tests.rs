@@ -2193,7 +2193,7 @@ fn a_persisted_audio_feed_is_re_applied_by_a_boot_take() {
             *takes,
             vec![(
                 "out1".to_owned(),
-                super::AudioChoice::Source("route_boot_b".to_owned())
+                super::AudioChoice::Source("route_bootaudio_b".to_owned())
             )],
             "the persisted feed is parsed into one boot take"
         );
@@ -2204,7 +2204,10 @@ fn a_persisted_audio_feed_is_re_applied_by_a_boot_take() {
         &template,
         true,
         false,
-        "route_boot",
+        // Unique per test (#385): source ids are process-wide keys (live
+        // lifecycle, anchor slots); a prefix shared with a parallel test
+        // lets one run's teardown retire the other's sources.
+        "route_bootaudio",
         TICKS,
         prep,
         move |slot| {
@@ -2225,7 +2228,7 @@ fn a_persisted_audio_feed_is_re_applied_by_a_boot_take() {
                 let s = handle.snapshot();
                 (s.outputs
                     .get(1)
-                    .is_some_and(|v| v.audio == "src:route_boot_b"))
+                    .is_some_and(|v| v.audio == "src:route_bootaudio_b"))
                 .then_some(s)
             });
             *record.lock().unwrap() = Some((o.tick, s));
@@ -2237,7 +2240,7 @@ fn a_persisted_audio_feed_is_re_applied_by_a_boot_take() {
         "the boot take applies within a few ticks: {tick}"
     );
     assert_eq!(s.outputs[1].bus, "program", "the video is untouched");
-    assert_eq!(s.outputs[1].audio_choice, "src:route_boot_b");
+    assert_eq!(s.outputs[1].audio_choice, "src:route_bootaudio_b");
     assert_eq!(s.outputs[0].audio, "program");
     assert_eq!(run.frames, TICKS);
 }
