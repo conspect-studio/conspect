@@ -59,6 +59,10 @@ pub(crate) struct Change {
     pub bus: Option<String>,
     /// What it requires (`None`: undeterminable).
     pub needs: Option<Vec<Need>>,
+    /// The content identities it brings (ADR-0114 decision 5.4): every
+    /// attachment of a token that passes the check for it is cleared for
+    /// them before the engine hears of the change.
+    pub ids: Vec<(super::identity::Component, u64)>,
 }
 
 /// What the output was seen to carry: by an outcome (`op` set when it
@@ -244,6 +248,7 @@ impl CastStreams {
             origin: None,
             generation: None,
             ladder: super::ladder::LadderState::default(),
+            attachments: Vec::new(),
         });
         Ok(Claim { id, token, first })
     }
@@ -260,7 +265,8 @@ impl CastStreams {
     pub fn remove(&self, id: &str) -> Option<StreamView> {
         let mut inner = self.lock();
         let at = inner.entries.iter().position(|e| e.id == id)?;
-        let entry = inner.entries.remove(at);
+        let mut entry = inner.entries.remove(at);
+        entry.fence_attachments();
         inner.last_report_ms.remove(id);
         Some(Registry::view(&entry))
     }
@@ -426,6 +432,7 @@ impl CastStreams {
             bus: change.bus,
             needs: change.needs,
         });
+        let ids = change.ids;
         // Every token at the new generation is authorized for EVERYTHING
         // the output may carry now or still serves (the invariant of
         // [`super::registry::Gate`]).
@@ -439,6 +446,22 @@ impl CastStreams {
             &mut revoked,
             now,
         );
+        // Decision 5.4: clearance for a requested change is added only for
+        // tokens that passed the check for it (every token still armed at the
+        // new generation), in this critical section, before the request goes
+        // to the engine. Replaced whole; read without a lock by the gate.
+        let generation = inner.gates.get(config_id).map(|g| g.generation);
+        for entry in inner.entries.iter_mut().filter(|e| {
+            e.config_id == config_id && e.generation.is_some() && e.generation == generation
+        }) {
+            for attachment in &entry.attachments {
+                let mut clearance = attachment.clearance().as_ref().clone();
+                for (component, id) in &ids {
+                    clearance = clearance.with(component, *id);
+                }
+                attachment.set_clearance(clearance);
+            }
+        }
         revoked
     }
 
@@ -606,7 +629,8 @@ impl CastStreams {
         let Some(at) = inner.entries.iter().position(|e| e.id == id) else {
             return;
         };
-        let entry = inner.entries.remove(at);
+        let mut entry = inner.entries.remove(at);
+        entry.fence_attachments();
         inner.last_report_ms.remove(id);
         if was_first && inner.streams_on(&entry.config_id) == 0 {
             inner.slots.remove(&entry.config_id);
@@ -730,7 +754,7 @@ impl CastStreams {
     /// A stream with a live push attachment is live as long as its receiver
     /// keeps calling (decision 5.5); without one, only a playlist fetch is.
     fn push_liveness(entry: &mut Entry, now: u64) {
-        if entry.ladder.push_attachments > 0 {
+        if entry.ladder.push_attachments > 0 || entry.live_attachments() {
             entry.last_playlist_ms = Some(now);
         }
     }
@@ -750,6 +774,65 @@ impl CastStreams {
         };
         entry.ladder.push_attachments = entry.ladder.push_attachments.saturating_add(1);
         true
+    }
+
+    /// Register `attachment` on the stream it names (ADR-0114 decision
+    /// 5.2), only while that stream is live and armed at `generation`, its
+    /// output's CURRENT one (the admission the caller just made). At most
+    /// [`super::MAX_PER_RUNG`] live attachments per rung: the oldest of that
+    /// rung is fenced (make-before-break: the new one is registered first).
+    /// `false`: refused (the caller fences it).
+    pub fn attach(
+        &self,
+        attachment: &std::sync::Arc<super::identity::CastAttachment>,
+        generation: u64,
+    ) -> bool {
+        let now = self.now_ms();
+        let mut inner = self.lock();
+        let Some(at) = inner
+            .entries
+            .iter()
+            .position(|e| e.id == attachment.stream_id && !e.expired(now))
+        else {
+            return false;
+        };
+        let servable = inner
+            .entries
+            .get(at)
+            .is_some_and(|e| inner.servable(e) && e.generation == Some(generation));
+        let Some(entry) = inner.entries.get_mut(at) else {
+            return false;
+        };
+        if !servable || attachment.is_fenced() || entry.config_id != attachment.config_id {
+            return false;
+        }
+        entry.live_attachments();
+        entry.attachments.push(std::sync::Arc::clone(attachment));
+        let rung = attachment.rung;
+        while entry.attachments.iter().filter(|a| a.rung == rung).count() > super::MAX_PER_RUNG {
+            if let Some(oldest) = entry.attachments.iter().position(|a| a.rung == rung) {
+                entry.attachments.remove(oldest).fence();
+            }
+        }
+        while entry.attachments.len() > super::MAX_ATTACHMENTS {
+            entry.attachments.remove(0).fence();
+        }
+        entry.last_playlist_ms = Some(now);
+        true
+    }
+
+    /// The live push attachments of stream `id` (tests, diagnostics).
+    #[must_use]
+    pub fn attachments(&self, id: &str) -> Vec<std::sync::Arc<super::identity::CastAttachment>> {
+        self.lock()
+            .entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .map(|e| {
+                e.live_attachments();
+                e.attachments.clone()
+            })
+            .unwrap_or_default()
     }
 
     /// End a push attachment of stream `id` (see [`Self::attach_push`]).

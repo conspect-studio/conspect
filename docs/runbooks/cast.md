@@ -47,8 +47,11 @@ Design: [ADR-0111](../decisions/ADR-0111-cast-output.md), [cast-output.md](../ar
 4. Engine-side casting ("Cast from the engine", ADR-M011) also needs `[control] cast_media_base` set to the
    engine's public `https://` base, and the `devices-net` + `discovery` features (in the shipped presets).
 5. Transport ladder ([ADR-0114](../decisions/ADR-0114-cast-low-latency-ladder.md)): `[cast] ladder = ["hls"]` is
-   the default and the only value this build accepts (the lower-latency rungs are not built yet; naming one fails
-   validation). The receiver probes the device on every cast; the probe is stored with the stream.
+   the default. `["moq", "hls"]` also offers MoQ (engine side only: the receiver's MoQ player is a later slice, so
+   leave the default until it ships). MoQ is offered only while the engine's MoQ listener runs and a registry
+   subscription is free (16 per run, shared with the desk's MoQ viewers); otherwise the receiver gets HLS.
+   `webrtc` and `srt` are not built yet and fail validation. The receiver probes the device on every cast; the
+   probe is stored with the stream.
 
 ## 2. Cast
 

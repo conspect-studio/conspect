@@ -354,14 +354,21 @@ async fn take_ladder(state: &AppState, token: &str, body: Body) -> Response {
         .cast_engine
         .as_ref()
         .and_then(|engine| engine.clock(&again.config_id, t1.saturating_mul(1000)));
-    let offer = request.full.then(|| {
-        crate::cast_streams::ladder::offer(
-            &state.cast_streams.ladder(),
-            crate::cast_streams::ladder::SERVED_RUNGS,
+    let offered = if request.full {
+        let failed = request.failed.as_ref().map(|f| f.rung.clone());
+        Some(attach_best(
+            state,
+            token,
+            &again,
             request.probe.as_ref(),
-        )
-    });
-    let (attach, then) = offer.map_or((None, Vec::new()), |(attach, then)| (Some(attach), then));
+            failed.as_deref(),
+        ))
+    } else {
+        None
+    };
+    let (attach, then) = offered
+        .as_ref()
+        .map_or((None, Vec::new()), |o| (Some(o.rung), o.then.clone()));
     let full = request.full;
     let t0 = request.t0_us;
     if state
@@ -386,7 +393,7 @@ async fn take_ladder(state: &AppState, token: &str, body: Body) -> Response {
         serde_json::json!({
             "v": 1,
             "clock": clock,
-            "attach": attach.map(|rung| serde_json::json!({ "rung": rung })),
+            "attach": offered.map(|o| o.attach),
             "then": then,
             "srt": null,
         })
@@ -398,6 +405,122 @@ async fn take_ladder(state: &AppState, token: &str, body: Body) -> Response {
         answer.to_string(),
     )
         .into_response()
+}
+
+/// The rung a ladder call attaches, already admitted, and the rest.
+struct Offered {
+    rung: &'static str,
+    attach: serde_json::Value,
+    then: Vec<&'static str>,
+}
+
+/// The rungs the running engine can serve now (decision 3, first rule):
+/// HLS always; `MoQ` while a `MoQ` provider is ready and the run labels the
+/// output (no labels: no gate, so no push rung).
+fn served_now(state: &AppState, config_id: &str) -> Vec<&'static str> {
+    let mut served = vec!["hls"];
+    let labelled = crate::cast_streams::reauth::labels(state, config_id).is_some();
+    if labelled && state.moq.available() {
+        served.insert(0, "moq");
+    }
+    served
+}
+
+/// Walk the offer (decision 3, "What the engine leaves out", in order) and
+/// admit the first rung that admits: a rung that cannot be admitted now (no
+/// subscription left, a codec the lease refuses) is left out and the next
+/// one is tried, never an error (review note R2-N4). HLS needs no admission.
+fn attach_best(
+    state: &AppState,
+    token: &str,
+    admitted: &crate::cast_streams::Admitted,
+    probe: Option<&crate::cast_streams::ladder::ReceiverProbe>,
+    failed: Option<&str>,
+) -> Offered {
+    // A call reporting `failed` answers with the next rung: the failed one
+    // is left out of this answer (the device's own memory keeps it out of
+    // later ones through `skip`). HLS is the floor and is never left out.
+    let mut served = served_now(state, &admitted.config_id);
+    served.retain(|rung| *rung == "hls" || Some(*rung) != failed);
+    let (first, mut rest) =
+        crate::cast_streams::ladder::offer(&state.cast_streams.ladder(), &served, probe);
+    let mut candidate = first;
+    loop {
+        if candidate == "hls" {
+            return Offered {
+                rung: "hls",
+                attach: serde_json::json!({ "rung": "hls" }),
+                then: rest,
+            };
+        }
+        if candidate == "moq" {
+            if let Some(attach) = attach_moq(state, token, admitted) {
+                return Offered {
+                    rung: "moq",
+                    attach,
+                    then: rest,
+                };
+            }
+        }
+        candidate = if rest.is_empty() {
+            "hls"
+        } else {
+            rest.remove(0)
+        };
+    }
+}
+
+/// Admit a `MoQ` cast lease for `admitted` (ADR-0114 slice 4): the attachment
+/// is cleared for the identities current right after the shared check, the
+/// lease runs with the token owner's CURRENT principal (decision 5.6), and
+/// it is registered with the token in one critical section that requires
+/// the token still armed at the same generation; on any failure the lease
+/// is fenced and nothing is offered.
+fn attach_moq(
+    state: &AppState,
+    token: &str,
+    admitted: &crate::cast_streams::Admitted,
+) -> Option<serde_json::Value> {
+    let owner = crate::cast_streams::reauth::owner_of(state, &admitted.stream_id)?;
+    let (labels, clearance) =
+        crate::cast_streams::reauth::clearance_now(state, &admitted.config_id)?;
+    let attachment = std::sync::Arc::new(crate::cast_streams::identity::CastAttachment::new(
+        &admitted.stream_id,
+        &admitted.config_id,
+        "moq",
+        labels,
+        clearance,
+    ));
+    let scope = crate::preview::WhepScope::Output(admitted.config_id.clone());
+    let lease = state.moq.open_cast(&owner, &scope, &attachment).ok()?;
+    if !state.cast_streams.attach(&attachment, admitted.generation) {
+        attachment.fence();
+        return None;
+    }
+    // PR 516 review, lens 2: the clearance is a snapshot taken after the
+    // barrier. Run the barrier again now that the attachment is registered
+    // (from here every revoke fences it) and require the same generation and
+    // the same labels: a change in between (a requested one commits a new
+    // generation; an unrequested one is engine-minted and never cleared)
+    // fences it and the receiver plays HLS. The gate would refuse such a
+    // window anyway; this hands out no lease for it at all.
+    let same_generation = crate::cast_streams::reauth::admit(state, token)
+        .is_some_and(|again| again.generation == admitted.generation);
+    let same_labels = crate::cast_streams::reauth::clearance_now(state, &admitted.config_id)
+        .is_some_and(|(_, now)| now == *attachment.clearance());
+    if !(same_generation && same_labels) {
+        attachment.fence();
+        return None;
+    }
+    Some(serde_json::json!({
+        "rung": "moq",
+        "url": lease.url,
+        "broadcast": lease.broadcast,
+        "protocol": lease.protocol,
+        "video": lease.video,
+        "audio": lease.audio,
+        "expires_in_ms": lease.expires_in_ms,
+    }))
 }
 
 async fn receiver_redirect() -> Response {

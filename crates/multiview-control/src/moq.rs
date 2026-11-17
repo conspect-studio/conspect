@@ -147,6 +147,36 @@ pub trait MoqProvider: Send + Sync {
         subscription_id: &str,
         ttl: Duration,
     ) -> Result<(MoqLease, Arc<dyn MoqFence>), MoqReject>;
+    /// Admit a cast push attachment (ADR-0114 slice 4): the same admission
+    /// as [`Self::admit`] for `scope` (always one output), single rendition,
+    /// with `gate` judging every window before it is offered to the
+    /// transport. The default refuses: a provider without the gate never
+    /// carries a cast.
+    /// # Errors
+    /// As [`Self::admit`].
+    fn admit_cast(
+        &self,
+        principal: &Principal,
+        scope: &WhepScope,
+        subscription_id: &str,
+        ttl: Duration,
+        gate: Arc<crate::cast_streams::identity::CastAttachment>,
+    ) -> Result<(MoqLease, Arc<dyn MoqFence>), MoqReject> {
+        let _ = (principal, scope, subscription_id, ttl, gate);
+        Err(MoqReject::Unavailable)
+    }
+}
+/// A cast lease's fence: revoking it (DELETE, expiry, registry drop) also
+/// fences the cast attachment, so the token registry stops counting it.
+struct CastLeaseFence {
+    transport: Arc<dyn MoqFence>,
+    attachment: Arc<crate::cast_streams::identity::CastAttachment>,
+}
+impl MoqFence for CastLeaseFence {
+    fn revoke(&self) {
+        self.transport.revoke();
+        self.attachment.fence();
+    }
 }
 struct Unavailable;
 impl MoqProvider for Unavailable {
@@ -166,6 +196,9 @@ struct Entry {
     generation: u64,
     fence: Option<Arc<dyn MoqFence>>,
     fenced: Arc<std::sync::atomic::AtomicBool>,
+    /// A cast lease's attachment: once it is fenced the entry is forgotten
+    /// at the next cast admission, so a renewal frees its slot at once.
+    cast: Option<Arc<crate::cast_streams::identity::CastAttachment>>,
 }
 /// Bounded control registry. Identity tombstones survive expiry for one bounded
 /// grace period so a matching DELETE can acknowledge the completed fence.
@@ -230,6 +263,7 @@ impl MoqRegistry {
                 generation: lease.generation,
                 fence: Some(fence),
                 fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                cast: None,
             },
         );
         let weak = Arc::downgrade(self);
@@ -266,6 +300,86 @@ impl MoqRegistry {
             }
         });
         Ok(lease)
+    }
+    /// Admit a cast push attachment (ADR-0114 slice 4) under the same bounded
+    /// registry, TTL and expiry as [`Self::open`]. The attachment's closer is
+    /// the transport fence, so a token revoke fences the lease at once.
+    /// # Errors
+    /// Returns capacity or provider admission failure.
+    pub fn open_cast(
+        self: &Arc<Self>,
+        principal: &Principal,
+        scope: &WhepScope,
+        attachment: &Arc<crate::cast_streams::identity::CastAttachment>,
+    ) -> Result<MoqLease, MoqReject> {
+        let mut entries = self.entries.lock().map_err(|_| MoqReject::Unavailable)?;
+        // Fenced cast leases (renewed, revoked) hold no media: free them.
+        let gone: Vec<Arc<dyn MoqFence>> = {
+            let ids: Vec<String> = entries
+                .iter()
+                .filter(|(_, e)| e.cast.as_ref().is_some_and(|a| a.is_fenced()))
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.iter()
+                .filter_map(|id| entries.remove(id).and_then(|mut e| e.fence.take()))
+                .collect()
+        };
+        if entries.len() >= self.capacity {
+            drop(entries);
+            for fence in gone {
+                fence.revoke();
+            }
+            return Err(MoqReject::Capacity);
+        }
+        let started = std::time::Instant::now();
+        let id = uuid::Uuid::new_v4().to_string();
+        let (mut lease, transport) =
+            self.provider
+                .admit_cast(principal, scope, &id, self.ttl, Arc::clone(attachment))?;
+        let closer = Arc::clone(&transport);
+        attachment.set_closer(Box::new(move || closer.revoke()));
+        let fence: Arc<dyn MoqFence> = Arc::new(CastLeaseFence {
+            transport,
+            attachment: Arc::clone(attachment),
+        });
+        lease.lease_id.clone_from(&id);
+        lease.expires_in_ms = u64::try_from(self.ttl.saturating_sub(started.elapsed()).as_millis())
+            .unwrap_or(u64::MAX);
+        entries.insert(
+            id.clone(),
+            Entry {
+                owner: principal.key_id.clone(),
+                scope: scope.label(),
+                generation: lease.generation,
+                fence: Some(fence),
+                fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                cast: Some(Arc::clone(attachment)),
+            },
+        );
+        drop(entries);
+        for fence in gone {
+            fence.revoke();
+        }
+        self.schedule_expiry(id);
+        Ok(lease)
+    }
+    fn schedule_expiry(self: &Arc<Self>, id: String) {
+        let weak = Arc::downgrade(self);
+        let ttl = self.ttl;
+        tokio::spawn(async move {
+            tokio::time::sleep(ttl).await;
+            if let Some(registry) = weak.upgrade() {
+                let fence = registry
+                    .entries
+                    .lock()
+                    .ok()
+                    .and_then(|mut entries| entries.remove(&id))
+                    .and_then(|mut entry| entry.fence.take());
+                if let Some(fence) = fence {
+                    fence.revoke();
+                }
+            }
+        });
     }
     /// Fence only the owner, scope and exact binding generation.
     /// # Errors
@@ -493,6 +607,7 @@ mod tests {
                     checked: checked.clone(),
                 })),
                 fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                cast: None,
             },
         );
         assert!(
@@ -527,6 +642,7 @@ mod tests {
                 generation: 7,
                 fence: Some(Arc::new(Panics)),
                 fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                cast: None,
             },
         );
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

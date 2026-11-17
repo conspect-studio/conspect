@@ -12,6 +12,7 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+multiview-framestore = { workspace = true }
 # The capture runtime inside is unix-only (process groups, openat-pinned
 # files); on other platforms only its portable request model is built and the
 # control plane reports capture unavailable.

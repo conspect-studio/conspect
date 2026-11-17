@@ -2450,6 +2450,9 @@ pub struct Pipeline {
     /// [`StreamKind::AudioTrack`](multiview_ffmpeg::StreamKind::AudioTrack)`(i)`.
     /// Empty when no route names a `target_track`.
     discrete_track_inputs: Vec<String>,
+    /// The names of [`Self::discrete_track_inputs`], same order (ADR-0114
+    /// decision 5.4: a cast output's track components).
+    discrete_track_names: Vec<String>,
     /// Published at drive start; control reads without locking or waiting on bake.
     audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
     /// Per-source **audio** ingest plans (AUD-2): how to open + decode each
@@ -3530,6 +3533,8 @@ impl Pipeline {
         let discrete_tracks = declared_discrete_tracks(config.audio.as_ref());
         let discrete_track_inputs: Vec<String> =
             discrete_tracks.iter().map(|t| t.input_id.clone()).collect();
+        let discrete_track_names: Vec<String> =
+            discrete_tracks.iter().map(|t| t.name.clone()).collect();
         apply_output_audio_selections(&mut outputs, &config.outputs, &discrete_tracks);
         // #343: an output at a rate other than Program's leaves the Program
         // egress (its runner, key and binding) and runs in a rate lane.
@@ -3827,6 +3832,7 @@ impl Pipeline {
             player_aliases,
             audio_routing: config.audio.clone(),
             discrete_track_inputs,
+            discrete_track_names,
             audio_route: Arc::new(multiview_framestore::SwapCell::empty()),
             audio_ingest_plans,
             tone_ingest_plans,
@@ -4377,6 +4383,10 @@ impl Pipeline {
             subtitle_end,
             consumer: ConsumerRouting {
                 router: Box::new(router),
+                cast_labels: crate::cast_output::CastLabeller::new(
+                    &self.cast_outputs.load(),
+                    &self.discrete_track_names,
+                ),
                 base_force,
                 inband_sets: self.output_inband_sets.clone(),
                 base_formats: self.rendition_formats.clone(),
@@ -5421,7 +5431,30 @@ impl Pipeline {
                     fps: self.cadence,
                     codec: encode.map_or_else(String::new, |cfg| cfg.codec_name.clone()),
                     epoch: self.epoch.clone(),
+                    labels: Arc::new(
+                        multiview_control::cast_streams::identity::OutputLabels::new(),
+                    ),
+                    index,
+                    tracks: self.cast_tracks(index),
                 })
+            })
+            .collect()
+    }
+
+    /// The discrete tracks output `index` carries, with their route inputs
+    /// (ADR-0114 decision 5.4 components).
+    fn cast_tracks(&self, index: usize) -> Vec<(String, String)> {
+        let Some(tracks) = self.output_audio_tracks.get(index) else {
+            return Vec::new();
+        };
+        tracks
+            .iter()
+            // Index 0 is the program mix; track `i` is `i + 1`.
+            .filter_map(|&slot| {
+                let track = slot.checked_sub(1)?;
+                let name = self.discrete_track_names.get(track)?.clone();
+                let input = self.discrete_track_inputs.get(track)?.clone();
+                Some((name, input))
             })
             .collect()
     }
@@ -8548,6 +8581,9 @@ struct ConsumerRouting {
     /// Boxed: this value lives across the run's awaits, and inline it grew
     /// the run future past `clippy::large_futures`.
     router: Box<crate::output_routing::OutputRouter>,
+    /// The cast outputs' content labeller (ADR-0114 decision 5.4).
+    cast_labels: crate::cast_output::CastLabeller,
+
     /// Per base video key: its worker's forced-IDR request cell.
     base_force: Vec<Arc<AtomicU64>>,
     /// Per output: [`BindingConfig::inband_parameter_changes_ok`].
@@ -9290,6 +9326,7 @@ fn consumer_main<D: WindowDelivery>(
 ) -> Result<Vec<crate::binding_delivery::BindingStatus>, PipelineError> {
     let ConsumerRouting {
         mut router,
+        mut cast_labels,
         base_force,
         inband_sets,
         base_formats,
@@ -9638,6 +9675,16 @@ fn consumer_main<D: WindowDelivery>(
                 kind: "dispatch",
                 reason: format!("{e:?}"),
             })?;
+        // ADR-0114 decision 5.4: label what every cast output carries now,
+        // after this tick's takes and every move outcome of the windows
+        // offered so far (two fingerprint hashes per cast output; no
+        // allocation unless something changed).
+        cast_labels.label(
+            &router,
+            item.tick_index,
+            &|output| dispatcher.undelivered_window(output),
+            &track_inputs.load(),
+        );
         // Every output tick hands any admitted-but-undelivered tail to its
         // transport, so a quiet encoder cannot strand an admitted window behind a
         // subscriber's bounded handoff. Off-clock, never waits on a peer.

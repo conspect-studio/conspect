@@ -605,6 +605,184 @@ pub struct CastOutputEntry {
     /// The run's outbound presentation epoch (`EXT-X-PROGRAM-DATE-TIME`),
     /// read by the ladder route's clock pair (ADR-0114).
     pub epoch: multiview_output::SharedEpoch,
+    /// Its per-component content labels (ADR-0114 decision 5.4), written by
+    /// the bake consumer ([`CastLabeller`]).
+    pub labels: Arc<multiview_control::cast_streams::identity::OutputLabels>,
+    /// Its index in the run's output list.
+    pub index: usize,
+    /// The discrete tracks it carries: `(track name, route input)`.
+    pub tracks: Vec<(String, String)>,
+}
+
+/// Writes every cast output's content labels on the bake consumer (ADR-0114
+/// decision 5.4; design note section 11). Once per consumer iteration, after
+/// the router tick: per output it compares two fingerprints (no allocation)
+/// and only on a change computes the identity and publishes one entry. A
+/// requested change (take, layout edit) is processed at a tick no later
+/// than the first tick that carries it, so its entry is never late; a change
+/// the engine makes by itself is labelled at the dispatcher's next
+/// unoffered window (a fallback's content starts at a RAP at or after it).
+/// Then `labelled_through` moves to that same window: every earlier window
+/// has been offered and every change it carries is recorded.
+pub(crate) struct CastLabeller {
+    outputs: Vec<LabelledOutput>,
+    /// The live track-input vector last compared (pointer identity: a
+    /// re-point publishes a new vector, so an unchanged pointer means no
+    /// track moved and nothing is compared).
+    last_inputs: Option<Arc<Vec<String>>>,
+}
+
+struct LabelledOutput {
+    index: usize,
+    labels: Arc<multiview_control::cast_streams::identity::OutputLabels>,
+    video: Option<u64>,
+    audio: Option<u64>,
+    /// `(track name, configured input, index in the run's declared tracks)`.
+    tracks: Vec<(String, String, Option<usize>)>,
+    track_inputs: Vec<Option<String>>,
+    unrequested: Option<u64>,
+    /// The control-plane requests this labeller already used.
+    consumed: multiview_control::cast_streams::identity::Consumed,
+}
+
+impl CastLabeller {
+    /// One labeller over `entries` (empty: zero work per tick); `declared`:
+    /// the run's declared discrete track names, in the order of the live
+    /// track-input vector.
+    pub(crate) fn new(entries: &[CastOutputEntry], declared: &[String]) -> Self {
+        Self {
+            last_inputs: None,
+            outputs: entries
+                .iter()
+                .map(|e| LabelledOutput {
+                    index: e.index,
+                    labels: Arc::clone(&e.labels),
+                    video: None,
+                    audio: None,
+                    tracks: e
+                        .tracks
+                        .iter()
+                        .map(|(name, input)| {
+                            (
+                                name.clone(),
+                                input.clone(),
+                                declared.iter().position(|d| d == name),
+                            )
+                        })
+                        .collect(),
+                    track_inputs: Vec::new(),
+                    unrequested: None,
+                    consumed: multiview_control::cast_streams::identity::Consumed::default(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Label the changes `router` shows. `tick`: the tick being processed;
+    /// `next_window`: the dispatcher's first window not offered yet;
+    /// `inputs`: the live route input of each declared track, by name.
+    ///
+    /// Every change is labelled from the first window not judged yet (the
+    /// previous `labelled_through`): never later than the content it
+    /// labels, at worst a few windows early. Early is safe: a requested
+    /// change's identity was cleared, for every token that survives it,
+    /// before the engine heard of it, and an unrequested one is refused
+    /// whatever it labels.
+    pub(crate) fn label(
+        &mut self,
+        router: &crate::output_routing::OutputRouter,
+        tick: u64,
+        undelivered: &dyn Fn(usize) -> Option<i128>,
+        inputs: &Arc<Vec<String>>,
+    ) {
+        use multiview_control::cast_streams::identity::{
+            engine_minted, identity, track_content, Component,
+        };
+        if self.outputs.is_empty() {
+            return;
+        }
+        let inputs_moved = self
+            .last_inputs
+            .as_ref()
+            .is_none_or(|last| !Arc::ptr_eq(last, inputs));
+        if inputs_moved {
+            self.last_inputs = Some(Arc::clone(inputs));
+        }
+        for out in &mut self.outputs {
+            // Per binding: a window held behind a dynamic stage is offered
+            // later than the global dispatch index says (PR 516 review,
+            // lens 1); the mark never passes a window not offered yet.
+            let next = undelivered(out.index)
+                .and_then(|w| u64::try_from(w).ok())
+                .unwrap_or(tick)
+                .min(tick.saturating_add(1));
+            let from = out.labels.labelled_through();
+            let unrequested = router.cast_unrequested(out.index);
+            let forced = out.unrequested.is_some_and(|seen| seen != unrequested);
+            let first = out.unrequested.is_none();
+            out.unrequested = Some(unrequested);
+            let label = |labels: &multiview_control::cast_streams::identity::OutputLabels,
+                         consumed: &mut multiview_control::cast_streams::identity::Consumed,
+                         id: u64| {
+                if first {
+                    id
+                } else if forced {
+                    engine_minted(id)
+                } else {
+                    labels.label(id, consumed)
+                }
+            };
+            let video = router.cast_video_fingerprint(out.index);
+            if out.video != Some(video) || forced {
+                out.video = Some(video);
+                if let Some(content) = router.cast_video_content(out.index) {
+                    let id = identity(&Component::Video, &content);
+                    out.labels.record(
+                        &Component::Video,
+                        if first { 0 } else { from },
+                        label(&out.labels, &mut out.consumed, id),
+                    );
+                }
+            }
+            let audio = router.cast_audio_fingerprint(out.index);
+            if out.audio != Some(audio) || forced {
+                out.audio = Some(audio);
+                let id = identity(&Component::Audio, &router.cast_audio_content(out.index));
+                out.labels.record(
+                    &Component::Audio,
+                    if first { 0 } else { from },
+                    label(&out.labels, &mut out.consumed, id),
+                );
+            }
+            if out.track_inputs.len() != out.tracks.len() {
+                out.track_inputs = vec![None; out.tracks.len()];
+            }
+            let check_tracks = inputs_moved || out.track_inputs.iter().any(Option::is_none);
+            for ((name, configured, at), seen) in out
+                .tracks
+                .iter()
+                .zip(out.track_inputs.iter_mut())
+                .filter(|_| check_tracks)
+            {
+                let input = at
+                    .and_then(|at| inputs.get(at))
+                    .map_or(configured.as_str(), String::as_str);
+                if seen.as_deref() != Some(input) {
+                    let input = input.to_owned();
+                    let first_seen = seen.is_none();
+                    let component = Component::Track(name.clone());
+                    let id = identity(&component, &track_content(&input));
+                    // A re-pointed track is a change nobody requested through
+                    // the routing seam: engine range.
+                    let labelled = if first_seen { id } else { engine_minted(id) };
+                    out.labels
+                        .record(&component, if first_seen { 0 } else { from }, labelled);
+                    *seen = Some(input);
+                }
+            }
+            out.labels.set_labelled_through(next);
+        }
+    }
 }
 
 /// The cast outputs of one run, in configured order.
@@ -701,6 +879,17 @@ impl multiview_control::cast_engine::CastEngine for CastEngineAdapter {
     fn deactivate(&self, id: &str) -> Result<(), multiview_control::cast_engine::CastEngineError> {
         self.entry(id)?.gate.deactivate();
         Ok(())
+    }
+
+    fn labels(
+        &self,
+        id: &str,
+    ) -> Option<Arc<multiview_control::cast_streams::identity::OutputLabels>> {
+        let outputs = self.0.load();
+        outputs
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| Arc::clone(&entry.labels))
     }
 
     fn clock(

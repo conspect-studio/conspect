@@ -6,8 +6,8 @@
 //! ```
 //!
 //! `ladder` names the rungs the engine may offer a receiver on
-//! `POST /cast/<token>/ladder`, best first. Only `hls` exists today
-//! (ADR-0114 slice 2); `moq`, `webrtc` and `srt` are reserved names that a
+//! `POST /cast/<token>/ladder`, best first. `hls` and `moq` exist
+//! (ADR-0114 slices 2 and 4); `webrtc` and `srt` are reserved names that a
 //! later slice enables, and are refused until then so that a config never
 //! names a rung the build cannot serve. `hls` is the floor of every ladder
 //! and must be listed: a receiver always falls back to it.
@@ -20,9 +20,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::ConfigError;
 
 /// The rungs this build can serve.
-pub const SERVABLE_RUNGS: &[&str] = &["hls"];
+pub const SERVABLE_RUNGS: &[&str] = &["moq", "hls"];
 /// Rung names reserved for later slices of ADR-0114.
-pub const RESERVED_RUNGS: &[&str] = &["moq", "webrtc", "srt"];
+pub const RESERVED_RUNGS: &[&str] = &["webrtc", "srt"];
 
 /// See the module docs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,13 +129,21 @@ mod tests {
         for (ladder, needle) in [
             ("[]", "empty"),
             ("[\"hls\", \"rtmp\"]", "unknown rung"),
-            ("[\"moq\", \"hls\"]", "not built yet"),
+            ("[\"webrtc\", \"hls\"]", "not built yet"),
             ("[\"srt\", \"hls\"]", "not built yet"),
             ("[\"hls\", \"hls\"]", "twice"),
         ] {
             let error = parse(&format!("ladder = {ladder}")).validate().unwrap_err();
             assert!(error.to_string().contains(needle), "{ladder}: {error}");
         }
+    }
+
+    /// ADR-0114 slice 4: `moq` is served by this build and may be enabled.
+    #[test]
+    fn moq_may_be_enabled_ahead_of_hls() {
+        let config = parse("ladder = [\"moq\", \"hls\"]");
+        config.validate().unwrap();
+        assert!(config.enables("moq"));
     }
 
     #[test]

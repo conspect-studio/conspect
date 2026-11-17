@@ -42,6 +42,10 @@ pub(super) struct Entry {
     pub generation: Option<u64>,
     /// The ladder call's state: rate, last probe, transport (ADR-0114).
     pub ladder: super::ladder::LadderState,
+    /// Its push attachments (ADR-0114 decision 5.2; at most
+    /// [`super::MAX_ATTACHMENTS`]): fenced when the token stops being
+    /// served (revoked, expired, removed, re-armed away).
+    pub attachments: Vec<std::sync::Arc<super::identity::CastAttachment>>,
 }
 
 impl Entry {
@@ -56,6 +60,20 @@ impl Entry {
 
     pub(super) fn expired(&self, now: u64) -> bool {
         now >= self.expires_ms()
+    }
+
+    /// Fence every push attachment (one atomic store each, then the
+    /// transport's bounded closer; no I/O).
+    pub(super) fn fence_attachments(&mut self) {
+        for attachment in self.attachments.drain(..) {
+            attachment.fence();
+        }
+    }
+
+    /// Forget fenced attachments; whether a live one is left.
+    pub(super) fn live_attachments(&mut self) -> bool {
+        self.attachments.retain(|a| !a.is_fenced());
+        !self.attachments.is_empty()
     }
 }
 
@@ -559,7 +577,8 @@ impl Registry {
     /// Revoke entry `at` on the server's behalf (see
     /// [`super::CastStreams::revoke`]).
     pub(super) fn revoke_at(&mut self, at: usize, reason: &str, now: u64) -> Entry {
-        let entry = self.entries.remove(at);
+        let mut entry = self.entries.remove(at);
+        entry.fence_attachments();
         self.last_report_ms.remove(&entry.id);
         let horizon = now.saturating_sub(ms(MAX_LIFETIME));
         self.revoked.retain(|r| r.at_ms >= horizon);
@@ -613,6 +632,9 @@ impl Registry {
         sinks: Option<&HashMap<String, SinkMark>>,
     ) -> Vec<Ended> {
         let before = self.entries.len();
+        for entry in self.entries.iter_mut().filter(|e| e.expired(now)) {
+            entry.fence_attachments();
+        }
         self.entries.retain(|e| !e.expired(now));
         if self.entries.len() != before {
             let ids: std::collections::HashSet<&str> =

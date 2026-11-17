@@ -672,6 +672,38 @@ impl RoutedAudio {
             .map_or(AudioSource::Program, |b| b.target().clone())
     }
 
+    /// A fingerprint of what the output's program-audio slot carries (or
+    /// is moving to): equal fingerprints carry the same audio. No allocation
+    /// (ADR-0114 decision 5.4: the cast labels compare it every tick).
+    pub(crate) fn carried_fingerprint(&self, output: usize) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        match self
+            .outputs
+            .get(output)
+            .and_then(|o| o.staged.as_ref().map(|s| &s.bus).or(o.bus.as_ref()))
+            .map(PrivateBus::target)
+        {
+            None | Some(AudioSource::Program) => 0_u8.hash(&mut h),
+            Some(AudioSource::Source(id)) => (1_u8, id).hash(&mut h),
+            Some(AudioSource::Preview) => 2_u8.hash(&mut h),
+            Some(AudioSource::Silence) => 3_u8.hash(&mut h),
+            Some(AudioSource::Track { name, input }) => (4_u8, name, input).hash(&mut h),
+        }
+        h.finish()
+    }
+
+    /// The content string of what the slot carries (ADR-0114 decision 5.4,
+    /// `identity::audio_content`).
+    pub(crate) fn carried_content(&self, output: usize) -> String {
+        match self.carried(output) {
+            AudioSource::Track { name, input } => {
+                multiview_control::cast_streams::identity::audio_content("", Some((&name, &input)))
+            }
+            other => other.label(),
+        }
+    }
+
     /// The tick whose sample block contains sample `g`.
     pub(crate) fn tick_of_sample(&self, g: u64) -> u64 {
         let num = u128::from(self.cadence.num.unsigned_abs().max(1));

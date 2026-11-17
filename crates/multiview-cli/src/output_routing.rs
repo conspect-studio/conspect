@@ -1585,6 +1585,10 @@ pub struct OutputRouter {
     /// Routed outputs' audio (`audio = follow`); `None` for a run without
     /// program audio.
     audio: Option<crate::routing_audio::RoutedAudio>,
+    /// Per output: changes the engine made by itself (a video fallback, a
+    /// stale move landing, an audio stage falling back). ADR-0114 decision
+    /// 5.4: the cast labeller mints those in the engine's range.
+    unrequested: Vec<u64>,
     #[cfg(test)]
     audio_tap: crate::routing_audio::AudioTapCell,
     /// Start-up (boot) takes (#329).
@@ -1806,6 +1810,7 @@ impl OutputRouter {
             holdings_rebuilds: 0,
             reaper: Some(reaper),
             audio: None,
+            unrequested: Vec::new(),
             #[cfg(test)]
             audio_tap,
             boot: BootTakes::default(),
@@ -2051,6 +2056,72 @@ impl OutputRouter {
                 }
             }
         }
+    }
+
+    fn count_unrequested(&mut self, index: usize) {
+        if self.unrequested.len() <= index {
+            self.unrequested.resize(index.saturating_add(1), 0);
+        }
+        if let Some(n) = self.unrequested.get_mut(index) {
+            *n = n.wrapping_add(1);
+        }
+    }
+
+    /// Changes the engine made by itself on output `index` (see the field).
+    pub(crate) fn cast_unrequested(&self, index: usize) -> u64 {
+        self.unrequested.get(index).copied().unwrap_or(0)
+    }
+
+    /// A fingerprint of the picture output `index` carries (equal
+    /// fingerprints carry the same picture closure; ADR-0114 decision 5.4).
+    /// No allocation.
+    pub(crate) fn cast_video_fingerprint(&self, index: usize) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        match self.outputs.get(index).map(|o| &o.bus) {
+            None => 0_u8.hash(&mut h),
+            Some(PictureBus::Layout(layout)) => {
+                (
+                    1_u8,
+                    &layout.id,
+                    layout.body.revision,
+                    Arc::as_ptr(&layout.body),
+                )
+                    .hash(&mut h);
+            }
+            Some(bus) => (2_u8, bus).hash(&mut h),
+        }
+        h.finish()
+    }
+
+    /// The content of the picture output `index` carries
+    /// (`identity::video_content`).
+    pub(crate) fn cast_video_content(&self, index: usize) -> Option<String> {
+        let bus = &self.outputs.get(index)?.bus;
+        let body = match bus {
+            PictureBus::Layout(layout) => Some(layout.body.as_ref()),
+            _ => None,
+        };
+        Some(multiview_control::cast_streams::identity::video_content(
+            &bus.as_str(),
+            body,
+        ))
+    }
+
+    /// A fingerprint and the content of the audio output `index`'s
+    /// program-audio slot carries (`program` without routed audio).
+    pub(crate) fn cast_audio_fingerprint(&self, index: usize) -> u64 {
+        self.audio
+            .as_ref()
+            .map_or(0, |audio| audio.carried_fingerprint(index))
+    }
+
+    /// See [`Self::cast_audio_fingerprint`].
+    pub(crate) fn cast_audio_content(&self, index: usize) -> String {
+        self.audio.as_ref().map_or_else(
+            || "program".to_owned(),
+            |audio| audio.carried_content(index),
+        )
     }
 
     /// One Program tick: drain dynamic events, takes, opens and dispatcher
@@ -3195,6 +3266,7 @@ impl OutputRouter {
                                 out.key = key;
                                 out.since = at;
                             }
+                            self.count_unrequested(output_index);
                             self.dirty = true;
                         }
                     }
@@ -3204,7 +3276,9 @@ impl OutputRouter {
                     reason,
                 } => self.move_refused(output_index, reason, tick, dispatcher),
                 MoveOutcome::Superseded { output_index } => superseded.push(output_index),
-                MoveOutcome::AudioFallback { .. } => {}
+                MoveOutcome::AudioFallback { output_index } => {
+                    self.count_unrequested(output_index);
+                }
                 MoveOutcome::AudioApplied { .. } | MoveOutcome::AudioRefused { .. } => {
                     if let Some(audio) = self.audio.as_mut() {
                         audio.on_outcome(&outcome, dispatcher);
@@ -3212,6 +3286,7 @@ impl OutputRouter {
                     self.dirty = true;
                 }
                 MoveOutcome::Fallback { output_index } => {
+                    self.count_unrequested(output_index);
                     self.pass_fell_back(output_index, dispatcher);
                     if let Some(out) = self.outputs.get_mut(output_index) {
                         out.bus = PictureBus::Program;

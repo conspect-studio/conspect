@@ -216,6 +216,22 @@ impl crate::moq::MoqProvider for DeferredProvider {
             ttl,
         )
     }
+    fn admit_cast(
+        &self,
+        principal: &crate::auth::Principal,
+        scope: &crate::preview::WhepScope,
+        subscription_id: &str,
+        ttl: std::time::Duration,
+        gate: Arc<crate::cast_streams::identity::CastAttachment>,
+    ) -> Result<(crate::moq::MoqLease, Arc<dyn crate::moq::MoqFence>), MoqReject> {
+        self.inner.get().ok_or(MoqReject::Unavailable)?.admit_cast(
+            principal,
+            scope,
+            subscription_id,
+            ttl,
+            gate,
+        )
+    }
 }
 
 /// [`start_shared`] serving the certificate from `resolver` (the front door's

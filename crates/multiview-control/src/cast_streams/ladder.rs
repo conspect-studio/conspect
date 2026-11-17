@@ -307,8 +307,9 @@ impl LadderState {
     }
 }
 
-/// The rungs this build serves (ADR-0114 slice 2: HLS only).
-pub const SERVED_RUNGS: &[&str] = &["hls"];
+/// The rungs this build can serve (ADR-0114 slices 2 and 4). What a run
+/// serves at a given moment is narrower (`routes::cast_public::served_now`).
+pub const SERVED_RUNGS: &[&str] = &["moq", "hls"];
 
 /// The rung to attach and the rest, best first (decision 3, "What the
 /// engine leaves out", in that order): rungs the build or the run cannot
@@ -801,11 +802,18 @@ mod tests {
         }
     }
 
+    /// ADR-0114 slice 4: this build serves `moq` and `hls`; `srt` and
+    /// `webrtc` are never offered, whatever the ladder enables.
     #[test]
-    fn the_offer_of_this_build_is_hls_only() {
+    fn the_offer_of_this_build_is_moq_then_hls() {
         let all: Vec<String> = ["srt", "moq", "webrtc", "hls"].map(String::from).to_vec();
         let probe = probe_with(Some(FrameCounter::Rvfc), &[]);
-        assert_eq!(offer(&all, SERVED_RUNGS, Some(&probe)), ("hls", vec![]));
+        assert_eq!(
+            offer(&all, SERVED_RUNGS, Some(&probe)),
+            ("moq", vec!["hls"])
+        );
+        let no_frames = probe_with(None, &[]);
+        assert_eq!(offer(&all, SERVED_RUNGS, Some(&no_frames)), ("hls", vec![]));
         assert_eq!(
             offer(&["hls".to_owned()], SERVED_RUNGS, None),
             ("hls", vec![])

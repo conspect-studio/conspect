@@ -123,6 +123,9 @@ struct Ctl {
     /// The engine side of the cast output's subtitle feed (with
     /// [`Setup::tracks`]).
     subtitle_feed: Option<multiview_output::hls::SubtitleFeed>,
+    /// The run's effective-output registry slot (the `MoQ` factory's source).
+    #[allow(dead_code)] // Read by the `moq-output` tests only.
+    windows: crate::output_window_registry::WindowSubscriptionSlot,
 }
 
 impl Ctl {
@@ -342,6 +345,7 @@ where
     let rendition_configs = pipeline.rendition_config_count();
     let cast_slot: CastOutputsSlot = pipeline.cast_outputs();
     let routing_slot: OutputRoutingSlot = pipeline.output_routing();
+    let window_slot = pipeline.window_subscriptions();
     let video_pts = Arc::new(Mutex::new(Vec::new()));
     let audio_packets = Arc::new(AtomicU64::new(0));
     let hls: TestSinkRunner = {
@@ -381,6 +385,7 @@ where
         let ended = Arc::clone(&ended);
         let (cast_slot, routing_slot) = (Arc::clone(&cast_slot), Arc::clone(&routing_slot));
         let subtitle_feed = subtitle_feed.clone();
+        let windows = Arc::clone(&window_slot);
         std::thread::spawn(move || {
             let cast = wait_for("the cast output", Duration::from_secs(30), || {
                 cast_slot.load().first().cloned()
@@ -396,6 +401,7 @@ where
                 ended,
                 stop,
                 subtitle_feed,
+                windows,
             };
             control(&ctl);
         })
@@ -1185,6 +1191,25 @@ const RELATIVE_SHED_SLACK: u64 = FPS;
 /// (every tick emitted, contiguous HLS video PTS, the control's HLS audio
 /// count, the clock's cadence while the fault is in place) is unchanged.
 fn assert_unaffected_relative(control: &(Run, ChaosSeen), run: &Run, seen: &ChaosSeen) {
+    let (control_run, control_seen) = control;
+    assert!(
+        control_run.hls_audio_packets > 0,
+        "the run carries program audio"
+    );
+    assert_eq!(
+        relative_violations(control, run, seen),
+        Vec::<String>::new(),
+        "{:?} (control run {:?})",
+        run.lines,
+        isolation_violations(control_run, CHAOS_TICKS, None, &control_seen.progress, 6)
+    );
+}
+
+/// The predicate of [`assert_unaffected_relative`]: the control run's own
+/// violations (shed excepted) and the chaos run's, with the shed count
+/// bounded relative to the control run. Empty when isolated. One predicate,
+/// so the negative control can prove THIS check sees a shared stall.
+fn relative_violations(control: &(Run, ChaosSeen), run: &Run, seen: &ChaosSeen) -> Vec<String> {
     let (control, control_seen) = control;
     let not_shed = |violations: Vec<String>| -> Vec<String> {
         violations
@@ -1192,39 +1217,30 @@ fn assert_unaffected_relative(control: &(Run, ChaosSeen), run: &Run, seen: &Chao
             .filter(|v| !v.starts_with("the hot queue shed"))
             .collect()
     };
-    assert_eq!(
-        not_shed(isolation_violations(
-            control,
-            CHAOS_TICKS,
-            None,
-            &control_seen.progress,
-            6
-        )),
-        Vec::<String>::new(),
-        "the control run"
-    );
-    assert!(
-        control.hls_audio_packets > 0,
-        "the run carries program audio"
-    );
-    assert_eq!(
-        not_shed(isolation_violations(
-            run,
-            CHAOS_TICKS,
-            Some(control.hls_audio_packets),
-            &seen.progress,
-            6
-        )),
-        Vec::<String>::new(),
-        "{:?}",
-        run.lines
-    );
-    assert!(
-        run.dropped <= control.dropped + RELATIVE_SHED_SLACK,
-        "the chaos run shed {} frame(s), the control run {}",
-        run.dropped,
-        control.dropped
-    );
+    let mut all: Vec<String> = not_shed(isolation_violations(
+        control,
+        CHAOS_TICKS,
+        None,
+        &control_seen.progress,
+        6,
+    ))
+    .into_iter()
+    .map(|v| format!("control: {v}"))
+    .collect();
+    all.extend(not_shed(isolation_violations(
+        run,
+        CHAOS_TICKS,
+        Some(control.hls_audio_packets),
+        &seen.progress,
+        6,
+    )));
+    if run.dropped > control.dropped + RELATIVE_SHED_SLACK {
+        all.push(format!(
+            "the chaos run shed {} frame(s), the control run {}",
+            run.dropped, control.dropped
+        ));
+    }
+    all
 }
 
 /// (e) R3 chaos test, invariants #1 and #10: a cast sink whose disk write
@@ -2065,4 +2081,392 @@ fn l_a_ladder_flood_costs_the_clock_zero_ticks_and_the_hls_output_zero_packets()
         "the cast packager published during the flood: {detail}"
     );
     assert!(run.cast_packets > 0, "the cast sink received packets");
+}
+
+// ---- ADR-0114 slice 4 (engine): labels, the registry entry, the MoQ rung ----
+
+/// The take helper of the identity tests: apply `bus` on the cast output
+/// (re-issued on `FeedNotFresh`, as test d does).
+fn take_to(
+    ctl: &Ctl,
+    outcomes: &std::sync::mpsc::Receiver<crate::output_routing::TakeOutcome>,
+    op: &str,
+    bus: &crate::routing_aux::PictureBus,
+) {
+    use crate::output_routing::{OutputTake, RefuseReason, TakeResult};
+    let index = ctl.routing.index_of("cast-1").unwrap();
+    for attempt in 0..5 {
+        let operation_id = format!("cast:{op}-{attempt}");
+        ctl.routing
+            .try_take(OutputTake {
+                operation_id: operation_id.clone(),
+                output_index: index,
+                bus: Some(bus.clone()),
+                audio: None,
+                principal: "operator".to_owned(),
+            })
+            .unwrap();
+        let outcome = wait_for(&operation_id, Duration::from_secs(10), || {
+            outcomes.try_recv().ok()
+        });
+        match outcome.outcome {
+            TakeResult::Applied => return,
+            TakeResult::Refused(RefuseReason::FeedNotFresh) => {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            other => panic!("{operation_id}: {other:?}"),
+        }
+    }
+    panic!("{op} never applied");
+}
+
+/// ADR-0114 open question "Whether a `cast` output is admitted to the
+/// effective-output registry and has the no-reorder proof", settled on the
+/// real pipeline: the cast output's binding is in the registry, its video
+/// carries the production encoder's `NoReorder` proof, and its audio is the
+/// program AAC.
+#[test]
+fn i_the_cast_binding_enters_the_registry_with_the_no_reorder_proof() {
+    drive("cast_i", Until::Stop, |ctl| {
+        ctl.wait_tick(2 * FPS);
+        let factory = wait_for("the registry", Duration::from_secs(10), || {
+            ctl.windows.load()
+        });
+        let binding = factory
+            .resolve(&multiview_control::WhepScope::Output("cast-1".into()))
+            .expect("the cast output resolves in the effective-output registry");
+        assert_eq!(binding.output_id, "cast-1");
+        assert_eq!(
+            binding.video.reorder,
+            crate::rendition_workers::ReorderBound::NoReorder,
+            "the production encoder's no-reorder proof"
+        );
+        assert!(binding
+            .audio
+            .iter()
+            .any(|a| a.kind == multiview_ffmpeg::StreamKind::Audio));
+        ctl.stop.stop();
+    });
+}
+
+/// Decision 5.4 on the real pipeline: the bake consumer labels what the
+/// cast output carries. Program from tick 0; a take requested by the
+/// control plane (its identity registered first) is labelled with that
+/// identity at or before its first tick; an unrequested move is labelled in
+/// the engine's range; `labelled_through` follows the dispatcher.
+#[test]
+fn j_the_engine_labels_requested_and_unrequested_changes() {
+    use crate::routing_aux::PictureBus;
+    use multiview_control::cast_streams::identity::{identity, Component, ENGINE_MINTED};
+    drive("cast_j", Until::Stop, |ctl| {
+        ctl.wait_tick(2 * FPS);
+        let outcomes = ctl.routing.outcomes().expect("one outcome reader");
+        let labels = &ctl.cast.labels;
+        let program = identity(&Component::Video, "program");
+        assert_eq!(labels.resolve(&Component::Video, 1), Some(program));
+        assert_eq!(
+            labels.resolve(&Component::Audio, 1),
+            Some(identity(&Component::Audio, "program"))
+        );
+        let through = labels.labelled_through();
+        assert!(through > 0 && through <= ctl.tick() + 1, "{through}");
+        // Requested: the control plane registers the identity first.
+        let source = identity(&Component::Video, "src:cast_j_b");
+        labels.expect(&[source]);
+        take_to(
+            ctl,
+            &outcomes,
+            "to-b",
+            &PictureBus::Source("cast_j_b".to_owned()),
+        );
+        wait_for("the take labelled", Duration::from_secs(10), || {
+            (labels.lists().get(&Component::Video)?.current()? == source).then_some(())
+        });
+        let list = labels.lists().get(&Component::Video).cloned().unwrap();
+        let (at, _) = *list.entries().last().unwrap();
+        let since =
+            ctl.routing.snapshot().outputs[ctl.routing.index_of("cast-1").unwrap()].since_tick;
+        assert!(
+            at <= since,
+            "labelled from {at}, the feed started at {since}"
+        );
+        // Unrequested (the identity of Program was not registered for it
+        // now): the take back to Program is labelled in the engine range,
+        // so no attachment is cleared for it by a control-plane identity.
+        take_to(ctl, &outcomes, "back", &PictureBus::Program);
+        wait_for("the move back labelled", Duration::from_secs(10), || {
+            let id = labels.lists().get(&Component::Video)?.current()?;
+            (id & !ENGINE_MINTED == program).then_some(())
+        });
+        let id = labels
+            .lists()
+            .get(&Component::Video)
+            .unwrap()
+            .current()
+            .unwrap();
+        assert_eq!(id, program | ENGINE_MINTED, "not requested: engine range");
+        ctl.stop.stop();
+    });
+}
+
+#[cfg(feature = "moq-output")]
+mod moq_rung {
+    use super::*;
+    use crate::moq_outputs::factory::RegistryFeedFactory;
+    use multiview_control::auth::{Principal, Role};
+    use multiview_control::cast_streams::identity::{CastAttachment, Clearance, Component};
+    use multiview_control::moq_provider::AuthorizedFeedFactory;
+    use multiview_moq::provider::Fence;
+
+    fn owner() -> Principal {
+        Principal {
+            key_id: "owner".into(),
+            role: Role::Operator,
+            scoped_object_ids: None,
+            scoped_output_ids: None,
+            scoped_discovery_domains: None,
+        }
+    }
+
+    /// A real cast `MoQ` attachment on the running pipeline, cleared for what
+    /// the output carries now (as the ladder admits it).
+    fn attach(
+        ctl: &Ctl,
+        runtime: &tokio::runtime::Runtime,
+    ) -> (
+        Arc<CastAttachment>,
+        tokio::sync::mpsc::Receiver<multiview_moq::av::AvWindow>,
+        multiview_control::moq_provider::AuthorizedFeed,
+    ) {
+        let factory = wait_for("the registry", Duration::from_secs(10), || {
+            ctl.windows.load()
+        });
+        let feed_factory = RegistryFeedFactory::from_subscriptions((*factory).clone()).unwrap();
+        let labels = Arc::clone(&ctl.cast.labels);
+        let attachment = Arc::new(CastAttachment::new(
+            "stream",
+            "cast-1",
+            "moq",
+            Arc::clone(&labels),
+            Clearance::of(&labels.current()),
+        ));
+        let (sink, windows) = Fence::channel(4);
+        let closer = Arc::clone(&sink);
+        attachment.set_closer(Box::new(move || closer.revoke()));
+        let _guard = runtime.enter();
+        let feed = feed_factory
+            .attach_cast(
+                &owner(),
+                &multiview_control::WhepScope::Output("cast-1".into()),
+                sink,
+                Arc::clone(&attachment),
+            )
+            .expect("a cast MoQ attachment on the real binding");
+        (attachment, windows, feed)
+    }
+
+    /// Decision 5.4 rows 1 and 7 on the real rung, real pipeline: a
+    /// requested take the owner is cleared for keeps the attachment
+    /// delivering; an unrequested move (the engine range) fences it, and no
+    /// window of the new content is delivered after the fence.
+    #[test]
+    fn k_a_real_cast_moq_attachment_survives_a_cleared_take_and_is_fenced_by_an_unrequested_one() {
+        use crate::routing_aux::PictureBus;
+        use multiview_control::cast_streams::identity::identity;
+        drive("cast_k", Until::Stop, |ctl| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            ctl.wait_tick(2 * FPS);
+            let outcomes = ctl.routing.outcomes().expect("one outcome reader");
+            let (attachment, mut windows, _feed) = attach(ctl, &runtime);
+            // A viewer that reads its transport queue continuously, as the
+            // real transport does; counts what it was handed.
+            let received = Arc::new(AtomicU64::new(0));
+            let reading = Arc::new(AtomicBool::new(true));
+            let reader = {
+                let (received, reading) = (Arc::clone(&received), Arc::clone(&reading));
+                std::thread::spawn(move || {
+                    while reading.load(Ordering::Acquire) {
+                        while windows.try_recv().is_ok() {
+                            received.fetch_add(1, Ordering::AcqRel);
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                })
+            };
+            wait_for("windows", Duration::from_secs(10), || {
+                (received.load(Ordering::Acquire) > 0).then_some(())
+            });
+            // The picture and the audio that follows it (as
+            // `reauth::before_change` computes them).
+            let source = identity(&Component::Video, "src:cast_k_b");
+            let audio = identity(&Component::Audio, "src:cast_k_b");
+            attachment.set_clearance(
+                attachment
+                    .clearance()
+                    .with(&Component::Video, source)
+                    .with(&Component::Audio, audio),
+            );
+            ctl.cast.labels.expect(&[source, audio]);
+            take_to(
+                ctl,
+                &outcomes,
+                "to-b",
+                &PictureBus::Source("cast_k_b".to_owned()),
+            );
+            let before = received.load(Ordering::Acquire);
+            ctl.run_seconds(2);
+            assert!(!attachment.is_fenced(), "{:?}", attachment.counters());
+            assert!(
+                received.load(Ordering::Acquire) > before,
+                "the cleared feed keeps playing"
+            );
+            // Unrequested: back to Program without registering the identity.
+            take_to(ctl, &outcomes, "back", &PictureBus::Program);
+            wait_for("the fence", Duration::from_secs(10), || {
+                attachment.is_fenced().then_some(())
+            });
+            let (passed, refused) = attachment.counters();
+            assert_eq!(refused, 1, "one refused window, then nothing is offered");
+            ctl.run_seconds(1);
+            let after = received.load(Ordering::Acquire);
+            ctl.run_seconds(1);
+            assert_eq!(
+                received.load(Ordering::Acquire),
+                after,
+                "nothing after the fence"
+            );
+            assert_eq!(attachment.counters().0, passed);
+            reading.store(false, Ordering::Release);
+            reader.join().unwrap();
+            ctl.stop.stop();
+        });
+    }
+
+    /// The negative control of [`m_stalled_cast_moq_viewers_cost_the_clock_zero_ticks_and_the_hls_output_zero_packets`]:
+    /// the same relative predicate fails for a 1.2 s stall of the SHARED
+    /// consumer (PR 516 review, lens 3: one predicate for both).
+    #[test]
+    fn n_a_shared_stall_fails_the_relative_isolation_predicate() {
+        let control = chaos_run("cast_nm0", Setup::LIVE, None, None);
+        let setup = Setup {
+            consumer_stall: Some((CHAOS_AT + FPS, SHARED_STALL)),
+            keep_fatal: true,
+            ..Setup::LIVE
+        };
+        let (run, seen) = chaos_run("cast_nm1", setup, None, None);
+        let violations = relative_violations(&control, &run, &seen);
+        assert!(!violations.is_empty(), "a shared stall must be detected");
+    }
+
+    /// R3 chaos, invariants #1 and #10 (ADR-0114 decision 6, "Long-run and
+    /// stalled-consumer proof", engine rows): cast `MoQ` attachments that never
+    /// read (stalled), one whose transport closer panics and one whose closer
+    /// wedges, fenced while the clock runs, on the real
+    /// pipeline, cost the clock zero ticks and the HLS binding zero packets
+    /// against the control run; the registry's subscription cap holds and
+    /// the next attachment is refused; retained bytes stay within the
+    /// subscription ceilings and return to zero after the viewers go. The
+    /// negative controls of this family (`n_…`) prove the same assertions
+    /// see a stall of the shared path.
+    #[test]
+    fn m_stalled_cast_moq_viewers_cost_the_clock_zero_ticks_and_the_hls_output_zero_packets() {
+        let control = chaos_run("cast_m0", Setup::LIVE, None, None);
+        let seen = Arc::new(Mutex::new(ChaosSeen::default()));
+        let caps = Arc::new(Mutex::new((0_usize, false, 0_usize)));
+        let (record, cap_record) = (Arc::clone(&seen), Arc::clone(&caps));
+        let run = bounded(Duration::from_secs(90), move || {
+            drive_in(
+                "cast_m1",
+                Until::Ticks(CHAOS_TICKS),
+                Setup::LIVE,
+                |_| {},
+                move |ctl| {
+                    let runtime = tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(1)
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    ctl.wait_tick(CHAOS_AT);
+                    // Fill every registry subscription with cast viewers that
+                    // never read their transport queue.
+                    let mut stalled = Vec::new();
+                    loop {
+                        let factory = ctl.windows.load().unwrap();
+                        if factory.slots_in_use() >= 16 {
+                            break;
+                        }
+                        stalled.push(attach(ctl, &runtime));
+                    }
+                    let factory = ctl.windows.load().unwrap();
+                    // The next one is refused (the ladder then offers the
+                    // next rung, review note R2-N4).
+                    let feed_factory =
+                        RegistryFeedFactory::from_subscriptions((*factory).clone()).unwrap();
+                    let extra = Arc::new(CastAttachment::new(
+                        "stream",
+                        "cast-1",
+                        "moq",
+                        Arc::clone(&ctl.cast.labels),
+                        Clearance::of(&ctl.cast.labels.current()),
+                    ));
+                    let (sink, _w) = Fence::channel(4);
+                    let refused = {
+                        let _guard = runtime.enter();
+                        feed_factory
+                            .attach_cast(
+                                &owner(),
+                                &multiview_control::WhepScope::Output("cast-1".into()),
+                                sink,
+                                extra,
+                            )
+                            .is_err()
+                    };
+                    // A panicking attachment (its transport closer panics)
+                    // and a wedged one (its closer blocks until the run
+                    // ends), fenced while the clock runs: the fence is an
+                    // atomic; the closer runs on the fencing thread, never
+                    // on the data plane.
+                    let (panicking, wedged) = (&stalled[0].0, &stalled[1].0);
+                    panicking.set_closer(Box::new(|| panic!("a broken transport")));
+                    let release = Arc::new(AtomicBool::new(false));
+                    let held = Arc::clone(&release);
+                    wedged.set_closer(Box::new(move || {
+                        while !held.load(Ordering::Acquire) {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }));
+                    panicking.fence();
+                    let fencer = {
+                        let wedged = Arc::clone(wedged);
+                        std::thread::spawn(move || wedged.fence())
+                    };
+                    let progress = ctl.sample_progress(CHAOS_TICKS - 20);
+                    release.store(true, Ordering::Release);
+                    fencer.join().unwrap();
+                    let mut caps = cap_record.lock().unwrap();
+                    *caps = (
+                        stalled.len(),
+                        refused,
+                        multiview_moq::provider::retained_payload_bytes(),
+                    );
+                    drop(caps);
+                    record.lock().unwrap().progress = progress;
+                    drop(stalled);
+                },
+            )
+        });
+        let seen = std::mem::take(&mut *seen.lock().unwrap());
+        let (attached, refused, retained) = *caps.lock().unwrap();
+        assert_eq!(attached, 16, "every subscription of the run filled");
+        assert!(refused, "admission refuses the 17th");
+        assert!(
+            retained <= multiview_moq::provider::retained_payload_limit(),
+            "{retained} retained bytes"
+        );
+        assert_unaffected_relative(&control, &run, &seen);
+    }
 }
