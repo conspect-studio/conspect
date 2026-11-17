@@ -86,6 +86,7 @@ fn cold_preview_hold_preserves_program_cadence_then_exact_tick_cut() {
             operation_id: "cut".into(),
             scene_version: 1,
             verb: SwitcherVerb::Cut,
+            expect: None,
         })
         .unwrap();
     for index in 0..9 {
@@ -146,6 +147,7 @@ fn cold_preview_deadline_reports_failure_without_pgm_swap() {
             operation_id: "hold".into(),
             scene_version: 1,
             verb: SwitcherVerb::Cut,
+            expect: None,
         })
         .unwrap();
     for index in 0..51 {

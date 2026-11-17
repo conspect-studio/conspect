@@ -196,6 +196,7 @@ async fn real_cut_follows_program_audio_and_never_mixes_preview() {
                     operation_id: format!("audio-cut-{index}"),
                     scene_version: 1,
                     verb: SwitcherVerb::Cut,
+                    expect: None,
                 })
                 .unwrap();
             let done = tokio::time::timeout(Duration::from_secs(4), outcomes.recv())

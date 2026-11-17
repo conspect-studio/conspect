@@ -7474,7 +7474,10 @@ export interface components {
             /** @description `video`, `audio` or `subtitle` (output subtitle slots, #345). */
             plane: string;
             /**
-             * @description A mixer input: `{"source": id}` or `"none"`. An output video slot 0:
+             * @description A mixer input: `{"source": id}`, `{"layout": id}` (a stored layout as
+             *     an M/E source, #307: Read on it AND on every source its cells bind;
+             *     it must solve on the running canvas with opaque cells and bind no other
+             *     layout or bus) or `"none"`; `{"bus": ..}` is refused. An output video slot 0:
              *     `{"source": id}`, `{"layout": id}` (a stored layout; Read on it AND on
              *     every source its cells bind) or `{"bus": ..}`; audio slot 0: `"follow"`;
              *     an output subtitle slot: `{"source": id}` or `"none"`.
@@ -9481,7 +9484,18 @@ export interface components {
              *     §12.8); exactly one of `source`/`input`. Requires declared inputs.
              */
             input?: number | null;
-            /** @description Referenced stored layout, when selecting an authored scene. */
+            /**
+             * @description A stored layout as the selected source (#307), for
+             *     `select_program`/`select_preview`: exactly one of
+             *     `source`/`input`/`layout`. Needs Read on the layout AND on every source
+             *     its cells bind (one generic 403); it must exist, solve on the running
+             *     canvas, have opaque cells and bind no other layout or bus (422
+             *     `unknown-source` / `layout-not-admissible`). With numbered inputs it
+             *     must be patched to an input (`not-on-an-input`). The engine source id
+             *     is `layout:<id>`; at most 4 layouts are M/E sources at once (409
+             *     `capacity`). Refused on `cut`/`auto`. A `source` of `layout:<id>` means
+             *     the same.
+             */
             layout?: string | null;
             /** @description M/E identity (`me1` for the first slice). */
             me: string;
@@ -11968,7 +11982,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The layout id does not exist, its stored body does not parse/solve, its canvas differs from the running session's pinned canvas (Class-2), or the running canvas is unknown (no seeded snapshot — the gate fails closed). Without `target` while a switcher M/E is declared: type `/problems/switcher-owns-program` (the Program canvas is the M/E bus; returned before the Idempotency-Key is reserved, so nothing is reserved, persisted or sent; the detail names `POST /routing/output/take` and a layout as a switcher source). With `target`: the output take's 422s. */
+            /** @description The layout id does not exist, its stored body does not parse/solve, its canvas differs from the running session's pinned canvas (Class-2), or the running canvas is unknown (no seeded snapshot — the gate fails closed). Without `target` while a switcher M/E is declared: type `/problems/switcher-owns-program` (the Program canvas is the M/E bus; returned before the Idempotency-Key is reserved, so nothing is reserved, persisted or sent; the detail names `POST /routing/output/take` and `POST /switcher/commands/select_preview` with `{"layout": id}`, a stored layout as an M/E source). With `target`: the output take's 422s. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -14921,7 +14935,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The replaced layout (new ETag in the response header). */
+            /** @description The replaced layout (new ETag in the response header). A layout registered as an M/E source (#307) swaps its body at the next tick. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -14939,7 +14953,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Not authorized to write. */
+            /** @description Not authorized to write; or `routed-layout`: the layout is on air on an output, or registered as an M/E source and the caller lacks the Program scope, the M/E or Read on every source the new body shows. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -14959,6 +14973,15 @@ export interface operations {
             };
             /** @description If-Match precondition failed. */
             412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `layout-not-admissible`: the layout is registered as an M/E source and the new body would no longer be one (another canvas, a translucent cell, or a nested layout/bus cell); nothing was committed. */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -15052,6 +15075,15 @@ export interface operations {
             };
             /** @description No layout with that id. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `layout-on-air`: this layout is registered as an M/E source (#307): it is on Program, Preview or a mixer input, or was within the last 10 s; nothing changed. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -17191,7 +17223,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `slot-medium-mismatch` (an audio slot other than slot 0 follow; a subtitle slot on an output kind that carries no subtitles, or a subtitle slot given a `{layout}` or `{bus}`: subtitle essences come from sources), `unknown-slot` (video slot >= 1; a subtitle slot >= the output's declared `slots.subtitle` count or named twice; subtitle crosspoints mixed with video/audio ones or naming two outputs), `unknown-source` (a layout or bus on a mixer input; an unknown feed; more than 4 distinct layouts in one set), or not 1..=64 crosspoints. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan. A subtitle slot (`{"source": id}` or `"none"`) is planned with path `subtitle`; an unknown source is an `unknown-source` refusal in the plan, and a source that declares no `captions` carries `note: source-has-no-captions` (not a refusal: the slot carries an empty track). */
+            /** @description `slot-medium-mismatch` (an audio slot other than slot 0 follow; a subtitle slot on an output kind that carries no subtitles, or a subtitle slot given a `{layout}` or `{bus}`: subtitle essences come from sources), `unknown-slot` (video slot >= 1; a subtitle slot >= the output's declared `slots.subtitle` count or named twice; subtitle crosspoints mixed with video/audio ones or naming two outputs), `unknown-source` (a bus on a mixer input; a mixer input's `{layout}` inside a multi-destination set; an unknown source or stored layout; an unknown feed; more than 4 distinct layouts in one request), `layout-not-admissible` (a mixer input's `{layout}`: not on the running canvas, a translucent cell, or a cell binding another layout or a bus — nested layouts and buses are not M/E sources), or not 1..=64 crosspoints. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan. A plan never registers a mixer input's layout. A subtitle slot (`{"source": id}` or `"none"`) is planned with path `subtitle`; an unknown source is an `unknown-source` refusal in the plan, and a source that declares no `captions` carries `note: source-has-no-captions` (not a refusal: the slot carries an empty track). */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -17254,7 +17286,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `conflict` (the Idempotency-Key was first used for another body: an output take's other output or feed, a set's other crosspoints; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity` (a set's new encoders exceed the caller's per-principal cap or the global sessions), `aux-capacity` (no free layout canvas), or no source lease. */
+            /** @description `conflict` (the Idempotency-Key was first used for another body: an output take's other output or feed, a set's other crosspoints; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity` (a set's new encoders exceed the caller's per-principal cap or the global sessions; also: a mixer input's `{layout}` would be the fifth stored layout registered as an M/E source, or a source it shows cannot be leased; the key is released), `layout-changed` (a mixer input's `{layout}` was edited or deleted while this request was in flight; the key is released, retry), `aux-capacity` (no free layout canvas), or no source lease. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -17263,7 +17295,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `slot-medium-mismatch`, `unknown-slot`, `unknown-source`, `unknown-feed` (an output slot's unknown layout or subtitle source) / `layout-not-admissible` (an output slot's layout), missing Idempotency-Key, or not 1..=64 crosspoints (subtitle rules as on `/patch/plan`). A subtitle take re-points the output's subtitle route table at once; its outcome rides `route.output` as `subtitle:applied` or `subtitle:refused:not-in-run` (see the subtitle design note). */
+            /** @description `slot-medium-mismatch`, `unknown-slot`, `unknown-source` (also: a mixer input's `{layout}` inside a multi-destination set), `unknown-feed` (an output slot's unknown layout or subtitle source) / `layout-not-admissible` (an output slot's or a mixer input's layout), missing Idempotency-Key, or not 1..=64 crosspoints (subtitle rules as on `/patch/plan`). A subtitle take re-points the output's subtitle route table at once; its outcome rides `route.output` as `subtitle:applied` or `subtitle:refused:not-in-run` (see the subtitle design note). */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -17281,7 +17313,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `engine-busy` (a mailbox is full: the key and leases are released, and a set's armed mixer half is refused; or a `{layout}` could not be read now: every layout-read slot is in use) or `idempotency-capacity` (also: 256 sets already await their outcome). */
+            /** @description `engine-busy` (a mailbox is full: the key and leases are released, and a set's armed mixer half is refused; or a `{layout}` could not be read now: every layout-read slot is in use; or the output clock did not adopt a newly registered mixer-input layout within 1 s) or `idempotency-capacity` (also: 256 sets already await their outcome). */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -20411,6 +20443,7 @@ export interface operations {
                     "application/json": components["schemas"]["SwitcherAccepted"];
                 };
             };
+            /** @description Not authorized for the M/E, Program scope, a referenced object, or (a `layout` select, or a CUT/AUTO whose Preview is `layout:<id>`) every source the stored layout binds; one generic refusal. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -20419,6 +20452,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description Switcher unavailable; `capacity` (a fifth stored layout as an M/E source, or a source it shows cannot be leased; key released); `layout-changed` (the stored layout was edited or deleted while this request was in flight; key released, retry); no source lease. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -20427,6 +20461,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description Invalid verb or references (exactly one of `source`/`input`/`layout` on a select; none on cut/auto), `not-on-an-input`, `unknown-slot`, `unknown-source` (no such stored layout), `layout-not-admissible` (another canvas, a translucent cell, or a nested layout/bus cell). */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -20435,6 +20470,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description `engine-busy`: the mailbox is full, a stored layout could not be read now, or the output clock did not adopt a newly registered layout within 1 s (key released). */
             503: {
                 headers: {
                     [name: string]: unknown;
