@@ -422,22 +422,77 @@ fn settle_workers(r: &OutputRouter, bound: std::time::Duration) {
     }
 }
 
-/// The calling thread's cumulative time runnable but waiting for a CPU
-/// (preempted), from `/proc/thread-self/schedstat` (Linux; field 2, ns).
-/// `None` elsewhere, so a caller then counts the whole wall time (strict, not
-/// preemption-corrected: the CI routing steps run on Linux, where
-/// [`a_slow_close_never_blocks_the_consumer`] requires this to be readable).
-/// Field 2 is `sched_info` run delay, kept whether or not the
-/// `kernel.sched_schedstats` sysctl is on.
-///
-/// A router call's wall time minus this is time it spent on a CPU or
-/// sleeping/blocked: a wait, timed join, sleep or spin is all still counted;
-/// only host preemption (#501: 83 ms on a loaded 2-core run with the router
-/// behaving correctly) is not.
-fn runqueue_wait() -> Option<std::time::Duration> {
-    let stat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
-    let ns = stat.split_whitespace().nth(1)?.parse::<u64>().ok()?;
-    Some(std::time::Duration::from_nanos(ns))
+/// The router's cost over a span of calls (maxima per call).
+#[derive(Clone, Copy, Debug, Default)]
+struct RouterCost {
+    /// Longest on-CPU time of one call.
+    on_cpu: std::time::Duration,
+    /// Longest wall time of one call that gave up its CPU to wait.
+    waited: std::time::Duration,
+    /// Calls that waited.
+    waits: u64,
+}
+
+/// One sample of the calling thread's scheduler accounting (Linux:
+/// `/proc/thread-self/schedstat` field 1, on-CPU ns, and
+/// `voluntary_ctxt_switches` in `/proc/thread-self/status`).
+#[derive(Clone, Copy)]
+struct ThreadTimes {
+    /// Time on a CPU.
+    on_cpu: std::time::Duration,
+    /// Times the thread gave up its CPU to wait (sleep, park, futex, join).
+    waits: u64,
+}
+
+impl ThreadTimes {
+    /// `None` off Linux or when unreadable.
+    fn sample() -> Option<Self> {
+        let stat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
+        let mut fields = stat.split_whitespace();
+        let on_cpu = fields.next()?.parse::<u64>().ok()?;
+        let status = std::fs::read_to_string("/proc/thread-self/status").ok()?;
+        let waits = status
+            .lines()
+            .find_map(|l| l.strip_prefix("voluntary_ctxt_switches:"))?
+            .trim()
+            .parse()
+            .ok()?;
+        Some(Self {
+            on_cpu: std::time::Duration::from_nanos(on_cpu),
+            waits,
+        })
+    }
+
+    /// The router's own cost of one call whose wall time `took` encloses
+    /// both samples (#501 reviews R2-R4): its on-CPU time, and, if it gave up
+    /// its CPU to wait (a sleep, timed join, park or contended lock), its
+    /// whole wall time. Host preemption of a call that never waited never
+    /// counts, wherever it lands (the #501 flake: 83 ms on a loaded 2-core
+    /// run with a correct router); on-CPU work (a spin) always counts. Off
+    /// Linux the wall time counts as a wait.
+    fn router_cost(
+        before: Option<Self>,
+        after: Option<Self>,
+        took: std::time::Duration,
+    ) -> RouterCost {
+        let (Some(b), Some(a)) = (before, after) else {
+            return RouterCost {
+                on_cpu: took,
+                waited: took,
+                waits: 1,
+            };
+        };
+        let waited = a.waits != b.waits;
+        RouterCost {
+            on_cpu: a.on_cpu.saturating_sub(b.on_cpu),
+            waited: if waited {
+                took
+            } else {
+                std::time::Duration::ZERO
+            },
+            waits: u64::from(waited),
+        }
+    }
 }
 
 fn pts(t: u64) -> MediaTime {
@@ -458,9 +513,9 @@ struct Harness {
     base_force: Arc<AtomicU64>,
     live: bool,
     max_router: std::time::Duration,
-    /// The longest router call, less the time the calling thread spent
-    /// runnable but not running (see [`runqueue_wait`]).
-    max_router_unqueued: std::time::Duration,
+    /// The router calls' own cost, never host preemption (see
+    /// [`ThreadTimes::router_cost`]).
+    router_cost: RouterCost,
     /// The pre-bake canvas handed to `publish_clean` per tick (kept alive so
     /// pointer identity is meaningful).
     clean: Vec<(u64, Arc<Nv12Image>)>,
@@ -561,7 +616,7 @@ fn harness_full(
         base_force,
         live: true,
         max_router: std::time::Duration::ZERO,
-        max_router_unqueued: std::time::Duration::ZERO,
+        router_cost: RouterCost::default(),
         clean: Vec::new(),
         aux_active,
         aux_sent,
@@ -643,23 +698,20 @@ impl Harness {
         self.clean.push((t, clean));
         // The baked Program picture, for a reformatted output's key (#342 B3).
         self.r.publish_program(t, &canvas());
-        // The wall interval encloses both runqueue reads, so only preemption
-        // inside the measured interval is subtracted, and the reads' own cost
-        // counts against the router (#501 review R3).
+        // #501: what the router itself spent, not the host (see
+        // [`ThreadTimes`]). The wall interval encloses both samples.
         let started = Instant::now();
-        let queued = runqueue_wait();
+        let before = ThreadTimes::sample();
         self.r
             .on_tick(t, pts(t), &mut self.d, &mut self.rec)
             .unwrap();
-        let requeued = runqueue_wait();
+        let after = ThreadTimes::sample();
         let took = started.elapsed();
         self.max_router = self.max_router.max(took);
-        let preempted = requeued
-            .zip(queued)
-            .map_or(std::time::Duration::ZERO, |(after, before)| {
-                after.saturating_sub(before)
-            });
-        self.max_router_unqueued = self.max_router_unqueued.max(took.saturating_sub(preempted));
+        let cost = ThreadTimes::router_cost(before, after, took);
+        self.router_cost.on_cpu = self.router_cost.on_cpu.max(cost.on_cpu);
+        self.router_cost.waited = self.router_cost.waited.max(cost.waited);
+        self.router_cost.waits += cost.waits;
         // A live worker encodes within the tick period.
         std::thread::sleep(std::time::Duration::from_millis(2));
         settle_workers(&self.r, self.settle);
@@ -1117,6 +1169,32 @@ struct HeldClose {
     release: std::sync::mpsc::Sender<()>,
 }
 
+/// Opens [`SlowFinish`] encoders, recording each one's [`HeldClose`].
+fn slow_finish_opener(held: &Arc<std::sync::Mutex<Vec<HeldClose>>>) -> OpenFn {
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let opened = Arc::clone(held);
+    Box::new(move |_| {
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let entered = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
+        opened.lock().unwrap().push(HeldClose {
+            entered: Arc::clone(&entered),
+            exited: Arc::clone(&exited),
+            release,
+        });
+        let e: Box<dyn LiveEncoder> = Box::new(SlowFinish {
+            inner: FakeEnc {
+                forced: false,
+                encoded: Arc::clone(&encoded),
+            },
+            entered,
+            exited,
+            release: std::sync::Mutex::new(gate),
+        });
+        Ok(e)
+    })
+}
+
 /// Test 6: closing an encoder whose finish never returns on its own never
 /// blocks the consumer (#501).
 ///
@@ -1128,9 +1206,10 @@ struct HeldClose {
 /// Bounded-wait part: a router that waits a bounded time on a close (a timed
 /// join, a sleep, a spin) would still tick on, so for EVERY close the longest
 /// router call from just before the close through its held window must stay
-/// under 50 ms, as before #501, but counted without the time the router
-/// thread was runnable and preempted ([`runqueue_wait`]). That time is the
-/// host, not the router: it was the whole #501 flake. Repeated over
+/// within the router's own cost bound ([`ThreadTimes::router_cost`]): a call
+/// that gave up its CPU to wait, under 50 ms of wall time as before #501;
+/// every call, under 20 ms on a CPU; host preemption of a call that never
+/// waited (the whole #501 flake) never counts. Repeated over
 /// [`SLOW_CLOSES`] closes so a wait on any one of them (the first, or one
 /// conditional on reaper state) fails.
 #[test]
@@ -1144,33 +1223,11 @@ fn a_slow_close_never_blocks_the_consumer() {
     // silently absent there.
     #[cfg(target_os = "linux")]
     assert!(
-        runqueue_wait().is_some(),
-        "/proc/thread-self/schedstat is unreadable: the router bound would measure the host"
+        ThreadTimes::sample().is_some(),
+        "/proc/thread-self schedstat/status unreadable: the router bound would measure the host"
     );
-    let encoded = Arc::new(AtomicUsize::new(0));
     let held: Arc<std::sync::Mutex<Vec<HeldClose>>> = Arc::default();
-    let (enc, opened) = (Arc::clone(&encoded), Arc::clone(&held));
-    let open: OpenFn = Box::new(move |_| {
-        let (release, gate) = std::sync::mpsc::channel::<()>();
-        let entered = Arc::new(AtomicBool::new(false));
-        let exited = Arc::new(AtomicBool::new(false));
-        opened.lock().unwrap().push(HeldClose {
-            entered: Arc::clone(&entered),
-            exited: Arc::clone(&exited),
-            release,
-        });
-        let e: Box<dyn LiveEncoder> = Box::new(SlowFinish {
-            inner: FakeEnc {
-                forced: false,
-                encoded: Arc::clone(&enc),
-            },
-            entered,
-            exited,
-            release: std::sync::Mutex::new(gate),
-        });
-        Ok(e)
-    });
-    let mut x = harness(2, 6, Some(open));
+    let mut x = harness(2, 6, Some(slow_finish_opener(&held)));
     x.tick(0);
     let mut t = 1;
     let mut windows = Vec::new();
@@ -1191,7 +1248,7 @@ fn a_slow_close_never_blocks_the_consumer() {
             assert!(t < by, "back on Program ({rep})");
         }
         // Run to the linger close; measure from before the close.
-        x.max_router_unqueued = std::time::Duration::ZERO;
+        x.router_cost = RouterCost::default();
         let close_by = t + LINGER_TICKS + 2;
         while x.h.snapshot().dynamic_encoders_live > 0 {
             x.tick(t);
@@ -1224,7 +1281,7 @@ fn a_slow_close_never_blocks_the_consumer() {
             !exited.load(Ordering::SeqCst),
             "the router ran {SLOW_FINISH_TICKS} ticks only after finish() returned: it waited on the close ({rep})"
         );
-        windows.push(x.max_router_unqueued);
+        windows.push(x.router_cost);
         held.lock().unwrap()[rep].release.send(()).unwrap();
         let done = Instant::now() + SETTLE_BOUND;
         while !exited.load(Ordering::SeqCst) {
@@ -1232,11 +1289,15 @@ fn a_slow_close_never_blocks_the_consumer() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
+    // A call that waited is held to the original 50 ms wall bound; every
+    // call's on-CPU time to 20 ms (a healthy call uses ~1 ms in a debug
+    // build), stricter than 50 ms of wall for any work the router does.
     assert!(
         windows
             .iter()
-            .all(|w| *w < std::time::Duration::from_millis(50)),
-        "a router call during a held close took >= 50 ms (preemption excluded): {windows:?}"
+            .all(|w| w.waited < std::time::Duration::from_millis(50)
+                && w.on_cpu < std::time::Duration::from_millis(20)),
+        "a router call during a held close waited >= 50 ms or ran >= 20 ms on a CPU: {windows:?}"
     );
     x.tick(t);
     t += 1;
@@ -1250,6 +1311,7 @@ fn a_slow_close_never_blocks_the_consumer() {
         0,
         "handed to the reaper, not dropped"
     );
+    eprintln!("slow-close windows: {windows:?}");
 }
 
 /// A live encoder that counts its live worker threads (the encoder is owned
