@@ -954,7 +954,10 @@ pub(crate) async fn delete_source(
     let _mutation = state.lock_config_mutation().await;
     let current = accepted_source(&state, &id)?;
     if_match.require(SOURCE_KIND, &id, current.version)?;
-    crate::boot_model::commit_resource(&state, "sources", &id, None, None).await?;
+    // Issue #519: the commit itself journals the removal with the caller once
+    // the rename is visible (also when it is indeterminate), because the
+    // in-memory audit log does not survive a restart.
+    crate::boot_model::delete_resource_as(&state, "sources", &id, &principal.key_id).await?;
     if let Err(error) = state.sources.delete(&id) {
         if state.boot_model.is_none() {
             return Err(error);
