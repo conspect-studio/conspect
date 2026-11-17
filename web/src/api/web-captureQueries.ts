@@ -1,6 +1,6 @@
 // React Query bindings for the web-capture (VT fill) surface: capability
 // discovery, submitting a capture job, and polling it to a terminal state.
-import { useMutation, useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type {
   UseMutationResult,
   UseQueryResult,
@@ -9,8 +9,11 @@ import type {
 import {
   cancelCapture,
   createCapture,
+  deleteFillRefresh,
   getCaptureCapabilities,
   getCaptureJob,
+  getFillRefresh,
+  putFillRefresh,
   isTerminalCaptureState,
   OperationApiError,
 } from './web-capture';
@@ -18,7 +21,9 @@ import type {
   CaptureBody,
   CaptureCapabilities,
   CreateCaptureAccepted,
+  FillRefreshStatus,
   JobView,
+  RefreshScheduleBody,
   RequestOptions,
 } from './web-capture';
 
@@ -28,9 +33,18 @@ export type {
   CaptureTerms,
   CaptureView,
   CreateCaptureAccepted,
+  FillRefreshStatus,
   JobView,
+  RefreshScheduleBody,
 } from './web-capture';
-export { OperationApiError, WINDY_TERMS_VERSION, isTerminalCaptureState, windyFillId } from './web-capture';
+export {
+  MAX_REFRESH_MINUTES,
+  MIN_REFRESH_MINUTES,
+  OperationApiError,
+  WINDY_TERMS_VERSION,
+  isTerminalCaptureState,
+  windyFillId,
+} from './web-capture';
 
 /** Connection options threaded into the web-capture hooks. */
 export interface WebCaptureContext {
@@ -129,5 +143,59 @@ export function useCancelCapture(
         ...options(context),
         ...(vars.idempotencyKey !== undefined ? { idempotencyKey: vars.idempotencyKey } : {}),
       }),
+  });
+}
+
+/** Stable React Query key for one fill's scheduled refresh status. */
+export function fillRefreshKey(fillId: string): readonly unknown[] {
+  return ['media-fills', 'refresh', fillId] as const;
+}
+
+/**
+ * Poll one fill's scheduled refresh status (`null` = no schedule): every ~5s
+ * while a run is in flight, otherwise every ~30s (the scheduler's own tick).
+ */
+export function useFillRefresh(
+  fillId: string | undefined,
+  context: WebCaptureContext = {},
+): UseQueryResult<FillRefreshStatus | null, OperationApiError> {
+  return useQuery<FillRefreshStatus | null, OperationApiError>({
+    queryKey: fillRefreshKey(fillId ?? ''),
+    queryFn: (): Promise<FillRefreshStatus | null> => {
+      if (fillId === undefined) return Promise.resolve(null);
+      return getFillRefresh(fillId, options(context));
+    },
+    enabled: fillId !== undefined,
+    refetchInterval: (query): number => (query.state.data?.in_flight === true ? 5000 : 30000),
+  });
+}
+
+/** Install or replace a fill's scheduled refresh (`PUT .../refresh`). */
+export function usePutFillRefresh(
+  context: WebCaptureContext = {},
+): UseMutationResult<
+  FillRefreshStatus,
+  OperationApiError,
+  { readonly fillId: string; readonly body: RefreshScheduleBody }
+> {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (vars): Promise<FillRefreshStatus> => putFillRefresh(vars.fillId, vars.body, options(context)),
+    onSuccess: (status, vars): void => {
+      client.setQueryData(fillRefreshKey(vars.fillId), status);
+    },
+  });
+}
+
+/** Stop a fill's scheduled refresh (`DELETE .../refresh`). */
+export function useDeleteFillRefresh(
+  context: WebCaptureContext = {},
+): UseMutationResult<void, OperationApiError, { readonly fillId: string }> {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (vars): Promise<void> => deleteFillRefresh(vars.fillId, options(context)),
+    onSuccess: (_void, vars): void => {
+      client.setQueryData(fillRefreshKey(vars.fillId), null);
+    },
   });
 }

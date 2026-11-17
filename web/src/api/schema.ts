@@ -1842,6 +1842,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/media/fills/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_fill_refresh"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/media/fills/{id}/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_fill_refresh"];
+        put: operations["put_fill_refresh"];
+        post?: never;
+        delete: operations["delete_fill_refresh"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/media/players": {
         parameters: {
             query?: never;
@@ -5523,6 +5555,55 @@ export interface components {
             /** @description The feed URL with credentials and query removed. */
             url: string;
         };
+        /** @description Public per-fill refresh status (no URL, credential or path). */
+        FillRefreshStatus: {
+            /**
+             * Format: int32
+             * @description Consecutive failed runs (drives the back-off).
+             */
+            consecutive_failures: number;
+            /** @description What the slot shows during a refresh (always `play_last` today). */
+            during_refresh: string;
+            /** @description Fill id. */
+            fill_id: string;
+            /** @description Whether a run is in flight. */
+            in_flight: boolean;
+            /** @description Artifact id of the last successful load. */
+            last_artifact_id?: string | null;
+            /**
+             * Format: int64
+             * @description Capture job id of the current or last run (owner-scoped).
+             */
+            last_capture_job_id?: number | null;
+            /** @description Last failure, cleared on success. */
+            last_error?: string | null;
+            /** @description Last successful native load (RFC 3339 UTC). */
+            last_success_at?: string | null;
+            /**
+             * Format: int32
+             * @description Refresh period in minutes.
+             */
+            minutes: number;
+            /** @description Next due time (RFC 3339 UTC); meaningful while idle. */
+            next_due?: string | null;
+            /** @description Whether the schedule survives a server restart (config: yes; API: no). */
+            persistent: boolean;
+            /** @description `idle`, `capturing` or `loading`. */
+            phase: string;
+            /** @description Target media player. */
+            player: string;
+            /** @description Origin of the schedule. */
+            source: components["schemas"]["FillSource"];
+            /** @description Landing intent of scheduled loads. */
+            then: components["schemas"]["LoadThen"];
+            /** @description A replacement schedule is staged and takes effect when the in-flight run ends. */
+            update_pending: boolean;
+        };
+        /**
+         * @description Where a scheduled fill came from.
+         * @enum {string}
+         */
+        FillSource: "config" | "api";
         /** @description The `202` body of a successful salvo fire. */
         FiredBody: {
             /** @description The queued action id (also the pending-action + audit correlation id). */
@@ -8154,6 +8235,23 @@ export interface components {
          * @enum {string}
          */
         RedactionReason: "secret" | "url";
+        /** @description Register (or replace) a runtime refresh schedule for one fill. */
+        RefreshScheduleBody: {
+            /**
+             * @description The capture submitted every run; `fill_id` must equal the path id and
+             *     `target_player` must name an existing player.
+             */
+            capture: components["schemas"]["CaptureBody"];
+            /**
+             * Format: int32
+             * @description Refresh period in minutes, 1 through 1440.
+             */
+            minutes: number;
+            /** @description Run the first refresh in the current slot instead of the next one. */
+            start_now?: boolean;
+            /** @description Landing intent of each scheduled load (default resume). */
+            then?: components["schemas"]["LoadThen"];
+        };
         /**
          * @description An IS-04 **registration request**: the `{type, data}` body posted to a
          *     Registry's `POST /x-nmos/registration/v1.3/resource`.
@@ -15559,6 +15657,196 @@ export interface operations {
                 };
             };
             /** @description Already finished or key conflict. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_fill_refresh: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Refresh status of every visible scheduled fill. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FillRefreshStatus"][];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to read. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_fill_refresh: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Fill id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Refresh status of one scheduled fill. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FillRefreshStatus"];
+                };
+            };
+            /** @description Not authorized for this fill. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No schedule for this fill. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_fill_refresh: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Fill id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RefreshScheduleBody"];
+            };
+        };
+        responses: {
+            /** @description Schedule installed; runs as the calling key. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FillRefreshStatus"];
+                };
+            };
+            /** @description Not authorized for this fill or player. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown target player. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Config-declared fill or schedule capacity reached. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid interval, body identity or terms. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_fill_refresh: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Fill id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Schedule removed; the current clip keeps playing. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not authorized for this fill. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No schedule for this fill. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Config-declared fill. */
             409: {
                 headers: {
                     [name: string]: unknown;
