@@ -579,6 +579,66 @@ describe('WindyFillDialog', () => {
     });
   });
 
+  async function submitAndCapture(): Promise<Record<string, unknown> | undefined> {
+    let capturedView: Record<string, unknown> | undefined;
+    server.use(
+      http.post('*/api/v1/media/captures', async ({ request }) => {
+        const body = (await request.json()) as { view?: Record<string, unknown> };
+        capturedView = body.view;
+        return HttpResponse.json({ job_id: 7, status_url: '/api/v1/media/captures/7' }, { status: 202 });
+      }),
+      http.get('*/api/v1/media/captures/7', () =>
+        HttpResponse.json({ job_id: 7, fill_id: 'vt-vt-1-windy', state: 'queued' })),
+    );
+    renderDialog();
+    await waitFor(() => {
+      expect(screen.getByLabelText(/accept the/i)).toBeEnabled();
+    });
+    await userEvent.click(screen.getByLabelText(/accept the/i));
+    await userEvent.click(screen.getByRole('button', { name: 'Capture' }));
+    await waitFor(() => {
+      expect(capturedView).toBeDefined();
+    });
+    return capturedView;
+  }
+
+  it('"Use Premium" is on by default when Premium is available and submits public:false', async () => {
+    server.use(capabilitiesHandler({ premium_available: true }));
+    const view = await submitAndCapture();
+    expect(screen.getByLabelText(/Use Premium \(authenticated\) capture/i)).toBeChecked();
+    expect(view).toMatchObject({ public: false });
+  });
+
+  it('submits the public view when Premium is not available', async () => {
+    server.use(capabilitiesHandler({ premium_available: false }));
+    const view = await submitAndCapture();
+    expect(view).toMatchObject({ public: true });
+  });
+
+  it('an operator can opt out of Premium even when it is available', async () => {
+    server.use(capabilitiesHandler({ premium_available: true }));
+    let capturedView: Record<string, unknown> | undefined;
+    server.use(
+      http.post('*/api/v1/media/captures', async ({ request }) => {
+        const body = (await request.json()) as { view?: Record<string, unknown> };
+        capturedView = body.view;
+        return HttpResponse.json({ job_id: 8, status_url: '/api/v1/media/captures/8' }, { status: 202 });
+      }),
+      http.get('*/api/v1/media/captures/8', () =>
+        HttpResponse.json({ job_id: 8, fill_id: 'vt-vt-1-windy', state: 'queued' })),
+    );
+    renderDialog();
+    await waitFor(() => {
+      expect(screen.getByLabelText(/Use Premium/i)).toBeChecked();
+    });
+    await userEvent.click(screen.getByLabelText(/Use Premium/i));
+    await userEvent.click(screen.getByLabelText(/accept the/i));
+    await userEvent.click(screen.getByRole('button', { name: 'Capture' }));
+    await waitFor(() => {
+      expect(capturedView).toMatchObject({ public: true });
+    });
+  });
+
   it('omits the Premium option when the server does not support it', async () => {
     server.use(capabilitiesHandler({ premium_available: false }));
     renderDialog();

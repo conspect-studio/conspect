@@ -23,7 +23,9 @@ use multiview_compositor::readback::SimulatedGpuControl;
 use multiview_core::color::ColorInfo;
 use multiview_core::layout::{Canvas, Layout};
 use multiview_core::time::Rational;
-use multiview_engine::keyer::{KeyerDraw, KeyerFly, KeyerParams, MAX_DSK};
+use multiview_engine::keyer::{
+    DrawRole, KeyerDraw, KeyerFamily, KeyerFly, KeyerParams, MAX_KEYERS,
+};
 use multiview_engine::{CompositedFrame, CompositorDrive, OutputClock, Tick};
 
 const SIDE: u32 = 16;
@@ -74,8 +76,8 @@ fn tick(index: u64) -> Tick {
 }
 
 /// One full-canvas self-keyed (linear) keyer of `fill` at `weight`.
-fn draws(fill: &Arc<Nv12Image>, weight: f32) -> [Option<KeyerDraw>; MAX_DSK] {
-    let mut out = [const { None }; MAX_DSK];
+fn draws(fill: &Arc<Nv12Image>, weight: f32) -> [Option<KeyerDraw>; MAX_KEYERS] {
+    let mut out = [const { None }; MAX_KEYERS];
     out[0] = Some(KeyerDraw {
         keyer: 0,
         fill: Arc::clone(fill),
@@ -92,6 +94,9 @@ fn draws(fill: &Arc<Nv12Image>, weight: f32) -> [Option<KeyerDraw>; MAX_DSK] {
             invert: false,
             mask: None,
         },
+        family: KeyerFamily::Dsk,
+        role: DrawRole::Top,
+        wipe: None,
     });
     out
 }
@@ -101,7 +106,7 @@ fn luma(frame: &CompositedFrame) -> u8 {
 }
 
 /// The reference picture of `draws` on the CPU backend.
-fn reference(draws: &mut [Option<KeyerDraw>; MAX_DSK]) -> u8 {
+fn reference(draws: &mut [Option<KeyerDraw>; MAX_KEYERS]) -> u8 {
     let mut cpu = drive(RunBackend::cpu());
     cpu.set_keyer_draws(draws);
     luma(&cpu.compose(tick(0)).unwrap())
@@ -110,7 +115,7 @@ fn reference(draws: &mut [Option<KeyerDraw>; MAX_DSK]) -> u8 {
 /// Start a slow keyed job under `first` that misses the clock's wait, then
 /// return the drive and its simulated GPU control.
 fn with_a_late_keyed_job(
-    first: &mut [Option<KeyerDraw>; MAX_DSK],
+    first: &mut [Option<KeyerDraw>; MAX_KEYERS],
 ) -> (CompositorDrive<Nv12Image>, SimulatedGpuControl) {
     let (backend, gpu) = RunBackend::simulated_gpu(Duration::ZERO).unwrap();
     gpu.set_cpu_fallback_cost(SLOW);
