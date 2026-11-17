@@ -3402,7 +3402,7 @@ impl CommandDrain {
         let unavailable = drive
             .store(player)
             .is_none()
-            .then(|| crate::source_rails::no_channel_reason(player));
+            .then(|| crate::live_sources::no_channel_reason(player));
         // A repoint (alias A -> B) replaces this id's entry with B's store; the
         // previous player's own entry is never touched.
         if id != player || drive.store(player).is_none() {

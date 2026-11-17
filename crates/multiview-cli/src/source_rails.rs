@@ -66,11 +66,7 @@ pub const fn is_alias(kind: &SourceKind) -> bool {
     matches!(kind, SourceKind::MediaPlayer { .. })
 }
 
-/// The status detail of an alias whose player has no channel in this run.
-#[must_use]
-pub fn no_channel_reason(player: &str) -> String {
-    format!("media player {player:?} has no channel in this run; it shows no picture")
-}
+pub use crate::live_sources::no_channel_reason;
 
 /// Catalogue a `media_player` alias with its player's `store` (ADR-M012), so
 /// demand reports it and a consumer can lease it. `unavailable` is set when

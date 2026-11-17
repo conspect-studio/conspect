@@ -929,6 +929,13 @@ fn preview_remove(preview: &SharedStores, id: &str) {
     });
 }
 
+/// The status detail of a `media_player` alias whose player has no channel in
+/// this run (ADR-M012). Feature-independent: the drain computes it on every build.
+#[must_use]
+pub fn no_channel_reason(player: &str) -> String {
+    format!("media player {player:?} has no channel in this run; it shows no picture")
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
