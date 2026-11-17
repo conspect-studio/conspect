@@ -1013,3 +1013,35 @@ fn an_arm_bound_to_older_definitions_is_refused_and_arms_nothing() {
         "nothing was armed"
     );
 }
+
+/// Review round 4 (K3-R3-2): an `arm` on an idle machine stages only the
+/// previous arm set (no `SwitcherState` clone on the clock). A rejected
+/// frame still restores that set and the arm version exactly, alone and
+/// when a full stage follows in the same tick.
+#[test]
+fn a_rejected_frame_restores_an_arm_staged_without_a_machine_clone() {
+    let rig = rig();
+    let (handle, mut hook, mut drive) = build(&rig, &[usk("usk1", "gfx", 1, Some(FLY))]);
+    fresh(&rig, 0);
+    step(&mut hook, &mut drive, 0);
+    let before = handle.snapshot().unwrap();
+    let t1 = rig::tick(1);
+    for with_full_stage in [false, true] {
+        handle.try_send(cmd("arm", arm(false, &[1]))).unwrap();
+        if with_full_stage {
+            handle
+                .try_send(cmd(
+                    "mix",
+                    transition(serde_json::json!({"kind": "mix", "rate": 4})),
+                ))
+                .unwrap();
+        }
+        hook.driver.drain_at_tick(t1);
+        hook.driver.reject_composed_tick(t1, "compose failed");
+    }
+    fresh(&rig, 2);
+    step(&mut hook, &mut drive, 2);
+    let after = handle.snapshot().unwrap();
+    assert_eq!(after.next, before.next, "the arm set is restored");
+    assert_eq!(after.arm_version, before.arm_version, "and its version");
+}

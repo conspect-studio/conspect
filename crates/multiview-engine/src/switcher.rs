@@ -144,6 +144,16 @@ impl SwitcherState {
     pub fn armed(&self) -> &ArmedSet {
         &self.armed
     }
+    /// The shared arm set (an `Arc` clone restores it without allocating).
+    #[must_use]
+    pub fn armed_shared(&self) -> &Arc<ArmedSet> {
+        &self.armed
+    }
+    /// Put back an arm set captured by [`Self::armed_shared`] (a rejected
+    /// tick's rollback; no validation: it was valid when captured).
+    pub fn restore_armed(&mut self, armed: Arc<ArmedSet>) {
+        self.armed = armed;
+    }
     /// The selected transition descriptor: the operator's selection, which
     /// an AUTO's own rate never replaces (ADR-0112 §4).
     #[must_use]

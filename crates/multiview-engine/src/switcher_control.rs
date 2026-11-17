@@ -439,6 +439,7 @@ impl SwitcherControl {
             staged_success: Vec::with_capacity(MAX_COMMANDS_PER_TICK),
             spare_success: Vec::with_capacity(MAX_COMMANDS_PER_TICK),
             before_staged: None,
+            before_arm: None,
             inputs: None,
             inputs_version: 0,
             published_inputs_version: 0,
@@ -719,6 +720,10 @@ pub struct SwitcherTickDriver {
     staged_success: Vec<String>,
     spare_success: Vec<String>,
     before_staged: Option<Staged>,
+    /// The arm set and version before this tick's first `arm`, when nothing
+    /// else staged the full machine (review K3-R3-2): an `arm` only moves an
+    /// `Arc`, so restoring it needs no `SwitcherState` clone on the clock.
+    before_arm: Option<(Arc<multiview_core::switcher::ArmedSet>, u64)>,
     /// Numbered mixer inputs (§12.2); `None` = PGM/PVW select sources by id.
     inputs: Option<MixerInputs>,
     inputs_version: u64,
@@ -1535,7 +1540,13 @@ impl SwitcherTickDriver {
                 } else if armed.keys.iter().any(|&k| !self.keyers.usk_defined(k)) {
                     Err(REFUSE_ARM_UNKNOWN_KEY.to_owned())
                 } else {
-                    self.stage();
+                    // Allocation-free staging (review K3-R3-2): a full stage
+                    // already covers the arm; otherwise keep only the
+                    // previous set (an `Arc` clone) and version.
+                    if self.before_staged.is_none() && self.before_arm.is_none() {
+                        self.before_arm =
+                            Some((Arc::clone(self.machine.armed_shared()), self.arm_version));
+                    }
                     self.machine.arm_shared(armed).map_err(|e| e.to_string())
                 };
                 match result {
@@ -1931,6 +1942,7 @@ impl SwitcherTickDriver {
     /// call this; failure calls `reject_composed_tick` instead.
     pub fn commit_composed_tick(&mut self, tick: Tick) {
         self.before_staged = None;
+        self.before_arm = None;
         // The armed patch composed on this tick: the set is committed at T
         // (its outcome rides this tick's applied receipts).
         if self
@@ -2058,6 +2070,7 @@ impl SwitcherTickDriver {
                 let _ = armed.arm.abort_apply();
             }
         }
+        let before_arm = self.before_arm.take();
         if let Some(previous) = self.before_staged.take() {
             self.machine = previous.machine;
             self.active_auto = previous.active_auto;
@@ -2067,6 +2080,13 @@ impl SwitcherTickDriver {
                 self.inputs = Some(table);
                 self.inputs_version = version;
             }
+        }
+        // An `arm` staged without a full stage (review K3-R3-2). A full stage
+        // taken later in the same tick captured the machine AFTER that arm,
+        // so the arm set and version are restored last, over it.
+        if let Some((armed, version)) = before_arm {
+            self.machine.restore_armed(armed);
+            self.arm_version = version;
         }
         // A rejected frame aborts any AUTO: Program stays on the source the
         // restored machine names, which the hook re-binds.
