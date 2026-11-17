@@ -94,6 +94,8 @@ pub(crate) enum Command {
 struct OutputRegistration {
     max_viewers: u32,
     feed: EgressFeed,
+    /// Which registration this is (see [`WhepServeHandle::register_output_generation`]).
+    generation: u64,
 }
 
 /// A handle the WHEP control provider uses to negotiate / release viewer sessions
@@ -208,15 +210,31 @@ impl WhepServeHandle {
     /// at run start (the cli's sink runner owns the paired
     /// [`EgressSink`](crate::egress::EgressSink)).
     pub fn register_output(&self, output_id: &str, max_viewers: u32, feed: EgressFeed) {
+        let _ = self.register_output_generation(output_id, max_viewers, feed);
+    }
+
+    /// [`Self::register_output`], returning the registration's generation
+    /// so that only its owner can remove it
+    /// ([`Self::unregister_output_generation`]).
+    pub fn register_output_generation(
+        &self,
+        output_id: &str,
+        max_viewers: u32,
+        feed: EgressFeed,
+    ) -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let generation = NEXT.fetch_add(1, Ordering::AcqRel);
         if let Ok(mut outputs) = self.inner.outputs.lock() {
             outputs.insert(
                 output_id.to_owned(),
                 OutputRegistration {
                     max_viewers: max_viewers.max(1),
                     feed,
+                    generation,
                 },
             );
         }
+        generation
     }
 
     /// Negotiate a WHEP viewer session for `output_id` from the player's SDP
@@ -402,11 +420,17 @@ impl WhepServeHandle {
         true
     }
 
-    /// Remove output `output_id`'s registration (the cast rung's last viewer
-    /// left); its viewers are ended by the driver as their feed is gone.
-    pub fn unregister_output(&self, output_id: &str) {
+    /// Remove output `output_id`'s registration `generation` (the cast rung's
+    /// last viewer left), never a newer one; its viewers are ended by the
+    /// driver as their feed is gone.
+    pub fn unregister_output_generation(&self, output_id: &str, generation: u64) {
         if let Ok(mut outputs) = self.inner.outputs.lock() {
-            outputs.remove(output_id);
+            if outputs
+                .get(output_id)
+                .is_some_and(|r| r.generation == generation)
+            {
+                outputs.remove(output_id);
+            }
         }
     }
 

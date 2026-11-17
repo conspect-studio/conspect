@@ -1360,7 +1360,9 @@ serves it.
 **One feed per cast output** (`multiview-cli` `cast_webrtc`). The first viewer of a cast output starts it: one
 effective-output registry subscription, one off-clock thread, ONE Opus encoder (96 kbit/s, `PROGRAM_OPUS_BIT_RATE`)
 and one egress feed registered on the shared WHEP-serve lane (the UDP 443 socket and its ICE-TCP candidates, as a
-`webrtc` output's viewers). It stops when its last viewer is fenced. The registry cost is therefore one
+`webrtc` output's viewers). The feed thread retires itself 2 s after its last viewer was fenced (DELETE, revoke, a
+dead session), releasing the subscription, the encoder and only its own lane registration (a generation number).
+An offer reserves the feed before it negotiates, so a retiring feed is never handed a new viewer. The registry cost is therefore one
 subscription per cast output with viewers, as decision 6 says, shared with the desk's 16.
 
 **Audio.** The Opus encoder is fed by decoding the output's own program AAC (the encoded slot every other rung
@@ -1368,17 +1370,22 @@ carries), not from a second audio tap. Two reasons: the AAC packet carries the e
 (the open question of decision 2, item 3, is settled without new engine code), and the content identity of the
 audio WebRTC carries is the one the gate already judges. The decoded blocks wait in a tap of at most 8 blocks
 (decision 6); the encoder is seeded with the engine time of its first block and stamps from its own sample counter
-after it, so its RTP time is `floor(E * 48000 / 1e6) mod 2^32`. Discrete tracks are not carried on this rung.
+after it, so its RTP time is `floor(E * 48000 / 1e6) mod 2^32`. A gap in the audio (a dropped window, a decode error, a
+block dropped from the tap) re-seeds the encoder at the next block's own engine time, so the Opus timeline never
+compresses a gap. Discrete tracks are not carried on this rung.
 
 **The gate at the driver's write.** The feed thread judges each window with every viewer's attachment
 (`CastAttachment::admit_window`, the same gate as MoQ, audio packets at their first and last sample) and marks the
 window passed per viewer. Every sample pushed to the egress feed carries its window's sequence number; the driver
-writes a sample to a viewer only when that viewer's attachment passed that window
-(`CastAttachment::may_write`, one atomic load). A fenced viewer's session is disconnected at the next driver tick
+writes a sample to a viewer only when that viewer's attachment passed that window: the attachment records the first
+and the last window it passed, and a viewer that joined later is never written an older queued window
+(`CastAttachment::may_write`, two atomic loads). An Opus packet carries the OLDEST window any of its input samples
+came from (staging and codec look-ahead included), so a new viewer is never written audio of a window it did not
+judge. A fenced viewer's session is disconnected at the next driver tick
 (DTLS close, not drained); a dead session fences its attachment. One viewer refused does not stop the others.
 
-**RTP and RTCP.** Video `R = floor(E * 90000 / 1e6) mod 2^32` from the tick-derived PTS
-(`EgressMedia::rtp_timestamp`, the rtpwrap helper); str0m adds no offset (test
+**RTP and RTCP.** Video `R = floor(E * 90000 / 1e6) mod 2^32` with `E` the tick-derived PTS in µs, floored (so at
+29.97 fps tick 1 is `R = 3002`, the value the receiver's inverse map expects); str0m adds no offset (test
 `the_cast_write_path_sends_the_given_rtp_timestamp_without_offset` reads the sent packet, across 2^32, and fails
 with a one-tick offset injected). The RTCP sender-report wallclock of both streams is the epoch's wall time of the
 sample's `E`, mapped onto the monotonic clock str0m takes (`Session::write_sample_at`); without a validated epoch it

@@ -27,7 +27,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use multiview_control::cast_streams::identity::{CastAttachment, Component, GateRefusal};
@@ -44,6 +43,10 @@ pub const OPUS_TAP_BLOCKS: usize = 8;
 /// Viewers per cast output (one token has at most two `WebRTC` attachments;
 /// the run has at most 32 tokens).
 pub const MAX_CAST_VIEWERS: u32 = 64;
+/// Opus look-ahead in samples at 48 kHz (libopus: 312; the native encoder's
+/// is smaller): input this far before a packet's first sample may be coded
+/// into it.
+const OPUS_LOOKAHEAD: i64 = 960;
 /// How long the feed thread parks between empty polls.
 const FEED_PARK: Duration = Duration::from_millis(5);
 
@@ -62,21 +65,29 @@ impl ViewerGate for Gate {
     }
 }
 
-/// One cast output's feed while it has viewers.
+/// One cast output's feed while it has viewers. The worker thread owns its
+/// retirement (PR 521 review): it ends itself once no viewer is live and no
+/// admission is in flight, and marks `done`; the control plane only forgets
+/// finished feeds and never joins under a lock.
 struct Feed {
     viewers: Arc<Mutex<Vec<Arc<CastAttachment>>>>,
+    /// Admissions in flight (an offer being negotiated): the worker does not
+    /// retire while one is pending.
+    pending: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
+    done: Arc<AtomicBool>,
 }
 
 impl Drop for Feed {
     fn drop(&mut self) {
+        // Detached: the worker sees `stop` within one park and exits.
         self.stop.store(true, Ordering::Release);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
     }
 }
+
+/// How long a feed with no live viewer lingers before it retires (a
+/// receiver re-attaching after a step-down keeps its encoder).
+const FEED_LINGER: Duration = Duration::from_secs(2);
 
 /// Counters a test or the status reads.
 #[derive(Debug, Default)]
@@ -126,32 +137,17 @@ impl CliCastWebRtc {
         self.feeds.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Forget feeds whose viewers are all fenced (closes their Opus encoder
-    /// and their registry subscription).
+    /// Forget feeds whose worker retired (it unregistered itself).
     fn prune(&self) {
-        let mut gone = Vec::new();
-        {
-            let mut feeds = self.feeds();
-            feeds.retain(|id, feed| {
-                let live = feed.viewers.lock().is_ok_and(|mut v| {
-                    v.retain(|a| !a.is_fenced());
-                    !v.is_empty()
-                });
-                if !live {
-                    gone.push(id.clone());
-                }
-                live
-            });
-        }
-        for id in gone {
-            self.handle.unregister_output(&id);
-        }
+        self.feeds()
+            .retain(|_, feed| !feed.done.load(Ordering::Acquire));
     }
 
     fn start_feed(&self, config_id: &str) -> Result<Feed, CastWhepReject> {
         let factory = self.windows.load().ok_or(CastWhepReject::Unavailable)?;
+        let scope = multiview_control::WhepScope::Output(config_id.to_owned());
         let binding = factory
-            .resolve(&multiview_control::WhepScope::Output(config_id.to_owned()))
+            .resolve(&scope)
             .map_err(|_| CastWhepReject::Unavailable)?;
         let epoch = self
             .epochs
@@ -161,16 +157,17 @@ impl CliCastWebRtc {
             .map(|e| e.epoch.clone())
             .ok_or(CastWhepReject::Unavailable)?;
         let subscription = factory
-            .subscribe(
-                &multiview_control::WhepScope::Output(config_id.to_owned()),
-                binding.config_generation,
-            )
+            .subscribe(&scope, binding.config_generation)
             .map_err(|_| CastWhepReject::Unavailable)?;
         let (sink, feed) = egress_feed();
-        self.handle
-            .register_output(config_id, MAX_CAST_VIEWERS, feed);
+        let generation = self
+            .handle
+            .register_output_generation(config_id, MAX_CAST_VIEWERS, feed);
         let viewers = Arc::new(Mutex::new(Vec::new()));
+        // The admission that starts the feed is pending from the start.
+        let pending = Arc::new(AtomicU64::new(1));
         let stop = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
         let worker = FeedWorker::new(
             &binding,
             subscription,
@@ -179,19 +176,74 @@ impl CliCastWebRtc {
             epoch,
             Arc::clone(&self.stats),
         );
+        let retire = Retire {
+            handle: Some(self.handle.clone()),
+            output: config_id.to_owned(),
+            generation,
+            pending: Arc::clone(&pending),
+            done: Arc::clone(&done),
+        };
         let thread_stop = Arc::clone(&stop);
-        let join = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("cast-webrtc-feed".to_owned())
-            .spawn(move || worker.run(&thread_stop))
+            .spawn(move || {
+                worker.run(&thread_stop, &retire);
+                retire.finish();
+            })
             .map_err(|_| {
-                self.handle.unregister_output(config_id);
+                self.handle
+                    .unregister_output_generation(config_id, generation);
                 CastWhepReject::Unavailable
             })?;
         Ok(Feed {
             viewers,
+            pending,
             stop,
-            join: Some(join),
+            done,
         })
+    }
+}
+
+/// `pending` of a retired feed: no admission may reserve it again.
+const CLOSED: u64 = u64::MAX;
+
+/// Reserve one admission on a feed unless it is closed.
+fn reserve(pending: &AtomicU64) -> bool {
+    let mut n = pending.load(Ordering::Acquire);
+    loop {
+        if n == CLOSED {
+            return false;
+        }
+        match pending.compare_exchange_weak(
+            n,
+            n.saturating_add(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(seen) => n = seen,
+        }
+    }
+}
+
+/// What a feed worker needs to retire itself.
+struct Retire {
+    /// `None` in the test seam (no WHEP lane).
+    handle: Option<WhepServeHandle>,
+    output: String,
+    generation: u64,
+    pending: Arc<AtomicU64>,
+    done: Arc<AtomicBool>,
+}
+
+impl Retire {
+    fn finish(&self) {
+        // Only this feed's registration: a newer feed of the same output
+        // registered meanwhile keeps its own.
+        if let Some(handle) = &self.handle {
+            handle.unregister_output_generation(&self.output, self.generation);
+        }
+        self.done.store(true, Ordering::Release);
     }
 }
 
@@ -210,52 +262,53 @@ impl CastWebRtc for CliCastWebRtc {
         attachment: Arc<CastAttachment>,
     ) -> Result<CastWhepAnswer, CastWhepReject> {
         self.prune();
-        let viewers = {
+        // Reserve the admission under the lock (the worker never retires
+        // while one is pending), then negotiate outside it.
+        let (viewers, pending) = {
             let mut feeds = self.feeds();
-            if !feeds.contains_key(config_id) {
+            let live = feeds
+                .get(config_id)
+                .filter(|f| !f.done.load(Ordering::Acquire) && !f.stop.load(Ordering::Acquire));
+            if live.is_some_and(|feed| reserve(&feed.pending)) {
+            } else {
                 let feed = self.start_feed(config_id)?;
                 feeds.insert(config_id.to_owned(), feed);
             }
-            feeds
-                .get(config_id)
-                .map(|f| Arc::clone(&f.viewers))
-                .ok_or(CastWhepReject::Unavailable)?
+            let feed = feeds.get(config_id).ok_or(CastWhepReject::Unavailable)?;
+            (Arc::clone(&feed.viewers), Arc::clone(&feed.pending))
         };
         let gate: Arc<dyn ViewerGate> = Arc::new(Gate(Arc::clone(&attachment)));
-        let answer = match self.handle.negotiate_cast(config_id, offer, gate) {
-            Ok(answer) => answer,
+        let result = self.handle.negotiate_cast(config_id, offer, gate);
+        let outcome = match result {
+            Ok(answer) => {
+                let session_id = answer.session_id.to_string();
+                let handle = self.handle.clone();
+                let (output, session) = (config_id.to_owned(), session_id.clone());
+                attachment.set_closer(Box::new(move || {
+                    let _ = handle.release(&output, &session);
+                }));
+                viewers
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(attachment);
+                Ok(CastWhepAnswer {
+                    session_id,
+                    sdp: answer.answer_sdp,
+                })
+            }
             Err(
                 multiview_webrtc::WebRtcError::MalformedSdp(_)
                 | multiview_webrtc::WebRtcError::NoCompatibleCodec,
-            ) => {
-                self.prune();
-                return Err(CastWhepReject::Offer);
-            }
-            Err(_) => {
-                self.prune();
-                return Err(CastWhepReject::Unavailable);
-            }
+            ) => Err(CastWhepReject::Offer),
+            Err(_) => Err(CastWhepReject::Unavailable),
         };
-        let session_id = answer.session_id.to_string();
-        let handle = self.handle.clone();
-        let (output, session) = (config_id.to_owned(), session_id.clone());
-        attachment.set_closer(Box::new(move || {
-            let _ = handle.release(&output, &session);
-        }));
-        viewers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(attachment);
-        Ok(CastWhepAnswer {
-            session_id,
-            sdp: answer.answer_sdp,
-        })
+        // The viewer (if any) is in the list before the reservation ends.
+        pending.fetch_sub(1, Ordering::AcqRel);
+        outcome
     }
 
     fn release(&self, config_id: &str, session_id: &str) -> bool {
-        let released = self.handle.release(config_id, session_id);
-        self.prune();
-        released
+        self.handle.release(config_id, session_id)
     }
 }
 
@@ -270,14 +323,24 @@ pub(crate) fn spawn_feed_for_test(
     epoch: multiview_output::SharedEpoch,
     stats: Arc<CastWebRtcStats>,
     stop: Arc<AtomicBool>,
-) -> JoinHandle<()> {
+) -> std::thread::JoinHandle<()> {
     let scope = multiview_control::WhepScope::Output(config_id.to_owned());
     let binding = factory.resolve(&scope).unwrap();
     let subscription = factory
         .subscribe(&scope, binding.config_generation)
         .unwrap();
     let worker = FeedWorker::new(&binding, subscription, sink, viewers, epoch, stats);
-    std::thread::spawn(move || worker.run(&stop))
+    let retire = Retire {
+        handle: None,
+        output: config_id.to_owned(),
+        generation: 0,
+        pending: Arc::new(AtomicU64::new(0)),
+        done: Arc::new(AtomicBool::new(false)),
+    };
+    std::thread::spawn(move || {
+        worker.run(&stop, &retire);
+        retire.finish();
+    })
 }
 
 /// The off-clock thread of one cast output's feed.
@@ -295,9 +358,15 @@ struct FeedWorker {
     opus: Option<multiview_ffmpeg::OpusEncoder>,
     /// Engine media time (µs) of the Opus encoder's sample 0.
     opus_base_us: Option<i64>,
-    /// The decoded blocks waiting for the encoder (at most
-    /// [`OPUS_TAP_BLOCKS`]; the oldest is dropped).
-    tap: std::collections::VecDeque<(i64, Vec<f32>)>,
+    /// The decoded blocks waiting for the encoder, with their engine time
+    /// and window (at most [`OPUS_TAP_BLOCKS`]; the oldest is dropped).
+    tap: std::collections::VecDeque<(i64, u64, Vec<f32>)>,
+    /// Samples given to the Opus encoder since it was seeded.
+    fed: i64,
+    /// `(first encoder sample, window)` of every block given to the encoder
+    /// that a coming packet can still contain (bounded: pruned as packets
+    /// are emitted; at most a few blocks of staging and look-ahead).
+    provenance: std::collections::VecDeque<(i64, u64)>,
     window: u64,
     held: Option<crate::output_window_registry::SubscriptionWindow>,
 }
@@ -337,14 +406,36 @@ impl FeedWorker {
             opus: None,
             opus_base_us: None,
             tap: std::collections::VecDeque::with_capacity(OPUS_TAP_BLOCKS),
+            fed: 0,
+            provenance: std::collections::VecDeque::with_capacity(OPUS_TAP_BLOCKS),
             window: 0,
             held: None,
         }
     }
 
-    fn run(mut self, stop: &AtomicBool) {
+    fn run(mut self, stop: &AtomicBool, retire: &Retire) {
+        let mut idle_since: Option<Instant> = None;
         loop {
             if stop.load(Ordering::Acquire) {
+                break;
+            }
+            // Retire once no viewer is live and no admission is pending, for
+            // FEED_LINGER (the last viewer's DELETE, revoke or death).
+            let live = {
+                let mut viewers = self.viewers.lock().unwrap_or_else(PoisonError::into_inner);
+                viewers.retain(|v| !v.is_fenced());
+                !viewers.is_empty()
+            };
+            if live || retire.pending.load(Ordering::Acquire) > 0 {
+                idle_since = None;
+            } else if idle_since.get_or_insert_with(Instant::now).elapsed() >= FEED_LINGER
+                && retire
+                    .pending
+                    .compare_exchange(0, CLOSED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                // Closed atomically: no admission can reserve this feed now
+                // (`reserve` refuses CLOSED), and none was pending.
                 break;
             }
             let next = match self.held.take() {
@@ -466,7 +557,9 @@ impl FeedWorker {
         let media_us = micros_of(pts, self.video);
         let sample = EgressSample {
             media: EgressMedia::Video,
-            rtp_timestamp: EgressMedia::Video.rtp_timestamp(pts, self.video),
+            // Decision 2: `R = floor(E * 90000 / 1e6) mod 2^32`, from `E`
+            // itself (the receiver maps `R` back with the same formula).
+            rtp_timestamp: rtp_of_micros(media_us, 90_000),
             keyframe: packet.is_keyframe(),
             data: data.to_vec(),
             cast: Some(self.stamp(media_us, seq)),
@@ -485,40 +578,93 @@ impl FeedWorker {
             return;
         };
         let Ok(pcm) = decoder.decode_interleaved(packet) else {
+            // A decode error is a gap: the next block re-seeds.
+            self.reset_opus();
             return;
         };
         if pcm.is_empty() {
             return;
         }
         if self.tap.len() >= OPUS_TAP_BLOCKS {
+            // A dropped block is a gap too (never concatenated across).
             self.tap.pop_front();
+            self.reset_opus();
         }
-        self.tap.push_back((micros_of(pts, base), pcm));
-        if self.opus.is_none() {
-            let Ok(encoder) =
-                multiview_ffmpeg::OpusEncoder::new(multiview_ffmpeg::opus::PROGRAM_OPUS_BIT_RATE)
-            else {
+        self.tap.push_back((micros_of(pts, base), seq, pcm));
+        self.drain_tap();
+    }
+
+    /// Drop the Opus encoder and its staging (a gap in the audio: the
+    /// next block re-seeds it at that block's own engine time, so the Opus
+    /// timeline never compresses a gap; PR 521 review).
+    fn reset_opus(&mut self) {
+        if self.opus.take().is_some() {
+            self.stats.opus_closed.fetch_add(1, Ordering::AcqRel);
+        }
+        self.opus_base_us = None;
+        self.fed = 0;
+        self.provenance.clear();
+    }
+
+    /// Encode what the tap holds. Each block's engine time is checked
+    /// against the encoder's running sample position; a mismatch beyond
+    /// one sample is a gap and re-seeds the encoder. Every Opus packet is
+    /// stamped with the OLDEST window any of its input samples (staging and
+    /// codec delay included) came from, so a viewer that joined later is
+    /// never written audio of a window it did not judge.
+    fn drain_tap(&mut self) {
+        let epoch = self.epoch.clone();
+        while let Some((block_us, seq, block)) = self.tap.pop_front() {
+            if let Some(base_us) = self.opus_base_us {
+                let expected = base_us.saturating_add(self.fed.saturating_mul(1_000_000) / 48_000);
+                if (block_us - expected).abs() > 1_000_000 / 48_000 + 1 {
+                    self.reset_opus();
+                }
+            }
+            if self.opus.is_none() {
+                let Ok(encoder) = multiview_ffmpeg::OpusEncoder::new(
+                    multiview_ffmpeg::opus::PROGRAM_OPUS_BIT_RATE,
+                ) else {
+                    return;
+                };
+                self.stats.opus_opened.fetch_add(1, Ordering::AcqRel);
+                self.opus = Some(encoder);
+                self.opus_base_us = Some(block_us);
+            }
+            let Some(base_us) = self.opus_base_us else {
                 return;
             };
-            self.stats.opus_opened.fetch_add(1, Ordering::AcqRel);
-            self.opus = Some(encoder);
-            self.opus_base_us = self.tap.front().map(|(us, _)| *us);
-        }
-        let Some(base_us) = self.opus_base_us else {
-            return;
-        };
-        let epoch = self.epoch.clone();
-        while let Some((_, block)) = self.tap.pop_front() {
+            let frames = i64::try_from(block.len() / 2).unwrap_or(0);
+            self.provenance.push_back((self.fed, seq));
+            self.fed = self.fed.saturating_add(frames);
             let Some(opus) = self.opus.as_mut() else {
                 return;
             };
             if opus.push_interleaved_f32(&block).is_err() {
+                self.reset_opus();
                 return;
             }
+            let mut coded_out = Vec::new();
             while let Ok(Some(coded)) = opus.receive_packet() {
+                coded_out.push(coded);
+            }
+            for coded in coded_out {
                 // The encoder's own sample counter from `base_us`.
                 let offset = coded.pts().unwrap_or(0);
                 let media_us = base_us.saturating_add(offset.saturating_mul(1_000_000) / 48_000);
+                // Input that can be inside this packet: from its first sample
+                // less the codec look-ahead, to its end.
+                let first = offset.saturating_sub(OPUS_LOOKAHEAD);
+                let window = self.oldest_window_from(first);
+                // Forget provenance no later packet can reach.
+                while self.provenance.len() > 1
+                    && self
+                        .provenance
+                        .get(1)
+                        .is_some_and(|(start, _)| *start <= first)
+                {
+                    self.provenance.pop_front();
+                }
                 let Some(data) = coded.payload() else {
                     continue;
                 };
@@ -528,13 +674,24 @@ impl FeedWorker {
                     keyframe: false,
                     data: data.to_vec(),
                     cast: Some(CastStamp {
-                        window: seq,
+                        window,
                         wallclock: wallclock_of(&epoch, media_us),
                     }),
                 };
                 let _ = self.sink.push(sample);
             }
         }
+    }
+
+    /// The oldest window whose samples start at or after `first` can
+    /// overlap — the window of the block containing sample `first`.
+    fn oldest_window_from(&self, first: i64) -> u64 {
+        self.provenance
+            .iter()
+            .rev()
+            .find(|(start, _)| *start <= first)
+            .or_else(|| self.provenance.front())
+            .map_or(0, |(_, seq)| *seq)
     }
 }
 
@@ -550,9 +707,14 @@ fn tick_of(pts: i64, base: Rational, cadence: Rational) -> Option<u64> {
     u64::try_from(num.div_euclid(den)).ok()
 }
 
-/// Engine media time `E` in µs of `pts` in `base` (exact integer floor).
+/// Engine media time `E` in µs of `pts` in `base` (exact integer floor;
+/// decision 2: `E` is the PTS in µs, truncated).
 fn micros_of(pts: i64, base: Rational) -> i64 {
-    multiview_core::time::rescale(pts, base, Rational::new(1, 1_000_000))
+    let num = i128::from(pts)
+        .saturating_mul(i128::from(base.num))
+        .saturating_mul(1_000_000);
+    let den = i128::from(base.den.max(1));
+    i64::try_from(num.div_euclid(den)).unwrap_or(i64::MAX)
 }
 
 /// `R = floor(E * clock / 1e6) mod 2^32` (decision 2).
@@ -610,14 +772,178 @@ mod tests {
         let before = rtp_of_micros(wrap_us - 20_000, 48_000);
         let after = rtp_of_micros(wrap_us + 20_000, 48_000);
         assert_eq!(after.wrapping_sub(before), 1920);
-        // The video path's helper agrees with the formula for a tick PTS.
-        let fps = Rational::new(1, 25);
-        for tick in [0_i64, 1, 1_000_000, 1_193_046] {
-            assert_eq!(
-                EgressMedia::Video.rtp_timestamp(tick, fps),
-                rtp_of_micros(micros_of(tick, fps), 90_000)
-            );
+        // Fractional cadences (PR 521 review): E is floored to µs first,
+        // then R is floored: 30 fps tick 1 is E = 33 333 µs, R = 2 999;
+        // 30000/1001 tick 1 is E = 33 366 µs, R = 3 002.
+        assert_eq!(micros_of(1, Rational::new(1, 30)), 33_333);
+        assert_eq!(
+            rtp_of_micros(micros_of(1, Rational::new(1, 30)), 90_000),
+            2_999
+        );
+        assert_eq!(micros_of(1, Rational::new(1001, 30_000)), 33_366);
+        assert_eq!(
+            rtp_of_micros(micros_of(1, Rational::new(1001, 30_000)), 90_000),
+            3_002
+        );
+        // 25 fps is exact: tick t is t * 3600.
+        assert_eq!(
+            rtp_of_micros(micros_of(7, Rational::new(1, 25)), 90_000),
+            25_200
+        );
+    }
+
+    // ---- the feed lifecycle on a real WHEP-serve lane and registry ----
+
+    use multiview_control::cast_streams::identity::{Clearance, OutputLabels};
+    use multiview_webrtc::transport::{Direction, MediaKind, Session, SessionConfig};
+
+    fn offer() -> String {
+        let mut viewer = Session::new(&SessionConfig::default(), Instant::now());
+        viewer
+            .add_host_candidate("[::1]:50000".parse().unwrap())
+            .unwrap();
+        viewer
+            .create_offer_with_direction(&[MediaKind::Video, MediaKind::Audio], Direction::RecvOnly)
+            .unwrap()
+    }
+
+    struct Rig {
+        rung: Arc<CliCastWebRtc>,
+        handle: WhepServeHandle,
+        factory: Arc<crate::output_window_registry::SubscriptionFactory>,
+        _registry: crate::output_window_registry::OutputWindowRegistry,
+        _endpoint: multiview_webrtc::transport::WhepServeEndpoint,
+    }
+
+    fn rig() -> Rig {
+        let config = multiview_webrtc::config::EndpointConfig {
+            udp_port: 0,
+            advertised_addresses: vec!["2001:db8::1".parse().unwrap()],
+            ..multiview_webrtc::config::EndpointConfig::default()
+        };
+        let (endpoint, handle) =
+            multiview_webrtc::transport::WhepServeEndpoint::bind(config).unwrap();
+        let binding = crate::output_window_registry::tests::binding("cast-1", 0);
+        let generation = binding.config_generation;
+        let (registry, factory) =
+            crate::output_window_registry::OutputWindowRegistry::new(vec![binding], generation)
+                .unwrap();
+        let factory = Arc::new(factory);
+        let windows = crate::output_window_registry::window_subscription_slot();
+        windows.store(Some(Arc::clone(&factory)));
+        let outputs = crate::cast_output::cast_outputs_slot();
+        outputs.store(Arc::new(vec![crate::cast_output::CastOutputEntry {
+            id: "cast-1".into(),
+            dir: std::path::PathBuf::new(),
+            gate: Arc::new(crate::cast_output::CastGate::new()),
+            width: 1920,
+            height: 1080,
+            fps: Rational::new(25, 1),
+            codec: String::new(),
+            epoch: multiview_output::SharedEpoch::default(),
+            labels: Arc::new(OutputLabels::new()),
+            index: 0,
+            tracks: Vec::new(),
+        }]));
+        Rig {
+            rung: Arc::new(CliCastWebRtc::new(handle.clone(), windows, outputs)),
+            handle,
+            factory,
+            _registry: registry,
+            _endpoint: endpoint,
         }
+    }
+
+    fn attachment() -> Arc<CastAttachment> {
+        Arc::new(CastAttachment::new(
+            "s",
+            "cast-1",
+            "webrtc",
+            Arc::new(OutputLabels::new()),
+            Clearance::default(),
+        ))
+    }
+
+    fn wait(what: &str, mut f: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !f() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "timed out: {what}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// PR 521 review: the last viewer leaving (DELETE through its fence)
+    /// retires the feed by itself: the registry subscription and the WHEP
+    /// registration are released without another request.
+    #[test]
+    fn the_last_viewer_leaving_retires_the_feed_without_another_request() {
+        let r = rig();
+        let a = attachment();
+        r.rung
+            .negotiate("cast-1", &offer(), Arc::clone(&a))
+            .unwrap();
+        assert_eq!(
+            r.factory.slots_in_use(),
+            1,
+            "one subscription per cast output"
+        );
+        let b = attachment();
+        r.rung
+            .negotiate("cast-1", &offer(), Arc::clone(&b))
+            .unwrap();
+        assert_eq!(r.factory.slots_in_use(), 1, "a second viewer shares it");
+        a.fence();
+        b.fence();
+        wait("the feed retired", || r.factory.slots_in_use() == 0);
+        wait("the registration removed", || {
+            r.handle.negotiate("cast-1", &offer(), true).is_err()
+        });
+    }
+
+    /// PR 521 review: concurrent first offers never orphan a viewer: every
+    /// admitted viewer's feed is the live one (each of them is served), and
+    /// one subscription serves them all.
+    #[test]
+    fn concurrent_first_offers_share_one_live_feed() {
+        let r = rig();
+        let viewers: Vec<_> = (0..8).map(|_| attachment()).collect();
+        let threads: Vec<_> = viewers
+            .iter()
+            .map(|a| {
+                let (rung, a) = (Arc::clone(&r.rung), Arc::clone(a));
+                std::thread::spawn(move || rung.negotiate("cast-1", &offer(), a).is_ok())
+            })
+            .collect();
+        let admitted = threads
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(admitted, 8);
+        assert_eq!(r.factory.slots_in_use(), 1);
+        let feeds = r.rung.feeds();
+        let feed = feeds.get("cast-1").expect("one live feed");
+        assert_eq!(feed.viewers.lock().unwrap().len(), 8, "no viewer orphaned");
+        assert!(!feed.done.load(Ordering::Acquire));
+    }
+
+    /// A retired feed's late unregister never removes a newer registration.
+    #[test]
+    fn a_retired_feed_never_unregisters_its_successor() {
+        let r = rig();
+        let (_, feed) = egress_feed();
+        let old = r.handle.register_output_generation("x", 4, feed.clone());
+        let new = r.handle.register_output_generation("x", 4, feed);
+        r.handle.unregister_output_generation("x", old);
+        assert!(
+            r.handle.negotiate("x", &offer(), true).is_ok(),
+            "the newer one stays"
+        );
+        r.handle.unregister_output_generation("x", new);
+        assert!(r.handle.negotiate("x", &offer(), true).is_err());
     }
 
     #[test]
