@@ -31559,6 +31559,7 @@ loop_default = true
     /// gate, decoder selection, primed NV12+A) → runtime ingest decode →
     /// `TileStore` publish. Every picture the worker publishes after the
     /// commit, primed and decoded alike, carries the asset's straight alpha.
+    #[allow(clippy::print_stdout, clippy::indexing_slicing)] // SKIP notes; fixed-size planes.
     fn runtime_alpha_case(file: &str, encoder: &str, codec: &[&str], tolerance: u8) {
         let _budget = crate::player::budget_test_guard();
         let encoders = std::process::Command::new("ffmpeg")

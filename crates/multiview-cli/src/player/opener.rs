@@ -688,27 +688,12 @@ fn open_one(
     if stop.load(Ordering::Acquire) || coordinator.is_superseded(generation) {
         return Err(OpenAbort::Abandoned);
     }
-    // VP9 with alpha (WebM `alpha_mode=1`) opens `libvpx-vp9`, the only libav
-    // decoder that merges the alpha side stream (ADR-0112 §5); without it the
-    // asset plays opaque with a warning, exactly as the legacy player path.
-    let vp9_alpha = crate::pipeline::vp9_alpha_decoder(
-        "player-opener",
-        true,
-        demuxer.input(),
+    let decoder = open_video_decoder(
+        &demuxer,
         facts.stream_index,
-    );
-    let decoder = match vp9_alpha.and_then(|name| {
-        crate::pipeline::open_named_decoder(
-            "player-opener",
-            facts.parameters.clone(),
-            facts.time_base,
-            name,
-        )
-    }) {
-        Some(decoder) => decoder,
-        None => StreamVideoDecoder::new(facts.parameters, facts.time_base)
-            .map_err(|error| failed(LoadFailureReason::DecoderOpen, error))?,
-    };
+        facts.parameters,
+        facts.time_base,
+    )?;
     let mut decoder = decoder.with_declared_fps(Some(cadence));
     demuxer.arm_deadline(config.prime_timeout);
     let primed = prime(
@@ -726,17 +711,7 @@ fn open_one(
     if stop.load(Ordering::Acquire) || coordinator.is_superseded(generation) {
         return Err(OpenAbort::Abandoned);
     }
-    let mut scaler = TileScaler::new(config.tile_width, config.tile_height);
-    let mut alpha = has_alpha.then(crate::pipeline::MediaAlpha::default);
-    let first_image = Arc::new(
-        crate::pipeline::tile_image_with_alpha(
-            &mut scaler,
-            &mut alpha,
-            &first_frame,
-            config.canvas_color.output_tag(),
-        )
-        .map_err(|error| failed(LoadFailureReason::InvalidData, error))?,
-    );
+    let (scaler, alpha, first_image) = first_tile_image(&first_frame, has_alpha, config)?;
     if stop.load(Ordering::Acquire) || coordinator.is_superseded(generation) {
         return Err(OpenAbort::Abandoned);
     }
@@ -770,6 +745,55 @@ fn open_one(
         alpha,
         artifact_lease: request.spec.artifact_lease.clone(),
     })
+}
+
+/// The primed frame as a tile image, plus the scaler and (for an alpha clip)
+/// the NV12+A attacher that move with the decoder. Built here, on the opener,
+/// so the ingest thread never allocates the alpha path (ADR-0058, #391).
+fn first_tile_image(
+    frame: &DecodedVideoFrame,
+    has_alpha: bool,
+    config: &OpenerConfig,
+) -> Result<
+    (
+        TileScaler,
+        Option<crate::pipeline::MediaAlpha>,
+        Arc<Nv12Image>,
+    ),
+    OpenAbort,
+> {
+    let mut scaler = TileScaler::new(config.tile_width, config.tile_height);
+    let mut alpha = has_alpha.then(crate::pipeline::MediaAlpha::default);
+    let image = crate::pipeline::tile_image_with_alpha(
+        &mut scaler,
+        &mut alpha,
+        frame,
+        config.canvas_color.output_tag(),
+    )
+    .map_err(|error| failed(LoadFailureReason::InvalidData, error))?;
+    Ok((scaler, alpha, Arc::new(image)))
+}
+
+/// The clip's software video decoder. VP9 with alpha (`WebM` `alpha_mode=1`)
+/// opens `libvpx-vp9`, the only libav decoder that merges the alpha side
+/// stream (ADR-0112 §5); without it the asset plays opaque with a warning,
+/// exactly as on the legacy player path. Every other stream opens its codec's
+/// default decoder.
+fn open_video_decoder(
+    demuxer: &Demuxer,
+    stream_index: usize,
+    parameters: ffmpeg::codec::Parameters,
+    time_base: Rational,
+) -> Result<StreamVideoDecoder, OpenAbort> {
+    let vp9_alpha =
+        crate::pipeline::vp9_alpha_decoder("player-opener", true, demuxer.input(), stream_index);
+    if let Some(decoder) = vp9_alpha.and_then(|name| {
+        crate::pipeline::open_named_decoder("player-opener", parameters.clone(), time_base, name)
+    }) {
+        return Ok(decoder);
+    }
+    StreamVideoDecoder::new(parameters, time_base)
+        .map_err(|error| failed(LoadFailureReason::DecoderOpen, error))
 }
 
 /// Exact rounded sample index of an integer-frame timestamp (48 kHz), using

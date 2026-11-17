@@ -184,7 +184,7 @@ pub(super) fn validate_cadence(
 pub(super) enum PixelAlpha {
     /// No alpha: an ordinary opaque clip.
     Opaque,
-    /// Alpha the NV12+A decode carries (ProRes 4444, qtrle, PNG, TGA, VP9
+    /// Alpha the NV12+A decode carries (`ProRes` 4444, `qtrle`, PNG, TGA, VP9
     /// alpha via `libvpx-vp9`, ...).
     Supported,
     /// Alpha the layout map cannot carry (e.g. paletted `pal8`).
