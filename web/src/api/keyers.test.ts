@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   commandKeyer, extrapolatedTick, flyPresetRect, keyerFillRedacted, keyerFillSource, keyerKeyRedacted,
-  keyerKeySource, keyerRampWeight, keyerRamping, keyTallyForSource, planKeyer,
+  keyerKeySource, keyerRampWeight, keyerRamping, keyTallyForSource, normalizeHexColor, planKeyer, toggleArmed,
 } from './keyers';
 import type { KeyerRow } from './keyers';
 import { i18n } from '@lingui/core';
@@ -141,3 +141,19 @@ describe('planKeyer / commandKeyer', () => {
     await expect(commandKeyer('keyer_set', { ...req, action: 'keyer_set' }, { idempotencyKey: 'k2' })).rejects.toMatchObject({ status: 409, problemType: '/problems/on-air-protected', detail: 'on air' });
   });
 });
+
+describe('K3/K7 helpers', () => {
+  it('normalizeHexColor accepts #RGB and #RRGGBB only', () => {
+    expect(normalizeHexColor('#0F0')).toBe('#00ff00');
+    expect(normalizeHexColor('#00B140')).toBe('#00b140');
+    expect(normalizeHexColor('green')).toBeUndefined();
+    expect(normalizeHexColor('#00b14')).toBeUndefined();
+    expect(normalizeHexColor(null)).toBeUndefined();
+  });
+  it('toggleArmed flips BKGD or one key and keeps the rest', () => {
+    expect(toggleArmed({ background: true, keys: ['a'] }, { kind: 'background' })).toEqual({ background: false, keys: ['a'] });
+    expect(toggleArmed({ background: true, keys: ['a'] }, { kind: 'key', id: 'b' })).toEqual({ background: true, keys: ['a', 'b'] });
+    expect(toggleArmed({ background: true, keys: ['a', 'b'] }, { kind: 'key', id: 'a' })).toEqual({ background: true, keys: ['b'] });
+  });
+});
+

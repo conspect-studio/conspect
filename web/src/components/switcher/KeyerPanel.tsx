@@ -1,7 +1,10 @@
 // A keyer panel (design note §10, K5): fill and key pickers limited to
 // sources the caller may read (inputs `in:<n>` are never offered), type
-// (luma|linear) with clip/gain/invert, mask, fly x/y/w/h with corner presets,
-// and the loss policy.
+// (luma|linear, and chroma with its `#RRGGBB` reference colour for a DSK, K7)
+// with clip/gain/invert, mask, fly x/y/w/h with corner presets, and the loss
+// policy. An upstream keyer (K3, `family = "usk"`) gets the same editor
+// without chroma and sends `family: "usk"`; it is never offered chroma
+// (`usk-chroma`) and never sends DSK-only fields (rate, color).
 //
 // Every value shown is the authoritative committed value from the snapshot
 // row unless the operator edited that field; untouched fields follow each new
@@ -18,7 +21,7 @@ import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import { Label } from '../ui/label';
 import type { FlyPreset, KeyerFields, KeyerKind, KeyerLossPolicy, KeyerPlan, KeyerRect, KeyerRow, KeyerSize } from '../../api/keyers';
-import { FLY_PRESETS, flyPresetRect, keyerFillRedacted, keyerFillSource, keyerKeyRedacted, keyerKeySource } from '../../api/keyers';
+import { FLY_PRESETS, flyPresetRect, keyerFillRedacted, keyerFillSource, keyerIsUsk, keyerKeyRedacted, keyerKeySource, keyerKind, normalizeHexColor } from '../../api/keyers';
 import { OperationApiError } from '../../api/operations';
 
 export interface KeyerPanelProps {
@@ -39,6 +42,7 @@ interface Edits {
   readonly fill?: string;
   readonly key?: string;
   readonly type?: KeyerKind;
+  readonly color?: string;
   readonly clip?: string;
   readonly gain?: string;
   readonly invert?: boolean;
@@ -50,6 +54,9 @@ interface Review { readonly json: string; readonly fields: KeyerFields; readonly
 
 const LOSS_POLICIES: readonly KeyerLossPolicy[] = ['drop_to_off_air', 'hold_last_good'];
 const AXES = ['x', 'y', 'w', 'h'] as const;
+/** The reference offered when a keyer first becomes chroma (a broadcast green). */
+const DEFAULT_CHROMA = '#00b140';
+type Invalid = 'clip' | 'gain' | 'fly' | 'mask' | 'color' | 'chroma-key';
 
 function rectDraft(rect: KeyerRect): RectDraft {
   return { x: String(rect.x), y: String(rect.y), w: String(rect.w), h: String(rect.h) };
@@ -68,13 +75,28 @@ function sameRect(a: KeyerRect | null | undefined, b: KeyerRect | null | undefin
  * The `keyer_set` fields of `edits` against the committed `row`: only edited
  * fields whose value differs, or the reason the draft is invalid.
  */
-function keyerSetFields(row: KeyerRow, edits: Edits): { readonly fields: KeyerFields; readonly changed: boolean; readonly invalid?: 'clip' | 'gain' | 'fly' | 'mask' } {
-  const fields: { -readonly [K in keyof KeyerFields]: KeyerFields[K] } = { keyer: row.id };
+function keyerSetFields(row: KeyerRow, edits: Edits): { readonly fields: KeyerFields; readonly changed: boolean; readonly invalid?: Invalid } {
+  const usk = keyerIsUsk(row);
+  // `family` scopes the object id; it is not a change by itself.
+  const fields: { -readonly [K in keyof KeyerFields]: KeyerFields[K] } = usk ? { keyer: row.id, family: 'usk' } : { keyer: row.id };
+  const baseCount = Object.keys(fields).length;
+  let invalid: Invalid | undefined;
   if (edits.fill !== undefined && edits.fill !== '' && edits.fill !== keyerFillSource(row)) fields.fill = edits.fill;
-  if (edits.key !== undefined && !keyerKeyRedacted(row) && edits.key !== (keyerKeySource(row) ?? '')) fields.key = edits.key;
-  const rowType: KeyerKind = row.type === 'luma' ? 'luma' : 'linear';
-  if (edits.type !== undefined && edits.type !== rowType) fields.type = edits.type;
-  let invalid: 'clip' | 'gain' | 'fly' | 'mask' | undefined;
+  const rowType = keyerKind(row);
+  const type = edits.type ?? rowType;
+  if (type !== rowType) fields.type = type;
+  if (type === 'chroma') {
+    // K7: a chroma key keys the fill itself (`chroma-key-source`) and needs its reference colour.
+    if (keyerKeyRedacted(row)) invalid = 'chroma-key';
+    else if (keyerKeySource(row) !== undefined) fields.key = '';
+    const color = normalizeHexColor(edits.color ?? normalizeHexColor(row.color) ?? DEFAULT_CHROMA);
+    if (color === undefined) invalid = 'color';
+    else if (color !== normalizeHexColor(row.color)) fields.color = color;
+  } else {
+    if (edits.key !== undefined && !keyerKeyRedacted(row) && edits.key !== (keyerKeySource(row) ?? '')) fields.key = edits.key;
+    // A colour on another type is refused (`chroma-color-without-chroma`): clear it.
+    if (!usk && row.color !== null && row.color !== undefined && row.color !== '') fields.color = '';
+  }
   if (edits.clip !== undefined) {
     const clip = Number(edits.clip);
     if (edits.clip.trim() === '' || !Number.isFinite(clip) || clip < 0 || clip > 1) invalid = 'clip';
@@ -95,7 +117,7 @@ function keyerSetFields(row: KeyerRow, edits: Edits): { readonly fields: KeyerFi
     if (rect === undefined) invalid = name;
     else if (!sameRect(rect, row[name])) fields[name] = rect;
   }
-  const changed = Object.keys(fields).length > 1;
+  const changed = Object.keys(fields).length > baseCount;
   return invalid === undefined ? { fields, changed } : { fields, changed, invalid };
 }
 
@@ -119,7 +141,9 @@ export function KeyerPanel({ row, sources, disabledReason, canvas, onPlan, onApp
   // Displayed values: the edit, else the authoritative committed value.
   const fill = edits.fill ?? keyerFillSource(row) ?? '';
   const key = edits.key ?? keyerKeySource(row) ?? '';
-  const type: KeyerKind = edits.type ?? (row.type === 'luma' ? 'luma' : 'linear');
+  const usk = keyerIsUsk(row);
+  const type: KeyerKind = edits.type ?? keyerKind(row);
+  const color = edits.color ?? normalizeHexColor(row.color) ?? DEFAULT_CHROMA;
   const clip = edits.clip ?? String(row.clip);
   const gain = edits.gain ?? String(row.gain);
   const invert = edits.invert ?? row.invert;
@@ -140,6 +164,8 @@ export function KeyerPanel({ row, sources, disabledReason, canvas, onPlan, onApp
     : draft.invalid === 'gain' ? t`Gain must be a number of 0 or more`
     : draft.invalid === 'fly' ? t`Fly x/y must be whole numbers of 0 or more and width/height at least 1`
     : draft.invalid === 'mask' ? t`Mask x/y must be whole numbers of 0 or more and width/height at least 1`
+    : draft.invalid === 'color' ? t`The chroma colour must be #RRGGBB`
+    : draft.invalid === 'chroma-key' ? t`A chroma key keys the fill itself, but this keyer's key source is hidden from you, so it cannot be cleared`
     : undefined;
   const reviewReason = disabledReason ?? invalidReason ?? (draft.changed ? undefined : t`No changes to review`);
   const applyReason = disabledReason ?? (reviewed === undefined ? t`Review this change first` : !reviewed.plan.can_take ? t`The reviewed change was refused` : undefined);
@@ -214,7 +240,7 @@ export function KeyerPanel({ row, sources, disabledReason, canvas, onPlan, onApp
                 {sources.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}
               </select>}
         </div>
-        <div className="space-y-1">
+        {type !== 'chroma' && <div className="space-y-1">
           <Label htmlFor={`keyer-key-${row.id}`}><Trans>Key</Trans></Label>
           {keyRedacted
             ? <p id={`keyer-key-${row.id}`} role="status" data-testid={`keyer-key-redacted-${row.id}`}><Trans>redacted</Trans></p>
@@ -223,18 +249,24 @@ export function KeyerPanel({ row, sources, disabledReason, canvas, onPlan, onApp
                 <option value="">{t`Self key (fill alpha)`}</option>
                 {sources.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}
               </select>}
-        </div>
+        </div>}
         <div className="space-y-1">
           <Label htmlFor={`keyer-type-${row.id}`}><Trans>Type</Trans></Label>
           <select id={`keyer-type-${row.id}`} className="rounded border bg-background p-2" value={type} {...base}
-            onChange={(event) => { edit({ type: event.target.value === 'luma' ? 'luma' : 'linear' }); }}>
+            onChange={(event) => { const v = event.target.value; edit({ type: v === 'luma' ? 'luma' : v === 'chroma' && !usk ? 'chroma' : 'linear' }); }}>
             <option value="linear">{t`Linear`}</option>
             <option value="luma">{t`Luma`}</option>
+            {!usk && <option value="chroma">{t`Chroma`}</option>}
           </select>
         </div>
       </div>
-      {type === 'luma' && (
+      {(type === 'luma' || type === 'chroma') && (
         <div className="flex flex-wrap items-end gap-3">
+          {type === 'chroma' && <div className="space-y-1"><Label htmlFor={`keyer-color-${row.id}`}><Trans>Chroma colour</Trans></Label>
+            <input id={`keyer-color-${row.id}`} type="color" value={normalizeHexColor(color) ?? DEFAULT_CHROMA} {...base}
+              aria-invalid={draft.invalid === 'color'} className="h-9 w-16 rounded border bg-background"
+              onChange={(event) => { edit({ color: event.target.value }); }} />
+            <span className="ml-2 font-mono text-xs" data-testid={`keyer-color-value-${row.id}`}>{color}</span></div>}
           <div className="space-y-1"><Label htmlFor={`keyer-clip-${row.id}`}><Trans>Clip</Trans></Label>
             <Input id={`keyer-clip-${row.id}`} type="number" min="0" max="1" step="0.01" value={clip} {...base} aria-invalid={draft.invalid === 'clip'} className="w-24" onChange={(event) => { edit({ clip: event.target.value }); }} /></div>
           <div className="space-y-1"><Label htmlFor={`keyer-gain-${row.id}`}><Trans>Gain</Trans></Label>

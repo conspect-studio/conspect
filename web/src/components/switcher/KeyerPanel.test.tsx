@@ -244,4 +244,60 @@ describe('KeyerPanel', () => {
       expect(document.getElementById(describedBy ?? '')?.textContent).toBe('Switcher unavailable');
     }
   });
+
+  it('K7: chroma offers a colour picker and sends type, #rrggbb colour and clears the key source', async () => {
+    const { onPlan } = panel({ row: { ...BASE_ROW, key: 'cam-1' } });
+    await userEvent.selectOptions(screen.getByLabelText('Type'), 'chroma');
+    expect(screen.queryByLabelText('Key')).toBeNull();
+    const picker = screen.getByLabelText<HTMLInputElement>('Chroma colour');
+    expect(picker.type).toBe('color');
+    expect(picker.value).toBe('#00b140');
+    expect(screen.getByLabelText('Clip')).toBeTruthy();
+    expect(screen.getByLabelText('Gain')).toBeTruthy();
+    await userEvent.click(review());
+    expect(onPlan).toHaveBeenLastCalledWith({ keyer: 'dsk1', type: 'chroma', key: '', color: '#00b140' });
+  });
+
+  it('K7: a committed chroma row shows its colour; a colour edit sends only the colour', async () => {
+    const { onPlan } = panel({ row: { ...BASE_ROW, type: 'chroma', color: '#0F0', clip: 0.05, gain: 8 } });
+    expect(screen.getByLabelText<HTMLInputElement>('Chroma colour').value).toBe('#00ff00');
+    expect(review()).toHaveProperty('disabled', true);
+    const picker = screen.getByLabelText<HTMLInputElement>('Chroma colour');
+    // jsdom has no colour dialog: set the value as the browser would.
+    const { fireEvent } = await import('@testing-library/react');
+    fireEvent.input(picker, { target: { value: '#0000ff' } });
+    fireEvent.change(picker, { target: { value: '#0000ff' } });
+    await userEvent.click(review());
+    expect(onPlan).toHaveBeenLastCalledWith({ keyer: 'dsk1', color: '#0000ff' });
+  });
+
+  it('K7: leaving chroma clears the colour (a colour on another type is refused)', async () => {
+    const { onPlan } = panel({ row: { ...BASE_ROW, type: 'chroma', color: '#00b140' } });
+    await userEvent.selectOptions(screen.getByLabelText('Type'), 'luma');
+    await userEvent.click(review());
+    expect(onPlan).toHaveBeenLastCalledWith({ keyer: 'dsk1', type: 'luma', color: '' });
+  });
+
+  it('K7: chroma with a hidden key source cannot be reviewed', async () => {
+    panel({ row: { ...BASE_ROW, key: 'redacted' } });
+    await userEvent.selectOptions(screen.getByLabelText('Type'), 'chroma');
+    expect(screen.getByTestId('keyer-invalid-dsk1')).toHaveTextContent('key source is hidden');
+    expect(review()).toHaveProperty('disabled', true);
+  });
+
+  it('K3: a USK panel never offers chroma and sends family usk', async () => {
+    const { onPlan } = panel({ row: { ...BASE_ROW, id: 'usk1', family: 'usk' } });
+    const options = Array.from(screen.getByLabelText<HTMLSelectElement>('Type').options).map((o) => o.value);
+    expect(options).toEqual(['linear', 'luma']);
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Invert matte' }));
+    await userEvent.click(review());
+    expect(onPlan).toHaveBeenLastCalledWith({ keyer: 'usk1', family: 'usk', invert: true });
+  });
+
+  it('K3: a USK panel with no edit has nothing to review', () => {
+    panel({ row: { ...BASE_ROW, id: 'usk1', family: 'usk' } });
+    expect(review()).toHaveProperty('disabled', true);
+    expect(review()).toHaveAttribute('title', 'No changes to review');
+  });
 });
+

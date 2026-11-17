@@ -3,8 +3,9 @@
 // routes (ADR-0113 §8, K4): `keyer_cut`, `keyer_auto`, `keyer_tie`, `keyer_set`.
 // Requests go through the generated openapi-fetch client with the generated
 // request/response types (`SwitcherRequest`, `KeyerRow`, `KeyerPlan`, …) —
-// never a hand-written fetch or wire type. The upstream `arm` verb and USK
-// rows arrive with K3 (#388, not merged); nothing here assumes them.
+// never a hand-written fetch or wire type. K3 (#388) adds upstream keyer rows
+// (`family = "usk"`), the `arm` verb ({background, keys}) and the `armed`
+// view; K7 (#392) adds `type = "chroma"` with its `color` (DSK only).
 import { t } from '@lingui/core/macro';
 import type { components } from './types';
 import { createApiClient } from './client';
@@ -20,10 +21,11 @@ export type KeyerRect = Schemas['KeyerRectDoc'];
 export type KeyerSize = Schemas['KeyerSizeDoc'];
 export type KeyerRamp = Schemas['KeyerRampView'];
 export type KeyerAccepted = Schemas['SwitcherAccepted'];
-export type KeyerAction = 'keyer_cut' | 'keyer_auto' | 'keyer_tie' | 'keyer_set';
+export type ArmedView = Schemas['ArmedView'];
+export type KeyerAction = 'keyer_cut' | 'keyer_auto' | 'keyer_tie' | 'keyer_set' | 'arm';
 /** A keyer verb request: the generated `SwitcherRequest` with the action narrowed to a keyer verb. */
 export type KeyerRequest = Schemas['SwitcherRequest'] & { readonly action: KeyerAction };
-export type KeyerKind = 'luma' | 'linear';
+export type KeyerKind = 'luma' | 'linear' | 'chroma';
 export type KeyerLossPolicy = 'drop_to_off_air' | 'hold_last_good';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -88,6 +90,30 @@ export function keyerFillRedacted(row: KeyerRow): boolean {
 export function keyerKeyRedacted(row: KeyerRow): boolean {
   return row.key === 'redacted';
 }
+/** Whether this row is an upstream keyer (K3): CUT outside a transition only, armed through `arm`, no AUTO/TIE/chroma. */
+export function keyerIsUsk(row: KeyerRow): boolean {
+  return row.family === 'usk';
+}
+/** The committed key type of a row (an unknown wire value reads as linear). */
+export function keyerKind(row: KeyerRow): KeyerKind {
+  return row.type === 'luma' || row.type === 'chroma' ? row.type : 'linear';
+}
+/** `#RGB` / `#RRGGBB` to lowercase `#rrggbb`, or `undefined` when not a hex colour. */
+export function normalizeHexColor(value: string | null | undefined): string | undefined {
+  if (value === null || value === undefined) return undefined;
+  if (/^#[0-9a-f]{3}$/i.test(value)) return `#${value.slice(1).split('').map((c) => c + c).join('')}`.toLowerCase();
+  return /^#[0-9a-f]{6}$/i.test(value) ? value.toLowerCase() : undefined;
+}
+/** One arm-strip toggle: BKGD or an upstream keyer id. */
+export type ArmTarget = { readonly kind: 'background' } | { readonly kind: 'key'; readonly id: string };
+/** The `arm` set after toggling BKGD or one key. */
+export function toggleArmed(armed: ArmedView, target: ArmTarget): ArmedView {
+  if (target.kind === 'background') return { background: !armed.background, keys: [...armed.keys] };
+  return armed.keys.includes(target.id)
+    ? { background: armed.background, keys: armed.keys.filter((k) => k !== target.id) }
+    : { background: armed.background, keys: [...armed.keys, target.id] };
+}
+
 /** Whether this row is currently ramping. */
 export function keyerRamping(row: KeyerRow): boolean {
   return row.ramp !== null && row.ramp !== undefined;

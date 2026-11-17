@@ -112,4 +112,27 @@ describe('KeyerStrip', () => {
     view.rerender(<I18nProvider i18n={i18n}><KeyerStrip row={{ ...BASE_ROW, rate: 40 }} tick={100} disabledReason={undefined} onTie={vi.fn()} onCut={vi.fn()} onAuto={vi.fn()} /></I18nProvider>);
     expect(screen.getByLabelText<HTMLInputElement>('Rate in frames for dsk1').value).toBe('40');
   });
+
+  it('K3: a USK strip has CUT only (no TIE, rate or AUTO) and an armed badge', () => {
+    withI18n(<KeyerStrip row={{ ...BASE_ROW, id: 'usk1', family: 'usk', armed: true }} tick={100} disabledReason={undefined} onTie={vi.fn()} onCut={vi.fn()} onAuto={vi.fn()} />);
+    expect(screen.getByRole('button', { name: 'Cut' })).toHaveProperty('disabled', false);
+    expect(screen.queryByRole('button', { name: 'Auto' })).toBeNull();
+    expect(screen.queryByRole('checkbox', { name: 'Tie' })).toBeNull();
+    expect(screen.queryByLabelText('Rate in frames for usk1')).toBeNull();
+    expect(screen.getByTestId('keyer-armed-usk1')).toHaveTextContent('Armed');
+  });
+
+  it('K3: a USK CUT is disabled during a background transition, with its reason', () => {
+    withI18n(<KeyerStrip row={{ ...BASE_ROW, id: 'usk1', family: 'usk' }} tick={100} disabledReason={undefined} transitionInFlight onTie={vi.fn()} onCut={vi.fn()} onAuto={vi.fn()} />);
+    const cut = screen.getByRole('button', { name: 'Cut' });
+    expect(cut).toHaveProperty('disabled', true);
+    expect(cut).toHaveAttribute('title', 'An upstream keyer cuts only outside a transition');
+    expect(document.getElementById(cut.getAttribute('aria-describedby') ?? '')).toHaveTextContent('outside a transition');
+  });
+
+  it('a DSK CUT stays enabled during a background transition', () => {
+    withI18n(<KeyerStrip row={BASE_ROW} tick={100} disabledReason={undefined} transitionInFlight onTie={vi.fn()} onCut={vi.fn()} onAuto={vi.fn()} />);
+    expect(screen.getByRole('button', { name: 'Cut' })).toHaveProperty('disabled', false);
+  });
 });
+
