@@ -70,7 +70,8 @@ pub enum LoadFailureCode {
     Vfr,
     /// The clip declares no frame rate.
     NoCadence,
-    /// The clip carries an alpha plane.
+    /// The clip carries alpha the player cannot decode (an unsupported alpha
+    /// pixel format, or HEVC alpha, which decodes opaque).
     Alpha,
     /// The container has no video stream.
     NoVideoStream,

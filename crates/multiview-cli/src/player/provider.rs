@@ -255,7 +255,7 @@ const fn generic_detail(code: LoadFailureCode) -> &'static str {
         LoadFailureCode::WrongCadence => "clip frame rate does not match the canvas frame rate",
         LoadFailureCode::Vfr => "clip is variable frame rate",
         LoadFailureCode::NoCadence => "clip declares no frame rate",
-        LoadFailureCode::Alpha => "clip carries an alpha plane",
+        LoadFailureCode::Alpha => "clip carries alpha the player cannot decode",
         LoadFailureCode::NoVideoStream => "container has no video stream",
         LoadFailureCode::UnknownLength => "clip length is unknown",
         LoadFailureCode::InvalidWindow => "clip playout window is invalid",
