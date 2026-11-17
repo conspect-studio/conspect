@@ -95,4 +95,16 @@ describe('ArmStrip', () => {
     expect(screen.queryByTestId('keyer-arm-e')).toBeNull();
     expect(screen.getAllByRole('button')).toHaveLength(5);
   });
+
+  it('K5-R2-01: an incomplete armed view (a hidden key is armed) makes every toggle read-only with its reason', async () => {
+    const { onArm } = strip({ armed: { background: true, keys: ['usk1'], complete: false } });
+    for (const id of ['keyer-arm-background', 'keyer-arm-usk1', 'keyer-arm-usk2']) {
+      const toggle = screen.getByTestId(id);
+      expect(toggle, id).toHaveProperty('disabled', true);
+      expect(toggle).toHaveAttribute('title', 'A key you cannot see is armed, so the arm set cannot be changed here');
+      expect(document.getElementById(toggle.getAttribute('aria-describedby') ?? '')).toHaveTextContent('A key you cannot see is armed');
+    }
+    await userEvent.click(screen.getByTestId('keyer-arm-usk2'));
+    expect(onArm).not.toHaveBeenCalled();
+  });
 });

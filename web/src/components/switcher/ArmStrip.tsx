@@ -9,27 +9,31 @@
 // source is hidden is shown (its lamp too) but is not toggleable: `arm`
 // needs Read on an armed key's sources. Because `arm` replaces the whole set,
 // an armed key with hidden sources blocks every toggle (the server would
-// refuse the set with 403). The set may never become empty (422), so the last
+// refuse the set with 403). An armed key the caller may not read at all is
+// absent from `armed.keys`; the server then sends `armed.complete = false`
+// (a boolean only) and refuses any `arm` (409 `arm-hidden-keys`, review
+// K5-R2-01), so the whole strip is read-only with that reason, never a
+// toggle that would silently disarm the hidden key. The set may never become empty (422), so the last
 // lit toggle cannot be switched off. Every disabled toggle states its reason
 // as `title` and `aria-describedby`.
 import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { Button } from '../ui/button';
-import type { ArmedView, ArmTarget, KeyerRow } from '../../api/keyers';
+import type { ArmedView, ArmSet, ArmTarget, KeyerRow } from '../../api/keyers';
 import { keyerFillRedacted, keyerKeyRedacted, toggleArmed } from '../../api/keyers';
 
 /** At most four upstream keyers per M/E (K3). */
 export const MAX_ARM_KEYS = 4;
 
 export interface ArmStripProps {
-  /** The engine's armed set as the caller may see it. */
-  readonly armed: ArmedView;
+  /** The engine's armed set as the caller may see it (`complete` may be absent from an older backend). */
+  readonly armed: Omit<ArmedView, 'complete'> & { readonly complete?: boolean };
   /** The M/E's upstream keyer rows the caller may read, in declared order. */
   readonly keys: readonly KeyerRow[];
   /** Non-empty reason disables every toggle (engine unavailable, a request or outcome in flight, a transition running, …). */
   readonly disabledReason: string | undefined;
   /** Plan and command `arm` with the next full set. */
-  readonly onArm: (next: ArmedView) => void;
+  readonly onArm: (next: ArmSet) => void;
 }
 
 function sourcesHidden(row: KeyerRow): boolean {
@@ -42,8 +46,11 @@ export function ArmStrip({ armed, keys, disabledReason, onArm }: ArmStripProps):
   const shown = keys.slice(0, MAX_ARM_KEYS);
   const litCount = (armed.background ? 1 : 0) + armed.keys.length;
   const blockedByHidden = shown.some((row) => armed.keys.includes(row.id) && sourcesHidden(row));
+  // Older backends send no flag: their view is the whole set.
+  const incomplete = !(armed.complete ?? true);
   const reasonFor = (lit: boolean, row?: KeyerRow): string | undefined => {
     if (disabledReason !== undefined) return disabledReason;
+    if (incomplete) return t`A key you cannot see is armed, so the arm set cannot be changed here`;
     if (row !== undefined && sourcesHidden(row)) return t`This key's sources are hidden from you, so you cannot arm it`;
     if (blockedByHidden) return t`An armed key's sources are hidden from you, so the arm set cannot be changed here`;
     if (lit && litCount <= 1) return t`At least one of BKGD or a key must stay armed`;

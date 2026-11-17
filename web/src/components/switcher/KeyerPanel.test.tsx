@@ -300,4 +300,3 @@ describe('KeyerPanel', () => {
     expect(review()).toHaveAttribute('title', 'No changes to review');
   });
 });
-

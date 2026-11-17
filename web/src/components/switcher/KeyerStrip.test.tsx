@@ -135,4 +135,3 @@ describe('KeyerStrip', () => {
     expect(screen.getByRole('button', { name: 'Cut' })).toHaveProperty('disabled', false);
   });
 });
-

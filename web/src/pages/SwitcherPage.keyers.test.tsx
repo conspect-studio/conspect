@@ -45,10 +45,17 @@ let state = BASE_STATE;
 let calls: { path: string; key: string | null; body: unknown }[] = [];
 let planAnswer: unknown = { can_take: true, class: 'class1', keyer: 'main/dsk1', on_air: false };
 let planGate: Promise<void> | undefined;
+let getGate: Promise<void> | undefined;
+let getFails = false;
 let commandAnswer: () => Response = () => HttpResponse.json({ operation_id: 'op-x', kind: 'x' }, { status: 202 });
 
 const server = setupServer(
-  http.get('*/api/v1/switcher/me1', () => HttpResponse.json(state)),
+  http.get('*/api/v1/switcher/me1', async () => {
+    const snapshot = state;
+    if (getGate) await getGate;
+    if (getFails) return HttpResponse.json({ title: 'engine busy', status: 503 }, { status: 503 });
+    return HttpResponse.json(snapshot);
+  }),
   http.get('*/api/v1/patch', () => HttpResponse.json({ title: 'not found', status: 404 }, { status: 404 })),
   http.get('*/api/v1/sources', () => HttpResponse.json([{ id: 'gfx-channel-1', name: 'GFX 1', body: { kind: 'bars' } }, { id: 'cam-1', name: 'Cam 1', body: { kind: 'bars' } }])),
   http.post('*/api/v1/switcher/plan', async ({ request }) => {
@@ -67,6 +74,8 @@ afterEach(() => {
   calls = [];
   planAnswer = { can_take: true, class: 'class1', keyer: 'main/dsk1', on_air: false };
   planGate = undefined;
+  getGate = undefined;
+  getFails = false;
   commandAnswer = () => HttpResponse.json({ operation_id: 'op-x', kind: 'x' }, { status: 202 });
   state = BASE_STATE;
   vi.useRealTimers();
@@ -306,5 +315,92 @@ describe('SwitcherPage arm strip (K3 #388)', () => {
     await userEvent.click(within(strip).getByRole('button', { name: 'Cut' }));
     await waitFor(() => { expect(calls.map((c) => c.path)).toEqual(['plan', 'commands/keyer_cut']); });
     expect(calls[1]?.body).toMatchObject({ action: 'keyer_cut', keyer: 'usk1', family: 'usk', on: true });
+  });
+});
+
+describe('arm and keyer editing after an outcome (review K5-R2-02)', () => {
+  const applied = (op: string, tick: number) => {
+    const outcome = { t: 'switcher.operation', id: 'me1', corr: op, data: { me: 'me1', program: 'main', operation_id: op, tick, completed: true } } as const;
+    act(() => { if (lastClient) getOperationTracker(lastClient).onEnvelope({ v: 1, topic: 'switcher', seq: 2, ts: 0, ...outcome }); });
+    emit(outcome);
+  };
+
+  it('stays gated until the post-outcome snapshot arrives, so a fast second toggle keeps the first key', async () => {
+    commandAnswer = () => HttpResponse.json({ operation_id: 'op-arm', kind: 'arm' }, { status: 202 });
+    state = { ...BASE_STATE, keyers: [DSK1, USK1, USK2], armed: { background: true, keys: [] } };
+    page();
+    await userEvent.click(await screen.findByTestId('keyer-arm-usk1'));
+    await waitFor(() => { expect(calls.map((c) => c.path)).toEqual(['plan', 'commands/arm']); });
+    await screen.findByText(/op-arm/);
+    // The engine applied it; the refreshed snapshot is slow to come back.
+    const slow = deferred();
+    getGate = slow.promise;
+    state = { ...BASE_STATE, tick: 8, keyers: [DSK1, { ...USK1, armed: true }, USK2], armed: { background: true, keys: ['usk1'] } };
+    applied('op-arm', 8);
+    await screen.findByText(/Switcher applied/i);
+    const usk2 = screen.getByTestId('keyer-arm-usk2');
+    expect(usk2).toHaveProperty('disabled', true);
+    expect(usk2).toHaveAttribute('title', 'Refreshing the switcher state after the last operation');
+    expect(within(screen.getByTestId('keyer-panel-dsk1')).getByRole('button', { name: 'Review' })).toHaveProperty('disabled', true);
+    await userEvent.click(usk2);
+    expect(calls.filter((c) => c.path === 'commands/arm')).toHaveLength(1);
+    slow.resolve();
+    await waitFor(() => { expect(screen.getByTestId('keyer-arm-usk1')).toHaveAttribute('aria-pressed', 'true'); });
+    await waitFor(() => { expect(screen.getByTestId('keyer-arm-usk2')).toHaveProperty('disabled', false); });
+    commandAnswer = () => HttpResponse.json({ operation_id: 'op-arm-2', kind: 'arm' }, { status: 202 });
+    await userEvent.click(screen.getByTestId('keyer-arm-usk2'));
+    await waitFor(() => { expect(calls.filter((c) => c.path === 'commands/arm')).toHaveLength(2); });
+    expect(calls.filter((c) => c.path === 'commands/arm')[1]?.body).toMatchObject({ background: true, keys: ['usk1', 'usk2'] });
+  });
+
+  it('fails closed with a reason when the post-outcome refresh fails, until a later snapshot succeeds', async () => {
+    commandAnswer = () => HttpResponse.json({ operation_id: 'op-arm', kind: 'arm' }, { status: 202 });
+    state = { ...BASE_STATE, keyers: [DSK1, USK1, USK2], armed: { background: true, keys: [] } };
+    page();
+    await userEvent.click(await screen.findByTestId('keyer-arm-usk1'));
+    await screen.findByText(/op-arm/);
+    getFails = true;
+    applied('op-arm', 8);
+    await waitFor(() => {
+      expect(screen.getByTestId('keyer-arm-usk2')).toHaveAttribute('title',
+        'The switcher state could not be refreshed after the last operation; keyer and arm controls stay disabled until it is');
+    });
+    expect(screen.getByTestId('keyer-arm-usk2')).toHaveProperty('disabled', true);
+    getFails = false;
+    state = { ...BASE_STATE, tick: 9, keyers: [DSK1, { ...USK1, armed: true }, USK2], armed: { background: true, keys: ['usk1'] } };
+    emit({ t: 'switcher.keyer', id: 'me1/usk1', data: { me: 'me1', program: 'main', keyer: 'me1/usk1', tick: 9, on_air: false, stale: false, fill: 'cam-1' } });
+    await waitFor(() => { expect(screen.getByTestId('keyer-arm-usk2')).toHaveProperty('disabled', false); });
+  });
+});
+
+describe('a DSK and a USK with the same id (review K5-R2-03)', () => {
+  const DSK_KEY1 = { ...DSK1, id: 'key1', type: 'luma' };
+  const USK_KEY1 = { ...DSK1, id: 'key1', family: 'usk', fill: 'cam-1', type: 'luma' };
+
+  it('keeps labels, descriptions and drafts per family', async () => {
+    state = { ...BASE_STATE, in_flight: true, keyers: [DSK_KEY1, USK_KEY1], armed: { background: true, keys: [] } };
+    page();
+    await waitFor(() => { expect(screen.getAllByTestId('keyer-panel-key1')).toHaveLength(2); });
+    const [dskPanel, uskPanel] = screen.getAllByTestId('keyer-panel-key1');
+    const [dskStrip, uskStrip] = screen.getAllByTestId('keyer-strip-key1');
+    // Every label targets the control in its own panel.
+    for (const panel of [dskPanel!, uskPanel!]) {
+      for (const name of ['Fill', 'Type', 'Clip', 'Gain', 'Loss policy']) {
+        expect(panel.contains(within(panel).getByLabelText(name)), name).toBe(true);
+      }
+    }
+    // The USK CUT's description is its own (outside a transition), not the DSK's.
+    const uskCut = within(uskStrip!).getByRole('button', { name: 'Cut' });
+    const described = document.getElementById(uskCut.getAttribute('aria-describedby') ?? '');
+    expect(uskStrip!.contains(described)).toBe(true);
+    expect(described).toHaveTextContent('outside a transition');
+    expect(within(dskStrip!).getByLabelText('Rate in frames for key1')).toBe(within(dskStrip!).getByRole('spinbutton'));
+    // Independent drafts: editing the USK's clip leaves the DSK's alone.
+    const uskClip = within(uskPanel!).getByLabelText('Clip');
+    await userEvent.clear(uskClip);
+    await userEvent.type(uskClip, '0.5');
+    expect(uskClip).toHaveValue(0.5);
+    expect(within(dskPanel!).getByLabelText('Clip')).toHaveValue(0);
+    expect(screen.getAllByRole('region', { name: /key1 panel/ }).map((r) => r.getAttribute('aria-label'))).toEqual(['Keyer key1 panel', 'Upstream keyer key1 panel']);
   });
 });

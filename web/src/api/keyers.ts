@@ -94,6 +94,14 @@ export function keyerKeyRedacted(row: KeyerRow): boolean {
 export function keyerIsUsk(row: KeyerRow): boolean {
   return row.family === 'usk';
 }
+/**
+ * A row's identity on the desk: DSK and USK ids live in separate namespaces
+ * (a DSK `key1` and a USK `key1` may coexist), so React keys and DOM ids
+ * (label targets, `aria-describedby`) are namespaced by family + id.
+ */
+export function keyerDomKey(row: KeyerRow): string {
+  return `${keyerIsUsk(row) ? 'usk' : 'dsk'}-${row.id}`;
+}
 /** The committed key type of a row (an unknown wire value reads as linear). */
 export function keyerKind(row: KeyerRow): KeyerKind {
   return row.type === 'luma' || row.type === 'chroma' ? row.type : 'linear';
@@ -106,8 +114,10 @@ export function normalizeHexColor(value: string | null | undefined): string | un
 }
 /** One arm-strip toggle: BKGD or an upstream keyer id. */
 export type ArmTarget = { readonly kind: 'background' } | { readonly kind: 'key'; readonly id: string };
+/** An `arm` request's set: `{background, keys}` (never the view's `complete`). */
+export interface ArmSet { readonly background: boolean; readonly keys: readonly string[] }
 /** The `arm` set after toggling BKGD or one key. */
-export function toggleArmed(armed: ArmedView, target: ArmTarget): ArmedView {
+export function toggleArmed(armed: ArmSet, target: ArmTarget): ArmSet {
   if (target.kind === 'background') return { background: !armed.background, keys: [...armed.keys] };
   return armed.keys.includes(target.id)
     ? { background: armed.background, keys: armed.keys.filter((k) => k !== target.id) }

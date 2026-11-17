@@ -156,4 +156,3 @@ describe('K3/K7 helpers', () => {
     expect(toggleArmed({ background: true, keys: ['a', 'b'] }, { kind: 'key', id: 'a' })).toEqual({ background: true, keys: ['b'] });
   });
 });
-

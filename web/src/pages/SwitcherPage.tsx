@@ -20,8 +20,8 @@ import { useJpegPreview } from '../preview/useJpegPreview';
 import { getPatch, planPatch, takePatch } from '../api/patch';
 import type { PatchRequest } from '../api/patch';
 import { MixerInputBank } from '../components/switcher/MixerInputBank';
-import { commandKeyer, extrapolatedTick, keyerIsUsk, keyerRampWeight, planKeyer } from '../api/keyers';
-import type { ArmedView, KeyerFields, KeyerRequest, KeyerRow } from '../api/keyers';
+import { commandKeyer, extrapolatedTick, keyerDomKey, keyerIsUsk, keyerRampWeight, planKeyer } from '../api/keyers';
+import type { ArmedView, ArmSet, KeyerFields, KeyerRequest, KeyerRow } from '../api/keyers';
 import { OperationApiError } from '../api/operations';
 import type { RealtimeStatus } from '../realtime/connection';
 import { KeyerStrip } from '../components/switcher/KeyerStrip';
@@ -144,7 +144,31 @@ export function SwitcherPage(): JSX.Element {
   // Unknown (including unobserved/replay) is not permission to take again.
   const settled = operation?.phase === 'applied' || operation?.phase === 'failed';
   const ready = state.data !== undefined && (operationId === undefined || settled) && !submitting;
-  const keyerReason = ready ? undefined : !state.data ? t`Switcher unavailable` : submitting ? t`A switcher request is in flight` : t`Operation in flight or outcome pending`;
+  // Review K5-R2-02: the arm set and the keyer drafts are built from the
+  // snapshot, so after an outcome they stay gated until a snapshot read
+  // AFTER the outcome arrives. The engine publishes the snapshot before the
+  // tick's outcomes, so a GET started once the outcome is known reads a state
+  // at or after it; `invalidateQueries` cancels any older in-flight GET and
+  // starts that one. A failed refresh keeps them gated (fail closed) until a
+  // later GET succeeds.
+  const [refreshed, setRefreshed] = useState<{ readonly op: string; readonly ok: boolean; readonly at: number } | undefined>();
+  useEffect(() => {
+    if (operationId === undefined || !settled) return undefined;
+    let live = true;
+    const started = Date.now();
+    void queryClient.invalidateQueries({ queryKey: STATE_KEY }, { cancelRefetch: true }).then(() => {
+      if (!live) return;
+      const query = queryClient.getQueryState(STATE_KEY);
+      const ok = query?.status === 'success' && query.dataUpdatedAt >= started && query.errorUpdatedAt < started;
+      setRefreshed({ op: operationId, ok, at: Date.now() });
+    });
+    return () => { live = false; };
+  }, [operationId, settled, queryClient]);
+  const refreshReason = operationId === undefined || !settled ? undefined
+    : refreshed?.op !== operationId ? t`Refreshing the switcher state after the last operation`
+    : refreshed.ok || state.dataUpdatedAt > refreshed.at ? undefined
+    : t`The switcher state could not be refreshed after the last operation; keyer and arm controls stay disabled until it is`;
+  const keyerReason = ready ? refreshReason : !state.data ? t`Switcher unavailable` : submitting ? t`A switcher request is in flight` : t`Operation in flight or outcome pending`;
   const [keyerError, setKeyerError] = useState<string | undefined>();
   const keyerMutate = useMutation({
     mutationFn: async (fields: Omit<KeyerRequest, 'me' | 'program'>) => {
@@ -164,7 +188,7 @@ export function SwitcherPage(): JSX.Element {
   // the same gate; the toggles light only from the engine's `armed` view.
   const [armError, setArmError] = useState<string | undefined>();
   const armMutate = useMutation({
-    mutationFn: async (next: ArmedView) => {
+    mutationFn: async (next: ArmSet) => {
       const req: KeyerRequest = { me: 'me1', program: 'main', action: 'arm', background: next.background, keys: [...next.keys] };
       const plan = await planKeyer(req);
       if (!plan.can_take) throw new Error(plan.refusal?.detail ?? t`The arm set was refused`);
@@ -176,7 +200,7 @@ export function SwitcherPage(): JSX.Element {
       setArmError(reason instanceof OperationApiError && reason.detail !== undefined ? `${reason.message}: ${reason.detail}` : reason.message);
     },
   });
-  const arm = (next: ArmedView): void => { void gated(() => armMutate.mutateAsync(next)).catch(() => undefined); };
+  const arm = (next: ArmSet): void => { void gated(() => armMutate.mutateAsync(next)).catch(() => undefined); };
   const take = (intent: Intent): void => { void gated(() => mutate.mutateAsync(intent)).catch(() => undefined); };
   // The output tick now, extrapolated from the snapshot at the exact cadence
   // so a ramp's progress advances between (change-only) snapshots.
@@ -267,7 +291,7 @@ export function SwitcherPage(): JSX.Element {
           )}
           {(state.data?.keyers ?? []).map((row) => (
             <KeyerStrip
-              key={row.id}
+              key={keyerDomKey(row)}
               row={row}
               tick={tickNow}
               disabledReason={keyerReason}
@@ -280,7 +304,7 @@ export function SwitcherPage(): JSX.Element {
           {keyerError !== undefined && <p role="alert" className="text-destructive">{keyerError}</p>}
           {(state.data?.keyers ?? []).map((row) => (
             <KeyerPanel
-              key={`panel-${row.id}`}
+              key={`panel-${keyerDomKey(row)}`}
               row={row}
               sources={sources.data ?? []}
               disabledReason={keyerReason}

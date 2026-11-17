@@ -21,7 +21,7 @@ import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import { Label } from '../ui/label';
 import type { FlyPreset, KeyerFields, KeyerKind, KeyerLossPolicy, KeyerPlan, KeyerRect, KeyerRow, KeyerSize } from '../../api/keyers';
-import { FLY_PRESETS, flyPresetRect, keyerFillRedacted, keyerFillSource, keyerIsUsk, keyerKeyRedacted, keyerKeySource, keyerKind, normalizeHexColor } from '../../api/keyers';
+import { FLY_PRESETS, flyPresetRect, keyerFillRedacted, keyerFillSource, keyerDomKey, keyerIsUsk, keyerKeyRedacted, keyerKeySource, keyerKind, normalizeHexColor } from '../../api/keyers';
 import { OperationApiError } from '../../api/operations';
 
 export interface KeyerPanelProps {
@@ -169,7 +169,8 @@ export function KeyerPanel({ row, sources, disabledReason, canvas, onPlan, onApp
     : undefined;
   const reviewReason = disabledReason ?? invalidReason ?? (draft.changed ? undefined : t`No changes to review`);
   const applyReason = disabledReason ?? (reviewed === undefined ? t`Review this change first` : !reviewed.plan.can_take ? t`The reviewed change was refused` : undefined);
-  const reasonId = `keyer-panel-reason-${row.id}`;
+  const domId = keyerDomKey(row);
+  const reasonId = `keyer-panel-reason-${domId}`;
   /** Disabled state plus its reason as `title` and `aria-describedby` (design note §10). */
   const gate = (reason: string | undefined, describedBy = reasonId): { disabled: boolean; title?: string; 'aria-describedby'?: string } =>
     reason === undefined ? { disabled: false } : { disabled: true, title: reason, 'aria-describedby': describedBy };
@@ -226,33 +227,33 @@ export function KeyerPanel({ row, sources, disabledReason, canvas, onPlan, onApp
   };
 
   return (
-    <section className="space-y-2 rounded border p-3" aria-label={t`Keyer ${row.id} panel`} data-testid={`keyer-panel-${row.id}`}>
+    <section className="space-y-2 rounded border p-3" aria-label={usk ? t`Upstream keyer ${row.id} panel` : t`Keyer ${row.id} panel`} data-testid={`keyer-panel-${row.id}`} data-family={usk ? 'usk' : 'dsk'}>
       <h3 className="font-semibold uppercase">{row.id}</h3>
       <span className="sr-only" id={reasonId}>{disabledReason}</span>
       <div className="flex flex-wrap items-end gap-3">
         <div className="space-y-1">
-          <Label htmlFor={`keyer-fill-${row.id}`}><Trans>Fill</Trans></Label>
+          <Label htmlFor={`keyer-fill-${domId}`}><Trans>Fill</Trans></Label>
           {fillRedacted
-            ? <p id={`keyer-fill-${row.id}`} role="status" data-testid={`keyer-fill-redacted-${row.id}`}><Trans>redacted</Trans></p>
-            : <select id={`keyer-fill-${row.id}`} className="rounded border bg-background p-2" value={fill} {...base}
+            ? <p id={`keyer-fill-${domId}`} role="status" data-testid={`keyer-fill-redacted-${row.id}`}><Trans>redacted</Trans></p>
+            : <select id={`keyer-fill-${domId}`} className="rounded border bg-background p-2" value={fill} {...base}
                 onChange={(event) => { edit({ fill: event.target.value }); }}>
                 <option value="">{t`Choose a source`}</option>
                 {sources.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}
               </select>}
         </div>
         {type !== 'chroma' && <div className="space-y-1">
-          <Label htmlFor={`keyer-key-${row.id}`}><Trans>Key</Trans></Label>
+          <Label htmlFor={`keyer-key-${domId}`}><Trans>Key</Trans></Label>
           {keyRedacted
-            ? <p id={`keyer-key-${row.id}`} role="status" data-testid={`keyer-key-redacted-${row.id}`}><Trans>redacted</Trans></p>
-            : <select id={`keyer-key-${row.id}`} className="rounded border bg-background p-2" value={key} {...base}
+            ? <p id={`keyer-key-${domId}`} role="status" data-testid={`keyer-key-redacted-${row.id}`}><Trans>redacted</Trans></p>
+            : <select id={`keyer-key-${domId}`} className="rounded border bg-background p-2" value={key} {...base}
                 onChange={(event) => { edit({ key: event.target.value }); }}>
                 <option value="">{t`Self key (fill alpha)`}</option>
                 {sources.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}
               </select>}
         </div>}
         <div className="space-y-1">
-          <Label htmlFor={`keyer-type-${row.id}`}><Trans>Type</Trans></Label>
-          <select id={`keyer-type-${row.id}`} className="rounded border bg-background p-2" value={type} {...base}
+          <Label htmlFor={`keyer-type-${domId}`}><Trans>Type</Trans></Label>
+          <select id={`keyer-type-${domId}`} className="rounded border bg-background p-2" value={type} {...base}
             onChange={(event) => { const v = event.target.value; edit({ type: v === 'luma' ? 'luma' : v === 'chroma' && !usk ? 'chroma' : 'linear' }); }}>
             <option value="linear">{t`Linear`}</option>
             <option value="luma">{t`Luma`}</option>
@@ -262,15 +263,15 @@ export function KeyerPanel({ row, sources, disabledReason, canvas, onPlan, onApp
       </div>
       {(type === 'luma' || type === 'chroma') && (
         <div className="flex flex-wrap items-end gap-3">
-          {type === 'chroma' && <div className="space-y-1"><Label htmlFor={`keyer-color-${row.id}`}><Trans>Chroma colour</Trans></Label>
-            <input id={`keyer-color-${row.id}`} type="color" value={normalizeHexColor(color) ?? DEFAULT_CHROMA} {...base}
+          {type === 'chroma' && <div className="space-y-1"><Label htmlFor={`keyer-color-${domId}`}><Trans>Chroma colour</Trans></Label>
+            <input id={`keyer-color-${domId}`} type="color" value={normalizeHexColor(color) ?? DEFAULT_CHROMA} {...base}
               aria-invalid={draft.invalid === 'color'} className="h-9 w-16 rounded border bg-background"
               onChange={(event) => { edit({ color: event.target.value }); }} />
             <span className="ml-2 font-mono text-xs" data-testid={`keyer-color-value-${row.id}`}>{color}</span></div>}
-          <div className="space-y-1"><Label htmlFor={`keyer-clip-${row.id}`}><Trans>Clip</Trans></Label>
-            <Input id={`keyer-clip-${row.id}`} type="number" min="0" max="1" step="0.01" value={clip} {...base} aria-invalid={draft.invalid === 'clip'} className="w-24" onChange={(event) => { edit({ clip: event.target.value }); }} /></div>
-          <div className="space-y-1"><Label htmlFor={`keyer-gain-${row.id}`}><Trans>Gain</Trans></Label>
-            <Input id={`keyer-gain-${row.id}`} type="number" min="0" step="0.01" value={gain} {...base} aria-invalid={draft.invalid === 'gain'} className="w-24" onChange={(event) => { edit({ gain: event.target.value }); }} /></div>
+          <div className="space-y-1"><Label htmlFor={`keyer-clip-${domId}`}><Trans>Clip</Trans></Label>
+            <Input id={`keyer-clip-${domId}`} type="number" min="0" max="1" step="0.01" value={clip} {...base} aria-invalid={draft.invalid === 'clip'} className="w-24" onChange={(event) => { edit({ clip: event.target.value }); }} /></div>
+          <div className="space-y-1"><Label htmlFor={`keyer-gain-${domId}`}><Trans>Gain</Trans></Label>
+            <Input id={`keyer-gain-${domId}`} type="number" min="0" step="0.01" value={gain} {...base} aria-invalid={draft.invalid === 'gain'} className="w-24" onChange={(event) => { edit({ gain: event.target.value }); }} /></div>
         </div>
       )}
       <label className="flex items-center gap-1 text-sm">
@@ -295,8 +296,8 @@ export function KeyerPanel({ row, sources, disabledReason, canvas, onPlan, onApp
           <div className="flex flex-wrap items-end gap-2">
             {AXES.map((axis) => (
               <div className="space-y-1" key={axis}>
-                <Label htmlFor={`keyer-fly-${axis}-${row.id}`}><Trans>Fly {axisLabel(axis)}</Trans></Label>
-                <Input id={`keyer-fly-${axis}-${row.id}`} type="number" min={axis === 'w' || axis === 'h' ? '1' : '0'} step="1" value={fly[axis]} {...base}
+                <Label htmlFor={`keyer-fly-${axis}-${domId}`}><Trans>Fly {axisLabel(axis)}</Trans></Label>
+                <Input id={`keyer-fly-${axis}-${domId}`} type="number" min={axis === 'w' || axis === 'h' ? '1' : '0'} step="1" value={fly[axis]} {...base}
                   aria-invalid={draft.invalid === 'fly'} className="w-24" onChange={(event) => { edit({ fly: { ...fly, [axis]: event.target.value } }); }} />
               </div>
             ))}
@@ -314,8 +315,8 @@ export function KeyerPanel({ row, sources, disabledReason, canvas, onPlan, onApp
           <div className="flex flex-wrap items-end gap-2">
             {AXES.map((axis) => (
               <div className="space-y-1" key={axis}>
-                <Label htmlFor={`keyer-mask-${axis}-${row.id}`}><Trans>Mask {axisLabel(axis)}</Trans></Label>
-                <Input id={`keyer-mask-${axis}-${row.id}`} type="number" min={axis === 'w' || axis === 'h' ? '1' : '0'} step="1" value={mask[axis]} {...base}
+                <Label htmlFor={`keyer-mask-${axis}-${domId}`}><Trans>Mask {axisLabel(axis)}</Trans></Label>
+                <Input id={`keyer-mask-${axis}-${domId}`} type="number" min={axis === 'w' || axis === 'h' ? '1' : '0'} step="1" value={mask[axis]} {...base}
                   aria-invalid={draft.invalid === 'mask'} className="w-24" onChange={(event) => { edit({ mask: { ...mask, [axis]: event.target.value } }); }} />
               </div>
             ))}
@@ -327,17 +328,17 @@ export function KeyerPanel({ row, sources, disabledReason, canvas, onPlan, onApp
         {invalidReason !== undefined && <p role="alert" data-testid={`keyer-invalid-${row.id}`}>{invalidReason}</p>}
       </fieldset>
       <div className="space-y-1">
-        <Label htmlFor={`keyer-loss-${row.id}`}><Trans>Loss policy</Trans></Label>
-        <select id={`keyer-loss-${row.id}`} className="rounded border bg-background p-2" value={loss} {...base}
+        <Label htmlFor={`keyer-loss-${domId}`}><Trans>Loss policy</Trans></Label>
+        <select id={`keyer-loss-${domId}`} className="rounded border bg-background p-2" value={loss} {...base}
           onChange={(event) => { edit({ loss: event.target.value === 'hold_last_good' ? 'hold_last_good' : 'drop_to_off_air' }); }}>
           {LOSS_POLICIES.map((policy) => <option key={policy} value={policy}>{policy === 'hold_last_good' ? t`Hold last good` : t`Drop to off air`}</option>)}
         </select>
       </div>
       <div className="flex flex-wrap items-center gap-2">
-        <Button {...gate(reviewReason, `keyer-review-reason-${row.id}`)} onClick={() => { void runReview(); }}><Trans>Review</Trans></Button>
-        <span className="sr-only" id={`keyer-review-reason-${row.id}`}>{reviewReason}</span>
-        <Button {...gate(applyReason, `keyer-apply-reason-${row.id}`)} onClick={() => { void apply(false); }}><Trans>Apply</Trans></Button>
-        <span className="sr-only" id={`keyer-apply-reason-${row.id}`}>{applyReason}</span>
+        <Button {...gate(reviewReason, `keyer-review-reason-${domId}`)} onClick={() => { void runReview(); }}><Trans>Review</Trans></Button>
+        <span className="sr-only" id={`keyer-review-reason-${domId}`}>{reviewReason}</span>
+        <Button {...gate(applyReason, `keyer-apply-reason-${domId}`)} onClick={() => { void apply(false); }}><Trans>Apply</Trans></Button>
+        <span className="sr-only" id={`keyer-apply-reason-${domId}`}>{applyReason}</span>
         {reviewed !== undefined && (
           <span role="status" data-testid={`keyer-plan-${row.id}`}>
             {reviewed.plan.class === 'class1' ? t`Class 1 (seamless, one tick)` : t`Class 2 (controlled reset)`}

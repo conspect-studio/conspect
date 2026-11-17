@@ -11,7 +11,7 @@ import { Trans, useLingui } from '@lingui/react/macro';
 import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import type { KeyerRow } from '../../api/keyers';
-import { keyerIsUsk, keyerRampWeight, keyerRamping } from '../../api/keyers';
+import { keyerDomKey, keyerIsUsk, keyerRampWeight, keyerRamping } from '../../api/keyers';
 
 export interface KeyerStripProps {
   readonly row: KeyerRow;
@@ -40,14 +40,15 @@ export function KeyerStrip({ row, tick, disabledReason, transitionInFlight = fal
   const rateReason = rateValid ? undefined : t`Rate must be a whole number of frames, 1–300`;
   const ramping = keyerRamping(row);
   const weight = ramping ? keyerRampWeight(row, tick) : undefined;
-  const describedById = `keyer-strip-reason-${row.id}`;
+  const domId = keyerDomKey(row);
+  const describedById = `keyer-strip-reason-${domId}`;
   const usk = keyerIsUsk(row);
   const reason = disabledReason;
   const cutReason = reason ?? (usk && transitionInFlight ? t`An upstream keyer cuts only outside a transition` : undefined);
   const autoReason = reason ?? rateReason;
   const tieReason = reason;
   return (
-    <div className="flex flex-wrap items-center gap-2 rounded border p-2" aria-label={t`Keyer ${row.id} strip`} data-testid={`keyer-strip-${row.id}`}>
+    <div className="flex flex-wrap items-center gap-2 rounded border p-2" aria-label={usk ? t`Upstream keyer ${row.id} strip` : t`Keyer ${row.id} strip`} data-testid={`keyer-strip-${row.id}`} data-family={usk ? 'usk' : 'dsk'}>
       <span className="font-semibold uppercase">{row.id}</span>
       <span
         role="status"
@@ -85,9 +86,9 @@ export function KeyerStrip({ row, tick, disabledReason, transitionInFlight = fal
         <Trans>Cut</Trans>
       </Button>
       {!usk && <>
-      <label className="sr-only" htmlFor={`keyer-rate-${row.id}`}><Trans>Rate in frames for {row.id}</Trans></label>
+      <label className="sr-only" htmlFor={`keyer-rate-${domId}`}><Trans>Rate in frames for {row.id}</Trans></label>
       <Input
-        id={`keyer-rate-${row.id}`}
+        id={`keyer-rate-${domId}`}
         type="number"
         min={MIN_RATE}
         max={MAX_RATE}
