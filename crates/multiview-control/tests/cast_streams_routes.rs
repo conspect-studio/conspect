@@ -3978,7 +3978,7 @@ mod moq_rung {
         (doc["id"].as_str().unwrap().to_owned(), token_of(&doc))
     }
 
-    /// The ladder attaches MoQ through the shared check: one admission with
+    /// The ladder attaches `MoQ` through the shared check: one admission with
     /// the owner's principal on the cast output only, the lease fields of
     /// decision 3, `then: ["hls"]`, and the attachment cleared for the
     /// identities current now and registered with the token.
@@ -4008,7 +4008,7 @@ mod moq_rung {
     }
 
     /// Review note R2-N4: no subscription left gives the next rung, not an
-    /// error; a receiver without a frame counter is never offered MoQ.
+    /// error; a receiver without a frame counter is never offered `MoQ`.
     #[tokio::test]
     async fn no_subscription_left_offers_the_next_rung() {
         let (rig, fake) = moq_rig(0);
@@ -4097,8 +4097,8 @@ mod moq_rung {
         ));
     }
 
-    /// Decision 3: a call reporting `failed` for MoQ answers with the next
-    /// rung (here HLS), not MoQ again.
+    /// Decision 3: a call reporting `failed` for `MoQ` answers with the next
+    /// rung (here HLS), not `MoQ` again.
     #[tokio::test]
     async fn a_failed_moq_answers_the_next_rung() {
         let (rig, fake) = moq_rig(16);
