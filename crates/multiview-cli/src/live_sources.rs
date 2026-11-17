@@ -244,6 +244,41 @@ pub trait IngestSpawner: Send + Sync {
 
     /// A source left the run. Hub worker only.
     fn source_removed(&self, _id: &str) {}
+
+    /// Catalogue a `media_player` alias (ADR-M012) over its player's `store`
+    /// so demand reports and leases it; `unavailable` says why it can show no
+    /// picture (its player has no channel). Returns `true` on a
+    /// demand-managed run. Never starts a producer. Hub worker only.
+    fn catalogue_alias(
+        &self,
+        _source: &multiview_config::Source,
+        _store: &Arc<TileStore<Nv12Image>>,
+        _unavailable: Option<String>,
+    ) -> bool {
+        false
+    }
+
+    /// A `media_player` alias bound to `store` left the run (removed, or
+    /// edited into another kind). Withdraw its catalogue entry and pins only
+    /// while the entry is still that very alias (a later definition under the
+    /// id is never touched). The store is the player channel's and is never
+    /// cleared. Hub worker only.
+    fn alias_removed(&self, _id: &str, _store: &Arc<TileStore<Nv12Image>>) {}
+}
+
+/// A live `media_player` alias binding (ADR-M012) for the hub: no producer,
+/// only the catalogue entry and the preview/wall store map.
+pub struct AliasBind {
+    /// The alias source document.
+    pub source: multiview_config::Source,
+    /// The player channel's store (or a never-fed one when it has none).
+    pub store: Arc<TileStore<Nv12Image>>,
+    /// Why the alias can show no picture, when its player has no channel.
+    pub unavailable: Option<String>,
+    /// A producer ran (or a shed removal of one is pending) under this id:
+    /// the hub tears it down BEFORE it binds the alias, in this one ordered
+    /// request, so no separate teardown can land after the binding.
+    pub replaces_producer: bool,
 }
 
 /// A request travelling from the frame-boundary drain to the hub worker.
@@ -259,6 +294,22 @@ enum HubRequest {
     Teardown {
         /// The source id whose producer goes away.
         id: String,
+    },
+    /// Bind (or repoint) a `media_player` alias: catalogue it and publish its
+    /// store to the preview/wall map. Never spawns anything. Boxed: it carries
+    /// a full config `Source`.
+    BindAlias(Box<AliasBind>),
+    /// A `media_player` alias left: withdraw its catalogue entry and, unless
+    /// the id is the player channel itself, its preview entry — each only
+    /// while it still holds `store`, so a stale (retried) unbind never removes
+    /// a later definition under the same id.
+    UnbindAlias {
+        /// The alias id.
+        id: String,
+        /// The store the alias was bound to.
+        store: Arc<TileStore<Nv12Image>>,
+        /// Keep the preview entry (the id is the player channel itself).
+        keep_preview: bool,
     },
     /// Stop the worker (run over): tear down + join every owned producer and
     /// exit. Sent by [`LiveSourceHub::shutdown`] — an explicit request because
@@ -323,6 +374,23 @@ impl SubmitFault {
     pub fn gone(&self) {
         self.0.store(2, Ordering::Release);
     }
+    /// Shed only the NEXT teardown request as [`HubSubmit::Full`]; every
+    /// other submission (and every later teardown) goes through. Models a
+    /// queue that fills for one request and drains before the next.
+    pub fn full_next_teardown(&self) {
+        self.0.store(3, Ordering::Release);
+    }
+    /// The forced outcome of a teardown request (consumes a one-shot).
+    fn forced_teardown(&self) -> Option<HubSubmit> {
+        if self
+            .0
+            .compare_exchange(3, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Some(HubSubmit::Full);
+        }
+        self.forced()
+    }
     fn forced(&self) -> Option<HubSubmit> {
         match self.0.load(Ordering::Acquire) {
             1 => Some(HubSubmit::Full),
@@ -375,10 +443,40 @@ impl LiveSourceHandle {
     /// [`HubSubmit::Full`]/[`HubSubmit::Gone`].
     #[must_use]
     pub fn request_teardown(&self, id: &str) -> HubSubmit {
-        if let Some(forced) = self.forced() {
+        if let Some(forced) = self.fault.as_ref().and_then(SubmitFault::forced_teardown) {
             return forced;
         }
         let request = HubRequest::Teardown { id: id.to_owned() };
+        Self::submit_outcome(&self.tx.try_send(request))
+    }
+
+    /// Request a `media_player` alias binding (ADR-M012). Never blocks; a shed
+    /// request is reported as [`HubSubmit::Full`]/[`HubSubmit::Gone`] (the
+    /// drive binding already applied; only its status/preview entry lags).
+    #[must_use]
+    pub fn request_bind_alias(&self, bind: AliasBind) -> HubSubmit {
+        if let Some(forced) = self.forced() {
+            return forced;
+        }
+        Self::submit_outcome(&self.tx.try_send(HubRequest::BindAlias(Box::new(bind))))
+    }
+
+    /// Request a `media_player` alias unbinding. Never blocks.
+    #[must_use]
+    pub fn request_unbind_alias(
+        &self,
+        id: &str,
+        store: &Arc<TileStore<Nv12Image>>,
+        keep_preview: bool,
+    ) -> HubSubmit {
+        if let Some(forced) = self.forced() {
+            return forced;
+        }
+        let request = HubRequest::UnbindAlias {
+            id: id.to_owned(),
+            store: Arc::clone(store),
+            keep_preview,
+        };
         Self::submit_outcome(&self.tx.try_send(request))
     }
 
@@ -520,6 +618,39 @@ fn worker_loop(
                     ingest.source_removed(&id);
                 }
                 preview_remove(preview, &id);
+            }
+            HubRequest::BindAlias(bind) => {
+                let AliasBind {
+                    source,
+                    store,
+                    unavailable,
+                    replaces_producer,
+                } = *bind;
+                if replaces_producer {
+                    // Producer -> alias: stop and forget the producer first,
+                    // exactly as a removal does, then bind — one ordered
+                    // request (review ship-1111 #1).
+                    teardown(&source.id, &mut owned, registry);
+                    if let Some(ingest) = ingest {
+                        ingest.source_removed(&source.id);
+                    }
+                }
+                preview_insert(preview, &source.id, &store);
+                if let Some(ingest) = ingest {
+                    ingest.catalogue_alias(&source, &store, unavailable);
+                }
+            }
+            HubRequest::UnbindAlias {
+                id,
+                store,
+                keep_preview,
+            } => {
+                if let Some(ingest) = ingest {
+                    ingest.alias_removed(&id, &store);
+                }
+                if !keep_preview {
+                    preview_remove_if(preview, &id, &store);
+                }
             }
             HubRequest::Shutdown => break,
         }
@@ -836,6 +967,20 @@ fn preview_insert(preview: &SharedStores, id: &str, store: &Arc<TileStore<Nv12Im
     });
 }
 
+/// RCU-remove `id` from the shared preview map only while it maps to `store`.
+fn preview_remove_if(preview: &SharedStores, id: &str, store: &Arc<TileStore<Nv12Image>>) {
+    preview.rcu(|map| {
+        let mut next = HashMap::clone(map);
+        if next
+            .get(id)
+            .is_some_and(|current| Arc::ptr_eq(current, store))
+        {
+            next.remove(id);
+        }
+        next
+    });
+}
+
 /// RCU-remove `id` from the shared preview map.
 fn preview_remove(preview: &SharedStores, id: &str) {
     preview.rcu(|map| {
@@ -843,6 +988,13 @@ fn preview_remove(preview: &SharedStores, id: &str) {
         next.remove(id);
         next
     });
+}
+
+/// The status detail of a `media_player` alias whose player has no channel in
+/// this run (ADR-M012). Feature-independent: the drain computes it on every build.
+#[must_use]
+pub fn no_channel_reason(player: &str) -> String {
+    format!("media player {player:?} has no channel in this run; it shows no picture")
 }
 
 #[cfg(test)]

@@ -251,6 +251,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # #518: no debuginfo in the test/dev profiles and no incremental cache. The
+    # job builds the whole workspace's test executables, then rebuilds
+    # multiview-cli with `sqlite` on top; debuginfo was most of that bulk.
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@v7
       # The ubuntu runner has ~14 GiB free; the workspace test binaries plus the
@@ -276,6 +283,20 @@ jobs:
         # SCALING correctness is covered unconditionally by
         # tile_driven_scales_with_coverage_not_tile_count.
         run: cargo test --locked --workspace -- --skip tile_driven_meets_budget
+      # #518: the workspace's test executables (one per integration-test target,
+      # each linking the whole engine) filled the runner before the sqlite
+      # rebuilds below (ENOSPC on every run since 17 Nov). They already ran, so
+      # delete them (and any incremental cache; the job disables it, so that is
+      # defensive); the libraries the sqlite steps reuse stay. `df` after each
+      # sqlite step logs the headroom.
+      - name: free the finished test executables (ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          df -h /
+          du -sh target/debug/deps target/debug/incremental 2>/dev/null || true
+          find target/debug/deps -maxdepth 1 -type f -executable ! -name '*.so' -delete
+          rm -rf target/debug/incremental
+          df -h /
       - name: test multiview-control --features sqlite (desired-state projection)
         # The default build carries no SQLite (its licence is outside the
         # cargo-deny allowlist), so the layouts.db projection never ran in CI.
@@ -298,6 +319,9 @@ jobs:
           --test source_output_durable
           --test boot_config_model
           --test sqlite_repo
+      - name: disk after the step above (ubuntu)
+        if: always() && matrix.os == 'ubuntu-latest'
+        run: df -h /
       - name: test multiview-cli --features sqlite (boot migration + rebind)
         # The real boot path over a real layouts.db: first-boot migration of an
         # active.toml + layouts.db install with no desired.json, layout rebind,
@@ -313,6 +337,9 @@ jobs:
           --features sqlite
           --test desired_migration
           --test boot_resume
+      - name: disk after the step above (ubuntu)
+        if: always() && matrix.os == 'ubuntu-latest'
+        run: df -h /
       - name: test multiview-cli --features sqlite (bind_and_serve restore)
         # The `control` module lib tests under the same feature: restoring
         # accepted names and versions through bind_and_serve. A separate step
@@ -325,6 +352,9 @@ jobs:
           -p multiview-cli
           --features sqlite
           --lib control::
+      - name: disk after the step above (ubuntu)
+        if: always() && matrix.os == 'ubuntu-latest'
+        run: df -h /
 
   # ── feature-gated clippy + test matrix (IN-7) ────────────────────────────────
   # The default `lint` and `test` jobs run with default features only (pure-Rust,
