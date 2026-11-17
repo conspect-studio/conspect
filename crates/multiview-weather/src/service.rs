@@ -108,6 +108,26 @@ pub struct WeatherService {
     store: Arc<WeatherStore>,
     locations: Arc<watch::Sender<Vec<LocationSpec>>>,
     products: Arc<Mutex<BTreeMap<String, Freshness>>>,
+    /// Serializes [`Self::republish`]: the view is built from the freshness
+    /// map and the published entries, then stored, as one step. Without it a
+    /// `set_locations` placeholder built before a poll pass could land after
+    /// that pass and erase its freshness/error until the next poll (#483).
+    publish: Arc<Mutex<()>>,
+    /// Test seam: runs once inside `republish`, after the view is built and
+    /// before it is stored (deterministic interleave for #483).
+    #[cfg(test)]
+    before_publish: Arc<Mutex<Option<PublishHook>>>,
+}
+
+/// Test-only one-shot hook with a `Debug` face, fired only by the `republish`
+/// running on the thread that armed it.
+#[cfg(test)]
+struct PublishHook(std::thread::ThreadId, Box<dyn FnOnce() + Send>);
+#[cfg(test)]
+impl std::fmt::Debug for PublishHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PublishHook")
+    }
 }
 
 impl Default for WeatherService {
@@ -125,6 +145,9 @@ impl WeatherService {
             store,
             locations: Arc::new(tx),
             products: Arc::new(Mutex::new(BTreeMap::new())),
+            publish: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            before_publish: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -157,6 +180,12 @@ impl WeatherService {
     /// last-good parses; an empty map means "keep whatever is published"
     /// (used for config edits between polls).
     fn republish(&self, parsed: &BTreeMap<String, Parsed>) {
+        // Management plane only (render workers read the store with
+        // `try_read`); held across plain map work, never an await.
+        let _serial = self
+            .publish
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let freshness = self.products.lock().map(|p| p.clone()).unwrap_or_default();
         let locations = self.locations.borrow().clone();
         let previous: BTreeMap<String, Arc<LocationWeather>> = self
@@ -197,6 +226,24 @@ impl WeatherService {
                     .as_ref()
                     .map(|(p, _)| freshness.get(p).cloned().unwrap_or_default()),
             });
+        }
+        #[cfg(test)]
+        {
+            let hook = self
+                .before_publish
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(hook) = hook {
+                if hook.0 == std::thread::current().id() {
+                    (hook.1)();
+                } else {
+                    *self
+                        .before_publish
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+                }
+            }
         }
         self.store.publish_all(out);
     }
@@ -464,6 +511,63 @@ mod tests {
         assert!(data.forecast.is_none());
         assert_eq!(data.forecast_freshness.error.as_deref(), Some("boom"));
         assert!(svc.product_freshness("IDN11060").unwrap().error.is_some());
+    }
+
+    /// #483, deterministic interleave: the `set_locations` placeholder view is
+    /// built (empty freshness) while the poller's first pass records the
+    /// error and republishes. The later of the two stores must not erase the
+    /// recorded error: republishes are serialized, so the error stays visible
+    /// without waiting for the next (backed-off, 10 min) poll.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_placeholder_racing_the_first_poll_never_erases_its_error() {
+        let fake = Fake::default();
+        fake.fail.store(true, Ordering::SeqCst);
+        let svc = WeatherService::default();
+        let _task = svc.spawn(fake.clone(), std::future::pending());
+        settle().await; // the idle pass's republish has run
+        let observer = svc.clone();
+        *svc.before_publish.lock().unwrap() = Some(PublishHook(
+            std::thread::current().id(),
+            Box::new(move || {
+                // The placeholder view is built; hold it until the poller has
+                // recorded the failure, and give the poller's own republish a
+                // bounded chance to land first (it cannot while serialized).
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                while observer
+                    .product_freshness("IDN11060")
+                    .and_then(|f| f.error)
+                    .is_none()
+                {
+                    assert!(std::time::Instant::now() < deadline, "the poller ran");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let grace = std::time::Instant::now() + Duration::from_millis(500);
+                while std::time::Instant::now() < grace
+                    && !observer
+                        .store()
+                        .get("sydney")
+                        .is_some_and(|p| p.data.forecast_freshness.error.is_some())
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }),
+        ));
+        svc.set_locations(vec![sydney()]);
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 2, "one failed pass");
+        // The poller's republish (blocked behind the placeholder) lands next.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !svc
+            .store()
+            .get("sydney")
+            .is_some_and(|p| p.data.forecast_freshness.error.is_some())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the recorded error was erased by the placeholder view"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 2, "no refetch needed");
     }
 
     #[test]
