@@ -13,7 +13,9 @@
 # escaping GHA cache's branch-isolation + 10 GB LRU eviction.
 #
 # Flavours (selected by build-args, published as ghcr.io/<owner>/multiview-ffmpeg
-# :9.0.2-{lgpl,nvidia,gpl}):
+# :9.0.2-srt1.5.7-{lgpl,nvidia,gpl}; the srt part names the bundled libsrt,
+# /opt/multiview-ffmpeg/lib/libsrt.so.1.5.7, which FFmpeg's srt protocol and the
+# multiview-srt-sys listener leaf both load):
 #   * lgpl   — FF_HWACCEL=vaapi  FF_LICENSE=lgpl  (VAAPI + Intel QSV/libvpl on
 #              amd64; multi-arch; the genuinely LGPL-clean default).
 #   * nvidia — FF_HWACCEL=nvidia FF_LICENSE=lgpl  (NVENC/NVDEC/cuvid/scale_cuda
@@ -58,6 +60,13 @@ RUN chmod 0755 /usr/local/bin/ffmpeg-fetch-source.sh \
     FFMPEG_GPG_KEY="${FFMPEG_GPG_KEY}" \
     FFMPEG_GIT_COMMIT="${FFMPEG_GIT_COMMIT}" \
     /usr/local/bin/ffmpeg-fetch-source.sh /src
+# libsrt security floor (GHSA-m96h-3rc9-xx6h, fixed in 1.5.7): the pinned,
+# SHA-256-verified upstream tarball, fetched once here like the FFmpeg source.
+ARG LIBSRT_VERSION=1.5.7
+ARG LIBSRT_SHA256=017cd1e437ef2073a4dd10ddf7b55e86bc3d6ebac0393d13bd22f6a57055d32b
+COPY deploy/libsrt-build.sh /usr/local/bin/libsrt-build.sh
+RUN LIBSRT_VERSION="${LIBSRT_VERSION}" LIBSRT_SHA256="${LIBSRT_SHA256}" \
+    bash /usr/local/bin/libsrt-build.sh fetch /src/libsrt
 
 # -----------------------------------------------------------------------------
 # Stage: builder — toolchain + the LGPL-clean external libs our allowlist enables,
@@ -88,19 +97,24 @@ ARG FF_LICENSE=lgpl
 # Buildx supplies TARGETARCH (amd64|arm64); QSV/libvpl is gated amd64-only both
 # in the apt install below and in deploy/ffmpeg-build.sh.
 ARG TARGETARCH
+ARG LIBSRT_VERSION=1.5.7
+ARG LIBSRT_SHA256=017cd1e437ef2073a4dd10ddf7b55e86bc3d6ebac0393d13bd22f6a57055d32b
 
 # Build toolchain + the LGPL-clean external libs our allowlist enables (libopus,
-# libsrt, gnutls/nettle, libdrm) + VAAPI (libva) and, on amd64 vaapi builds,
+# gnutls/nettle, libdrm) + VAAPI (libva) and, on amd64 vaapi builds,
 # Intel QSV (libvpl) userspace. `git` is needed for the nv-codec-headers clone on
 # the nvidia path; clang/llvm provide --enable-cuda-llvm (JIT scale_cuda, no CUDA
 # SDK). libvpl-dev is amd64-only — install it only there so the arm64 leg builds
 # (the script also gates --enable-libvpl on TARGETARCH=amd64). No x264/x265-dev
 # here in the lgpl default; the gpl profile pulls them in below.
+# NO Debian libsrt: trixie's 1.5.4 lacks the 1.5.7 listener heap-overflow fix
+# (GHSA-m96h-3rc9-xx6h). deploy/libsrt-build.sh builds the pinned 1.5.7 into
+# the prefix instead (cmake + OpenSSL headers; OpenSSL is Apache-2.0).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl gnupg git \
-      build-essential clang llvm pkg-config nasm yasm make patch \
-      libopus-dev libsrt-openssl-dev libgnutls28-dev libdrm-dev libva-dev zlib1g-dev \
+      build-essential clang llvm pkg-config nasm yasm make patch cmake libssl-dev \
+      libopus-dev libgnutls28-dev libdrm-dev libva-dev zlib1g-dev \
  && if [ "${FF_HWACCEL}" = "vaapi" ] && [ "$(dpkg --print-architecture)" = "amd64" ]; then \
       apt-get install -y --no-install-recommends libvpl-dev; \
     fi \
@@ -116,6 +130,7 @@ RUN apt-get update \
 # aborts. Output: /opt/multiview-ffmpeg/{lib,include,lib/pkgconfig}.
 COPY --from=source /src /usr/src/ffmpeg
 COPY deploy/ffmpeg-build.sh /usr/local/bin/ffmpeg-build.sh
+COPY deploy/libsrt-build.sh /usr/local/bin/libsrt-build.sh
 COPY deploy/ffmpeg-patches /usr/local/bin/ffmpeg-patches
 RUN chmod 0755 /usr/local/bin/ffmpeg-build.sh \
  && FF_HWACCEL="${FF_HWACCEL}" \
@@ -127,6 +142,9 @@ RUN chmod 0755 /usr/local/bin/ffmpeg-build.sh \
     FF_LICENSE="${FF_LICENSE}" \
     TARGETARCH="${TARGETARCH:-amd64}" \
     FF_PREFIX=/opt/multiview-ffmpeg \
+    LIBSRT_VERSION="${LIBSRT_VERSION}" \
+    LIBSRT_SHA256="${LIBSRT_SHA256}" \
+    LIBSRT_TARBALL="/usr/src/ffmpeg/libsrt/srt-${LIBSRT_VERSION}.tar.gz" \
     /usr/local/bin/ffmpeg-build.sh \
  && rm -rf /usr/src/ffmpeg
 
