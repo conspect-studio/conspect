@@ -275,6 +275,24 @@ impl LutSet {
         tile_color: ColorInfo,
         canvas: CanvasColor,
     ) -> Result<[f32; 3]> {
+        let lin = self.tile_yuv_to_tile_linear(y8, cb8, cr8, tile_color)?;
+        let conv = primaries::convert_matrix(tile_color.primaries, canvas.primaries)?;
+        Ok(primaries::apply(conv, lin))
+    }
+
+    /// LUT-backed twin of [`crate::pipeline::tile_yuv_to_tile_linear`]:
+    /// steps 1-3 (tile-gamut linear RGB, before the primaries convert).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`crate::pipeline::tile_yuv_to_canvas_linear`].
+    pub fn tile_yuv_to_tile_linear(
+        &self,
+        y8: u8,
+        cb8: u8,
+        cr8: u8,
+        tile_color: ColorInfo,
+    ) -> Result<[f32; 3]> {
         let tile_range = range::require_resolved(tile_color.range)?;
         if tile_color.transfer == TransferCharacteristic::Unspecified {
             return Err(Error::UnresolvedColor("transfer"));
@@ -292,14 +310,11 @@ impl LutSet {
 
         let rgb_gamma = matrix::yuv_to_rgb(y, cb, cr, tile_color.matrix)?;
 
-        let lin = [
+        Ok([
             self.eotf(rgb_gamma[0], tile_color.transfer)?,
             self.eotf(rgb_gamma[1], tile_color.transfer)?,
             self.eotf(rgb_gamma[2], tile_color.transfer)?,
-        ];
-
-        let conv = primaries::convert_matrix(tile_color.primaries, canvas.primaries)?;
-        Ok(primaries::apply(conv, lin))
+        ])
     }
 
     /// LUT-backed twin of [`crate::pipeline::canvas_linear_to_output_yuv`]: the

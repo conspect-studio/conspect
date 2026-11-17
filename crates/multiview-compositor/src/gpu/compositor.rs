@@ -900,7 +900,7 @@ impl GpuCompositor {
         // composes on its persistent CPU reference (never drawn unkeyed).
         let key_sources = tiles
             .iter()
-            .filter(|t| t.key.as_ref().is_some_and(|k| k.source.is_some()))
+            .filter(|t| t.key.as_ref().is_some_and(|k| k.signal_source().is_some()))
             .count();
         let layers_needed = tiles.len().saturating_add(key_sources);
         if layers_needed > usize::try_from(MAX_TILES).unwrap_or(usize::MAX) {
@@ -921,7 +921,7 @@ impl GpuCompositor {
         for tile in tiles {
             max_w = max_w.max(tile.image.width());
             max_h = max_h.max(tile.image.height());
-            if let Some(src) = tile.key.as_ref().and_then(|k| k.source) {
+            if let Some(src) = tile.key.as_ref().and_then(|k| k.signal_source()) {
                 max_w = max_w.max(src.width());
                 max_h = max_h.max(src.height());
             }
@@ -1066,9 +1066,10 @@ impl GpuCompositor {
         // Key sources: only their Y plane (the matte reads luma only), into
         // the layer `KeyParams::build` recorded (after the fill layers).
         for (kp, tile) in key_params.iter().zip(tiles) {
-            if let (Some(layer), Some(src)) =
-                (kp.key_layer(), tile.key.as_ref().and_then(|k| k.source))
-            {
+            if let (Some(layer), Some(src)) = (
+                kp.key_layer(),
+                tile.key.as_ref().and_then(|k| k.signal_source()),
+            ) {
                 write_tile_plane(
                     queue,
                     y_tex,
@@ -1594,7 +1595,7 @@ fn pack_params(
             }
             None => params,
         };
-        let key_layer = match tile.key.as_ref().and_then(|k| k.source) {
+        let key_layer = match tile.key.as_ref().and_then(|k| k.signal_source()) {
             Some(src) => {
                 require_even_positive(src.width(), src.height(), "key source")?;
                 let layer = next_key_layer;

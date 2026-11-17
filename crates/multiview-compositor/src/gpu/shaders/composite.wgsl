@@ -22,7 +22,10 @@
 // reads only post-range-expand Y (step 1), of the fill or of a separate key
 // source resident in its own `y_planes` layer, sampled with its own
 // nearest-neighbour map (kx = floor(ddx × key_w / dst_w)). Mirrors
-// `key::key_factor`. Scene groups fold into a second pair of vec4 registers
+// `key::key_factor`. A chroma key (slice K7, ADR-C007 §3) instead measures
+// the Euclidean distance of the fill's tile-gamut linear RGB (after step 3,
+// before the step-4 primaries convert) to a reference converted once per
+// frame on the CPU, through a CPU-sanitized edge (`chroma_edge`). Scene groups fold into a second pair of vec4 registers
 // (outgoing / incoming) merged at the next top tile or the end of the list,
 // mirroring the CPU oracle's segment semantics (the last grouped tile's
 // merge wins).
@@ -60,7 +63,8 @@ struct KeyParams {
     // bits 8-9 the scene group: 0 top, 1 both, 2 out, 3 in).
     head: vec4<u32>,
     // x: base of this tile's 256-entry matte table in `mattes` (valid under
-    // KEY_HAS_TABLE); y,z,w: padding.
+    // KEY_HAS_TABLE). A chroma key: y edge mode (CHROMA_EDGE_*), z,w the
+    // sanitized finite clip and gain as f32 bits.
     table: vec4<u32>,
     // Mask rectangle in fill-source pixels: x, y, w, h (half-open).
     mask: vec4<u32>,
@@ -68,10 +72,16 @@ struct KeyParams {
     merge: vec4<f32>,
     // Opaque DIP colour (linear, canvas gamut), a = 1.
     dip_colour: vec4<f32>,
+    // A chroma key's reference, tile-gamut linear RGB; w padding.
+    chroma: vec4<f32>,
 };
 
 const KEY_KIND_BITS: u32 = 3u;
 const KEY_KIND_LINEAR: u32 = 1u;
+const KEY_KIND_CHROMA: u32 = 3u;
+const CHROMA_EDGE_ONE: u32 = 1u;
+const CHROMA_EDGE_STEP: u32 = 2u;
+const CHROMA_EDGE_RAMP: u32 = 3u;
 const KEY_INVERT: u32 = 4u;
 const KEY_HAS_SOURCE: u32 = 8u;
 const KEY_HAS_MASK: u32 = 16u;
@@ -120,7 +130,7 @@ fn y_code(v8: f32) -> u32 {
 // function of the signal's 8-bit Y code (the key source's, else the fill's),
 // looked up in the tile's table (`KeyParams::build` / `push_matte_table`).
 fn key_factor(k: KeyParams, sx: u32, sy: u32, ddx: u32, ddy: u32, dst_w: u32, dst_h: u32,
-              fill_y8: f32) -> f32 {
+              fill_y8: f32, lin_tile: vec3<f32>) -> f32 {
     let flags = k.head.w;
     let kind = flags & KEY_KIND_BITS;
     if kind == 0u {
@@ -133,6 +143,13 @@ fn key_factor(k: KeyParams, sx: u32, sy: u32, ddx: u32, ddy: u32, dst_w: u32, ds
             return 0.0;
         }
     }
+    if kind == KEY_KIND_CHROMA {
+        let m = chroma_matte(k, lin_tile);
+        if (flags & KEY_INVERT) != 0u {
+            return 1.0 - m;
+        }
+        return m;
+    }
     if (flags & KEY_HAS_TABLE) == 0u {
         // A linear self key: no signal, matte 1.
         return 1.0;
@@ -144,6 +161,27 @@ fn key_factor(k: KeyParams, sx: u32, sy: u32, ddx: u32, ddy: u32, dst_w: u32, ds
         code = y_code(textureLoad(y_planes, vec2<i32>(i32(kx), i32(ky)), i32(k.head.x), 0).r * 255.0);
     }
     return mattes[k.table.x + code];
+}
+
+// The chroma matte before invert. Mirrors `key::chroma_matte` through the
+// CPU-sanitized edge (`uniforms::chroma_edge`): no NaN or infinity reaches
+// the shader, and the distance of finite linear values is finite.
+fn chroma_matte(k: KeyParams, lin_tile: vec3<f32>) -> f32 {
+    let diff = lin_tile - k.chroma.rgb;
+    let d = sqrt(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
+    let mode = k.table.y;
+    let clip = bitcast<f32>(k.table.z);
+    let gain = bitcast<f32>(k.table.w);
+    if mode == CHROMA_EDGE_ONE {
+        return 1.0;
+    }
+    if mode == CHROMA_EDGE_STEP {
+        return select(0.0, 1.0, d > clip);
+    }
+    if mode == CHROMA_EDGE_RAMP {
+        return clamp((d - clip) * gain, 0.0, 1.0);
+    }
+    return 0.0;
 }
 
 // Merge the two scene accumulators (premultiplied linear). Mirrors
@@ -350,10 +388,11 @@ fn composite_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         //    per-pixel alpha folds into the opacity here, premultiplied ONCE.
         //    A keyer's mask × matte (ADR-0113 §3) folds in at the same step;
         //    its matte is a table lookup on the fill's (or key source's) 8-bit
-        //    Y code, the input of step 1 (never steps 2-4).
+        //    Y code, the input of step 1, or for a chroma key the distance of
+        //    `lin_tile` (step 3's output); it never alters steps 2-4.
         let a = clamp(t.opacity_transfer.x, 0.0, 1.0) * sample_tile_alpha(t, sx, sy)
             * wipe_coverage(t, px, py, cw, ch)
-            * key_factor(k, sx, sy, ddx, ddy, dst_w, dst_h, yuv8.x);
+            * key_factor(k, sx, sy, ddx, ddy, dst_w, dst_h, yuv8.x, lin_tile);
         let src = vec4<f32>(lin * a, a);
         let inv = 1.0 - src.a;
         switch group {
