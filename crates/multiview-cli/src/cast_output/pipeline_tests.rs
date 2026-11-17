@@ -2470,3 +2470,118 @@ mod moq_rung {
         assert_unaffected_relative(&control, &run, &seen);
     }
 }
+
+/// ADR-0114 slice 5 on the real pipeline: the cast `WebRTC` feed (one
+/// registry subscription, ONE Opus encoder for every viewer) carries real
+/// H.264 and Opus with `R = floor(E * clock / 1e6) mod 2^32`, every sample
+/// stamped with the window its viewers passed; an unrequested move fences the
+/// viewers and nothing after it is marked passed.
+#[cfg(feature = "webrtc-native")]
+#[test]
+fn w_the_cast_webrtc_feed_is_one_opus_encoder_and_engine_time() {
+    use crate::cast_webrtc::{spawn_feed_for_test, CastWebRtcStats};
+    use crate::routing_aux::PictureBus;
+    use multiview_control::cast_streams::identity::{CastAttachment, Clearance};
+    use multiview_webrtc::egress::{egress_feed, EgressMedia};
+    drive("cast_w", Until::Stop, |ctl| {
+        ctl.wait_tick(2 * FPS);
+        let outcomes = ctl.routing.outcomes().expect("one outcome reader");
+        let factory = wait_for("the registry", Duration::from_secs(10), || {
+            ctl.windows.load()
+        });
+        let labels = Arc::clone(&ctl.cast.labels);
+        let viewer = |id: &str| {
+            Arc::new(CastAttachment::new(
+                id,
+                "cast-1",
+                "webrtc",
+                Arc::clone(&labels),
+                Clearance::of(&labels.current()),
+            ))
+        };
+        let viewers = Arc::new(Mutex::new(vec![viewer("a"), viewer("b"), viewer("c")]));
+        let (sink, feed) = egress_feed();
+        let stats = Arc::new(CastWebRtcStats::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let join = spawn_feed_for_test(
+            &factory,
+            "cast-1",
+            sink,
+            Arc::clone(&viewers),
+            ctl.cast.epoch.clone(),
+            Arc::clone(&stats),
+            Arc::clone(&stop),
+        );
+        let mut video = Vec::new();
+        let mut audio = Vec::new();
+        let start = Instant::now();
+        while (video.len() < 25 || audio.len() < 25) && start.elapsed() < Duration::from_secs(20) {
+            while let Some(s) = feed.pop() {
+                let stamp = s.cast.expect("every cast sample is stamped");
+                assert!(viewers
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|v| v.may_write(stamp.window)));
+                match s.media {
+                    EgressMedia::Video => video.push(s.rtp_timestamp),
+                    _ => audio.push(s.rtp_timestamp),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            video.len() >= 25 && audio.len() >= 25,
+            "{} video, {} audio",
+            video.len(),
+            audio.len()
+        );
+        // Three viewers, one encoder.
+        assert_eq!(stats.opus_opened.load(Ordering::Acquire), 1);
+        // Video: one frame is 3600 at 90 kHz (25 fps), in engine time.
+        for pair in video.windows(2) {
+            assert_eq!(pair[1].wrapping_sub(pair[0]), 3600, "{video:?}");
+        }
+        // Opus: 20 ms = 960 at 48 kHz, contiguous.
+        for pair in audio.windows(2) {
+            assert_eq!(pair[1].wrapping_sub(pair[0]), 960, "{audio:?}");
+        }
+        // Engine time: the video RTP of tick t is t * 3600 (no offset): the
+        // first one is a multiple of 3600 below the clock's tick count.
+        assert_eq!(video[0] % 3600, 0);
+        assert!(u64::from(video[0] / 3600) <= ctl.tick());
+        // Audio and video on one timeline: their engine times are within 1 s.
+        let v_us = i64::from(video[0]) * 1_000_000 / 90_000;
+        let a_us = i64::from(audio[0]) * 1_000_000 / 48_000;
+        assert!(
+            (v_us - a_us).abs() < 1_000_000,
+            "video {v_us} us, audio {a_us} us"
+        );
+        // An unrequested move fences every viewer.
+        take_to(
+            ctl,
+            &outcomes,
+            "to-b",
+            &PictureBus::Source("cast_w_b".to_owned()),
+        );
+        wait_for("the fence", Duration::from_secs(10), || {
+            viewers
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|v| v.is_fenced())
+                .then_some(())
+        });
+        let windows = stats.windows.load(Ordering::Acquire);
+        ctl.run_seconds(1);
+        assert_eq!(
+            stats.windows.load(Ordering::Acquire),
+            windows,
+            "nothing after the fence"
+        );
+        stop.store(true, Ordering::Release);
+        join.join().unwrap();
+        assert_eq!(stats.opus_closed.load(Ordering::Acquire), 1);
+        ctl.stop.stop();
+    });
+}

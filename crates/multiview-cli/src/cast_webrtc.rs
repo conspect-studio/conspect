@@ -263,6 +263,27 @@ impl CastWebRtc for CliCastWebRtc {
     }
 }
 
+/// TEST SEAM: run one cast output's feed (subscription, gate, Opus) into
+/// `sink` for `viewers`, on its own thread, without a WHEP transport.
+#[cfg(test)]
+pub(crate) fn spawn_feed_for_test(
+    factory: &crate::output_window_registry::SubscriptionFactory,
+    config_id: &str,
+    sink: EgressSink,
+    viewers: Arc<Mutex<Vec<Arc<CastAttachment>>>>,
+    epoch: multiview_output::SharedEpoch,
+    stats: Arc<CastWebRtcStats>,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    let scope = multiview_control::WhepScope::Output(config_id.to_owned());
+    let binding = factory.resolve(&scope).unwrap();
+    let subscription = factory
+        .subscribe(&scope, binding.config_generation)
+        .unwrap();
+    let worker = FeedWorker::new(&binding, subscription, sink, viewers, epoch, stats);
+    std::thread::spawn(move || worker.run(&stop))
+}
+
 /// The off-clock thread of one cast output's feed.
 struct FeedWorker {
     subscription: Subscription,
