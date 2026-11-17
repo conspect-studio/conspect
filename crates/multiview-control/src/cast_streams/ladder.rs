@@ -802,11 +802,15 @@ mod tests {
         }
     }
 
+    /// ADR-0114 slice 4: this build serves `moq` and `hls`; `srt` and
+    /// `webrtc` are never offered, whatever the ladder enables.
     #[test]
-    fn the_offer_of_this_build_is_hls_only() {
+    fn the_offer_of_this_build_is_moq_then_hls() {
         let all: Vec<String> = ["srt", "moq", "webrtc", "hls"].map(String::from).to_vec();
         let probe = probe_with(Some(FrameCounter::Rvfc), &[]);
-        assert_eq!(offer(&all, SERVED_RUNGS, Some(&probe)), ("hls", vec![]));
+        assert_eq!(offer(&all, SERVED_RUNGS, Some(&probe)), ("moq", vec!["hls"]));
+        let no_frames = probe_with(None, &[]);
+        assert_eq!(offer(&all, SERVED_RUNGS, Some(&no_frames)), ("hls", vec![]));
         assert_eq!(
             offer(&["hls".to_owned()], SERVED_RUNGS, None),
             ("hls", vec![])

@@ -129,13 +129,21 @@ mod tests {
         for (ladder, needle) in [
             ("[]", "empty"),
             ("[\"hls\", \"rtmp\"]", "unknown rung"),
-            ("[\"moq\", \"hls\"]", "not built yet"),
+            ("[\"webrtc\", \"hls\"]", "not built yet"),
             ("[\"srt\", \"hls\"]", "not built yet"),
             ("[\"hls\", \"hls\"]", "twice"),
         ] {
             let error = parse(&format!("ladder = {ladder}")).validate().unwrap_err();
             assert!(error.to_string().contains(needle), "{ladder}: {error}");
         }
+    }
+
+    /// ADR-0114 slice 4: `moq` is served by this build and may be enabled.
+    #[test]
+    fn moq_may_be_enabled_ahead_of_hls() {
+        let config = parse("ladder = [\"moq\", \"hls\"]");
+        config.validate().unwrap();
+        assert!(config.enables("moq"));
     }
 
     #[test]
