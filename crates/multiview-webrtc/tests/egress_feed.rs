@@ -42,15 +42,36 @@ fn audio(ts: u32) -> EgressSample {
 fn feed_is_fifo_and_bounded_drop_oldest() {
     let (sink, feed) = egress_feed();
     // Push past the cap; the oldest are evicted, the newest survive in order.
+    // (Audio: every frame decodes on its own, so drop-oldest keeps exactly
+    // the newest tail.)
     let count = u32::try_from(MAX_EGRESS).unwrap_or(u32::MAX) + 50;
     for i in 0..count {
-        let _ = sink.push(video(i, i == 0));
+        let _ = sink.push(audio(i));
     }
     assert!(feed.len() <= MAX_EGRESS, "feed must be bounded");
     assert_eq!(feed.dropped(), 50, "exactly the overflow was dropped");
     // Drop-oldest kept the newest tail: the first surviving sample is the 50th.
     let first = feed.pop().expect("a sample is buffered");
     assert_eq!(first.rtp_timestamp, 50, "drop-oldest kept the newest tail");
+}
+
+/// ADR-0114 decision 6: video past the cap evicts the oldest and, because
+/// every delta behind it referenced it, the rest of that GOP; video then
+/// waits for the next keyframe, so a viewer is never handed a frame whose
+/// reference was dropped.
+#[test]
+fn a_video_overflow_drops_the_broken_gop_and_waits_for_a_keyframe() {
+    let (sink, feed) = egress_feed();
+    let count = u32::try_from(MAX_EGRESS).unwrap_or(u32::MAX) + 50;
+    for i in 0..count {
+        let _ = sink.push(video(i, i == 0));
+    }
+    assert!(feed.len() <= MAX_EGRESS, "feed must be bounded");
+    assert!(feed.is_empty(), "no delta of the broken GOP survives");
+    let _ = sink.push(video(count, true));
+    let _ = sink.push(video(count + 1, false));
+    assert_eq!(feed.pop().expect("the keyframe").rtp_timestamp, count);
+    assert_eq!(feed.pop().expect("its delta").rtp_timestamp, count + 1);
 }
 
 #[test]
