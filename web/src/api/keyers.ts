@@ -153,6 +153,21 @@ export function keyerRamping(row: KeyerRow): boolean {
 }
 
 /**
+ * The `mask` rectangle (fill-source pixels), or `undefined` when unset or
+ * malformed. `mask` is a free-form object in the generated schema (same as
+ * `fly`), so this re-validates its shape rather than trusting the generated
+ * `Record<string, never>` placeholder.
+ */
+export function keyerMaskRect(row: KeyerRow): KeyerRect | undefined {
+  return isRect(row.mask) ? row.mask : undefined;
+}
+
+/** The `fly` rectangle (canvas pixels), or `undefined` when unset or malformed. */
+export function keyerFlyRect(row: KeyerRow): KeyerRect | undefined {
+  return isRect(row.fly) ? row.fly : undefined;
+}
+
+/**
  * Ramp progress in `[0, 1]` at `tick`, or `undefined` while not ramping. The
  * wire `ramp` is opaque in the generated schema (a free-form object), so this
  * re-validates its shape rather than trusting the generated type.

@@ -11,7 +11,7 @@ import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import { Label } from '../ui/label';
 import type { KeyerFields, KeyerKind, KeyerLossPolicy, KeyerPlan, KeyerRow, KeyerSize } from '../../api/keyers';
-import { FLY_PRESETS, flyPresetRect, keyerFillRedacted, keyerFillSource, keyerKeyRedacted, keyerKeySource } from '../../api/keyers';
+import { FLY_PRESETS, flyPresetRect, keyerFillRedacted, keyerFillSource, keyerKeyRedacted, keyerKeySource, keyerMaskRect } from '../../api/keyers';
 import type { FlyPreset } from '../../api/keyers';
 
 export interface KeyerPanelProps {
@@ -45,12 +45,24 @@ function draftFromRow(row: KeyerRow): {
   };
 }
 
+/** A non-negative integer typed as the mask box fields accept (empty/invalid is rejected, not clamped). */
+function isNonNegativeInteger(value: string): boolean {
+  return /^\d+$/.test(value);
+}
+
+const MASK_DEFAULT_BOX = { x: '0', y: '0', w: '100', h: '100' };
+
 /** One keyer's fill/key/type/geometry/loss editor, gated by a plan-first apply. */
 export function KeyerPanel({ row, sources, disabledReason, canvas, onPlan, onApply }: KeyerPanelProps): JSX.Element {
   const { t } = useLingui();
   const [draft, setDraft] = useState(() => draftFromRow(row));
   const [flyPreset, setFlyPreset] = useState<FlyPreset>('full');
   const [flyBox, setFlyBox] = useState({ w: String(Math.round(canvas.w / 2)), h: String(Math.round(canvas.h / 2)) });
+  const initialMask = keyerMaskRect(row);
+  const [maskEnabled, setMaskEnabled] = useState(initialMask !== undefined);
+  const [maskBox, setMaskBox] = useState(
+    initialMask ? { x: String(initialMask.x), y: String(initialMask.y), w: String(initialMask.w), h: String(initialMask.h) } : MASK_DEFAULT_BOX,
+  );
   const [plan, setPlan] = useState<KeyerPlan>();
   const [planning, setPlanning] = useState(false);
   const [applying, setApplying] = useState(false);
@@ -60,8 +72,13 @@ export function KeyerPanel({ row, sources, disabledReason, canvas, onPlan, onApp
   const keyRedacted = keyerKeyRedacted(row);
   const sourceChoices = sources; // `useSources()` already excludes unreadable/`in:<n>` entries.
 
+  const maskFieldsValid = Object.values(maskBox).every(isNonNegativeInteger);
+
   const buildFields = (): KeyerFields => {
     const fly = flyPreset === 'full' ? undefined : flyPresetRect(flyPreset, canvas, { w: Number(flyBox.w) || 0, h: Number(flyBox.h) || 0 });
+    const mask = maskEnabled && maskFieldsValid
+      ? { x: Number(maskBox.x), y: Number(maskBox.y), w: Number(maskBox.w), h: Number(maskBox.h) }
+      : null;
     return {
       keyer: row.id,
       ...(draft.fill === '' ? {} : { fill: draft.fill }),
@@ -71,11 +88,14 @@ export function KeyerPanel({ row, sources, disabledReason, canvas, onPlan, onApp
       invert: draft.invert,
       loss: draft.loss,
       ...(fly === undefined ? {} : { fly }),
+      mask,
     };
   };
 
   const changesSources = draft.fill !== (keyerFillSource(row) ?? '') || draft.key !== (keyerKeySource(row) ?? '');
   const disabled = disabledReason !== undefined;
+  const maskReason = disabledReason ?? (maskEnabled && !maskFieldsValid ? t`Mask x/y/w/h must be whole non-negative numbers` : undefined);
+  const reviewDisabled = disabled || planning || (maskEnabled && !maskFieldsValid);
 
   const runPlan = async (): Promise<KeyerPlan | undefined> => {
     setPlanning(true);
@@ -194,6 +214,47 @@ export function KeyerPanel({ row, sources, disabledReason, canvas, onPlan, onApp
           </div>
         )}
       </fieldset>
+      <fieldset className="space-y-1" disabled={disabled} data-testid={`keyer-mask-fieldset-${row.id}`}>
+        <legend className="text-sm font-medium"><Trans>Mask</Trans></legend>
+        <label className="flex items-center gap-1 text-sm">
+          <input
+            type="checkbox"
+            checked={maskEnabled}
+            disabled={disabled}
+            onChange={(event) => {
+              setMaskEnabled(event.target.checked);
+              if (!event.target.checked) setMaskBox(MASK_DEFAULT_BOX);
+            }}
+          />
+          <Trans>Enable mask</Trans>
+        </label>
+        {maskEnabled && (
+          <div className="flex flex-wrap items-end gap-2">
+            {(['x', 'y', 'w', 'h'] as const).map((axis) => (
+              <div className="space-y-1" key={axis}>
+                <Label htmlFor={`keyer-mask-${axis}-${row.id}`}>{axis === 'x' ? t`X` : axis === 'y' ? t`Y` : axis === 'w' ? t`Width` : t`Height`}</Label>
+                <Input
+                  id={`keyer-mask-${axis}-${row.id}`}
+                  type="number"
+                  min="0"
+                  step="1"
+                  value={maskBox[axis]}
+                  disabled={disabled}
+                  aria-invalid={!isNonNegativeInteger(maskBox[axis])}
+                  className="w-24"
+                  onChange={(event) => { setMaskBox({ ...maskBox, [axis]: event.target.value }); }}
+                />
+              </div>
+            ))}
+            <Button type="button" size="sm" variant="outline" disabled={disabled} onClick={() => { setMaskBox(MASK_DEFAULT_BOX); }}>
+              <Trans>Full (reset)</Trans>
+            </Button>
+          </div>
+        )}
+        {maskEnabled && !maskFieldsValid && (
+          <p role="alert" data-testid={`keyer-mask-error-${row.id}`}><Trans>Mask x/y/w/h must be whole non-negative numbers</Trans></p>
+        )}
+      </fieldset>
       <div className="space-y-1">
         <Label htmlFor={`keyer-loss-${row.id}`}><Trans>Loss policy</Trans></Label>
         <select
@@ -207,10 +268,10 @@ export function KeyerPanel({ row, sources, disabledReason, canvas, onPlan, onApp
         </select>
       </div>
       <div className="flex flex-wrap items-center gap-2">
-        <Button disabled={disabled || planning} title={disabledReason} aria-describedby={disabled ? `keyer-panel-reason-${row.id}` : undefined} onClick={() => { void onReview(); }}>
+        <Button disabled={reviewDisabled} title={maskReason} aria-describedby={maskReason !== undefined ? `keyer-panel-reason-${row.id}` : undefined} onClick={() => { void onReview(); }}>
           {planning ? t`Reviewing…` : t`Review & apply`}
         </Button>
-        {disabled && <span className="sr-only" id={`keyer-panel-reason-${row.id}`}>{disabledReason}</span>}
+        {maskReason !== undefined && <span className="sr-only" id={`keyer-panel-reason-${row.id}`}>{maskReason}</span>}
         {plan?.cost && (
           <span role="status" data-testid={`keyer-cost-${row.id}`}>
             <Trans>Cost delta {plan.cost.delta.toFixed(2)} — {plan.cost.fits ? t`fits the budget` : t`exceeds the budget`}</Trans>

@@ -23,6 +23,11 @@ function withI18n(node: React.ReactNode) {
   return render(<I18nProvider i18n={i18n}>{node}</I18nProvider>);
 }
 
+/** `mask` is a free-form object in the generated schema; build a row with a concrete mask rect. */
+function withMask(row: KeyerRow, mask: Record<string, unknown>): KeyerRow {
+  return { ...row, mask } as unknown as KeyerRow;
+}
+
 describe('KeyerPanel', () => {
   it('offers only readable sources for fill/key (no in:<n>, matching useSources())', () => {
     withI18n(<KeyerPanel row={BASE_ROW} sources={SOURCES} disabledReason={undefined} canvas={CANVAS} onPlan={vi.fn()} onApply={vi.fn()} />);
@@ -121,5 +126,79 @@ describe('KeyerPanel', () => {
     await userEvent.selectOptions(screen.getByLabelText('Type'), 'luma');
     expect(screen.getByLabelText('Clip')).toBeTruthy();
     expect(screen.getByLabelText('Gain')).toBeTruthy();
+  });
+
+  describe('mask', () => {
+    it('is off by default (no mask on the row) and reveals x/y/w/h once enabled', async () => {
+      withI18n(<KeyerPanel row={BASE_ROW} sources={SOURCES} disabledReason={undefined} canvas={CANVAS} onPlan={vi.fn()} onApply={vi.fn()} />);
+      expect(screen.queryByLabelText('X')).toBeNull();
+      await userEvent.click(screen.getByRole('checkbox', { name: 'Enable mask' }));
+      expect(screen.getByLabelText<HTMLInputElement>('X').value).toBe('0');
+      expect(screen.getByLabelText<HTMLInputElement>('Y').value).toBe('0');
+      expect(screen.getByLabelText<HTMLInputElement>('Width').value).toBe('100');
+      expect(screen.getByLabelText<HTMLInputElement>('Height').value).toBe('100');
+    });
+
+    it('pre-fills from an existing mask on the row', () => {
+      const row = withMask(BASE_ROW, { x: 10, y: 20, w: 300, h: 400 });
+      withI18n(<KeyerPanel row={row} sources={SOURCES} disabledReason={undefined} canvas={CANVAS} onPlan={vi.fn()} onApply={vi.fn()} />);
+      expect(screen.getByRole('checkbox', { name: 'Enable mask' })).toHaveProperty('checked', true);
+      expect(screen.getByLabelText<HTMLInputElement>('X').value).toBe('10');
+      expect(screen.getByLabelText<HTMLInputElement>('Width').value).toBe('300');
+    });
+
+    it('editing x/y/w/h includes the mask rect in the apply payload', async () => {
+      const onPlan = vi.fn().mockResolvedValue(PASS_PLAN);
+      const onApply = vi.fn().mockResolvedValue(undefined);
+      withI18n(<KeyerPanel row={BASE_ROW} sources={SOURCES} disabledReason={undefined} canvas={CANVAS} onPlan={onPlan} onApply={onApply} />);
+      await userEvent.click(screen.getByRole('checkbox', { name: 'Enable mask' }));
+      await userEvent.clear(screen.getByLabelText('X'));
+      await userEvent.type(screen.getByLabelText('X'), '15');
+      await userEvent.clear(screen.getByLabelText('Width'));
+      await userEvent.type(screen.getByLabelText('Width'), '640');
+      await userEvent.click(screen.getByRole('button', { name: 'Review & apply' }));
+      expect(onPlan).toHaveBeenCalledWith(expect.objectContaining({ mask: { x: 15, y: 0, w: 640, h: 100 } }));
+      expect(onApply).toHaveBeenCalledWith(expect.objectContaining({ mask: { x: 15, y: 0, w: 640, h: 100 } }), false);
+    });
+
+    it('disabling the mask after enabling sends mask: null (clears it)', async () => {
+      const row = withMask(BASE_ROW, { x: 10, y: 20, w: 300, h: 400 });
+      const onPlan = vi.fn().mockResolvedValue(PASS_PLAN);
+      const onApply = vi.fn().mockResolvedValue(undefined);
+      withI18n(<KeyerPanel row={row} sources={SOURCES} disabledReason={undefined} canvas={CANVAS} onPlan={onPlan} onApply={onApply} />);
+      await userEvent.click(screen.getByRole('checkbox', { name: 'Enable mask' }));
+      expect(screen.queryByLabelText('X')).toBeNull();
+      await userEvent.click(screen.getByRole('button', { name: 'Review & apply' }));
+      expect(onPlan).toHaveBeenCalledWith(expect.objectContaining({ mask: null }));
+    });
+
+    it('"Full (reset)" resets x/y to 0 and w/h to the default full box', async () => {
+      withI18n(<KeyerPanel row={BASE_ROW} sources={SOURCES} disabledReason={undefined} canvas={CANVAS} onPlan={vi.fn()} onApply={vi.fn()} />);
+      await userEvent.click(screen.getByRole('checkbox', { name: 'Enable mask' }));
+      await userEvent.clear(screen.getByLabelText('X'));
+      await userEvent.type(screen.getByLabelText('X'), '99');
+      await userEvent.click(screen.getByRole('button', { name: 'Full (reset)' }));
+      expect(screen.getByLabelText<HTMLInputElement>('X').value).toBe('0');
+      expect(screen.getByLabelText<HTMLInputElement>('Width').value).toBe('100');
+    });
+
+    it('a non-integer or negative mask field shows a validation error and disables Review & apply', async () => {
+      const onPlan = vi.fn();
+      withI18n(<KeyerPanel row={BASE_ROW} sources={SOURCES} disabledReason={undefined} canvas={CANVAS} onPlan={onPlan} onApply={vi.fn()} />);
+      await userEvent.click(screen.getByRole('checkbox', { name: 'Enable mask' }));
+      await userEvent.clear(screen.getByLabelText('Width'));
+      await userEvent.type(screen.getByLabelText('Width'), '-5');
+      expect(screen.getByTestId('keyer-mask-error-dsk1')).toHaveTextContent('Mask x/y/w/h must be whole non-negative numbers');
+      const review = screen.getByRole('button', { name: 'Review & apply' });
+      expect(review).toHaveProperty('disabled', true);
+      await userEvent.click(review);
+      expect(onPlan).not.toHaveBeenCalled();
+    });
+
+    it('every mask control is disabled with the reason when the panel is disabled (redacted/readonly)', () => {
+      withI18n(<KeyerPanel row={BASE_ROW} sources={SOURCES} disabledReason="Switcher unavailable" canvas={CANVAS} onPlan={vi.fn()} onApply={vi.fn()} />);
+      expect(screen.getByTestId(`keyer-mask-fieldset-dsk1`)).toHaveProperty('disabled', true);
+      expect(screen.getByRole('checkbox', { name: 'Enable mask' })).toHaveProperty('disabled', true);
+    });
   });
 });
