@@ -2976,4 +2976,334 @@ mod tests {
             .unwrap()
             .is_none());
     }
+    // ---- ADR-0114 decision 5.4, against the real MoQ rung ----------------
+    //
+    // The real registry, the real off-clock worker, the real converter and
+    // the real transport fence. The labels stand where the bake consumer
+    // writes them; each case moves them exactly as the engine does. Each
+    // case fails with the gate removed from `publish_gated` (revert-checked).
+
+    mod cast_gate {
+        use super::*;
+        use multiview_control::cast_streams::identity::{
+            engine_minted, identity, Clearance, OutputLabels,
+        };
+
+        /// A video window of tick `tick` (25 fps base: PTS = tick) and its
+        /// program audio block (48 kHz: 1920 samples per tick).
+        fn window(tick: i64) -> Vec<EncodedPacket> {
+            let mut audio = Packet::copy(&[0x21, 0x10, 0x05]);
+            audio.set_pts(Some(tick * 1920));
+            audio.set_dts(Some(tick * 1920));
+            vec![idr(tick), EncodedPacket::from_audio_packet(audio)]
+        }
+
+        pub(super) struct Cast {
+            pub(super) registry: FeedRegistry,
+            windows: tokio::sync::mpsc::Receiver<AvWindow>,
+            pub(super) sink: Arc<Fence>,
+            pub(super) labels: Arc<OutputLabels>,
+            pub(super) attachment: Arc<CastAttachment>,
+            _feed: AuthorizedFeed,
+        }
+
+        fn video_id(content: &str) -> u64 {
+            identity(&Component::Video, content)
+        }
+        fn audio_id(content: &str) -> u64 {
+            identity(&Component::Audio, content)
+        }
+
+        /// A cast attachment on `out-cast` cleared for `program` video and
+        /// audio; labels say `program` from tick 0, labelled through
+        /// `through`.
+        pub(super) fn cast(through: u64) -> Cast {
+            let registry =
+                FeedRegistry::new(&[binding("out-cast", 0, GENERATION, 1280, 720)]).unwrap();
+            let labels = Arc::new(OutputLabels::new());
+            labels.record(&Component::Video, 0, video_id("program"));
+            labels.record(&Component::Audio, 0, audio_id("program"));
+            labels.set_labelled_through(through);
+            let attachment = Arc::new(CastAttachment::new(
+                "stream",
+                "out-cast",
+                "moq",
+                Arc::clone(&labels),
+                Clearance::of(&[
+                    (Component::Video, video_id("program")),
+                    (Component::Audio, audio_id("program")),
+                ]),
+            ));
+            let (sink, windows) = Fence::channel(4);
+            let closer = Arc::clone(&sink);
+            attachment.set_closer(Box::new(move || closer.revoke()));
+            let feed = registry
+                .factory
+                .attach_cast(
+                    &global(),
+                    &WhepScope::Output("out-cast".into()),
+                    Arc::clone(&sink),
+                    Arc::clone(&attachment),
+                )
+                .unwrap();
+            Cast {
+                registry,
+                windows,
+                sink,
+                labels,
+                attachment,
+                _feed: feed,
+            }
+        }
+
+        impl Cast {
+            pub(super) fn offer(&mut self, tick: i64) {
+                self.registry.producer_mut().offer_complete(
+                    0,
+                    GENERATION,
+                    &window(tick),
+                    SPAN,
+                    Instant::now(),
+                );
+            }
+            pub(super) fn delivered(&mut self, bound: Duration) -> Vec<u64> {
+                let mut ticks = Vec::new();
+                while let Some(w) = recv_within(&mut self.windows, bound) {
+                    ticks.extend(w.video.packets.iter().map(|p| p.pts_us / 40_000));
+                }
+                ticks
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_cleared_window_is_delivered() {
+            let mut c = cast(100);
+            c.offer(1);
+            assert_eq!(c.delivered(Duration::from_millis(500)), [1]);
+            assert!(!c.attachment.is_fenced());
+        }
+
+        /// Row 1: picture fallback to a feed the owner may not read (an
+        /// unrequested change: engine range).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_picture_fallback_delivers_zero_packets_and_fences() {
+            let mut c = cast(100);
+            c.offer(1);
+            assert_eq!(c.delivered(Duration::from_millis(500)), [1]);
+            c.labels
+                .record(&Component::Video, 2, engine_minted(video_id("src:secret")));
+            c.labels.set_labelled_through(200);
+            for tick in 2..6 {
+                c.offer(tick);
+            }
+            assert!(c.delivered(Duration::from_millis(300)).is_empty());
+            assert!(c.attachment.is_fenced());
+            assert!(c.sink.revocation().is_revoked(), "the transport is closed");
+            assert!(wait_until(
+                || c.registry.active_subscriptions() == 0,
+                Duration::from_secs(2)
+            ));
+        }
+
+        /// Row 2: same picture, the audio slot moves to a source the owner
+        /// may not read: no audio packet of it, and the video of that window
+        /// is refused with it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_audio_move_refuses_the_whole_window() {
+            let mut c = cast(100);
+            c.labels
+                .record(&Component::Audio, 1, engine_minted(audio_id("src:secret")));
+            c.offer(1);
+            assert!(c.delivered(Duration::from_millis(300)).is_empty());
+            assert!(c.attachment.is_fenced());
+            assert_eq!(c.attachment.counters(), (0, 1));
+        }
+
+        /// Row 3: same bus name, new dependency (a layout edited on air):
+        /// the content identity changes though the bus does not.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_layout_edit_on_the_same_bus_is_refused_from_its_tick() {
+            use multiview_control::cast_streams::identity::layout_content;
+            let mut c = cast(100);
+            let before = layout_content("wall", &["cam1".into()], &multiview_config::LayoutAudio::Program);
+            let after = layout_content(
+                "wall",
+                &["cam1".into(), "secret".into()],
+                &multiview_config::LayoutAudio::Program,
+            );
+            c.labels.record(&Component::Video, 0, video_id(&before));
+            c.attachment.set_clearance(Clearance::of(&[
+                (Component::Video, video_id(&before)),
+                (Component::Audio, audio_id("program")),
+            ]));
+            c.offer(1);
+            assert_eq!(c.delivered(Duration::from_millis(500)), [1]);
+            c.labels
+                .record(&Component::Video, 3, engine_minted(video_id(&after)));
+            let mut got = Vec::new();
+            for tick in 2..=4 {
+                c.offer(tick);
+                got.extend(c.delivered(Duration::from_millis(200)));
+            }
+            assert_eq!(got, [2], "nothing at or after the edit's tick");
+            assert!(c.attachment.is_fenced());
+        }
+
+        /// Row 4: the change lands between production and enqueue. A window
+        /// produced before the change tick is delivered (never relabelled); a
+        /// window not labelled yet is held, never offered, and judged once
+        /// labelled.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_window_is_judged_only_once_labelled_and_never_relabelled() {
+            let mut c = cast(5);
+            c.offer(4);
+            assert_eq!(c.delivered(Duration::from_millis(500)), [4]);
+            c.offer(5);
+            c.offer(6);
+            assert!(c.delivered(Duration::from_millis(200)).is_empty());
+            assert!(!c.attachment.is_fenced());
+            c.labels
+                .record(&Component::Video, 6, engine_minted(video_id("src:secret")));
+            c.labels.set_labelled_through(7);
+            assert_eq!(
+                c.delivered(Duration::from_millis(500)),
+                [5],
+                "tick 5 keeps its own identity"
+            );
+            assert!(c.attachment.is_fenced(), "tick 6 is the new feed");
+        }
+
+        /// Row 5: a packet without a resolvable identity (a change list that
+        /// overflowed past its tick).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_packet_without_identity_is_refused() {
+            let mut c = cast(10_000);
+            for i in 0..20_u64 {
+                c.labels
+                    .record(&Component::Video, 100 + i, video_id("program") ^ (i + 1));
+            }
+            c.offer(1);
+            assert!(c.delivered(Duration::from_millis(300)).is_empty());
+            assert!(c.attachment.is_fenced());
+        }
+
+        /// Row 6: fence with a full attachment queue: the transport receives
+        /// nothing after the fence, and the subscription's queue is dropped
+        /// (retained bytes back to zero).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_fence_discards_the_queue_and_nothing_follows() {
+            let mut c = cast(10_000);
+            for tick in 1..=6 {
+                c.offer(tick);
+            }
+            c.attachment.fence();
+            for tick in 7..=10 {
+                c.offer(tick);
+            }
+            let got = c.delivered(Duration::from_millis(300));
+            assert!(got.iter().all(|t| *t <= 6), "{got:?}");
+            assert!(c.sink.revocation().is_revoked());
+            assert!(wait_until(
+                || c.registry.active_subscriptions() == 0 && c.registry.retained() == (0, 0),
+                Duration::from_secs(2)
+            ));
+        }
+
+        /// Row 7: owner cleared for the new feed (a requested change whose
+        /// identity was added to the clearance first): no gap.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_cleared_requested_change_keeps_the_attachment() {
+            let mut c = cast(10_000);
+            let cleared = c
+                .attachment
+                .clearance()
+                .with(&Component::Video, video_id("src:cam2"));
+            c.attachment.set_clearance(cleared);
+            c.labels.expect(&[video_id("src:cam2")]);
+            c.labels
+                .record(&Component::Video, 3, c.labels.label(video_id("src:cam2")));
+            let mut got = Vec::new();
+            for tick in 1..=5 {
+                c.offer(tick);
+                got.extend(c.delivered(Duration::from_millis(300)));
+            }
+            assert_eq!(got, [1, 2, 3, 4, 5]);
+            assert!(!c.attachment.is_fenced());
+        }
+
+        /// Row 8: re-attachment after a fence: a new attachment cleared only
+        /// for the present identities.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_reattachment_is_cleared_only_for_the_present() {
+            let mut c = cast(10_000);
+            c.labels
+                .record(&Component::Video, 2, engine_minted(video_id("src:cam2")));
+            c.offer(2);
+            assert!(c.delivered(Duration::from_millis(300)).is_empty());
+            assert!(c.attachment.is_fenced());
+            let present = Clearance::of(&c.labels.current());
+            assert!(present.clears(&Component::Video, engine_minted(video_id("src:cam2"))));
+            assert!(!present.clears(&Component::Video, video_id("program")));
+            let again = Arc::new(CastAttachment::new(
+                "stream",
+                "out-cast",
+                "moq",
+                Arc::clone(&c.labels),
+                present,
+            ));
+            let (sink, mut windows) = Fence::channel(4);
+            let _feed = c
+                .registry
+                .factory
+                .attach_cast(
+                    &global(),
+                    &WhepScope::Output("out-cast".into()),
+                    sink,
+                    Arc::clone(&again),
+                )
+                .unwrap();
+            c.offer(3);
+            assert!(recv_within(&mut windows, Duration::from_millis(500)).is_some());
+            c.labels
+                .record(&Component::Video, 4, engine_minted(video_id("program")));
+            c.offer(4);
+            assert!(recv_within(&mut windows, Duration::from_millis(300)).is_none());
+            assert!(again.is_fenced());
+        }
+
+        /// The negative control of row 1: the desk path (no gate) delivers
+        /// the same window.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn without_the_gate_the_fallback_would_be_delivered() {
+            let mut registry =
+                FeedRegistry::new(&[binding("out-cast", 0, GENERATION, 1280, 720)]).unwrap();
+            let (sink, mut windows) = Fence::channel(4);
+            let _feed = registry
+                .factory
+                .attach(&global(), &WhepScope::Output("out-cast".into()), sink)
+                .unwrap();
+            registry
+                .producer_mut()
+                .offer_complete(0, GENERATION, &window(2), SPAN, Instant::now());
+            assert!(recv_within(&mut windows, Duration::from_millis(500)).is_some());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_cast_never_attaches_to_program_or_the_wall() {
+            let c = cast(1);
+            let (sink, _w) = Fence::channel(4);
+            for scope in [WhepScope::Program, WhepScope::Wall] {
+                assert!(matches!(
+                    c.registry.factory.attach_cast(
+                        &global(),
+                        &scope,
+                        sink.clone(),
+                        Arc::clone(&c.attachment)
+                    ),
+                    Err(MoqReject::Forbidden)
+                ));
+            }
+        }
+    }
+
 }
