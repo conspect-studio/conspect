@@ -124,3 +124,52 @@ fn a_dsk_without_a_mix_effects_on_its_program_is_refused() {
     // The same document with the M/E validates.
     load(DSK).validate().unwrap();
 }
+
+const USK: &str = r#"
+[[switcher.mix_effects.keyers]]
+id = "usk1"
+fill = "gfx"
+key = "a"
+type = "luma"
+clip = 0.1
+gain = 4.0
+fly = { x = 320, y = 180, w = 160, h = 90 }
+max_source = { w = 320, h = 180 }
+z = 1
+"#;
+
+/// K3 (#388): the boot preflight (`validate`) accepts upstream keyers,
+/// round-trips them typed, and charges them to the shared keyer budget.
+#[test]
+fn a_usk_document_validates_round_trips_and_shares_the_budget() {
+    let cfg = load(USK);
+    cfg.validate().unwrap();
+    let switcher = cfg.switcher.as_ref().unwrap();
+    assert_eq!(switcher.mix_effects[0].keyers.len(), 1);
+    assert!(switcher.extra.is_empty(), "USKs are typed, not extra");
+    let again = MultiviewConfig::load_from_toml(&cfg.to_toml().unwrap()).unwrap();
+    assert_eq!(again.switcher, cfg.switcher);
+    // A full-canvas USK uses the whole default budget, so a DSK beside it
+    // is refused at boot.
+    let full = r#"
+[[switcher.mix_effects.keyers]]
+id = "usk1"
+fill = "gfx"
+"#;
+    load(full).validate().unwrap();
+    let error = load(&format!("{full}{DSK}")).validate().unwrap_err().to_string();
+    assert!(error.contains("keyer_budget"), "{error}");
+    // Outside this canvas.
+    let error = load(
+        r#"
+[[switcher.mix_effects.keyers]]
+id = "usk1"
+fill = "gfx"
+fly = { x = 600, y = 0, w = 160, h = 90 }
+"#,
+    )
+    .validate()
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("upstream keyer") && error.contains("canvas"), "{error}");
+}
