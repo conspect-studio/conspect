@@ -2756,3 +2756,28 @@ pub enum TransitionDescriptorDoc {
         mix_rate: u32,
     },
 }
+
+/// A keyer rectangle in pixels (`fly` in canvas pixels, `mask` in
+/// fill-source pixels); mirrors `multiview_config::KeyerRect`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KeyerRectDoc {
+    /// Left column.
+    pub x: u32,
+    /// Top row.
+    pub y: u32,
+    /// Width.
+    pub w: u32,
+    /// Height.
+    pub h: u32,
+}
+
+/// A picture size in pixels; mirrors `multiview_config::KeyerSize`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KeyerSizeDoc {
+    /// Width.
+    pub w: u32,
+    /// Height.
+    pub h: u32,
+}
