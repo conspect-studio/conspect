@@ -271,13 +271,6 @@ PY
   [ "${wait_ms}" -le "${MAX_WAIT_MS}" ] || { echo "  FAIL: a watchdog wait of ${wait_ms} ms (design: <= ${MAX_WAIT_MS} ms)"; return 1; }
   [ "${fire_ms}" -ge "${BOUND_MS}" ] && [ "${fire_ms}" -le $((BOUND_MS + wake_ms + LOGIC_SLACK_MS)) ] \
     || { echo "  FAIL: watchdog fired ${fire_ms} ms after the decision (want ${BOUND_MS}..$((BOUND_MS + wake_ms + LOGIC_SLACK_MS)): its worst wait was ${wake_ms} ms late)"; grep -E "scheduling class|chaos|teardown overran" "${log}" | cut -c1-240 | tail -6; return 1; }
-  # The host's wake latency is the host's, not the watchdog's: the fire bound
-  # above already holds against the measured lateness. One run over the host
-  # bound is a scheduling spike of the shared VM (#446: one wait 251 ms late
-  # in 40 runs, every other run 143-151 ms): retry that run once, as for the
-  # other environmental faults above; the retry over the bound fails.
-  [ "${wake_ms}" -le "${MAX_WAKE_LATE_MS}" ] \
-    || { echo "  host: a watchdog wait woke ${wake_ms} ms late (host bound ${MAX_WAKE_LATE_MS} ms); retrying"; return 3; }
   grep -q "exit watchdog scheduling class" "${log}" || { echo "  FAIL: watchdog class not reported"; return 1; }
   if [ "${mode}" = falterstop ]; then
     grep -q "chaos: forced shed" "${log}" || { echo "  FAIL: forced shed not exercised"; return 1; }
@@ -291,9 +284,17 @@ PY
     if [ -s "${m}" ]; then
       for seg in $(grep -v '^#' "${m}"); do [ -s "${WORK}/hls/${seg}" ] || { echo "  FAIL: listed segment missing"; return 1; }; done
     fi
-    return 0
+  else
+    check_hls || { echo "  FAIL: HLS invalid"; return 1; }
   fi
-  check_hls || { echo "  FAIL: HLS invalid"; return 1; }
+  # LAST, after every behavioural assertion of this run has passed: the host's
+  # wake latency is the host's, not the watchdog's (the fire bound above holds
+  # against the measured lateness). One run over the host bound is a
+  # scheduling spike of the shared VM (#446: one wait 251 ms late in 40 runs,
+  # every other run 143-151 ms): retry that run once, as for the other
+  # environmental faults above; the retry over the bound fails.
+  [ "${wake_ms}" -le "${MAX_WAKE_LATE_MS}" ] \
+    || { echo "  host: a watchdog wait woke ${wake_ms} ms late (host bound ${MAX_WAKE_LATE_MS} ms); retrying"; return 3; }
 }
 
 write_config
