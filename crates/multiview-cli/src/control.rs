@@ -2311,6 +2311,17 @@ pub struct CommandDrain {
     /// mirror runs ahead of the producer, so no upsert may be judged
     /// policy-only until a submission lands. Bounded like `applied_media`.
     unapplied: std::collections::HashSet<String>,
+    /// Removals whose hub teardown was shed (`Full`), retried one per tick
+    /// until accepted, so the hub always learns of a removal (its catalogue
+    /// entry, demand pins and producer go). Only an id the hub really knows
+    /// (an entry of `applied_media`) moves here, and a NEW id is admitted only
+    /// while `applied_media` + this set stay under
+    /// [`multiview_config::MAX_ADMITTED_SOURCES`], so the two together never
+    /// exceed the source cap however the queue sheds (review #477).
+    pending_teardowns: std::collections::BTreeSet<String>,
+    /// The live source cap ([`multiview_config::MAX_ADMITTED_SOURCES`]; a test
+    /// seam lowers it).
+    source_cap: usize,
     /// The live overlay working-set seam (ADR-W022), when wired
     /// ([`command_drain_with_live_overlays`] / [`command_drain_with_seams`]):
     /// the lock-free slot the bake consumer re-derives its overlay render
@@ -2396,6 +2407,8 @@ impl CommandDrain {
             live_sources: None,
             applied_media,
             unapplied: std::collections::HashSet::new(),
+            pending_teardowns: std::collections::BTreeSet::new(),
+            source_cap: multiview_config::MAX_ADMITTED_SOURCES,
             live_overlays: None,
             #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
             tile_spec_apply: None,
@@ -2444,7 +2457,8 @@ impl CommandDrain {
     /// `UpsertSource`/`RemoveSource` reach the running engine. See
     /// [`command_drain_with_live_sources`].
     #[must_use]
-    fn with_live_sources(mut self, live: crate::live_sources::LiveSourceHandle) -> Self {
+    #[doc(hidden)]
+    pub fn with_live_sources(mut self, live: crate::live_sources::LiveSourceHandle) -> Self {
         self.live_sources = Some(live);
         self
     }
@@ -2593,6 +2607,7 @@ impl CommandDrain {
             self.cell_ids_set = true;
         }
 
+        self.retry_pending_teardown();
         // Drain the bus, routing commands. Video re-points are enqueued (batched +
         // bounded); every other command is applied immediately as before.
         #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
@@ -3203,6 +3218,9 @@ impl CommandDrain {
         if self.policy_only_upsert(source, drive) {
             return;
         }
+        if self.over_source_cap(&source.id) {
+            return;
+        }
         let id = source.id.clone();
         // Reuse the registered store on an edit-by-id so the tile holds
         // last-good while the hub swaps the producer behind it.
@@ -3242,31 +3260,7 @@ impl CommandDrain {
                 store: Arc::clone(&store),
             }),
         };
-        // Only an ACCEPTED submission changes which media the producer runs
-        // (review R4-01); a shed one leaves the mirror ahead of the producer.
-        if submitted == crate::live_sources::HubSubmit::Accepted {
-            self.applied_media.insert(id.clone(), source.clone());
-            self.unapplied.remove(&id);
-        } else {
-            self.unapplied.insert(id.clone());
-        }
-        match submitted {
-            crate::live_sources::HubSubmit::Accepted => {}
-            crate::live_sources::HubSubmit::Full => {
-                tracing::warn!(
-                    source = %id,
-                    "live-source hub queue full; producer spawn shed — the tile \
-                     rides the slate (re-apply the source to retry)"
-                );
-            }
-            crate::live_sources::HubSubmit::Gone => {
-                tracing::warn!(
-                    source = %id,
-                    "live-source hub gone — live producer apply is disabled until \
-                     restart; the tile rides the slate"
-                );
-            }
-        }
+        self.record_upsert_submission(source, submitted);
         drive.insert_store(id.clone(), store);
         // Register the route key so a follow-up RouteVideo/SwapSource resolves:
         // in the run, the CompositorDrive store key IS the source id.
@@ -3368,13 +3362,21 @@ impl CommandDrain {
         // flags while the drain finishes the binding mutations — the same
         // window-shrinking order as upsert), then unregister the store.
         match seam.request_teardown(id) {
-            crate::live_sources::HubSubmit::Accepted => {}
+            crate::live_sources::HubSubmit::Accepted => {
+                self.pending_teardowns.remove(id);
+            }
             crate::live_sources::HubSubmit::Full => {
                 tracing::warn!(
                     source = %id,
                     "live-source hub queue full; producer teardown shed — the store \
-                     is unregistered (slate) but the producer stops only at run teardown"
+                     is unregistered (slate); the teardown is retried each tick"
                 );
+                // Only a source the hub knows can leave anything behind there;
+                // it moves from `applied_media` (removed below) to this set,
+                // so the pair stays within the cap.
+                if self.applied_media.contains_key(id) {
+                    self.pending_teardowns.insert(id.to_owned());
+                }
             }
             crate::live_sources::HubSubmit::Gone => {
                 tracing::warn!(
@@ -3398,6 +3400,101 @@ impl CommandDrain {
             audio_free.remove(id);
             slot.store(Arc::new(audio_free));
         }
+    }
+
+    /// Book one upsert submission's outcome: only an ACCEPTED submission
+    /// changes which media the producer runs (review R4-01); a shed one
+    /// leaves the mirror ahead of the producer.
+    fn record_upsert_submission(
+        &mut self,
+        source: &multiview_config::Source,
+        submitted: crate::live_sources::HubSubmit,
+    ) {
+        if submitted == crate::live_sources::HubSubmit::Accepted {
+            self.applied_media.insert(source.id.clone(), source.clone());
+            self.unapplied.remove(&source.id);
+            // The hub tears the old producer down before it applies this
+            // upsert, so a pending removal of the same id is now moot. Only an
+            // ACCEPTED re-add cancels it; a shed re-add keeps it pending.
+            self.pending_teardowns.remove(&source.id);
+        } else {
+            self.unapplied.insert(source.id.clone());
+        }
+        match submitted {
+            crate::live_sources::HubSubmit::Accepted => {}
+            crate::live_sources::HubSubmit::Full => {
+                tracing::warn!(
+                    source = %source.id,
+                    "live-source hub queue full; producer spawn shed — the tile \
+                     rides the slate (re-apply the source to retry)"
+                );
+            }
+            crate::live_sources::HubSubmit::Gone => {
+                tracing::warn!(
+                    source = %source.id,
+                    "live-source hub gone — live producer apply is disabled until \
+                     restart; the tile rides the slate"
+                );
+            }
+        }
+    }
+
+    /// Whether a NEW id must be held because hub-known sources plus shed
+    /// removals still awaiting their teardown reach the cap (review #477).
+    /// Held like a shed submit: re-apply once the hub has caught up.
+    fn over_source_cap(&mut self, id: &str) -> bool {
+        let known = self.applied_media.contains_key(id) || self.pending_teardowns.contains(id);
+        if known || self.applied_media.len() + self.pending_teardowns.len() < self.source_cap {
+            return false;
+        }
+        tracing::warn!(
+            source = %id,
+            pending = self.pending_teardowns.len(),
+            "upsert_source held: the live source cap is reached while removals \
+             await their teardown; re-apply to retry"
+        );
+        self.unapplied.insert(id.to_owned());
+        true
+    }
+
+    /// Resubmit ONE shed removal to the hub (non-blocking `try_send`). An
+    /// accepted re-add of the id already cancelled it (see `upsert_source`);
+    /// a shed re-add did not, so the old definition is still torn down here.
+    fn retry_pending_teardown(&mut self) {
+        let Some(seam) = self.live_sources.clone() else {
+            return;
+        };
+        let Some(id) = self.pending_teardowns.first().cloned() else {
+            return;
+        };
+        match seam.request_teardown(&id) {
+            crate::live_sources::HubSubmit::Accepted | crate::live_sources::HubSubmit::Gone => {
+                self.pending_teardowns.remove(&id);
+            }
+            crate::live_sources::HubSubmit::Full => {}
+        }
+    }
+
+    /// Shed removals still awaiting a hub teardown (test seam).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pending_teardowns(&self) -> usize {
+        self.pending_teardowns.len()
+    }
+
+    /// Sources the hub is known to run (test seam).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn applied_sources(&self) -> usize {
+        self.applied_media.len()
+    }
+
+    /// Lower the live source cap (test seam).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_source_cap(mut self, cap: usize) -> Self {
+        self.source_cap = cap;
+        self
     }
 
     /// Apply an `UpsertOverlay` (ADR-W022) at the frame boundary: upsert the

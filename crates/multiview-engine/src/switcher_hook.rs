@@ -33,6 +33,8 @@ pub struct SwitcherFrameHook<C> {
     pub preview_slot: Option<Arc<SwapCell<Option<Arc<Nv12Image>>>>>,
     /// Shared store map, reused rather than decoding the preview source twice.
     pub preview_stores: Option<HashMap<String, Arc<TileStore<Nv12Image>>>>,
+    /// The drive store generation last synced into the driver (issue #464).
+    stores_seen: Option<u64>,
     /// Wait-free PVW selection for the routed Preview feed (ADR-0108 §2.5):
     /// written only when the PVW source changes, so it allocates only then.
     pub preview_selection: Option<Arc<SwapCell<Option<Arc<str>>>>>,
@@ -91,6 +93,7 @@ impl<C> SwitcherFrameHook<C> {
             last_error: None,
             preview_slot: None,
             preview_stores: None,
+            stores_seen: None,
             preview_selection: None,
             last_preview: None,
             layout_sources: None,
@@ -212,6 +215,14 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         self.fps_den = drive.layout().canvas.fps_den;
         (self.legacy)(drive);
         self.adopt_layout_sources(drive);
+        // Issue #464: a source the drain added (or removed) this tick joins
+        // the M/E's prime set before commands are drained. One integer
+        // compare per tick; the resync runs only on a store-set change.
+        let generation = drive.stores_generation();
+        if self.stores_seen != Some(generation) {
+            self.driver.sync_live_stores(drive.stores());
+            self.stores_seen = Some(generation);
+        }
         self.driver.drain_at_tick(tick);
         // #469: the decoders see a new PGM/PVW source from the tick it is
         // selected (they act on it on their own threads, after the settle).
@@ -333,8 +344,12 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         // admitted compositor/rendition — this tap never composes or encodes.
         if let (Some(slot), Some(stores)) = (&self.preview_slot, &self.preview_stores) {
             let (_, preview) = self.driver.resolved_selections();
-            let picture = stores
-                .get(preview.as_str())
+            // The drive's current store first: a source added (or re-added)
+            // live is there; the boot map holds the rest.
+            let picture = self
+                .driver
+                .live_store(preview.as_str())
+                .or_else(|| stores.get(preview.as_str()))
                 .and_then(|store| store.read_at(frame.tick.pts).frame().cloned());
             // A missing PVW frame stays an honest "unavailable" monitor; it is
             // never replaced with the Program canvas.

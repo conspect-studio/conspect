@@ -1061,6 +1061,18 @@ jobs:
           --features webrtc
           --all-targets
           -- -D warnings
+      - name: test multiview-cli --features webrtc-native (WebRTC egress RTP wrap)
+        # #492: the WebRTC output egress must wrap RTP timestamps mod 2^32
+        # through the real fan-out → `run_webrtc_output` path. That test only
+        # builds with `webrtc-native` (ffmpeg-linked), which no other test leg
+        # enables. Scoped to the one module, NOT the full suite (#163).
+        timeout-minutes: 15
+        run: >
+          cargo test
+          --locked
+          -p multiview-cli
+          --features webrtc-native
+          --lib webrtc_rtp_wrap_tests
       - name: clippy multiview-cli --features ffmpeg,aes67
         # AES67 / SMPTE ST 2110-30 raw-PCM audio wiring (#96 / #103). The CLI RX
         # (`drive_aes67_rx`) + TX (`build_aes67_output` / `run_aes67_output`) sit
@@ -1229,6 +1241,24 @@ jobs:
           -p multiview-cli
           --features ffmpeg,aes67
           --lib hls_fetch
+      - name: test multiview-cli --features ffmpeg,youtube (switcher live sources, #464)
+        # Issue #464 (R3, invariants #1/#10): on a switcher run a new network
+        # or YouTube source starts live and can be taken, an off-bus edit
+        # applies live, and 20 adds under a command + M/E flood keep one frame
+        # per tick with zero repeats. Scoped to these two integration targets,
+        # NOT the full ffmpeg suite (issue #163). Runs even if an earlier
+        # independent test step failed; the job still fails.
+        if: ${{ success() || steps.audio-lib-tests.outcome == 'failure' }}
+        timeout-minutes: 15
+        run: >
+          cargo test
+          --locked
+          -p multiview-cli
+          --features ffmpeg,youtube
+          --test switcher_live_sources
+          --test switcher_live_source_chaos
+          --
+          --test-threads=1
       - name: clippy multiview-cli --features ffmpeg,srt-libsrt
         # Dual-stack SRT listener leaf (ADR-0039 decision 10, amended): off by
         # default, NOT implied by plain `ffmpeg`, so — exactly like

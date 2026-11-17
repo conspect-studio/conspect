@@ -65,6 +65,7 @@ import {
 } from "./approved/RoutingSurface";
 import type { RouteDest } from "./approved/RoutingSurface";
 import { useProgramTally } from "./approved/useProgramTally";
+import { PatchMatrix } from "./approved/PatchMatrix";
 
 /** A stream selector strategy (mirrors `StreamSelectorDoc.by`). */
 type SelectorBy = "best" | "index" | "language" | "stream_id";
@@ -356,6 +357,8 @@ export function RoutingPage(): JSX.Element {
   return (
     <RoutingFrame>
       <RoutingHead />
+
+      <PatchMatrix />
 
       <RouteTruthStrip pgm={{
           programSource,
