@@ -22,6 +22,7 @@ on:
     branches: [main]
     paths:
       - "deploy/ffmpeg-build.sh"
+      - "deploy/libsrt-build.sh"
       - "deploy/ffmpeg-fetch-source.sh"
       - "deploy/ffmpeg-signing-key.asc"
       - "deploy/ffmpeg-patches/**"
@@ -30,6 +31,7 @@ on:
   pull_request:
     paths:
       - "deploy/ffmpeg-build.sh"
+      - "deploy/libsrt-build.sh"
       - "deploy/ffmpeg-fetch-source.sh"
       - "deploy/ffmpeg-signing-key.asc"
       - "deploy/ffmpeg-patches/**"
@@ -61,6 +63,11 @@ env:
   # Dockerfile.ffmpeg ARGs, this value, the :<ver>-* tags in ci.yml/docker.yml,
   # and the Dockerfiles' FFMPEG_IMAGE defaults + soname asserts).
   FFMPEG_VERSION: "9.0.2"
+  # The bundled libsrt (deploy/libsrt-build.sh, security floor 1.5.7 for
+  # GHSA-m96h-3rc9-xx6h). Part of the published tag so an image that still
+  # carries an older libsrt can never be consumed under the new name. Must equal
+  # ARG LIBSRT_VERSION in deploy/Dockerfile.ffmpeg.
+  LIBSRT_VERSION: "1.5.7"
 
 permissions:
   contents: read
@@ -131,6 +138,7 @@ jobs:
           # WAV and raw-PCM features in every matrix leg before any image push.
           build-args: |
             FFMPEG_VERSION=${{ env.FFMPEG_VERSION }}
+            LIBSRT_VERSION=${{ env.LIBSRT_VERSION }}
             FF_HWACCEL=${{ matrix.hwaccel }}
             FF_LICENSE=${{ matrix.ff_license }}
           # Registry cache (durable, cross-branch, unbounded) on push; GHA
@@ -192,7 +200,7 @@ jobs:
           FLAVOUR: ${{ matrix.flavour }}
         run: |
           set -euo pipefail
-          TAG="${IMAGE}:${FFMPEG_VERSION}-${FLAVOUR}"
+          TAG="${IMAGE}:${FFMPEG_VERSION}-srt${LIBSRT_VERSION}-${FLAVOUR}"
           # Source refs from the flavour's per-arch digests (1 for nvidia, 2 else).
           SRC=()
           while IFS= read -r d; do
