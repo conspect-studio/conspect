@@ -100,6 +100,7 @@ fn capture(document: usize) -> Capture {
         background: Background::Opaque,
         document: "x".repeat(document),
         capture: multiview_webengine::capture::CaptureOptions::default(),
+        output_cadence: None,
     }
 }
 fn prov() -> Provenance {

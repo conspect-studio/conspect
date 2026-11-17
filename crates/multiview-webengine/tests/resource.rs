@@ -159,6 +159,7 @@ fn real_producer_descendant_cpu_reaches_observer() {
         background: Background::Opaque,
         document: "x".into(),
         capture: multiview_webengine::capture::CaptureOptions::default(),
+        output_cadence: None,
     };
     let cancel = AtomicBool::new(false);
     let mut best: Option<multiview_webengine::resource::ResourceSample> = None;
@@ -251,6 +252,7 @@ fn service_status_exposes_descendant_sample_while_running() {
                 background: Background::Opaque,
                 document: "x".into(),
                 capture: multiview_webengine::capture::CaptureOptions::default(),
+                output_cadence: None,
             },
             maximum_bytes: 1000,
             timeout: Duration::from_secs(60),

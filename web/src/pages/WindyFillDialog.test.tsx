@@ -436,6 +436,39 @@ describe('WindyFillDialog', () => {
     expect(document.querySelector('.animate-spin')).not.toBeInTheDocument();
   });
 
+  it('shows the typed failure reason and detail of a failed load (issue #474)', async () => {
+    server.use(
+      capabilitiesHandler(),
+      http.post('*/api/v1/media/captures', () =>
+        HttpResponse.json({ job_id: 52, status_url: '/api/v1/media/captures/52' }, { status: 202 })),
+      http.get('*/api/v1/media/captures/52', () =>
+        HttpResponse.json({ job_id: 52, fill_id: 'vt-vt-1-windy', state: 'succeeded', artifact_id: 'art-52' })),
+      http.post('*/api/v1/media/players/vt-1/load', () =>
+        HttpResponse.json({ operation: 11, state: 'pending' }, { status: 202 })),
+      http.get('*/api/v1/media/players/vt-1/load-operations/11', () =>
+        HttpResponse.json({
+          operation: 11,
+          state: 'failed',
+          native: null,
+          reason: 'wrong_cadence',
+          detail: 'clip frame rate 25/1 does not match the canvas frame rate 30000/1001',
+        })),
+    );
+
+    renderDialog();
+    await waitFor(() => {
+      expect(screen.getByLabelText(/accept the/i)).toBeEnabled();
+    });
+    await userEvent.click(screen.getByLabelText(/accept the/i));
+    await userEvent.click(screen.getByRole('button', { name: 'Capture' }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('load-failure-reason')).toHaveTextContent(
+        /Clip frame rate does not match the canvas.*25\/1 does not match the canvas frame rate 30000\/1001/,
+      );
+    });
+  });
+
   it('mints a distinct load key per new capture->load cycle, and a retried load reuses its key', async () => {
     const loadKeysByOperation = new Map<number, string>();
     let loadCalls = 0;

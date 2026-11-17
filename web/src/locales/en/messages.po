@@ -866,7 +866,7 @@ msgstr "Accent colour (#RRGGBB, optional)"
 msgid "Accept the publisher's audio (Opus)"
 msgstr "Accept the publisher's audio (Opus)"
 
-#: src/pages/WindyFillDialog.tsx:1129
+#: src/pages/WindyFillDialog.tsx:1174
 msgid "Accepted"
 msgstr "Accepted"
 
@@ -1677,7 +1677,7 @@ msgstr "Audio meters unavailable — no measured level telemetry"
 msgid "Audio mixer"
 msgstr "Audio mixer"
 
-#: src/pages/WindyFillDialog.tsx:1167
+#: src/pages/WindyFillDialog.tsx:1220
 msgid "audio present"
 msgstr "audio present"
 
@@ -2161,7 +2161,7 @@ msgstr "Can take."
 #: src/pages/SalvosPage.tsx:433
 #: src/pages/SystemActionsPage.tsx:151
 #: src/pages/TallyPage.tsx:432
-#: src/pages/WindyFillDialog.tsx:1186
+#: src/pages/WindyFillDialog.tsx:1239
 #: src/resources/CrudPage.tsx:380
 #: src/resources/CrudPage.tsx:425
 msgid "Cancel"
@@ -2281,11 +2281,11 @@ msgstr "Captions"
 
 #: src/pages/approved/MediaSurface.tsx:29
 #: src/pages/approved/MediaSurface.tsx:118
-#: src/pages/WindyFillDialog.tsx:1238
+#: src/pages/WindyFillDialog.tsx:1291
 msgid "Capture"
 msgstr "Capture"
 
-#: src/pages/WindyFillDialog.tsx:646
+#: src/pages/WindyFillDialog.tsx:691
 msgid "Capture a bounded Windy weather view and load it into this player."
 msgstr "Capture a bounded Windy weather view and load it into this player."
 
@@ -2293,11 +2293,11 @@ msgstr "Capture a bounded Windy weather view and load it into this player."
 msgid "Capture and the clip library listing are unavailable until their backend contracts ship."
 msgstr "Capture and the clip library listing are unavailable until their backend contracts ship."
 
-#: src/pages/WindyFillDialog.tsx:1102
+#: src/pages/WindyFillDialog.tsx:1147
 msgid "Capture job"
 msgstr "Capture job"
 
-#: src/pages/WindyFillDialog.tsx:887
+#: src/pages/WindyFillDialog.tsx:932
 msgid "Capture mode"
 msgstr "Capture mode"
 
@@ -2557,7 +2557,7 @@ msgstr "Check all token pages"
 msgid "Checked from this server."
 msgstr "Checked from this server."
 
-#: src/pages/WindyFillDialog.tsx:660
+#: src/pages/WindyFillDialog.tsx:705
 msgid "Checking capture capabilities…"
 msgstr "Checking capture capabilities…"
 
@@ -2785,10 +2785,50 @@ msgstr "Cleared only"
 msgid "Clip"
 msgstr "Clip"
 
+#: src/pages/WindyFillDialog.tsx:637
+msgid "Clip carries an alpha plane"
+msgstr "Clip carries an alpha plane"
+
+#: src/pages/WindyFillDialog.tsx:641
+msgid "Clip could not be parsed"
+msgstr "Clip could not be parsed"
+
+#: src/pages/WindyFillDialog.tsx:635
+msgid "Clip declares no frame rate"
+msgstr "Clip declares no frame rate"
+
+#: src/pages/WindyFillDialog.tsx:631
+msgid "Clip frame rate does not match the canvas"
+msgstr "Clip frame rate does not match the canvas"
+
+#: src/pages/WindyFillDialog.tsx:645
+msgid "Clip has no video stream"
+msgstr "Clip has no video stream"
+
+#: src/pages/WindyFillDialog.tsx:633
+msgid "Clip is variable frame rate"
+msgstr "Clip is variable frame rate"
+
+#: src/pages/WindyFillDialog.tsx:647
+msgid "Clip length is unknown"
+msgstr "Clip length is unknown"
+
 #: src/pages/approved/MediaSurface.tsx:86
 #: src/pages/approved/MediaSurface.tsx:119
 msgid "Clip library"
 msgstr "Clip library"
+
+#: src/pages/WindyFillDialog.tsx:639
+msgid "Clip not found"
+msgstr "Clip not found"
+
+#: src/pages/WindyFillDialog.tsx:643
+msgid "Clip open timed out"
+msgstr "Clip open timed out"
+
+#: src/pages/WindyFillDialog.tsx:649
+msgid "Clip playout window is invalid"
+msgstr "Clip playout window is invalid"
 
 #: src/components/broadcast/library/TranscriptRangeEditor.tsx:492
 msgid "Clip-ready selection"
@@ -2815,7 +2855,7 @@ msgstr "Clock source: receive time"
 #: src/iptv/BulkAddDialog.tsx:192
 #: src/iptv/SourceLinks.tsx:403
 #: src/iptv/SourceLinks.tsx:445
-#: src/pages/WindyFillDialog.tsx:1190
+#: src/pages/WindyFillDialog.tsx:1243
 msgid "Close"
 msgstr "Close"
 
@@ -3841,7 +3881,7 @@ msgid "CUDA-enabled image (NVDEC / NVENC plus a wgpu compositor) for NVIDIA GPUs
 msgstr "CUDA-enabled image (NVDEC / NVENC plus a wgpu compositor) for NVIDIA GPUs."
 
 #: src/pages/MediaPlayersPage.tsx:403
-#: src/pages/WindyFillDialog.tsx:1039
+#: src/pages/WindyFillDialog.tsx:1084
 msgid "Cue"
 msgstr "Cue"
 
@@ -3871,7 +3911,7 @@ msgstr "Cued:"
 msgid "Current"
 msgstr "Current"
 
-#: src/pages/WindyFillDialog.tsx:1045
+#: src/pages/WindyFillDialog.tsx:1090
 msgid "Current end-of-clip behaviour for this player: "
 msgstr "Current end-of-clip behaviour for this player: "
 
@@ -4596,7 +4636,7 @@ msgstr "Dual (analogue face + digital readout)"
 
 #: src/components/broadcast/library/MetadataInspector.tsx:347
 #: src/events/SourceEventsButton.tsx:66
-#: src/pages/WindyFillDialog.tsx:1164
+#: src/pages/WindyFillDialog.tsx:1217
 msgid "Duration"
 msgstr "Duration"
 
@@ -4901,7 +4941,7 @@ msgstr "Encoder utilisation (device total)"
 msgid "Encoder utilisation: ours over device total"
 msgstr "Encoder utilisation: ours over device total"
 
-#: src/pages/WindyFillDialog.tsx:971
+#: src/pages/WindyFillDialog.tsx:1016
 msgid "End hold (ms)"
 msgstr "End hold (ms)"
 
@@ -5033,7 +5073,7 @@ msgstr "EPG: {0}"
 msgid "Epoch"
 msgstr "Epoch"
 
-#: src/pages/WindyFillDialog.tsx:944
+#: src/pages/WindyFillDialog.tsx:989
 msgid "Equal"
 msgstr "Equal"
 
@@ -5083,7 +5123,7 @@ msgstr "Every document starts with a <0>schema_version</0> and then declares the
 msgid "Every input on the program mix is muted. Unmute at least one, or take them all off the mix."
 msgstr "Every input on the program mix is muted. Unmute at least one, or take them all off the mix."
 
-#: src/pages/WindyFillDialog.tsx:875
+#: src/pages/WindyFillDialog.tsx:920
 msgid "Every N minutes (coming soon — no scheduler yet)"
 msgstr "Every N minutes (coming soon — no scheduler yet)"
 
@@ -5290,7 +5330,7 @@ msgstr "Fill colour"
 
 #: src/pages/MediaPlayersPage.tsx:461
 #: src/pages/MediaPlayersPage.tsx:467
-#: src/pages/WindyFillDialog.tsx:643
+#: src/pages/WindyFillDialog.tsx:688
 msgid "Fill from web…"
 msgstr "Fill from web…"
 
@@ -5423,7 +5463,7 @@ msgstr "Format presets"
 msgid "Forward"
 msgstr "Forward"
 
-#: src/pages/WindyFillDialog.tsx:796
+#: src/pages/WindyFillDialog.tsx:841
 msgid "FPS"
 msgstr "FPS"
 
@@ -5431,7 +5471,7 @@ msgstr "FPS"
 msgid "Fractions of the tile, so a static logo or lower-third cannot mask a black or frozen background."
 msgstr "Fractions of the tile, so a static logo or lower-third cannot mask a black or frozen background."
 
-#: src/pages/WindyFillDialog.tsx:953
+#: src/pages/WindyFillDialog.tsx:998
 msgid "Frame duration (ms)"
 msgstr "Frame duration (ms)"
 
@@ -5462,11 +5502,11 @@ msgstr "Frame-accurate: every node presents the same frame index, with at most a
 
 #: src/pages/MediaPlayersPage.tsx:263
 #: src/pages/MediaPlayersPage.tsx:359
-#: src/pages/WindyFillDialog.tsx:1165
+#: src/pages/WindyFillDialog.tsx:1218
 msgid "frames"
 msgstr "frames"
 
-#: src/pages/WindyFillDialog.tsx:815
+#: src/pages/WindyFillDialog.tsx:860
 msgid "Frames"
 msgstr "Frames"
 
@@ -5976,7 +6016,7 @@ msgstr "HTTP only"
 msgid "HTTP(S) management endpoint. Wrap IPv6 literals in brackets."
 msgstr "HTTP(S) management endpoint. Wrap IPv6 literals in brackets."
 
-#: src/pages/WindyFillDialog.tsx:1068
+#: src/pages/WindyFillDialog.tsx:1113
 msgid "I accept the <0>Windy terms of use</0> ({WINDY_TERMS_VERSION})"
 msgstr "I accept the <0>Windy terms of use</0> ({WINDY_TERMS_VERSION})"
 
@@ -6501,7 +6541,7 @@ msgstr "Latency profile (optional)"
 msgid "Latency, robustness, and scale pull against each other. Buffering is what absorbs network jitter and gives retransmission time to repair loss — so cutting the buffer cuts your protection with it. A 120 ms SRT window is snappy but fragile on a lossy link; a 2 s window rides out trouble at the cost of 2 s. Plain HTTP segments are the most robust and scalable delivery there is, and also the slowest."
 msgstr "Latency, robustness, and scale pull against each other. Buffering is what absorbs network jitter and gives retransmission time to repair loss — so cutting the buffer cuts your protection with it. A 120 ms SRT window is snappy but fragile on a lossy link; a 2 s window rides out trouble at the cost of 2 s. Plain HTTP segments are the most robust and scalable delivery there is, and also the slowest."
 
-#: src/pages/WindyFillDialog.tsx:718
+#: src/pages/WindyFillDialog.tsx:763
 msgid "Latitude"
 msgstr "Latitude"
 
@@ -6821,7 +6861,7 @@ msgstr "LL-HLS (Low-Latency HLS)"
 
 #: src/pages/MediaPlayersPage.tsx:457
 #: src/pages/MediaPlayersPage.tsx:923
-#: src/pages/WindyFillDialog.tsx:1126
+#: src/pages/WindyFillDialog.tsx:1171
 msgid "Load"
 msgstr "Load"
 
@@ -6846,9 +6886,17 @@ msgstr "Load asset into player"
 msgid "Load candidates"
 msgstr "Load candidates"
 
+#: src/pages/WindyFillDialog.tsx:663
+msgid "Load failed"
+msgstr "Load failed"
+
 #: src/components/broadcast/library/VTReferenceSummary.tsx:283
 msgid "Load from library…"
 msgstr "Load from library…"
+
+#: src/pages/WindyFillDialog.tsx:659
+msgid "Load has no durable identity"
+msgstr "Load has no durable identity"
 
 #: src/events/JournalPanel.tsx:133
 msgid "Load older records"
@@ -7058,7 +7106,7 @@ msgstr "Locale"
 
 #: src/iptv/Controls.tsx:275
 #: src/pages/graphics/DataView.tsx:350
-#: src/pages/WindyFillDialog.tsx:698
+#: src/pages/WindyFillDialog.tsx:743
 msgid "Location"
 msgstr "Location"
 
@@ -7092,7 +7140,7 @@ msgstr "Long-running actions are accepted with an operation id and their outcome
 msgid "Long-running ops"
 msgstr "Long-running ops"
 
-#: src/pages/WindyFillDialog.tsx:734
+#: src/pages/WindyFillDialog.tsx:779
 msgid "Longitude"
 msgstr "Longitude"
 
@@ -7100,7 +7148,7 @@ msgstr "Longitude"
 msgid "Looking for Cast receivers…"
 msgstr "Looking for Cast receivers…"
 
-#: src/pages/WindyFillDialog.tsx:882
+#: src/pages/WindyFillDialog.tsx:927
 msgid "Loop"
 msgstr "Loop"
 
@@ -7268,7 +7316,7 @@ msgstr "Max"
 msgid "Max resolution"
 msgstr "Max resolution"
 
-#: src/pages/WindyFillDialog.tsx:989
+#: src/pages/WindyFillDialog.tsx:1034
 msgid "Max steps"
 msgstr "Max steps"
 
@@ -7917,6 +7965,10 @@ msgstr "No confirmed frame"
 msgid "No crosspoint grid: it needs both configured sources and known destinations (layout cells, audio discrete tracks). Use the typed selectors below."
 msgstr "No crosspoint grid: it needs both configured sources and known destinations (layout cells, audio discrete tracks). Use the typed selectors below."
 
+#: src/pages/WindyFillDialog.tsx:653
+msgid "No decodable frame"
+msgstr "No decodable frame"
+
 #: src/pages/approved/RoutingSurface.tsx:302
 msgid "No destinations known (no layout cells or discrete audio tracks). Use the typed selectors."
 msgstr "No destinations known (no layout cells or discrete audio tracks). Use the typed selectors."
@@ -8284,7 +8336,7 @@ msgstr "No watermark"
 msgid "Nodes enrol with a keypair identity: the node proves itself with its key, not with a network address, so a node keeps its identity across DHCP changes and re-images. That is why the management address is optional for the <0>displaynode</0> driver — an enrolled node finds the controller and authenticates itself. After a network loss the node reconnects with its enrolled identity, re-pulls its stream, and re-converges its sync offset before un-muting its output."
 msgstr "Nodes enrol with a keypair identity: the node proves itself with its key, not with a network address, so a node keeps its identity across DHCP changes and re-images. That is why the management address is optional for the <0>displaynode</0> driver — an enrolled node finds the controller and authenticates itself. After a network loss the node reconnects with its enrolled identity, re-pulls its stream, and re-converges its sync offset before un-muting its output."
 
-#: src/pages/WindyFillDialog.tsx:1017
+#: src/pages/WindyFillDialog.tsx:1062
 msgid "Nominal total frames: {nominalFrames} (cap {MAX_NOMINAL_FRAMES})."
 msgstr "Nominal total frames: {nominalFrames} (cap {MAX_NOMINAL_FRAMES})."
 
@@ -8646,7 +8698,7 @@ msgstr "On signal loss"
 msgid "on the Licence screen."
 msgstr "on the Licence screen."
 
-#: src/pages/WindyFillDialog.tsx:863
+#: src/pages/WindyFillDialog.tsx:908
 msgid "Once"
 msgstr "Once"
 
@@ -8920,7 +8972,7 @@ msgstr "Over ceiling"
 msgid "Over the layout drop zone."
 msgstr "Over the layout drop zone."
 
-#: src/pages/WindyFillDialog.tsx:678
+#: src/pages/WindyFillDialog.tsx:723
 msgid "Overlay"
 msgstr "Overlay"
 
@@ -9240,7 +9292,7 @@ msgstr "Planning…"
 
 #: src/components/broadcast/library/AssetAuditionControls.tsx:165
 #: src/pages/MediaPlayersPage.tsx:417
-#: src/pages/WindyFillDialog.tsx:1038
+#: src/pages/WindyFillDialog.tsx:1083
 msgid "Play"
 msgstr "Play"
 
@@ -9271,9 +9323,17 @@ msgid "Playback URLs are unavailable: this server does not provide them yet (bac
 msgstr "Playback URLs are unavailable: this server does not provide them yet (backend not deployed)."
 
 #: src/pages/MediaPlayersPage.tsx:872
-#: src/pages/WindyFillDialog.tsx:655
+#: src/pages/WindyFillDialog.tsx:700
 msgid "Player"
 msgstr "Player"
+
+#: src/pages/WindyFillDialog.tsx:655
+msgid "Player audio rail unavailable"
+msgstr "Player audio rail unavailable"
+
+#: src/pages/WindyFillDialog.tsx:657
+msgid "Player journal refused the load"
+msgstr "Player journal refused the load"
 
 #: src/pages/approved/PatchMatrix.tsx:192
 #: src/pages/OutputFeedRow.tsx:324
@@ -9329,11 +9389,11 @@ msgstr "Pre-roll"
 msgid "Précis"
 msgstr "Précis"
 
-#: src/pages/WindyFillDialog.tsx:844
+#: src/pages/WindyFillDialog.tsx:889
 msgid "Premium (authenticated) capture"
 msgstr "Premium (authenticated) capture"
 
-#: src/pages/WindyFillDialog.tsx:849
+#: src/pages/WindyFillDialog.tsx:894
 msgid "Premium Windy capture is not configured on this server; the public (unauthenticated) view is used."
 msgstr "Premium Windy capture is not configured on this server; the public (unauthenticated) view is used."
 
@@ -9633,7 +9693,7 @@ msgstr "Program-output timing is designed to remain independent of this device: 
 msgid "Promote this ephemeral session to a permanent managed Cast device."
 msgstr "Promote this ephemeral session to a permanent managed Cast device."
 
-#: src/pages/WindyFillDialog.tsx:945
+#: src/pages/WindyFillDialog.tsx:990
 msgid "Proportional to radar time"
 msgstr "Proportional to radar time"
 
@@ -9729,11 +9789,11 @@ msgstr "Queued"
 msgid "Queued remote actions you can cancel locally, and the immutable account audit trail."
 msgstr "Queued remote actions you can cancel locally, and the immutable account audit trail."
 
-#: src/pages/WindyFillDialog.tsx:690
+#: src/pages/WindyFillDialog.tsx:735
 msgid "Radar / storm"
 msgstr "Radar / storm"
 
-#: src/pages/WindyFillDialog.tsx:902
+#: src/pages/WindyFillDialog.tsx:947
 msgid "Radar steps"
 msgstr "Radar steps"
 
@@ -9789,7 +9849,7 @@ msgstr "Raw"
 msgid "Re-arm to the next occurrence (recurring daily)"
 msgstr "Re-arm to the next occurrence (recurring daily)"
 
-#: src/pages/WindyFillDialog.tsx:1242
+#: src/pages/WindyFillDialog.tsx:1295
 msgid "Re-capture"
 msgstr "Re-capture"
 
@@ -9834,7 +9894,7 @@ msgstr "Reading…"
 msgid "Ready"
 msgstr "Ready"
 
-#: src/pages/WindyFillDialog.tsx:918
+#: src/pages/WindyFillDialog.tsx:963
 msgid "Realtime"
 msgstr "Realtime"
 
@@ -9949,7 +10009,7 @@ msgid "Referer header (optional)"
 msgstr "Referer header (optional)"
 
 #: src/events/JournalPanel.tsx:97
-#: src/pages/WindyFillDialog.tsx:858
+#: src/pages/WindyFillDialog.tsx:903
 msgid "Refresh"
 msgstr "Refresh"
 
@@ -10329,11 +10389,11 @@ msgstr "Retry detach (same operation)"
 msgid "Retry live preview"
 msgstr "Retry live preview"
 
-#: src/pages/WindyFillDialog.tsx:1153
+#: src/pages/WindyFillDialog.tsx:1198
 msgid "Retry load"
 msgstr "Retry load"
 
-#: src/pages/WindyFillDialog.tsx:1220
+#: src/pages/WindyFillDialog.tsx:1273
 msgid "Retry same request"
 msgstr "Retry same request"
 
@@ -10987,7 +11047,7 @@ msgstr "Set at start"
 msgid "Set the receiver volume"
 msgstr "Set the receiver volume"
 
-#: src/pages/WindyFillDialog.tsx:1050
+#: src/pages/WindyFillDialog.tsx:1095
 msgid "Set this player to loop at end of clip in its configuration for a continuously-refreshed fill to play seamlessly."
 msgstr "Set this player to loop at end of clip in its configuration for a continuously-refreshed fill to play seamlessly."
 
@@ -11117,7 +11177,7 @@ msgstr "Silence"
 msgid "Silence level (dBFS)"
 msgstr "Silence level (dBFS)"
 
-#: src/pages/WindyFillDialog.tsx:1167
+#: src/pages/WindyFillDialog.tsx:1220
 msgid "silent"
 msgstr "silent"
 
@@ -11126,7 +11186,7 @@ msgid "Silent (gated)"
 msgstr "Silent (gated)"
 
 #: src/components/broadcast/library/MetadataInspector.tsx:368
-#: src/pages/WindyFillDialog.tsx:770
+#: src/pages/WindyFillDialog.tsx:815
 msgid "Size"
 msgstr "Size"
 
@@ -11385,7 +11445,7 @@ msgstr "Start a transfer"
 msgid "Start cast"
 msgstr "Start cast"
 
-#: src/pages/WindyFillDialog.tsx:1228
+#: src/pages/WindyFillDialog.tsx:1281
 msgid "Start new capture"
 msgstr "Start new capture"
 
@@ -12058,7 +12118,7 @@ msgstr "Temperature"
 
 #: src/pages/graphics/LibraryView.tsx:121
 #: src/pages/graphics/PlayoutView.tsx:469
-#: src/pages/WindyFillDialog.tsx:671
+#: src/pages/WindyFillDialog.tsx:716
 msgid "Template"
 msgstr "Template"
 
@@ -12521,7 +12581,7 @@ msgstr "The plan refuses this take"
 msgid "The previous command's outcome is unknown — repeating it could duplicate the command."
 msgstr "The previous command's outcome is unknown — repeating it could duplicate the command."
 
-#: src/pages/WindyFillDialog.tsx:1207
+#: src/pages/WindyFillDialog.tsx:1260
 msgid "The previous request's outcome may be unknown (a network error) — \"Retry same request\" resends it unchanged."
 msgstr "The previous request's outcome may be unknown (a network error) — \"Retry same request\" resends it unchanged."
 
@@ -12742,7 +12802,7 @@ msgstr "Theme: light. Switch to dark."
 msgid "Theme: system. Switch to light."
 msgstr "Theme: system. Switch to light."
 
-#: src/pages/WindyFillDialog.tsx:1026
+#: src/pages/WindyFillDialog.tsx:1071
 msgid "Then"
 msgstr "Then"
 
@@ -12989,7 +13049,7 @@ msgstr "This toast is announced to assistive technology."
 msgid "This URL must start with http:// or https://."
 msgstr "This URL must start with http:// or https://."
 
-#: src/pages/WindyFillDialog.tsx:1009
+#: src/pages/WindyFillDialog.tsx:1054
 msgid "This would capture {nominalFrames} frames, above the server's cap of {MAX_NOMINAL_FRAMES}. Lower max steps, frame duration or end hold."
 msgstr "This would capture {nominalFrames} frames, above the server's cap of {MAX_NOMINAL_FRAMES}. Lower max steps, frame duration or end hold."
 
@@ -13069,7 +13129,7 @@ msgstr "Timezone offset (minutes from UTC, optional)"
 msgid "Timezone offset (minutes from UTC)"
 msgstr "Timezone offset (minutes from UTC)"
 
-#: src/pages/WindyFillDialog.tsx:932
+#: src/pages/WindyFillDialog.tsx:977
 msgid "Timing"
 msgstr "Timing"
 
@@ -13657,6 +13717,10 @@ msgstr "Video bitrate (kbit/s)"
 msgid "Video cells"
 msgstr "Video cells"
 
+#: src/pages/WindyFillDialog.tsx:651
+msgid "Video decoder could not be opened"
+msgstr "Video decoder could not be opened"
+
 #: src/pages/OutputFeedRow.tsx:340
 msgid "Video feed for {outputName}"
 msgstr "Video feed for {outputName}"
@@ -13845,7 +13909,7 @@ msgstr "Watching"
 msgid "Weather is unavailable: this server does not provide it yet (backend not deployed)."
 msgstr "Weather is unavailable: this server does not provide it yet (backend not deployed)."
 
-#: src/pages/WindyFillDialog.tsx:664
+#: src/pages/WindyFillDialog.tsx:709
 msgid "Web capture is not provisioned on this server."
 msgstr "Web capture is not provisioned on this server."
 
@@ -14085,11 +14149,11 @@ msgstr "Width (px)"
 msgid "Width and height must both be even numbers from 16 to 8192, at most 3840 × 2160 pixels in area."
 msgstr "Width and height must both be even numbers from 16 to 8192, at most 3840 × 2160 pixels in area."
 
-#: src/pages/WindyFillDialog.tsx:691
+#: src/pages/WindyFillDialog.tsx:736
 msgid "Wind"
 msgstr "Wind"
 
-#: src/pages/WindyFillDialog.tsx:923
+#: src/pages/WindyFillDialog.tsx:968
 msgid "Wind only supports realtime capture."
 msgstr "Wind only supports realtime capture."
 
@@ -14097,7 +14161,7 @@ msgstr "Wind only supports realtime capture."
 msgid "Window"
 msgstr "Window"
 
-#: src/pages/WindyFillDialog.tsx:789
+#: src/pages/WindyFillDialog.tsx:834
 msgid "Windy requires a minimum width of 1024px (desktop geometry)."
 msgstr "Windy requires a minimum width of 1024px (desktop geometry)."
 
@@ -14238,7 +14302,7 @@ msgstr "Zone top (y, 0–1)"
 msgid "Zone width (0–1)"
 msgstr "Zone width (0–1)"
 
-#: src/pages/WindyFillDialog.tsx:753
+#: src/pages/WindyFillDialog.tsx:798
 msgid "Zoom"
 msgstr "Zoom"
 

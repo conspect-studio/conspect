@@ -7,7 +7,7 @@ use crate::{
     error::{ControlError, ControlResult},
 };
 use multiview_webengine::{
-    capture::{Background, Capture, WindyView},
+    capture::{Background, Capture, OutputCadence, WindyView},
     service::{CancelOutcome, JobId, Request, Service, State, SubmitError, Submitted},
 };
 use std::{sync::Arc, time::Duration};
@@ -21,6 +21,9 @@ pub struct Provider {
     ledger: Arc<Ledger>,
     streams: Arc<Semaphore>,
     pin_requests: Arc<Semaphore>,
+    /// The running canvas cadence every artifact is conformed to, so a media
+    /// player (which accepts only the exact canvas rate) can load it.
+    output_cadence: Option<OutputCadence>,
 }
 impl Default for Provider {
     fn default() -> Self {
@@ -30,6 +33,7 @@ impl Default for Provider {
             ledger: Arc::new(Ledger::memory()),
             streams: Arc::new(Semaphore::new(ARTIFACT_STREAMS)),
             pin_requests: Arc::new(Semaphore::new(ARTIFACT_STREAMS)),
+            output_cadence: None,
         }
     }
 }
@@ -47,7 +51,22 @@ impl Provider {
             ledger,
             streams: Arc::new(Semaphore::new(ARTIFACT_STREAMS)),
             pin_requests: Arc::new(Semaphore::new(ARTIFACT_STREAMS)),
+            output_cadence: None,
         }
+    }
+    /// Conform every capture to the engine's canvas cadence `num/den` (exact
+    /// rational). An out-of-range rate leaves captures unconformed, which a
+    /// `target_player` submit then refuses rather than producing an artifact
+    /// the player cannot load.
+    #[must_use]
+    pub fn with_canvas_cadence(mut self, num: i64, den: i64) -> Self {
+        self.output_cadence = canvas_output_cadence(num, den);
+        self
+    }
+    /// The conform cadence captures are encoded at, if known.
+    #[must_use]
+    pub const fn output_cadence(&self) -> Option<OutputCadence> {
+        self.output_cadence
     }
     /// Honest runtime capabilities, including the disabled URL download boundary.
     #[must_use]
@@ -95,7 +114,16 @@ impl Provider {
                 credentials: None,
             }),
             capture: body.view.capture_options(),
+            output_cadence: self.output_cadence,
         };
+        if body.target_player.is_some() && self.output_cadence.is_none() {
+            // A player accepts only the exact canvas rate: an unconformed
+            // artifact would be admitted, captured and then refused at load.
+            return Err(ControlError::Conflict(
+                "player-targeted capture needs the canvas cadence, which this run does not know"
+                    .into(),
+            ));
+        }
         capture
             .validate()
             .map_err(|_| ControlError::Validation("invalid capture view".into()))?;
@@ -379,6 +407,14 @@ fn missing(id: u64) -> ControlError {
         id: id.to_string(),
     }
 }
+/// The canvas `num/den` as a capture conform cadence, when representable.
+fn canvas_output_cadence(num: i64, den: i64) -> Option<OutputCadence> {
+    let cadence = OutputCadence {
+        num: u32::try_from(num).ok()?,
+        den: u32::try_from(den).ok()?,
+    };
+    cadence.validate().ok().map(|()| cadence)
+}
 fn submit_error(error: SubmitError) -> ControlError {
     match error {
         SubmitError::Invalid => ControlError::Validation("invalid capture request".into()),
@@ -421,5 +457,73 @@ mod pin_admission_tests {
         assert_eq!(provider.pin_requests.available_permits(), 2);
         assert_eq!(provider.streams.available_permits(), 2);
         assert!(provider.with_pin_request(|| Ok(())).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod cadence_tests {
+    use super::{canvas_output_cadence, Provider};
+    use crate::auth::{Principal, Role};
+    use crate::error::ControlError;
+    use multiview_webengine::capture::OutputCadence;
+
+    fn operator() -> Principal {
+        Principal {
+            key_id: "op".into(),
+            role: Role::Operator,
+            scoped_object_ids: None,
+            scoped_output_ids: None,
+            scoped_discovery_domains: None,
+        }
+    }
+    fn body(target: Option<&str>) -> super::CaptureBody {
+        serde_json::from_value(serde_json::json!({
+            "fill_id": "radar", "target_player": target,
+            "view": {"lat": -33.9, "lon": 150.3, "zoom": 10, "overlay": "radar",
+                     "width": 1280, "height": 720, "fps": 25, "frames": 25, "public": true,
+                     "capture": "realtime"},
+            "terms": {"accepted": true, "version": super::WINDY_TERMS_VERSION}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn canvas_cadence_maps_exactly_and_rejects_unrepresentable_rates() {
+        assert_eq!(
+            canvas_output_cadence(30000, 1001),
+            Some(OutputCadence {
+                num: 30000,
+                den: 1001
+            })
+        );
+        assert_eq!(
+            Provider::default()
+                .with_canvas_cadence(25, 1)
+                .output_cadence(),
+            Some(OutputCadence { num: 25, den: 1 })
+        );
+        for (num, den) in [(0, 1), (-25, 1), (25, 0), (25, -1), (1, 2), (i64::MAX, 1)] {
+            assert_eq!(canvas_output_cadence(num, den), None, "{num}/{den}");
+        }
+    }
+
+    #[test]
+    fn player_targeted_capture_requires_a_known_canvas_cadence() {
+        let unknown = Provider::default();
+        assert!(matches!(
+            unknown.submit(&operator(), "k", &body(Some("vt-1"))),
+            Err(ControlError::Conflict(_))
+        ));
+        // Untargeted captures still pass validation (then: no service).
+        assert!(matches!(
+            unknown.submit(&operator(), "k", &body(None)),
+            Err(ControlError::EngineBusy)
+        ));
+        // With the canvas cadence known, the conformed request validates.
+        let known = Provider::default().with_canvas_cadence(30000, 1001);
+        assert!(matches!(
+            known.submit(&operator(), "k", &body(Some("vt-1"))),
+            Err(ControlError::EngineBusy)
+        ));
     }
 }

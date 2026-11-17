@@ -793,6 +793,9 @@ pub(crate) async fn post_bulk_sources(
     // BOLA: authorise every id before revealing anything about any of them.
     for e in &body.sources {
         crate::auth::authorize_object(&principal, &e.id)?;
+        // A `media_player` entry exposes the bound player's frames through the
+        // new id: the caller must be authorized for that player too (#474 B1).
+        super::sources::authorize_bound_player(&principal, None, &e.body)?;
     }
     // Validate everything first; reject the whole request on any problem.
     let mut seen = HashSet::new();

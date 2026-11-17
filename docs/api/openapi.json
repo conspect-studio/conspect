@@ -19582,6 +19582,28 @@
         },
         "additionalProperties": false
       },
+      "LoadFailureCode": {
+        "type": "string",
+        "description": "Typed reason a load operation ended `failed`. Stable wire codes.",
+        "enum": [
+          "not_found",
+          "invalid_data",
+          "timeout",
+          "wrong_cadence",
+          "vfr",
+          "no_cadence",
+          "alpha",
+          "no_video_stream",
+          "unknown_length",
+          "invalid_window",
+          "decoder_open",
+          "no_frames",
+          "audio_unavailable",
+          "journal_failed",
+          "reference_missing",
+          "other"
+        ]
+      },
       "LoadOperation": {
         "type": "object",
         "description": "Bounded operation view; completion needs native video and audio adoption.",
@@ -19590,6 +19612,13 @@
           "state"
         ],
         "properties": {
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Short operator-facing explanation of `reason`. Redacted: never carries\na filesystem path, URL or credential; at most 256 bytes."
+          },
           "native": {
             "oneOf": [
               {
@@ -19606,6 +19635,17 @@
             "format": "int64",
             "description": "Operation id.",
             "minimum": 0
+          },
+          "reason": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LoadFailureCode",
+                "description": "Typed failure reason; present only when `state` is `failed`."
+              }
+            ]
           },
           "state": {
             "type": "string",
