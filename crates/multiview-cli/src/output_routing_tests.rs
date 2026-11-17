@@ -425,28 +425,30 @@ fn settle_workers(r: &OutputRouter, bound: std::time::Duration) {
 /// The router's cost over a span of calls (maxima per call).
 #[derive(Clone, Copy, Debug, Default)]
 struct RouterCost {
+    /// Longest cost of one measured call: on-CPU plus blocked time.
+    cost: std::time::Duration,
     /// Longest on-CPU time of one call (an upper bound: includes the
     /// samples' own few microseconds).
     on_cpu: std::time::Duration,
-    /// Longest time one call certainly spent blocked (a lower bound, exact
-    /// to within its sample reads' length).
-    blocked: std::time::Duration,
-    /// Calls whose sample reads took [`SAMPLE_WINDOW`] or more (a host stall
-    /// inside a read), so their blocked time is less precise.
+    /// Calls not measured because a sample read took [`SAMPLE_WINDOW`] or
+    /// more (a host stall inside a read): they prove nothing either way.
     uncertain: u64,
 }
 
 impl RouterCost {
     fn add(&mut self, call: Self) {
+        if call.uncertain > 0 {
+            self.uncertain += call.uncertain;
+            return;
+        }
+        self.cost = self.cost.max(call.cost);
         self.on_cpu = self.on_cpu.max(call.on_cpu);
-        self.blocked = self.blocked.max(call.blocked);
-        self.uncertain += call.uncertain;
     }
 }
 
-/// How long the two sample reads of one router call may take in all before
-/// the call counts as uncertain (a healthy read is ~20 us).
-const SAMPLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(5);
+/// How long one sample read may take before it is not tight enough to
+/// attribute time to the call it brackets (a healthy read is ~20 us).
+const SAMPLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// One sample of the calling thread's scheduler accounting (Linux,
 /// `/proc/thread-self/schedstat`: field 1 on-CPU ns, field 2 `sched_info`
@@ -471,40 +473,48 @@ impl ThreadTimes {
         })
     }
 
-    /// The router's own cost of one call (#501 reviews R2-R5), from samples
+    /// The router's own cost of one call (#501 reviews R2-R6), from samples
     /// `before` and `after` taken between wall reads `w0..w1` and `w2..w3`;
     /// the call ran in `w1..w2`.
     ///
     /// A thread's wall time is on-CPU + preempted + blocked. The samples'
     /// instants lie in `w0..w1` and `w2..w3`, so the sample interval
-    /// encloses the call, and its deltas over-count the call's on-CPU and
-    /// preempted time by at most what happened inside the read windows.
-    /// Hence `(w2 - w1) - Δcpu - Δqueued` is a LOWER bound on the time the
-    /// call blocked (sleep, timed join, park, contended lock). Host
-    /// preemption never raises it, wherever it lands, so a healthy router
-    /// cannot flake on it; a blocking wait counts in full unless the host
-    /// also stalled a ~20 us /proc read for as long (counted as
-    /// `uncertain`). `Δcpu` bounds the call's on-CPU time from above, so any
-    /// spin counts. Off Linux the wall time counts as both.
+    /// encloses the call and the deltas over-count its on-CPU and preempted
+    /// time by at most what happened inside the read windows. When both
+    /// windows are under [`SAMPLE_WINDOW`], the cost is
+    /// `Δon_cpu + ((w2 - w1) - Δon_cpu - Δrun_delay)`: the call's work plus
+    /// the time it slept, parked, joined or waited on a lock, short of the
+    /// truth by under 2 * [`SAMPLE_WINDOW`] at most, and never raised by host
+    /// preemption wherever it lands. Otherwise (a host stall inside a read)
+    /// the call is `uncertain`: not measured, so it can neither fail nor pass
+    /// a close (see the test). Off Linux the wall time counts.
     fn router_cost(
         before: Option<Self>,
         after: Option<Self>,
         [w0, w1, w2, w3]: [Instant; 4],
     ) -> RouterCost {
         let took = w2 - w1;
+        let wall = RouterCost {
+            cost: took,
+            on_cpu: took,
+            uncertain: 1,
+        };
         let (Some(b), Some(a)) = (before, after) else {
             return RouterCost {
-                on_cpu: took,
-                blocked: took,
                 uncertain: 0,
+                ..wall
             };
         };
         let on_cpu = a.on_cpu.saturating_sub(b.on_cpu);
+        if w1 - w0 >= SAMPLE_WINDOW || w3 - w2 >= SAMPLE_WINDOW {
+            return RouterCost { on_cpu, ..wall };
+        }
         let queued = a.queued.saturating_sub(b.queued);
+        let blocked = took.saturating_sub(on_cpu + queued);
         RouterCost {
+            cost: on_cpu + blocked,
             on_cpu,
-            blocked: took.saturating_sub(on_cpu + queued),
-            uncertain: u64::from((w1 - w0) + (w3 - w2) >= SAMPLE_WINDOW),
+            uncertain: 0,
         }
     }
 }
@@ -715,9 +725,19 @@ impl Harness {
         // #501: what the router itself spent, not the host. Each kernel
         // sample is bracketed by wall reads, so its (unknown) instant is
         // known to lie in a measured window (see [`ThreadTimes::router_cost`]).
-        let w0 = Instant::now();
-        let before = ThreadTimes::sample();
-        let w1 = Instant::now();
+        // A stalled read before the call is simply retaken (nothing has run
+        // yet); a stalled read after it makes the call `uncertain`.
+        let (mut w0, mut before, mut w1);
+        let mut tries = 0;
+        loop {
+            w0 = Instant::now();
+            before = ThreadTimes::sample();
+            w1 = Instant::now();
+            tries += 1;
+            if w1 - w0 < SAMPLE_WINDOW || tries == 3 {
+                break;
+            }
+        }
         self.r
             .on_tick(t, pts(t), &mut self.d, &mut self.rec)
             .unwrap();
@@ -1222,17 +1242,21 @@ fn slow_finish_opener(held: &Arc<std::sync::Mutex<Vec<HeldClose>>>) -> OpenFn {
 /// join, a sleep, a spin) would still tick on, so for EVERY close the longest
 /// router call from just before the close through its held window must stay
 /// within the router's own cost bound ([`ThreadTimes::router_cost`]): no
-/// call blocks 50 ms (the bound before #501) or runs 20 ms on a CPU, and
-/// host preemption (the whole #501 flake) never counts. Repeated over
-/// [`SLOW_CLOSES`] closes so a wait on any one of them (the first, or one
-/// conditional on reaper state) fails.
+/// call costs 50 ms of work plus waits (the bound before #501) or runs 20 ms
+/// on a CPU, and host preemption (the whole #501 flake) never counts.
+/// Repeated over
+/// [`SLOW_CLOSES`] fully measured closes so a wait on any one of them (the
+/// first, or one conditional on reaper state) fails.
 #[test]
 fn a_slow_close_never_blocks_the_consumer() {
     /// Ticks the router must run while a close is held: 3 s at 5 fps, the
     /// span of the old 3 s `finish()`.
     const SLOW_FINISH_TICKS: u64 = 16;
-    /// Independent slow closes.
+    /// Slow closes whose every router call was measured.
     const SLOW_CLOSES: usize = 5;
+    /// Closes tried at most to get them (a close with a host stall inside a
+    /// sample read is repeated, never judged: see [`RouterCost::uncertain`]).
+    const MAX_CLOSES: usize = 3 * SLOW_CLOSES;
     // Preemption correction is required where CI runs this test, never
     // silently absent there.
     #[cfg(target_os = "linux")]
@@ -1245,7 +1269,11 @@ fn a_slow_close_never_blocks_the_consumer() {
     x.tick(0);
     let mut t = 1;
     let mut windows = Vec::new();
-    for rep in 0..SLOW_CLOSES {
+    let mut unjudged = Vec::new();
+    for rep in 0..MAX_CLOSES {
+        if windows.len() == SLOW_CLOSES {
+            break;
+        }
         x.h.try_take(take(&format!("a{rep}"), 1, src())).unwrap();
         let by = t + 60;
         while !x.results().contains(&TakeResult::Applied) {
@@ -1295,7 +1323,11 @@ fn a_slow_close_never_blocks_the_consumer() {
             !exited.load(Ordering::SeqCst),
             "the router ran {SLOW_FINISH_TICKS} ticks only after finish() returned: it waited on the close ({rep})"
         );
-        windows.push(x.router_cost);
+        if x.router_cost.uncertain == 0 {
+            windows.push(x.router_cost);
+        } else {
+            unjudged.push(rep);
+        }
         held.lock().unwrap()[rep].release.send(()).unwrap();
         let done = Instant::now() + SETTLE_BOUND;
         while !exited.load(Ordering::SeqCst) {
@@ -1303,15 +1335,20 @@ fn a_slow_close_never_blocks_the_consumer() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
-    // No call may block 50 ms (the original wall bound, now without host
-    // preemption) or run 20 ms on a CPU (a healthy call uses ~1 ms in a
-    // debug build): stricter than 50 ms of wall for any work it does.
+    assert_eq!(
+        windows.len(),
+        SLOW_CLOSES,
+        "{SLOW_CLOSES} fully measured closes in {MAX_CLOSES}; unjudged: {unjudged:?}"
+    );
+    // No call may cost 50 ms (work plus waits: the original wall bound
+    // without host preemption), nor run 20 ms on a CPU (a healthy call uses
+    // ~1 ms in a debug build).
     assert!(
         windows
             .iter()
-            .all(|w| w.blocked < std::time::Duration::from_millis(50)
+            .all(|w| w.cost < std::time::Duration::from_millis(50)
                 && w.on_cpu < std::time::Duration::from_millis(20)),
-        "a router call during a held close blocked >= 50 ms or ran >= 20 ms on a CPU: {windows:?}"
+        "a router call during a held close cost >= 50 ms or ran >= 20 ms on a CPU: {windows:?}"
     );
     x.tick(t);
     t += 1;
@@ -1325,7 +1362,7 @@ fn a_slow_close_never_blocks_the_consumer() {
         0,
         "handed to the reaper, not dropped"
     );
-    eprintln!("slow-close windows: {windows:?}");
+    eprintln!("slow-close windows: {windows:?}; unjudged closes: {unjudged:?}");
 }
 
 /// A live encoder that counts its live worker threads (the encoder is owned
