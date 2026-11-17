@@ -2499,7 +2499,8 @@ fn w_the_cast_webrtc_feed_is_one_opus_encoder_and_engine_time() {
                 Clearance::of(&labels.current()),
             ))
         };
-        let viewers = Arc::new(Mutex::new(vec![viewer("a"), viewer("b"), viewer("c")]));
+        let handles = vec![viewer("a"), viewer("b"), viewer("c")];
+        let viewers = Arc::new(Mutex::new(crate::cast_webrtc::Viewers::of(handles.clone())));
         let (sink, feed) = egress_feed();
         let stats = Arc::new(CastWebRtcStats::default());
         let stop = Arc::new(AtomicBool::new(false));
@@ -2518,11 +2519,7 @@ fn w_the_cast_webrtc_feed_is_one_opus_encoder_and_engine_time() {
         while (video.len() < 25 || audio.len() < 25) && start.elapsed() < Duration::from_secs(20) {
             while let Some(s) = feed.pop() {
                 let stamp = s.cast.expect("every cast sample is stamped");
-                assert!(viewers
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .all(|v| v.may_write(stamp.window)));
+                assert!(handles.iter().all(|v| v.may_write(stamp.window)));
                 match s.media {
                     EgressMedia::Video => video.push(s.rtp_timestamp),
                     _ => audio.push(s.rtp_timestamp),
@@ -2565,12 +2562,7 @@ fn w_the_cast_webrtc_feed_is_one_opus_encoder_and_engine_time() {
             &PictureBus::Source("cast_w_b".to_owned()),
         );
         wait_for("the fence", Duration::from_secs(10), || {
-            viewers
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|v| v.is_fenced())
-                .then_some(())
+            handles.iter().all(|v| v.is_fenced()).then_some(())
         });
         let windows = stats.windows.load(Ordering::Acquire);
         ctl.run_seconds(1);
@@ -2616,7 +2608,7 @@ fn x_a_cast_webrtc_viewer_that_stops_reading_costs_the_clock_nothing_and_stays_b
                 let rss_before = rss();
                 let factory = ctl.windows.load().unwrap();
                 let labels = Arc::clone(&ctl.cast.labels);
-                let viewers = Arc::new(Mutex::new(
+                let viewers = Arc::new(Mutex::new(crate::cast_webrtc::Viewers::of(
                     (0..3)
                         .map(|i| {
                             Arc::new(CastAttachment::new(
@@ -2628,7 +2620,7 @@ fn x_a_cast_webrtc_viewer_that_stops_reading_costs_the_clock_nothing_and_stays_b
                             ))
                         })
                         .collect::<Vec<_>>(),
-                ));
+                )));
                 // The consumer end exists and is never read.
                 let (sink, feed) = egress_feed();
                 let stats = Arc::new(CastWebRtcStats::default());

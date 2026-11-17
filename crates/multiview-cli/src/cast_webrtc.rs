@@ -65,12 +65,40 @@ impl ViewerGate for Gate {
     }
 }
 
+/// A feed's viewers and whether the feed is closed. One lock decides both:
+/// the worker closes the feed only when no viewer is live and no admission is
+/// pending, and an admission is appended only to a feed that is not closed
+/// (PR 521 review round 2), so no viewer is ever admitted to a dead feed nor
+/// fenced by a retirement decided before it arrived.
+#[derive(Default)]
+pub(crate) struct Viewers {
+    list: Vec<Arc<CastAttachment>>,
+    closed: bool,
+}
+
+impl Viewers {
+    /// An open feed's viewers (tests).
+    #[cfg(test)]
+    pub(crate) fn of(list: Vec<Arc<CastAttachment>>) -> Self {
+        Self {
+            list,
+            closed: false,
+        }
+    }
+
+    /// The viewers (tests).
+    #[cfg(test)]
+    pub(crate) fn list(&self) -> &[Arc<CastAttachment>] {
+        &self.list
+    }
+}
+
 /// One cast output's feed while it has viewers. The worker thread owns its
 /// retirement (PR 521 review): it ends itself once no viewer is live and no
 /// admission is in flight, and marks `done`; the control plane only forgets
 /// finished feeds and never joins under a lock.
 struct Feed {
-    viewers: Arc<Mutex<Vec<Arc<CastAttachment>>>>,
+    viewers: Arc<Mutex<Viewers>>,
     /// Admissions in flight (an offer being negotiated): the worker does not
     /// retire while one is pending.
     pending: Arc<AtomicU64>,
@@ -163,7 +191,7 @@ impl CliCastWebRtc {
         let generation = self
             .handle
             .register_output_generation(config_id, MAX_CAST_VIEWERS, feed);
-        let viewers = Arc::new(Mutex::new(Vec::new()));
+        let viewers = Arc::new(Mutex::new(Viewers::default()));
         // The admission that starts the feed is pending from the start.
         let pending = Arc::new(AtomicU64::new(1));
         let stop = Arc::new(AtomicBool::new(false));
@@ -237,6 +265,11 @@ struct Retire {
 }
 
 impl Retire {
+    /// No admission may reserve this feed any more.
+    fn close(&self) {
+        self.pending.store(CLOSED, Ordering::Release);
+    }
+
     fn finish(&self) {
         // Only this feed's registration: a newer feed of the same output
         // registered meanwhile keeps its own.
@@ -287,14 +320,27 @@ impl CastWebRtc for CliCastWebRtc {
                 attachment.set_closer(Box::new(move || {
                     let _ = handle.release(&output, &session);
                 }));
-                viewers
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(attachment);
-                Ok(CastWhepAnswer {
-                    session_id,
-                    sdp: answer.answer_sdp,
-                })
+                let admitted = {
+                    let mut viewers = viewers.lock().unwrap_or_else(PoisonError::into_inner);
+                    if viewers.closed {
+                        false
+                    } else {
+                        viewers.list.push(Arc::clone(&attachment));
+                        true
+                    }
+                };
+                if admitted {
+                    Ok(CastWhepAnswer {
+                        session_id,
+                        sdp: answer.answer_sdp,
+                    })
+                } else {
+                    // The feed ended while this offer negotiated: its session
+                    // is released at once (the closer) and the receiver steps
+                    // down.
+                    attachment.fence();
+                    Err(CastWhepReject::Unavailable)
+                }
             }
             Err(
                 multiview_webrtc::WebRtcError::MalformedSdp(_)
@@ -319,7 +365,7 @@ pub(crate) fn spawn_feed_for_test(
     factory: &crate::output_window_registry::SubscriptionFactory,
     config_id: &str,
     sink: EgressSink,
-    viewers: Arc<Mutex<Vec<Arc<CastAttachment>>>>,
+    viewers: Arc<Mutex<Viewers>>,
     epoch: multiview_output::SharedEpoch,
     stats: Arc<CastWebRtcStats>,
     stop: Arc<AtomicBool>,
@@ -347,7 +393,7 @@ pub(crate) fn spawn_feed_for_test(
 struct FeedWorker {
     subscription: Subscription,
     sink: EgressSink,
-    viewers: Arc<Mutex<Vec<Arc<CastAttachment>>>>,
+    viewers: Arc<Mutex<Viewers>>,
     epoch: multiview_output::SharedEpoch,
     stats: Arc<CastWebRtcStats>,
     video: Rational,
@@ -376,7 +422,7 @@ impl FeedWorker {
         binding: &EffectiveBinding,
         subscription: Subscription,
         sink: EgressSink,
-        viewers: Arc<Mutex<Vec<Arc<CastAttachment>>>>,
+        viewers: Arc<Mutex<Viewers>>,
         epoch: multiview_output::SharedEpoch,
         stats: Arc<CastWebRtcStats>,
     ) -> Self {
@@ -421,22 +467,28 @@ impl FeedWorker {
             }
             // Retire once no viewer is live and no admission is pending, for
             // FEED_LINGER (the last viewer's DELETE, revoke or death).
-            let live = {
+            let idle = {
                 let mut viewers = self.viewers.lock().unwrap_or_else(PoisonError::into_inner);
-                viewers.retain(|v| !v.is_fenced());
-                !viewers.is_empty()
+                viewers.list.retain(|v| !v.is_fenced());
+                viewers.list.is_empty()
             };
-            if live || retire.pending.load(Ordering::Acquire) > 0 {
+            if !idle || retire.pending.load(Ordering::Acquire) > 0 {
                 idle_since = None;
-            } else if idle_since.get_or_insert_with(Instant::now).elapsed() >= FEED_LINGER
-                && retire
-                    .pending
-                    .compare_exchange(0, CLOSED, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                // Closed atomically: no admission can reserve this feed now
-                // (`reserve` refuses CLOSED), and none was pending.
-                break;
+            } else if idle_since.get_or_insert_with(Instant::now).elapsed() >= FEED_LINGER {
+                // Decide under the viewers lock: still no live viewer, and no
+                // admission reserved (CAS to CLOSED: `reserve` refuses it).
+                let mut viewers = self.viewers.lock().unwrap_or_else(PoisonError::into_inner);
+                viewers.list.retain(|v| !v.is_fenced());
+                if viewers.list.is_empty()
+                    && retire
+                        .pending
+                        .compare_exchange(0, CLOSED, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    viewers.closed = true;
+                    break;
+                }
+                idle_since = None;
             }
             let next = match self.held.take() {
                 Some(window) => Ok(Some(window)),
@@ -458,12 +510,16 @@ impl FeedWorker {
         if self.opus.take().is_some() {
             self.stats.opus_closed.fetch_add(1, Ordering::AcqRel);
         }
-        for viewer in self
-            .viewers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-        {
+        // Every exit (retired, stopped, producer ended) closes admission
+        // first: an offer negotiating now finds the feed closed and fences its
+        // own attachment. Then every viewer still here is fenced.
+        retire.close();
+        let fenced = {
+            let mut viewers = self.viewers.lock().unwrap_or_else(PoisonError::into_inner);
+            viewers.closed = true;
+            std::mem::take(&mut viewers.list)
+        };
+        for viewer in fenced {
             viewer.fence();
         }
     }
@@ -540,6 +596,7 @@ impl FeedWorker {
         self.viewers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .list
             .clone()
     }
 
@@ -926,8 +983,72 @@ mod tests {
         assert_eq!(r.factory.slots_in_use(), 1);
         let feeds = r.rung.feeds();
         let feed = feeds.get("cast-1").expect("one live feed");
-        assert_eq!(feed.viewers.lock().unwrap().len(), 8, "no viewer orphaned");
+        assert_eq!(
+            feed.viewers.lock().unwrap().list.len(),
+            8,
+            "no viewer orphaned"
+        );
         assert!(!feed.done.load(Ordering::Acquire));
+    }
+
+    /// PR 521 review round 2: an admission completing after its feed ended
+    /// (the producer ended mid-negotiation) is refused and its attachment
+    /// fenced, never handed a dead feed.
+    #[test]
+    fn an_admission_after_the_feed_closed_is_refused_and_fenced() {
+        let r = rig();
+        let first = attachment();
+        r.rung
+            .negotiate("cast-1", &offer(), Arc::clone(&first))
+            .unwrap();
+        // The producer ends: the run's registry closes.
+        let feed_viewers = Arc::clone(&r.rung.feeds().get("cast-1").unwrap().viewers);
+        drop(r._registry);
+        wait("the feed closed", || feed_viewers.lock().unwrap().closed);
+        assert!(first.is_fenced(), "its viewers are fenced");
+        // An offer that had reserved the old feed before it closed: the
+        // append under the lock sees `closed`.
+        let late = attachment();
+        {
+            let viewers = feed_viewers.lock().unwrap();
+            assert!(viewers.closed);
+        }
+        // A new offer finds no live feed and cannot start one (no producer).
+        assert!(r
+            .rung
+            .negotiate("cast-1", &offer(), Arc::clone(&late))
+            .is_err());
+        assert!(!feed_viewers
+            .lock()
+            .unwrap()
+            .list
+            .iter()
+            .any(|v| Arc::ptr_eq(v, &late)));
+    }
+
+    /// PR 521 review round 2: a viewer admitted during the linger (after the
+    /// worker last saw no viewer) keeps the feed: retirement is decided
+    /// under the same lock the admission appends under.
+    #[test]
+    fn a_viewer_admitted_during_the_linger_keeps_the_feed() {
+        let r = rig();
+        let a = attachment();
+        r.rung
+            .negotiate("cast-1", &offer(), Arc::clone(&a))
+            .unwrap();
+        a.fence();
+        std::thread::sleep(FEED_LINGER - Duration::from_millis(300));
+        let b = attachment();
+        r.rung
+            .negotiate("cast-1", &offer(), Arc::clone(&b))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(800));
+        assert!(!b.is_fenced(), "admitted during the linger: kept");
+        assert_eq!(r.factory.slots_in_use(), 1, "the same feed serves it");
+        b.fence();
+        wait("retired after its last viewer", || {
+            r.factory.slots_in_use() == 0
+        });
     }
 
     /// A retired feed's late unregister never removes a newer registration.
