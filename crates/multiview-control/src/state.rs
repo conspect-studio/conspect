@@ -525,7 +525,10 @@ impl LiveSourceCapability {
     /// Whether the running engine can apply a mutation of this `kind` live.
     #[must_use]
     pub fn is_live(&self, kind: &multiview_config::SourceKind) -> bool {
-        if kind.is_synthetic() {
+        // A media-player binding (ADR-M012) opens nothing: the drain aliases
+        // the id to the player channel at the frame boundary, on every run that
+        // applies sources live at all.
+        if kind.is_synthetic() || matches!(kind, multiview_config::SourceKind::MediaPlayer { .. }) {
             return self.synthetic;
         }
         // RIST is network media but feature-gated: it is live only when the
@@ -785,6 +788,16 @@ pub struct AppState {
     /// The running engine's cast outputs (ADR-0111); `None` until the binary
     /// installs the engine seam (no cast output can be used).
     pub cast_engine: Option<crate::cast_engine::SharedCastEngine>,
+    /// The run-bound view of what the running engine's cast outputs package
+    /// (#418 review ABUSE-STORE-R3): an immutable snapshot of the document
+    /// the run started with, captured when the cast engine seam attaches
+    /// (from the run's start document, [`Self::base_document`]). It is never
+    /// advanced: a restart-pending output PUT changes the accepted stores,
+    /// not the cast sink's renditions or subtitle slots, so the cast token
+    /// closure resolves carried tracks and slot sources here too — in
+    /// store-only runs (no boot model) as well. `None`: no run attached (the
+    /// closure then fails closed unless a boot model supplies the view).
+    pub cast_run: Option<Arc<MultiviewConfig>>,
     /// The cast stream tokens (ADR-0111, design §3): bounded, shared by
     /// every router clone of this state.
     pub cast_streams: Arc<crate::cast_streams::CastStreams>,
@@ -1142,6 +1155,7 @@ impl AppState {
             output_routing: None,
             me_layouts: None,
             cast_engine: None,
+            cast_run: None,
             cast_streams: Arc::new(crate::cast_streams::CastStreams::new()),
             program_metrics: None,
             frontdoor_metrics: None,
@@ -1622,11 +1636,39 @@ impl AppState {
         self
     }
 
+    /// Set the rungs `[cast] ladder` enables (ADR-0114; already validated).
+    #[must_use]
+    pub fn with_cast_ladder(self, ladder: Vec<String>) -> Self {
+        self.cast_streams.set_ladder(ladder);
+        self
+    }
+
     /// Install the engine seam of the cast outputs (ADR-0111).
     #[must_use]
+    ///
+    /// Attaching the seam binds the control plane to the run: the run's start
+    /// document ([`Self::base_document`], whichever of the two is installed
+    /// second) is snapshotted as [`Self::cast_run`] (#418 review
+    /// ABUSE-STORE-R3).
     pub fn with_cast_engine(mut self, engine: crate::cast_engine::SharedCastEngine) -> Self {
         self.cast_engine = Some(engine);
+        self.capture_cast_run();
         self
+    }
+
+    /// Snapshot the run's start document as [`Self::cast_run`] once both the
+    /// cast engine seam and the start document are installed. Never replaces
+    /// an existing snapshot (run-bound, immutable); an unparsable document
+    /// leaves it `None` (the closure fails closed).
+    fn capture_cast_run(&mut self) {
+        if self.cast_run.is_some() || self.cast_engine.is_none() {
+            return;
+        }
+        self.cast_run = self
+            .base_document
+            .as_deref()
+            .and_then(|doc| serde_json::from_value::<MultiviewConfig>(doc.clone()).ok())
+            .map(Arc::new);
     }
 
     /// Replace the live-preview provider (the binary wires an engine-backed one;
@@ -2171,6 +2213,7 @@ impl AppState {
     #[must_use]
     pub fn with_base_document(mut self, document: serde_json::Value) -> Self {
         self.base_document = Some(Arc::new(document));
+        self.capture_cast_run();
         self
     }
 

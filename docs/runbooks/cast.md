@@ -17,6 +17,24 @@ Design: [ADR-0111](../decisions/ADR-0111-cast-output.md), [cast-output.md](../ar
    ```
 
    A canvas faster than 30 fps cannot carry a cast output yet (#343); validation says so.
+
+   Audio languages and subtitles (#418) are slots of the cast output, declared like on an HLS output; the device
+   and the Cast panel's Audio and Subtitles pickers list them:
+
+   ```toml
+   [[outputs.slots.audio]]            # slot 0: the program mix
+   language = "en"
+   [[outputs.slots.audio]]            # slot 1: a discrete track ([audio] route target_track = "commentary")
+   track = "commentary"
+   language = "de"
+   [[outputs.slots.subtitle]]
+   language = "en"
+   name = "English"
+   source = "cam1"                    # the source whose captions it carries; re-patch on the Routing page
+   ```
+
+   Several pictures (for example two cameras) are several cast outputs: a Chromecast decodes one video at a time,
+   and the Cast panel's Video picker moves the device to another cast output.
 2. The host name must resolve on public DNS (Cast devices use their own resolvers and ignore LAN DNS) and serve a
    certificate chain the device's firmware trusts, on port 443.
 3. Receiver application id. The Conspect receiver is registered as application `8E05190C`
@@ -28,6 +46,9 @@ Design: [ADR-0111](../decisions/ADR-0111-cast-output.md), [cast-output.md](../ar
    Receiver: the stream plays, with Google's buffering defaults, no Conspect screen and no receiver diagnostics.
 4. Engine-side casting ("Cast from the engine", ADR-M011) also needs `[control] cast_media_base` set to the
    engine's public `https://` base, and the `devices-net` + `discovery` features (in the shipped presets).
+5. Transport ladder ([ADR-0114](../decisions/ADR-0114-cast-low-latency-ladder.md)): `[cast] ladder = ["hls"]` is
+   the default and the only value this build accepts (the lower-latency rungs are not built yet; naming one fails
+   validation). The receiver probes the device on every cast; the probe is stored with the stream.
 
 ## 2. Cast
 
@@ -48,6 +69,7 @@ Read `GET /api/v1/cast/config` and the stream (`GET /api/v1/cast/streams/{id}`),
 | "The cast stream has ended or its link expired" on the TV | The token was revoked (Stop, or a take moved the cast output to a feed the cast's owner may not see) or expired (60 s without a playlist fetch, or 12 h) | Start the cast again; `GET /api/v1/cast/streams/{id}` shows `cast-stream-revoked` and the reason |
 | `409 cast-capacity` | Every cast output is in use with other pictures | Stop a cast or declare another cast output |
 | `409 capacity` (routing) | No encoder free for that picture | Stop another routed feed |
+| You want to know what the TV can do, or its latency | The receiver's probe and figures | `GET /api/v1/cast/streams/{id}`: `receiver.caps` (what the device's browser supports), `transport.rung`, `transport.first_frame_ms`, `transport.latency_ms` (tick to present; `null` when `latency_method` is `unavailable`, for example with no engine clock yet), `transport.stalled` (no frame presented for 2 s) |
 | Cast output shows `last_error` about its directory | `dir` holds files the engine did not write | Point `dir` at an empty directory or remove `dir` |
 
 ## 4. Certificate check

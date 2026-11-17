@@ -23,11 +23,12 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use multiview_config::{MultiviewConfig, StartMode};
 use multiview_control::auth::{ApiKeyStore, Principal, Role};
-use multiview_control::cast_engine::{CastEngine, CastEngineError, CastOutputStatus};
+use multiview_control::cast_engine::{CastClock, CastEngine, CastEngineError, CastOutputStatus};
 use multiview_control::cast_streams::CastStreams;
 use multiview_control::output_routing::{
     AudioPlanCost, OutputLive, OutputOutcome, OutputRouting, OutputTakeRequest, PlanCost,
-    PlanRefusal, RoutedAudio, RoutedFeed, RoutingLive, TakeSubmitError,
+    PlanRefusal, RoutedAudio, RoutedFeed, RoutingLive, SubtitleTakeError, SubtitleTakeRequest,
+    TakeSubmitError,
 };
 use multiview_control::{
     boot_model::BootModel, command_bus, AppState, EngineStateSnapshot, InMemoryRepository,
@@ -127,10 +128,36 @@ struct FakeCast {
     activations: Mutex<Vec<(String, bool)>>,
     deactivations: Mutex<Vec<String>>,
     error: Mutex<Option<String>>,
+    /// The epoch pair `clock()` answers (`None`: no validated epoch).
+    clock: Mutex<Option<CastClock>>,
+    /// Video segments an active output reports (default 9).
+    segments: Mutex<HashMap<String, u64>>,
+    /// The engine status is unavailable (no outputs reported).
+    hidden: std::sync::atomic::AtomicBool,
+    /// The outputs report `disabled` (#418 review r7).
+    disabled: std::sync::atomic::AtomicBool,
+}
+
+impl FakeCast {
+    /// Set the video segments an active `id` reports.
+    fn set_segments(&self, id: &str, n: u64) {
+        self.segments.lock().unwrap().insert(id.to_owned(), n);
+    }
+    /// Move active `id` to file generation `generation` (a new packager).
+    fn set_generation(&self, id: &str, generation: u64) {
+        self.state
+            .lock()
+            .unwrap()
+            .insert(id.to_owned(), (true, generation));
+    }
 }
 
 impl CastEngine for FakeCast {
     fn outputs(&self) -> Vec<CastOutputStatus> {
+        if self.hidden.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
+        let segments = self.segments.lock().unwrap().clone();
         let state = self.state.lock().unwrap();
         let error = self.error.lock().unwrap().clone();
         ["cast-1", "cast-2"]
@@ -143,9 +170,14 @@ impl CastEngine for FakeCast {
                     active,
                     ready: active,
                     generation,
-                    video_segments: if active { 9 } else { 0 },
+                    video_segments: if active {
+                        segments.get(*id).copied().unwrap_or(9)
+                    } else {
+                        0
+                    },
                     dropped_packets: 0,
                     last_error: error.clone(),
+                    disabled: self.disabled.load(Ordering::SeqCst),
                     width: 640,
                     height: 360,
                     fps_num: 25,
@@ -162,13 +194,21 @@ impl CastEngine for FakeCast {
             .lock()
             .unwrap()
             .push((id.to_owned(), preroll));
-        self.state.lock().unwrap().insert(id.to_owned(), (true, 1));
-        Ok(1)
+        // Idempotent while active: the running generation.
+        let mut state = self.state.lock().unwrap();
+        let entry = state.entry(id.to_owned()).or_insert((false, 0));
+        if !entry.0 {
+            *entry = (true, 1);
+        }
+        Ok(entry.1)
     }
     fn deactivate(&self, id: &str) -> Result<(), CastEngineError> {
         self.deactivations.lock().unwrap().push(id.to_owned());
         self.state.lock().unwrap().insert(id.to_owned(), (false, 0));
         Ok(())
+    }
+    fn clock(&self, _id: &str, _wall_now_unix_ns: i64) -> Option<CastClock> {
+        *self.clock.lock().unwrap()
     }
 }
 
@@ -183,7 +223,13 @@ struct FakeRouting {
     plan_refusal: Mutex<Option<PlanRefusal>>,
     tx: SyncSender<OutputOutcome>,
     rx: Mutex<Option<Receiver<OutputOutcome>>>,
+    /// The live subtitle route table per output (#418).
+    subtitles: Mutex<HashMap<String, Vec<Option<String>>>>,
+    /// Run inside a subtitle take, before the table is swapped.
+    on_subtitle_take: SubtitleHook,
 }
+
+type SubtitleHook = Mutex<Option<Box<dyn Fn() + Send + Sync>>>;
 
 impl FakeRouting {
     fn new() -> Arc<Self> {
@@ -211,6 +257,8 @@ impl FakeRouting {
             plan_refusal: Mutex::new(None),
             tx,
             rx: Mutex::new(Some(rx)),
+            subtitles: Mutex::new(HashMap::new()),
+            on_subtitle_take: Mutex::new(None),
         })
     }
     fn takes(&self) -> Vec<OutputTakeRequest> {
@@ -272,6 +320,22 @@ impl OutputRouting for FakeRouting {
     fn snapshot(&self) -> Option<RoutingLive> {
         Some(self.live.lock().unwrap().clone())
     }
+    fn try_take_subtitles(&self, take: SubtitleTakeRequest) -> Result<u64, SubtitleTakeError> {
+        if let Some(hook) = self.on_subtitle_take.lock().unwrap().as_ref() {
+            hook();
+        }
+        let mut tables = self.subtitles.lock().unwrap();
+        let Some(table) = tables.get_mut(&take.output) else {
+            return Err(SubtitleTakeError::NotInRun);
+        };
+        for (slot, source) in take.slots {
+            table[slot] = source;
+        }
+        Ok(1)
+    }
+    fn subtitle_routes(&self, output: &str) -> Option<Vec<Option<String>>> {
+        self.subtitles.lock().unwrap().get(output).cloned()
+    }
     fn subscribe_outcomes(&self) -> Option<Receiver<OutputOutcome>> {
         self.rx.lock().unwrap().take()
     }
@@ -306,6 +370,27 @@ fn rig() -> Rig {
 
 /// [`rig`] with the `AppState` adjusted by `adjust` (e.g. JWT enabled).
 fn rig_with(adjust: impl FnOnce(AppState) -> AppState) -> Rig {
+    rig_doc(DOC, adjust)
+}
+
+/// [`rig_with`] over the configuration `doc`.
+fn rig_doc(doc: &str, adjust: impl FnOnce(AppState) -> AppState) -> Rig {
+    rig_mode(doc, Mode::Modeled, adjust)
+}
+
+/// How the rig's control plane is bound to the run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// A config-file run: the start document and a boot model.
+    Modeled,
+    /// A store-only run (no boot model) given its start document.
+    StoreOnly,
+    /// A store-only run with no start document at all (no run view).
+    Bare,
+}
+
+/// [`rig_doc`] in `mode`.
+fn rig_mode(doc: &str, mode: Mode, adjust: impl FnOnce(AppState) -> AppState) -> Rig {
     let tmp = tempfile::tempdir().unwrap();
     let mut dirs = HashMap::new();
     for id in ["cast-1", "cast-2"] {
@@ -314,7 +399,7 @@ fn rig_with(adjust: impl FnOnce(AppState) -> AppState) -> Rig {
         dirs.insert(id.to_owned(), dir);
     }
     std::fs::write(tmp.path().join("secret.m3u8"), "#EXTM3U\n#secret\n").unwrap();
-    let config = MultiviewConfig::load_from_toml(DOC).unwrap();
+    let config = MultiviewConfig::load_from_toml(doc).unwrap();
     config.validate().unwrap();
     let seeded = multiview_control::seed_resources(&config).unwrap();
     let engine = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(256));
@@ -325,6 +410,10 @@ fn rig_with(adjust: impl FnOnce(AppState) -> AppState) -> Rig {
         activations: Mutex::new(Vec::new()),
         deactivations: Mutex::new(Vec::new()),
         error: Mutex::new(None),
+        clock: Mutex::new(None),
+        segments: Mutex::new(HashMap::new()),
+        hidden: std::sync::atomic::AtomicBool::new(false),
+        disabled: std::sync::atomic::AtomicBool::new(false),
     });
     let routing = FakeRouting::new();
     let now = Arc::new(AtomicU64::new(1_000_000));
@@ -332,29 +421,34 @@ fn rig_with(adjust: impl FnOnce(AppState) -> AppState) -> Rig {
     let streams = Arc::new(CastStreams::with_clock(Arc::new(move || {
         clock_now.load(Ordering::SeqCst)
     })));
-    let state = AppState::new(
+    let mut state = AppState::new(
         Arc::clone(&engine),
         sender,
         Arc::new(InMemoryRepository::new()),
         Arc::new(keys()),
     )
-    .with_seeded_resources(seeded)
-    .with_base_document(serde_json::to_value(&config).unwrap())
-    .with_boot_model(Arc::new(BootModel::new(
-        tmp.path().join("multiview.toml"),
-        config.clone(),
-        config,
-        StartMode::Boot,
-        false,
-        None,
-    )))
-    .with_output_routing({
-        let seam: Arc<dyn OutputRouting> = routing.clone();
-        seam
-    })
-    .with_cast_engine(cast.clone())
-    .with_cast_streams(streams)
-    .with_cast_app_id(Some("1A2B3C4D".to_owned()));
+    .with_seeded_resources(seeded);
+    if mode != Mode::Bare {
+        state = state.with_base_document(serde_json::to_value(&config).unwrap());
+    }
+    if mode == Mode::Modeled {
+        state = state.with_boot_model(Arc::new(BootModel::new(
+            tmp.path().join("multiview.toml"),
+            config.clone(),
+            config,
+            StartMode::Boot,
+            false,
+            None,
+        )));
+    }
+    let state = state
+        .with_output_routing({
+            let seam: Arc<dyn OutputRouting> = routing.clone();
+            seam
+        })
+        .with_cast_engine(cast.clone())
+        .with_cast_streams(streams)
+        .with_cast_app_id(Some("1A2B3C4D".to_owned()));
     let state = adjust(state);
     Rig {
         router: multiview_control::router(state.clone()),
@@ -962,6 +1056,48 @@ async fn media_types_cache_cors_range_head_and_scope() {
     assert!(doc["fetches"]["segments"].as_u64().unwrap() >= 3);
 }
 
+/// #418: a `WebVTT` subtitle segment of the stream is served as `text/vtt`
+/// under the same token checks and counted as a segment fetch; another
+/// subtitle extension is not served.
+#[tokio::test]
+async fn webvtt_segments_are_served_as_text_vtt_and_counted_as_segments() {
+    let rig = rig();
+    let (_, a) = create(&rig, OPERATOR_TOKEN, serde_json::json!({})).await;
+    let ta = token_of(&a);
+    let dir = rig.dir.path().join("cast-1");
+    std::fs::write(dir.join("sub0-1-0.vtt"), "WEBVTT\n\n").unwrap();
+    std::fs::write(dir.join("sub0-1-0.srt"), "1\n").unwrap();
+    let r = send(
+        &rig.router,
+        public("GET", &format!("/cast/{ta}/sub0-1-0.vtt"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.headers()[header::CONTENT_TYPE], "text/vtt");
+    assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(body_bytes(r).await, b"WEBVTT\n\n");
+    let (status, body) = fetch(&rig, &format!("/cast/{ta}/sub0-1-0.srt")).await;
+    assert_eq!(
+        (status, body.as_slice()),
+        (StatusCode::NOT_FOUND, &b"not found\n"[..])
+    );
+    let (status, _) = fetch(&rig, &format!("/cast/{}/sub0-1-0.vtt", "B".repeat(43))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let id = a["id"].as_str().unwrap();
+    let doc = body_json(
+        send(
+            &rig.router,
+            support::get(&format!("/api/v1/cast/streams/{id}"), OPERATOR_TOKEN),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(doc["fetches"]["segments"], 1, "{doc}");
+    assert_eq!(doc["fetches"]["playlists"], 0, "{doc}");
+}
+
 fn report_req(token: &str, body: Vec<u8>) -> Request<Body> {
     public("POST", &format!("/cast/{token}/report"))
         .header(header::CONTENT_TYPE, "application/json")
@@ -1033,6 +1169,7 @@ async fn receiver_app_routes_headers_and_precedence() {
             "text/javascript; charset=utf-8",
         ),
         ("/cast/receiver/receiver.css", "text/css; charset=utf-8"),
+        ("/cast/receiver/probe.js", "text/javascript; charset=utf-8"),
     ] {
         let r = send(
             &rig.router,
@@ -1089,6 +1226,36 @@ async fn receiver_app_routes_headers_and_precedence() {
     )
     .await;
     assert_eq!(js, include_bytes!("../src/cast_receiver/receiver.js"));
+    let probe = body_bytes(
+        send(
+            &rig.router,
+            public("GET", "/cast/receiver/probe.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(probe, include_bytes!("../src/cast_receiver/probe.js"));
+    // The page loads the probe BEFORE the receiver (ADR-0114 slice 2).
+    let html = String::from_utf8(
+        body_bytes(
+            send(
+                &rig.router,
+                public("GET", "/cast/receiver/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await,
+        )
+        .await,
+    )
+    .unwrap();
+    let (p, r) = (
+        html.find("<script src=\"probe.js\">").unwrap(),
+        html.find("<script src=\"receiver.js\">").unwrap(),
+    );
+    assert!(p < r, "probe.js loads before receiver.js");
 }
 
 /// Captures every tracing event and span field as text.
@@ -2010,4 +2177,1679 @@ async fn an_authorized_request_in_flight_across_a_take_is_served() {
             "{file}: {body:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// #418 review ABUSE-1 / ABUSE-2: a cast stream carries its output's subtitle
+// slots and discrete audio tracks, so its token needs Read on them too.
+// ---------------------------------------------------------------------------
+
+/// [`DOC`] with cast-1 (output-0) carrying `slots` (TOML appended to its
+/// table) and `extra` appended to the document.
+fn doc_with(slots: &str, extra: &str) -> String {
+    let anchor = "id = \"cast-1\"\ncodec = \"h264\"\n";
+    assert!(DOC.contains(anchor));
+    format!(
+        "{}{extra}",
+        DOC.replacen(anchor, &format!("{anchor}{slots}"), 1)
+    )
+}
+
+/// cast-1 with one subtitle slot patched to `source`.
+fn subtitle_doc(source: &str) -> String {
+    doc_with(
+        &format!(
+            "[[outputs.slots.subtitle]]\nformat = \"webvtt\"\nlanguage = \"en\"\nsource = \"{source}\"\n"
+        ),
+        "",
+    )
+}
+
+/// A discrete track `secret-trk` routed from `secret-cam`.
+const SECRET_TRACK: &str = r#"
+[audio]
+sample_rate_hz = 48000
+[[audio.routes]]
+input_id = "secret-cam"
+channels = { kind = "stereo" }
+target_track = "secret-trk"
+"#;
+
+fn subtitle_take(token: &str, key: &str, source: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/api/v1/patch/take")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("Idempotency-Key", key)
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({"crosspoints": [{
+                "plane": "subtitle",
+                "destination": {"output": "output-0", "slot": 0},
+                "source": source,
+            }]}))
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
+/// ABUSE-1: an owner who may not read the subtitle slot's source gets no
+/// token — from the accepted config, and from the engine's live route table
+/// when it differs (the readback wins).
+#[tokio::test]
+async fn create_is_refused_when_the_owner_may_not_read_a_subtitle_source() {
+    let rig = rig_doc(&subtitle_doc("secret-cam"), |s| s);
+    let (status, doc) = create(
+        &rig,
+        SCOPED,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{doc}");
+    assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+    // An owner who may read it is served.
+    let (status, doc) = create(
+        &rig,
+        OPERATOR_2,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+
+    // Config says `a` (readable), the run's live table says `secret-cam`.
+    let rig = rig_doc(&subtitle_doc("a"), |s| s);
+    rig.routing
+        .subtitles
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), vec![Some("secret-cam".to_owned())]);
+    let (status, doc) = create(
+        &rig,
+        SCOPED,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{doc}");
+}
+
+/// ABUSE-1: a subtitle re-patch through `/patch/take` to a source the
+/// owner may not read revokes the token BEFORE the engine swaps the route
+/// table (no cue of it can be published to it); the owner's GET says why.
+#[tokio::test]
+async fn a_subtitle_repatch_to_an_unreadable_source_revokes_before_the_swap() {
+    let rig = rig_doc(&subtitle_doc("a"), |s| s);
+    rig.routing
+        .subtitles
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), vec![Some("a".to_owned())]);
+    let (status, doc) = create(
+        &rig,
+        SCOPED,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    let id = doc["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (state, observed) = (rig.state.clone(), Arc::clone(&seen));
+    *rig.routing.on_subtitle_take.lock().unwrap() = Some(Box::new(move || {
+        observed
+            .lock()
+            .unwrap()
+            .push(state.cast_streams.servable_on("cast-1"));
+    }));
+    let r = send(
+        &rig.router,
+        subtitle_take(
+            OPERATOR_TOKEN,
+            "abuse-1-subs",
+            serde_json::json!({"source": "secret-cam"}),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    assert_eq!(*seen.lock().unwrap(), vec![0], "servable at the swap");
+    assert_eq!(
+        rig.routing.subtitles.lock().unwrap()["cast-1"],
+        vec![Some("secret-cam".to_owned())]
+    );
+    for file in ["master.m3u8", "seg-v-1-0.m4s"] {
+        let (status, body) = fetch(&rig, &format!("/cast/{token}/{file}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{file}");
+        assert_eq!(body, b"not found\n", "{file}");
+    }
+    let own = body_json(
+        send(
+            &rig.router,
+            support::get(&format!("/api/v1/cast/streams/{id}"), SCOPED),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(own["type"], "/problems/cast-stream-revoked", "{own}");
+}
+
+/// ABUSE-1, the positive case: an owner who may read the new subtitle
+/// source keeps playing across the re-patch, while a co-viewer who may not
+/// loses its token.
+#[tokio::test]
+async fn a_subtitle_repatch_keeps_tokens_whose_owner_may_read_the_new_source() {
+    let rig = rig_doc(&subtitle_doc("a"), |s| s);
+    rig.routing
+        .subtitles
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), vec![Some("a".to_owned())]);
+    let (status, doc) = create(
+        &rig,
+        OPERATOR_2,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let keeps = token_of(&doc);
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let loses = token_of(&doc);
+    let generation = rig.state.cast_streams.generation("cast-1").unwrap();
+    let r = send(
+        &rig.router,
+        subtitle_take(
+            OPERATOR_TOKEN,
+            "abuse-1-subs-ok",
+            serde_json::json!({"source": "secret-cam"}),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    assert!(rig.state.cast_streams.generation("cast-1").unwrap() > generation);
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{keeps}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{loses}/master.m3u8")).await.0,
+        StatusCode::NOT_FOUND
+    );
+    // Unpatching (`none`) needs nothing: the remaining token keeps playing.
+    let r = send(
+        &rig.router,
+        subtitle_take(
+            OPERATOR_TOKEN,
+            "abuse-1-subs-none",
+            serde_json::json!("none"),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{keeps}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+}
+
+/// ABUSE-1: a subtitle route the engine swapped without a commit (seen
+/// only on its readback) is re-authorized by the media barrier before
+/// anything is served, even though the picture did not change.
+#[tokio::test]
+async fn the_media_barrier_rechecks_a_subtitle_route_seen_on_the_readback() {
+    let rig = rig_doc(&subtitle_doc("a"), |s| s);
+    rig.routing
+        .subtitles
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), vec![Some("a".to_owned())]);
+    let (status, doc) = create(
+        &rig,
+        SCOPED,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+    rig.routing
+        .subtitles
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), vec![Some("secret-cam".to_owned())]);
+    let (status, body) = fetch(&rig, &format!("/cast/{token}/sub0-1-0.vtt")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, b"not found\n");
+    assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+}
+
+/// ABUSE-1: a media request in flight (authorized, paused before opening
+/// its file) across a revoking subtitle re-patch never serves its bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_in_flight_across_a_revoking_subtitle_repatch_is_not_served() {
+    let rig = rig_doc(&subtitle_doc("a"), |s| s);
+    rig.routing
+        .subtitles
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), vec![Some("a".to_owned())]);
+    let (status, doc) = create(
+        &rig,
+        SCOPED,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    let (paused, resume) = pause_media(&rig);
+    let router = rig.router.clone();
+    let path = format!("/cast/{token}/master.m3u8");
+    let call = tokio::spawn(async move {
+        let response = send(&router, public("GET", &path).body(Body::empty()).unwrap()).await;
+        (response.status(), body_bytes(response).await)
+    });
+    paused.await.unwrap();
+    let r = send(
+        &rig.router,
+        subtitle_take(
+            OPERATOR_TOKEN,
+            "abuse-1-subs-flight",
+            serde_json::json!({"source": "secret-cam"}),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    resume.send(()).unwrap();
+    let (status, body) = call.await.unwrap();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, b"not found\n");
+}
+
+/// ABUSE-2: a discrete track the stream packages (an explicit audio slot,
+/// or `auto`) needs Read on the track and its route input; the routed audio
+/// (`follow`) is not the whole rendition set.
+#[tokio::test]
+async fn create_is_refused_when_the_owner_may_not_read_a_carried_audio_track() {
+    let slots = "[[outputs.slots.audio]]\n[[outputs.slots.audio]]\ntrack = \"secret-trk\"\n";
+    let auto = "audio = { mode = \"auto\" }\n";
+    for carried in [slots, auto] {
+        let rig = rig_doc(&doc_with(carried, SECRET_TRACK), |s| s);
+        let (status, doc) = create(
+            &rig,
+            SCOPED,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{carried}: {doc}");
+        assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+        let (status, doc) = create(
+            &rig,
+            OPERATOR_2,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{carried}: {doc}");
+        let token = token_of(&doc);
+        assert_eq!(
+            fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+            StatusCode::OK
+        );
+    }
+    // A program-only cast output declaring no track selection is unaffected.
+    let rig = rig_doc(&doc_with("", SECRET_TRACK), |s| s);
+    let (status, doc) = create(
+        &rig,
+        SCOPED,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+}
+
+/// ABUSE-2: a video take on an output carrying a private track keeps
+/// requiring it (the closure is complete on every re-check).
+#[tokio::test]
+async fn a_take_rechecks_the_carried_audio_tracks() {
+    let slots = "[[outputs.slots.audio]]\n[[outputs.slots.audio]]\ntrack = \"secret-trk\"\n";
+    let rig = rig_doc(&doc_with(slots, SECRET_TRACK), |s| s);
+    let (status, doc) = create(
+        &rig,
+        OPERATOR_2,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    let r = send(
+        &rig.router,
+        route_take(
+            OPERATOR_TOKEN,
+            "abuse-2-take",
+            "output-0",
+            serde_json::json!({"source": "secret-cam"}),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #418 review ABUSE-1-R2 / ABUSE-2-R2: an output PUT that changes a cast
+// output's subtitle or audio slots is restart-pending, while the running
+// sink keeps packaging the run's renditions. The token closure covers both.
+// ---------------------------------------------------------------------------
+
+/// PUT output-0 (cast-1) with its body edited by `edit` (restart-pending:
+/// the run keeps what it started with).
+async fn put_cast_1(rig: &Rig, edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>)) {
+    let r = send(
+        &rig.router,
+        support::get("/api/v1/outputs/output-0", ADMIN_TOKEN),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let etag = r.headers()[header::ETAG].to_str().unwrap().to_owned();
+    let current = body_json(r).await;
+    let mut body = current["body"].as_object().unwrap().clone();
+    edit(&mut body);
+    let r = send(
+        &rig.router,
+        support::put_json(
+            "/api/v1/outputs/output-0",
+            ADMIN_TOKEN,
+            Some(&etag),
+            &serde_json::json!({"name": current["name"], "body": body}),
+        ),
+    )
+    .await;
+    let status = r.status();
+    assert_eq!(status, StatusCode::OK, "{}", body_json(r).await);
+}
+
+/// Drop the output's slots (subtitle and audio) and its audio selection.
+fn drop_slots(body: &mut serde_json::Map<String, serde_json::Value>) {
+    body.remove("slots");
+    body.remove("audio");
+}
+
+/// ABUSE-1-R2: a restart-pending PUT removing a private subtitle slot does
+/// not hide it — whether the run reports its live table or not.
+#[tokio::test]
+async fn a_restart_pending_subtitle_slot_removal_still_needs_its_source() {
+    for live in [false, true] {
+        let rig = rig_doc(&subtitle_doc("secret-cam"), |s| s);
+        if live {
+            rig.routing
+                .subtitles
+                .lock()
+                .unwrap()
+                .insert("cast-1".to_owned(), vec![Some("secret-cam".to_owned())]);
+        }
+        put_cast_1(&rig, drop_slots).await;
+        let (status, doc) = create(
+            &rig,
+            SCOPED,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "live={live}: {doc}");
+        assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+        let (status, doc) = create(
+            &rig,
+            OPERATOR_2,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "live={live}: {doc}");
+    }
+}
+
+/// ABUSE-1-R2: the media barrier re-authorizes against the COMPLETE live
+/// table even when the accepted output no longer declares the slot: a live
+/// swap to a private source after a restart-pending removal revokes.
+#[tokio::test]
+async fn the_media_barrier_revokes_on_a_live_slot_the_accepted_config_removed() {
+    let rig = rig_doc(&subtitle_doc("a"), |s| s);
+    rig.routing
+        .subtitles
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), vec![Some("a".to_owned())]);
+    let (status, doc) = create(
+        &rig,
+        SCOPED,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    put_cast_1(&rig, drop_slots).await;
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+    rig.routing
+        .subtitles
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), vec![Some("secret-cam".to_owned())]);
+    let (status, body) = fetch(&rig, &format!("/cast/{token}/sub0-1-0.vtt")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, b"not found\n");
+    assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+}
+
+/// ABUSE-2-R2: a restart-pending PUT making the output program-only does
+/// not hide the private discrete track the running sink still packages —
+/// explicit `slots.audio` and `auto` selection alike.
+#[tokio::test]
+async fn a_restart_pending_audio_change_still_needs_the_running_tracks() {
+    let slots = "[[outputs.slots.audio]]\n[[outputs.slots.audio]]\ntrack = \"secret-trk\"\n";
+    let auto = "audio = { mode = \"auto\" }\n";
+    for carried in [slots, auto] {
+        let rig = rig_doc(&doc_with(carried, SECRET_TRACK), |s| s);
+        put_cast_1(&rig, drop_slots).await;
+        let (status, doc) = create(
+            &rig,
+            SCOPED,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{carried}: {doc}");
+        assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+        let (status, doc) = create(
+            &rig,
+            OPERATOR_2,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{carried}: {doc}");
+    }
+}
+
+/// ABUSE-2-R2 / ABUSE-1-R2: an existing token whose owner loses Read on a
+/// private track or subtitle source the RUN still publishes is revoked by
+/// the re-check (and the media barrier then refuses it), although the
+/// accepted config no longer declares the dependency.
+#[tokio::test]
+async fn a_recheck_revokes_on_running_dependencies_the_accepted_config_dropped() {
+    let slots = "[[outputs.slots.audio]]\n[[outputs.slots.audio]]\ntrack = \"secret-trk\"\n";
+    let docs = [
+        doc_with(slots, SECRET_TRACK),
+        doc_with("audio = { mode = \"auto\" }\n", SECRET_TRACK),
+        subtitle_doc("secret-cam"),
+    ];
+    for doc in &docs {
+        let rig = rig_doc(doc, |s| s);
+        let (status, created) = create(
+            &rig,
+            FRESH,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let token = token_of(&created);
+        put_cast_1(&rig, drop_slots).await;
+        assert!(rig.state.api_keys.set_principal(
+            "cs-fresh",
+            Principal {
+                key_id: "cs-fresh".to_owned(),
+                role: Role::Operator,
+                scoped_object_ids: Some(vec!["output-0".to_owned(), "a".to_owned()]),
+                scoped_output_ids: Some(vec!["output-0".to_owned(), "program:main".to_owned()]),
+                scoped_discovery_domains: None,
+            },
+        ));
+        multiview_control::cast_streams::lifecycle::recheck_now(&rig.state);
+        let (status, body) = fetch(&rig, &format!("/cast/{token}/master.m3u8")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{doc}");
+        assert_eq!(body, b"not found\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #418 review ABUSE-STORE-R3: a store-only run (no boot model) keeps a
+// run-bound view of what its cast outputs package — the start document
+// snapshotted when the cast engine attaches — so a restart-pending output
+// PUT cannot hide a running dependency; without any run view the closure
+// fails closed.
+// ---------------------------------------------------------------------------
+
+/// The carried-dependency documents: explicit `slots.audio` track, `auto`
+/// selection, a private subtitle slot.
+fn store_only_docs() -> [String; 3] {
+    let slots = "[[outputs.slots.audio]]\n[[outputs.slots.audio]]\ntrack = \"secret-trk\"\n";
+    [
+        doc_with(slots, SECRET_TRACK),
+        doc_with("audio = { mode = \"auto\" }\n", SECRET_TRACK),
+        subtitle_doc("secret-cam"),
+    ]
+}
+
+/// ABUSE-STORE-R3: in a store-only run, a restart-pending PUT dropping a
+/// private explicit track, the `auto` selection or a subtitle slot before
+/// the first token does not let a principal without Read on it create one
+/// (no live subtitle table: the run's slot sources stand in, never empty).
+#[tokio::test]
+async fn a_store_only_restart_pending_removal_still_needs_the_running_dependencies() {
+    for doc in &store_only_docs() {
+        let rig = rig_mode(doc, Mode::StoreOnly, |s| s);
+        assert!(rig.state.boot_model.is_none());
+        assert!(rig.state.cast_run.is_some());
+        put_cast_1(&rig, drop_slots).await;
+        let (status, created) = create(
+            &rig,
+            SCOPED,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{doc}: {created}");
+        assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+        let (status, created) = create(
+            &rig,
+            OPERATOR_2,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{doc}: {created}");
+    }
+}
+
+/// ABUSE-STORE-R3: in a store-only run, an existing token whose owner loses
+/// Read on a dependency the RUN still packages is revoked by the re-check
+/// and then refused at the media barrier, although a restart-pending PUT
+/// dropped it from the accepted stores.
+#[tokio::test]
+async fn a_store_only_recheck_revokes_on_running_dependencies_the_put_dropped() {
+    for doc in &store_only_docs() {
+        let rig = rig_mode(doc, Mode::StoreOnly, |s| s);
+        let (status, created) = create(
+            &rig,
+            FRESH,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let token = token_of(&created);
+        put_cast_1(&rig, drop_slots).await;
+        assert_eq!(
+            fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+            StatusCode::OK,
+            "{doc}"
+        );
+        assert!(rig.state.api_keys.set_principal(
+            "cs-fresh",
+            Principal {
+                key_id: "cs-fresh".to_owned(),
+                role: Role::Operator,
+                scoped_object_ids: Some(vec!["output-0".to_owned(), "a".to_owned()]),
+                scoped_output_ids: Some(vec!["output-0".to_owned(), "program:main".to_owned()]),
+                scoped_discovery_domains: None,
+            },
+        ));
+        multiview_control::cast_streams::lifecycle::recheck_now(&rig.state);
+        let (status, body) = fetch(&rig, &format!("/cast/{token}/master.m3u8")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{doc}");
+        assert_eq!(body, b"not found\n");
+        assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+    }
+}
+
+/// ABUSE-STORE-R3: in a store-only run, a live subtitle swap to a private
+/// source after the restart-pending removal is caught by the media barrier.
+#[tokio::test]
+async fn a_store_only_media_barrier_revokes_on_a_live_slot_the_put_removed() {
+    let rig = rig_mode(&subtitle_doc("a"), Mode::StoreOnly, |s| s);
+    let (status, created) = create(
+        &rig,
+        SCOPED,
+        serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let token = token_of(&created);
+    put_cast_1(&rig, drop_slots).await;
+    rig.routing
+        .subtitles
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), vec![Some("secret-cam".to_owned())]);
+    let (status, body) = fetch(&rig, &format!("/cast/{token}/sub0-1-0.vtt")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, b"not found\n");
+    assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+}
+
+/// ABUSE-STORE-R3: with no run-bound view at all (no start document, no
+/// boot model) what the cast output packages cannot be established:
+/// creation fails closed, even for an unscoped operator.
+#[tokio::test]
+async fn without_a_run_view_cast_creation_fails_closed() {
+    let rig = rig_mode(&subtitle_doc("a"), Mode::Bare, |s| s);
+    assert!(rig.state.cast_run.is_none());
+    for key in [SCOPED, OPERATOR_2] {
+        let (status, created) = create(
+            &rig,
+            key,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{created}");
+        assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #418 review ABUSE-HISTORY-R4: the media of a superseded feed (retained
+// segments and `.vtt` files, listed or not) stays servable for a while after
+// a take or a subtitle re-patch, so the gate keeps that feed's grants for
+// `MEDIA_RETENTION_MS` after an outcome settles a newer one.
+// ---------------------------------------------------------------------------
+
+/// The accepted subtitle slot sources of cast-1.
+fn accepted_subtitles(rig: &Rig) -> Vec<Option<String>> {
+    let config: MultiviewConfig = serde_json::from_value(
+        multiview_control::boot_model::current_desired_config(&rig.state).unwrap(),
+    )
+    .unwrap();
+    config
+        .outputs
+        .iter()
+        .find(|o| o.id() == "cast-1")
+        .and_then(|o| o.slots())
+        .map(|s| s.subtitle.iter().map(|s| s.source.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// Wait until the relay has handled the outcome of operation `op`.
+async fn settled(events: &mut multiview_engine::EventSubscription<Event>, op: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("the take's outcome is relayed")
+            .unwrap();
+        if let Event::RouteOutput(outcome) = event.event.as_ref() {
+            if outcome.operation_id == op {
+                return;
+            }
+        }
+    }
+}
+
+/// A take of output-0 to `feed` by an operator, waited until settled.
+async fn take_settled(rig: &Rig, key: &str, feed: serde_json::Value) {
+    let mut events = rig.state.engine.subscribe();
+    let r = send(
+        &rig.router,
+        route_take(OPERATOR_TOKEN, key, "output-0", feed),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    let op = body_json(r).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    settled(&mut events, &op).await;
+}
+
+/// A private-to-public subtitle re-patch (secret-cam → a) of output-0 on
+/// a rig whose run samples secret-cam, persisted, then an ordinary take of
+/// output-0 to source `a` whose outcome settles: the subtitle commit is gone
+/// from the gate, but secret-cam's cues stay servable.
+async fn repatched_then_settled(rig: &Rig) {
+    let r = send(
+        &rig.router,
+        subtitle_take(
+            OPERATOR_TOKEN,
+            "history-subs",
+            serde_json::json!({"source": "a"}),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    for _ in 0..500 {
+        if accepted_subtitles(rig) == vec![Some("a".to_owned())] {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(accepted_subtitles(rig), vec![Some("a".to_owned())]);
+    assert_eq!(
+        rig.routing.subtitles.lock().unwrap()["cast-1"],
+        vec![Some("a".to_owned())]
+    );
+    take_settled(rig, "history-take", serde_json::json!({"source": "a"})).await;
+    assert_eq!(rig.routing.bus("cast-1"), "src:a");
+}
+
+fn subtitle_history_rig() -> Rig {
+    let rig = rig_doc(&subtitle_doc("secret-cam"), |s| s);
+    rig.routing
+        .subtitles
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), vec![Some("secret-cam".to_owned())]);
+    rig
+}
+
+/// Keep `token` live across `total` of clock time (playlist fetches every
+/// 30 s refresh its idle expiry).
+async fn advance_keeping(rig: &Rig, token: &str, total: Duration) {
+    let step = Duration::from_secs(30);
+    let mut left = total;
+    while !left.is_zero() {
+        let d = left.min(step);
+        rig.advance(d);
+        left -= d;
+        assert_eq!(
+            fetch(rig, &format!("/cast/{token}/master.m3u8")).await.0,
+            StatusCode::OK
+        );
+    }
+}
+
+fn retention() -> Duration {
+    Duration::from_millis(multiview_control::cast_streams::MEDIA_RETENTION_MS)
+}
+
+/// ABUSE-HISTORY-R4 (the reviewer's scenario): an administrator's stream
+/// plays output-0 with private subtitle source secret-cam; an operator
+/// re-patches the subtitles to public `a` and takes the output to source
+/// `a`, and that outcome settles. A new principal allowed the output, Program
+/// and `a` but not secret-cam is refused while secret-cam's `.vtt` files
+/// may still be served, then admitted once the retention passed. The
+/// administrator's own token is never revoked by the history.
+#[tokio::test]
+async fn a_new_token_is_refused_while_a_superseded_private_subtitle_source_stays_servable() {
+    let rig = subtitle_history_rig();
+    let (status, admin) =
+        create(&rig, ADMIN_TOKEN, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{admin}");
+    let admin = token_of(&admin);
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "secret-cam on air: {doc}");
+    repatched_then_settled(&rig).await;
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{admin}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "retained secret-cam cues: {doc}"
+    );
+    advance_keeping(
+        &rig,
+        &admin,
+        retention().checked_sub(Duration::from_secs(1)).unwrap(),
+    )
+    .await;
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "just before the retention: {doc}"
+    );
+    advance_keeping(&rig, &admin, Duration::from_secs(1)).await;
+    // The sink is stalled (9 segments, as when superseded): the retention
+    // alone never expires the history (ABUSE-HISTORY-R4, round 5).
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "stalled sink: {doc}");
+    advance_keeping(&rig, &admin, Duration::from_secs(600)).await;
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "still stalled: {doc}");
+    // 20 more segments: the oldest retained file may still be of that era.
+    rig.cast.set_segments("cast-1", 9 + 20);
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "one file left: {doc}");
+    // 21: every file of the superseded era is retired.
+    rig.cast.set_segments("cast-1", 9 + 21);
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "sink replaced it: {doc}");
+    let scoped = token_of(&doc);
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{scoped}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+}
+
+/// ABUSE-HISTORY-R4, the video case: after a take from private
+/// `secret-cam` to public `a` settles, its retained segments may still be
+/// served: a principal without secret-cam gets no token until the retention
+/// passed.
+#[tokio::test]
+async fn a_new_token_is_refused_while_a_superseded_private_video_feed_stays_servable() {
+    let rig = rig();
+    let (status, admin) = create(
+        &rig,
+        ADMIN_TOKEN,
+        serde_json::json!({"output": "output-0", "feed": {"source": "secret-cam"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{admin}");
+    let admin = token_of(&admin);
+    assert_eq!(rig.routing.bus("cast-1"), "src:secret-cam");
+    take_settled(&rig, "history-video", serde_json::json!({"source": "a"})).await;
+    assert_eq!(rig.routing.bus("cast-1"), "src:a");
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{admin}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "retained secret-cam segments: {doc}"
+    );
+    advance_keeping(&rig, &admin, retention()).await;
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "stalled sink: {doc}");
+    rig.cast.set_segments("cast-1", 9 + 21);
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "retention over, sink replaced: {doc}"
+    );
+}
+
+/// ABUSE-HISTORY-R4: an existing token whose owner is re-scoped off the
+/// superseded private source while its media is still servable is revoked
+/// by the re-check (under the CURRENT grants, history included).
+#[tokio::test]
+async fn a_recheck_within_the_retention_revokes_an_owner_who_lost_the_superseded_source() {
+    let rig = subtitle_history_rig();
+    let (status, created) = create(&rig, FRESH, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let token = token_of(&created);
+    repatched_then_settled(&rig).await;
+    // The take and the re-check under unchanged grants keep it.
+    multiview_control::cast_streams::lifecycle::recheck_now(&rig.state);
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+    assert!(rig.state.api_keys.set_principal(
+        "cs-fresh",
+        Principal {
+            key_id: "cs-fresh".to_owned(),
+            role: Role::Operator,
+            scoped_object_ids: Some(vec![
+                "output-0".to_owned(),
+                "a".to_owned(),
+                "me1".to_owned(),
+            ]),
+            scoped_output_ids: Some(vec!["output-0".to_owned(), "program:main".to_owned()]),
+            scoped_discovery_domains: None,
+        },
+    ));
+    multiview_control::cast_streams::lifecycle::recheck_now(&rig.state);
+    let (status, body) = fetch(&rig, &format!("/cast/{token}/master.m3u8")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, b"not found\n");
+}
+
+/// ABUSE-HISTORY-R4 (round 5): a new file generation (a new activation or
+/// packager: new names, the old ones purged and never served) retires the
+/// superseded media once the retention elapsed, however few segments.
+#[tokio::test]
+async fn a_new_sink_generation_expires_the_history_after_the_retention() {
+    let rig = subtitle_history_rig();
+    let (status, admin) =
+        create(&rig, ADMIN_TOKEN, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{admin}");
+    let admin = token_of(&admin);
+    repatched_then_settled(&rig).await;
+    write_generation(&rig, "cast-1", 2);
+    rig.cast.set_generation("cast-1", 2);
+    rig.cast.set_segments("cast-1", 1);
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "within the retention: {doc}");
+    advance_keeping(&rig, &admin, retention()).await;
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "new generation: {doc}");
+    assert_eq!(rig.state.cast_streams.history_len("cast-1"), 0);
+}
+
+/// ABUSE-HISTORY-R4 (round 5): with the engine status unavailable nothing
+/// superseded is forgotten (fail closed), even when the sink did replace
+/// it; once the status is back and proves it, the history goes.
+#[tokio::test]
+async fn an_unavailable_sink_status_keeps_the_history() {
+    let rig = subtitle_history_rig();
+    let (status, admin) =
+        create(&rig, ADMIN_TOKEN, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{admin}");
+    let admin = token_of(&admin);
+    repatched_then_settled(&rig).await;
+    let kept = rig.state.cast_streams.history_len("cast-1");
+    assert!(kept > 0);
+    advance_keeping(&rig, &admin, retention()).await;
+    rig.cast.set_segments("cast-1", 9 + 21);
+    rig.cast.hidden.store(true, Ordering::SeqCst);
+    multiview_control::cast_streams::lifecycle::sweep_now(&rig.state);
+    multiview_control::cast_streams::lifecycle::recheck_now(&rig.state);
+    assert_eq!(
+        rig.state.cast_streams.history_len("cast-1"),
+        kept,
+        "status unavailable: kept"
+    );
+    rig.cast.hidden.store(false, Ordering::SeqCst);
+    multiview_control::cast_streams::lifecycle::sweep_now(&rig.state);
+    assert_eq!(rig.state.cast_streams.history_len("cast-1"), 0);
+}
+
+/// Write a minimal stream of file generation `generation` into `id`'s dir.
+fn write_generation(rig: &Rig, id: &str, generation: u64) {
+    let dir = rig.dir.path().join(id);
+    std::fs::write(dir.join(format!("seg-v-{generation}-0.m4s")), b"new-seg").unwrap();
+    std::fs::write(dir.join(format!("init-v-{generation}-0.mp4")), b"new-init").unwrap();
+    std::fs::write(
+        dir.join(format!("sub0-{generation}-0.vtt")),
+        "WEBVTT\n\nnew\n",
+    )
+    .unwrap();
+}
+
+/// ABUSE-HISTORY-R4 (round 5), defence in depth: a file of another
+/// generation than the output's current one (left by a best-effort purge)
+/// is the generic 404 even for a valid token; the current one is served,
+/// playlists always.
+#[tokio::test]
+async fn a_stale_generation_file_is_never_served() {
+    let rig = rig();
+    let (status, doc) = create(&rig, OPERATOR_TOKEN, serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    std::fs::write(
+        rig.dir.path().join("cast-1").join("sub0-1-0.vtt"),
+        "WEBVTT\n\nold\n",
+    )
+    .unwrap();
+    for file in ["seg-v-1-0.m4s", "init-v-1-0.mp4", "sub0-1-0.vtt"] {
+        assert_eq!(
+            fetch(&rig, &format!("/cast/{token}/{file}")).await.0,
+            StatusCode::OK,
+            "{file}"
+        );
+    }
+    write_generation(&rig, "cast-1", 2);
+    rig.cast.set_generation("cast-1", 2);
+    for file in ["seg-v-1-0.m4s", "init-v-1-0.mp4", "sub0-1-0.vtt"] {
+        let (status, body) = fetch(&rig, &format!("/cast/{token}/{file}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "stale {file}");
+        assert_eq!(body, b"not found\n");
+    }
+    for file in [
+        "seg-v-2-0.m4s",
+        "init-v-2-0.mp4",
+        "sub0-2-0.vtt",
+        "master.m3u8",
+    ] {
+        assert_eq!(
+            fetch(&rig, &format!("/cast/{token}/{file}")).await.0,
+            StatusCode::OK,
+            "{file}"
+        );
+    }
+}
+
+/// #418 review r7: a disabled output (its stream files could not be
+/// removed) serves nothing, not even to a valid token at the current
+/// generation: every media path is the generic 404.
+#[tokio::test]
+async fn a_disabled_output_serves_nothing_to_a_valid_token() {
+    let rig = rig();
+    let (status, doc) = create(&rig, OPERATOR_TOKEN, serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    for file in ["master.m3u8", "seg-v-1-0.m4s", "init-v-1-0.mp4"] {
+        assert_eq!(
+            fetch(&rig, &format!("/cast/{token}/{file}")).await.0,
+            StatusCode::OK,
+            "{file}"
+        );
+    }
+    // Even while the status still reads active (the gate deactivates on
+    // disable, but the flag alone suffices).
+    rig.cast.disabled.store(true, Ordering::SeqCst);
+    for file in ["master.m3u8", "seg-v-1-0.m4s", "init-v-1-0.mp4"] {
+        let (status, body) = fetch(&rig, &format!("/cast/{token}/{file}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{file}");
+        assert_eq!(body, b"not found\n");
+    }
+}
+
+/// #418 review r7: while the output is disabled, a generation change (or
+/// an inactive status) never expires the superseded grants: the old
+/// generation's files may be left on disk.
+#[tokio::test]
+async fn a_generation_change_on_a_disabled_output_keeps_the_history() {
+    let rig = subtitle_history_rig();
+    let (status, admin) =
+        create(&rig, ADMIN_TOKEN, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{admin}");
+    let admin = token_of(&admin);
+    repatched_then_settled(&rig).await;
+    let kept = rig.state.cast_streams.history_len("cast-1");
+    assert!(kept > 0);
+    advance_keeping(&rig, &admin, retention()).await;
+    rig.cast.disabled.store(true, Ordering::SeqCst);
+    rig.cast.set_generation("cast-1", 2);
+    rig.cast.set_segments("cast-1", 9 + 21);
+    multiview_control::cast_streams::lifecycle::sweep_now(&rig.state);
+    multiview_control::cast_streams::lifecycle::recheck_now(&rig.state);
+    assert_eq!(
+        rig.state.cast_streams.history_len("cast-1"),
+        kept,
+        "disabled: kept"
+    );
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "disabled: {doc}");
+    rig.cast
+        .state
+        .lock()
+        .unwrap()
+        .insert("cast-1".to_owned(), (false, 3));
+    multiview_control::cast_streams::lifecycle::sweep_now(&rig.state);
+    assert_eq!(
+        rig.state.cast_streams.history_len("cast-1"),
+        kept,
+        "disabled and inactive: kept"
+    );
+}
+
+// ---------------------------------------------------------------- ADR-0114 slice 2: the ladder route
+
+fn ladder_req(token: &str, body: &serde_json::Value) -> Request<Body> {
+    ladder_raw(token, serde_json::to_vec(body).unwrap())
+}
+
+fn ladder_raw(token: &str, body: Vec<u8>) -> Request<Body> {
+    public("POST", &format!("/cast/{token}/ladder"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, "https://cast.conspect.studio")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+fn probe_body() -> serde_json::Value {
+    serde_json::json!({
+        "v": 1,
+        "receiver": {"kind": "web", "build": "probe-1", "ua": "Mozilla/5.0 CrKey/1.56"},
+        "caps": {"wt": false, "mse": true, "vdec": "absent", "vdec_hw": false, "adec": "absent",
+                 "rtc": true, "rtc_h264": ["42e01f"], "rtc_opus": true, "rvfc": true,
+                 "frames": "rvfc", "srt": null},
+        "need": {"subtitles": false, "audio": null},
+        "skip": {},
+        "failed": null,
+        "clock": {"t0": 1_794_705_012_000_000_i64}
+    })
+}
+
+async fn ladder(
+    rig: &Rig,
+    token: &str,
+    body: &serde_json::Value,
+) -> (StatusCode, serde_json::Value, axum::http::HeaderMap) {
+    let r = send(&rig.router, ladder_req(token, body)).await;
+    let (status, headers) = (r.status(), r.headers().clone());
+    let bytes = body_bytes(r).await;
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or_default(),
+        headers,
+    )
+}
+
+async fn stream_doc(rig: &Rig, id: &str, token: &str) -> (StatusCode, serde_json::Value) {
+    let r = send(
+        &rig.router,
+        support::get(&format!("/api/v1/cast/streams/{id}"), token),
+    )
+    .await;
+    let status = r.status();
+    (
+        status,
+        serde_json::from_slice(&body_bytes(r).await).unwrap_or_default(),
+    )
+}
+
+/// The answer offers `hls` only, with the clock pair, `no-store` and the
+/// report route's CORS; the probe and the playing rung reach the owner's
+/// stream document.
+#[tokio::test]
+async fn the_ladder_offers_hls_with_the_clock_and_stores_the_probe() {
+    let rig = rig();
+    *rig.cast.clock.lock().unwrap() = Some(CastClock {
+        epoch_generation: 7,
+        media_us: 5_400_000_000,
+        wall_unix_us: 1_794_705_000_000_000,
+    });
+    let (_, doc) = create(&rig, OPERATOR_TOKEN, serde_json::json!({})).await;
+    let (token, id) = (token_of(&doc), doc["id"].as_str().unwrap().to_owned());
+    let (status, answer, headers) = ladder(&rig, &token, &probe_body()).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+    assert_eq!(
+        headers[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "https://cast.conspect.studio"
+    );
+    assert_eq!(headers[header::VARY], "Origin");
+    assert_eq!(answer["v"], 1);
+    assert_eq!(answer["attach"], serde_json::json!({"rung": "hls"}));
+    assert_eq!(answer["then"], serde_json::json!([]));
+    assert!(answer["srt"].is_null());
+    let clock = &answer["clock"];
+    assert_eq!(clock["source"], "epoch");
+    assert_eq!(clock["epoch_generation"], 7);
+    assert_eq!(clock["media_us"], 5_400_000_000_i64);
+    assert_eq!(clock["wall_unix_us"], 1_794_705_000_000_000_i64);
+    assert_eq!(clock["t0_unix_us"], 1_794_705_012_000_000.0);
+    let (t1, t2) = (
+        clock["t1_unix_us"].as_i64().unwrap(),
+        clock["t2_unix_us"].as_i64().unwrap(),
+    );
+    assert!(
+        t1 > 1_700_000_000_000_000 && t2 >= t1,
+        "t1 {t1} t2 {t2}: engine wall clock, t2 after t1"
+    );
+
+    let (status, view) = stream_doc(&rig, &id, OPERATOR_TOKEN).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(view["receiver"]["kind"], "web");
+    assert_eq!(view["receiver"]["caps"]["mse"], true);
+    assert_eq!(view["receiver"]["caps"]["frames"], "rvfc");
+    assert_eq!(
+        view["receiver"]["caps"]["rtc_h264"],
+        serde_json::json!(["42e01f"])
+    );
+    assert_eq!(view["transport"]["rung"], "hls");
+    assert!(view["transport"]["since_unix_ms"].as_u64().is_some());
+    assert_eq!(view["transport"]["fallbacks"], serde_json::json!([]));
+    assert!(view["transport"]["latency_ms"].is_null());
+
+    // A preflight of the ladder allows POST, as the report's.
+    let preflight = send(
+        &rig.router,
+        public("OPTIONS", &format!("/cast/{token}/ladder"))
+            .header(header::ORIGIN, "https://cast.conspect.studio")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        preflight.headers()[header::ACCESS_CONTROL_ALLOW_METHODS],
+        "POST, OPTIONS"
+    );
+    assert_eq!(preflight.headers()[header::CACHE_CONTROL], "no-store");
+}
+
+/// The clock-only call answers the clock only; without a validated epoch
+/// `clock` is `null` (never invented).
+#[tokio::test]
+async fn the_clock_only_call_and_no_epoch() {
+    let rig = rig();
+    let (_, doc) = create(&rig, OPERATOR_TOKEN, serde_json::json!({})).await;
+    let token = token_of(&doc);
+    let (status, answer, _) = ladder(&rig, &token, &probe_body()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(answer["clock"].is_null(), "no epoch: {answer}");
+    assert_eq!(answer["attach"]["rung"], "hls");
+    *rig.cast.clock.lock().unwrap() = Some(CastClock {
+        epoch_generation: 1,
+        media_us: 10,
+        wall_unix_us: 20,
+    });
+    let (status, answer, _) = ladder(
+        &rig,
+        &token,
+        &serde_json::json!({"v": 1, "clock": {"t0": 5}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let keys: Vec<&String> = answer.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["clock", "v"], "clock only: {answer}");
+    assert_eq!(answer["clock"]["media_us"], 10);
+}
+
+/// Wrong types answer 400; unknown fields are ignored; more than 2 KiB is
+/// 413; the rate is 1/s with a burst of 4, charged before validation.
+#[tokio::test]
+async fn ladder_validation_size_and_rate() {
+    let rig = rig();
+    let (_, doc) = create(&rig, OPERATOR_TOKEN, serde_json::json!({})).await;
+    let token = token_of(&doc);
+    let mut unknown = probe_body();
+    unknown["future_field"] = serde_json::json!({"nested": [1, 2, 3]});
+    unknown["caps"]["webgpu"] = serde_json::json!(true);
+    assert_eq!(
+        ladder(&rig, &token, &unknown).await.0,
+        StatusCode::OK,
+        "unknown fields ignored"
+    );
+    for bad in [
+        serde_json::json!({"v": 1, "caps": {"wt": "yes"}}),
+        serde_json::json!({"v": 1, "caps": {"rtc_h264": ["a","b","c","d","e","f","g","h","i"]}}),
+        serde_json::json!({"v": 1, "receiver": {"ua": "u".repeat(201)}}),
+    ] {
+        assert_eq!(
+            ladder(&rig, &token, &bad).await.0,
+            StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
+    // The burst of 4 is spent (1 good + 3 bad): the 5th call is refused
+    // before its body is read, whatever the body.
+    let r = send(&rig.router, ladder_req(&token, &probe_body())).await;
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(r.headers()[header::RETRY_AFTER], "1");
+    assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store");
+    rig.advance(Duration::from_secs(1));
+    for bad in [b"[1]".to_vec(), b"{\"v\":2}".to_vec(), b"not json".to_vec()] {
+        rig.advance(Duration::from_secs(1));
+        assert_eq!(
+            send(&rig.router, ladder_raw(&token, bad)).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    rig.advance(Duration::from_secs(1));
+    let mut big = probe_body();
+    big["pad"] = serde_json::json!("x".repeat(2100));
+    assert_eq!(
+        ladder(&rig, &token, &big).await.0,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    rig.advance(Duration::from_secs(1));
+    let mut fits = probe_body();
+    let len = serde_json::to_vec(&fits).unwrap().len();
+    fits["pad"] = serde_json::json!("x".repeat(2048 - len - 9));
+    assert_eq!(serde_json::to_vec(&fits).unwrap().len(), 2048);
+    assert_eq!(
+        ladder(&rig, &token, &fits).await.0,
+        StatusCode::OK,
+        "exactly 2 KiB is taken"
+    );
+}
+
+/// An unknown, revoked, expired or not-armed token, and an unknown file
+/// under a live token, answer the same 404 as the media route.
+#[tokio::test]
+async fn the_ladder_of_a_dead_token_is_the_same_404() {
+    let rig = rig();
+    let (_, doc) = create(&rig, OPERATOR_TOKEN, serde_json::json!({})).await;
+    let (token, id) = (token_of(&doc), doc["id"].as_str().unwrap().to_owned());
+    let (_, unknown_file) = fetch(&rig, &format!("/cast/{token}/nope-0.m4s")).await;
+    for t in ["C".repeat(43), "short".to_owned()] {
+        let r = send(&rig.router, ladder_req(&t, &probe_body())).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(body_bytes(r).await, unknown_file);
+    }
+    let r = send(
+        &rig.router,
+        delete(&format!("/api/v1/cast/streams/{id}"), OPERATOR_TOKEN),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    let r = send(&rig.router, ladder_req(&token, &probe_body())).await;
+    assert_eq!(r.status(), StatusCode::NOT_FOUND, "revoked");
+    assert_eq!(body_bytes(r).await, unknown_file);
+    // Expired: a never-fetched token lives 90 s.
+    let (_, doc) = create(&rig, OPERATOR_TOKEN, serde_json::json!({})).await;
+    let token = token_of(&doc);
+    rig.advance(Duration::from_secs(91));
+    assert_eq!(
+        ladder(&rig, &token, &probe_body()).await.0,
+        StatusCode::NOT_FOUND,
+        "expired"
+    );
+}
+
+/// A ladder call never keeps a token alive on HLS (no push attachment: the
+/// playlist fetch is the liveness), and does once a push attachment exists
+/// (ADR-0114 decision 5.5; no rung attaches in this build, so the hook is
+/// driven directly).
+#[tokio::test]
+async fn ladder_liveness_only_with_a_push_attachment() {
+    let rig = rig();
+    let (_, doc) = create(&rig, OPERATOR_TOKEN, serde_json::json!({})).await;
+    let (token, id) = (token_of(&doc), doc["id"].as_str().unwrap().to_owned());
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+    // HLS only: ladder calls at 19, 38 and 57 s, then 3 s more: expired 60 s
+    // after the last playlist fetch, whatever the ladder calls.
+    for _ in 0..3 {
+        rig.advance(Duration::from_secs(19));
+        assert_eq!(
+            ladder(
+                &rig,
+                &token,
+                &serde_json::json!({"v": 1, "clock": {"t0": 1}})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    rig.advance(Duration::from_secs(3));
+    assert_eq!(
+        ladder(&rig, &token, &probe_body()).await.0,
+        StatusCode::NOT_FOUND,
+        "no push attachment: the ladder is not liveness"
+    );
+
+    let (_, doc) = create(&rig, OPERATOR_TOKEN, serde_json::json!({})).await;
+    let (token, id2) = (token_of(&doc), doc["id"].as_str().unwrap().to_owned());
+    assert_ne!(id, id2);
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+        StatusCode::OK
+    );
+    assert!(rig.state.cast_streams.attach_push(&id2));
+    for _ in 0..5 {
+        rig.advance(Duration::from_secs(40));
+        assert_eq!(
+            ladder(
+                &rig,
+                &token,
+                &serde_json::json!({"v": 1, "clock": {"t0": 1}})
+            )
+            .await
+            .0,
+            StatusCode::OK,
+            "a push attachment: each ladder call counts as the playlist fetch"
+        );
+    }
+    // A report counts the same.
+    rig.advance(Duration::from_secs(40));
+    let r = send(
+        &rig.router,
+        report_req(&token, b"{\"state\":\"playing\"}".to_vec()),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    rig.advance(Duration::from_secs(40));
+    assert_eq!(ladder(&rig, &token, &probe_body()).await.0, StatusCode::OK);
+    rig.state.cast_streams.detach_push(&id2);
+    rig.advance(Duration::from_secs(61));
+    assert_eq!(
+        ladder(&rig, &token, &probe_body()).await.0,
+        StatusCode::NOT_FOUND,
+        "detached: expiry as before"
+    );
+}
+
+/// The probe, the transport and the fallbacks are shown to the owner and to
+/// admins only: another principal gets the same 404 as for an unknown id.
+#[tokio::test]
+async fn bola_the_probe_is_shown_to_the_owner_and_admins_only() {
+    let rig = rig();
+    let (_, doc) = create(&rig, OPERATOR_TOKEN, serde_json::json!({})).await;
+    let (token, id) = (token_of(&doc), doc["id"].as_str().unwrap().to_owned());
+    assert_eq!(ladder(&rig, &token, &probe_body()).await.0, StatusCode::OK);
+    let (status, owner) = stream_doc(&rig, &id, OPERATOR_TOKEN).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(owner["receiver"]["kind"], "web");
+    let (status, admin) = stream_doc(&rig, &id, ADMIN_TOKEN).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(admin["transport"]["rung"], "hls");
+    assert!(admin.get("path").is_none(), "the token only for the owner");
+    let (_, missing) = stream_doc(&rig, "cast-stream-nope", OPERATOR_2).await;
+    for other in [OPERATOR_2, VIEWER_TOKEN, SCOPED] {
+        let (status, body) = stream_doc(&rig, &id, other).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{other}");
+        assert!(body.get("receiver").is_none() && body.get("transport").is_none());
+        assert_eq!(body["status"], missing["status"]);
+    }
+    // The list never shows another principal's stream either.
+    let list = body_json(
+        send(
+            &rig.router,
+            support::get("/api/v1/cast/streams", OPERATOR_2),
+        )
+        .await,
+    )
+    .await;
+    assert!(list
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|s| s["id"] != id.as_str()));
+}
+
+/// The stored probe and the fallbacks are bounded: a later probe replaces
+/// the earlier (one per stream), at most 8 fallbacks are kept (oldest
+/// forgotten), and the stream's report carries the latency figures.
+#[tokio::test]
+async fn the_stored_probe_and_fallbacks_are_bounded() {
+    let rig = rig();
+    let (_, doc) = create(&rig, OPERATOR_TOKEN, serde_json::json!({})).await;
+    let (token, id) = (token_of(&doc), doc["id"].as_str().unwrap().to_owned());
+    for i in 0..20_u64 {
+        rig.advance(Duration::from_secs(1));
+        let mut body = probe_body();
+        body["receiver"]["build"] = serde_json::json!(format!("b{i}"));
+        body["failed"] = serde_json::json!({"rung": "moq", "stage": "first-frame", "ms": i});
+        assert_eq!(ladder(&rig, &token, &body).await.0, StatusCode::OK);
+    }
+    let (_, view) = stream_doc(&rig, &id, OPERATOR_TOKEN).await;
+    assert_eq!(
+        view["receiver"]["build"], "b19",
+        "the last probe replaces the earlier"
+    );
+    let fallbacks = view["transport"]["fallbacks"].as_array().unwrap();
+    assert_eq!(fallbacks.len(), 8);
+    assert_eq!(fallbacks[0]["ms"], 12, "oldest forgotten first");
+    assert_eq!(fallbacks[7]["stage"], "first-frame");
+    let report = serde_json::json!({"v": 1, "state": "playing", "transport": {
+        "rung": "hls", "first_frame_ms": 640, "latency_method": "frame",
+        "latency_ms": {"median": 7200, "p95": 7900, "samples": 148, "clock_error_ms": 2},
+        "resets": {"soft": 0, "hard": 0, "last": null}, "stalled": false}});
+    let r = send(
+        &rig.router,
+        report_req(&token, serde_json::to_vec(&report).unwrap()),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    let (_, view) = stream_doc(&rig, &id, OPERATOR_TOKEN).await;
+    let t = &view["transport"];
+    assert_eq!(t["first_frame_ms"], 640);
+    assert_eq!(
+        t["latency_ms"],
+        serde_json::json!({"median": 7200, "p95": 7900, "samples": 148, "method": "frame", "clock_error_ms": 2})
+    );
+    assert_eq!(t["resets"]["soft"], 0);
+    assert_eq!(t["stalled"], false);
+    assert_eq!(
+        t["rung"], "hls",
+        "the rung stays the one the engine offered"
+    );
+    // `unavailable` never shows a figure.
+    rig.advance(Duration::from_secs(1));
+    let report = serde_json::json!({"v": 1, "transport": {"latency_method": "unavailable",
+        "latency_ms": {"median": 1, "p95": 1, "samples": 1}, "stalled": true}});
+    send(
+        &rig.router,
+        report_req(&token, serde_json::to_vec(&report).unwrap()),
+    )
+    .await;
+    let (_, view) = stream_doc(&rig, &id, OPERATOR_TOKEN).await;
+    assert!(view["transport"]["latency_ms"].is_null());
+    assert_eq!(view["transport"]["latency_method"], "unavailable");
+    assert_eq!(view["transport"]["stalled"], true);
+}
+
+/// The ladder runs the same token check as the media route: a take to a
+/// feed the owner may not read revokes the token, and its ladder call then
+/// answers 404 (the ABUSE-1 barrier is part of the one admission function).
+#[tokio::test]
+async fn the_ladder_runs_the_shared_token_check() {
+    let rig = rig();
+    let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{doc}");
+    let token = token_of(&doc);
+    assert_eq!(ladder(&rig, &token, &probe_body()).await.0, StatusCode::OK);
+    // The engine falls back to a source the scoped owner may not read; the
+    // readback shows it before any outcome is relayed.
+    rig.routing
+        .live
+        .lock()
+        .unwrap()
+        .outputs
+        .get_mut("cast-1")
+        .unwrap()
+        .bus = "source:secret-cam".to_owned();
+    rig.advance(Duration::from_secs(1));
+    assert_eq!(
+        ladder(&rig, &token, &probe_body()).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        fetch(&rig, &format!("/cast/{token}/master.m3u8")).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// A POST to `/cast/<token>/<file>` whose body is held until `release`.
+fn held_public_post(
+    path: &str,
+    body: Vec<u8>,
+    polled: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) -> Request<Body> {
+    let stream = async_stream::stream! {
+        let _ = polled.send(());
+        let _ = release.await;
+        yield Ok::<_, std::io::Error>(body);
+    };
+    public("POST", path)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// ADR-0114 5.1, the request in flight: a report or ladder call whose body is
+/// still arriving when the token is revoked, or when the engine falls back
+/// to a feed its owner may not read, answers the generic 404 whatever the
+/// body (valid, malformed, oversized), and stores nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_body_in_flight_across_a_revoke_or_fallback_is_the_generic_404() {
+    let mut big = probe_body();
+    big["pad"] = serde_json::json!("x".repeat(2100));
+    let bodies: Vec<(&str, Vec<u8>)> = vec![
+        ("report", serde_json::to_vec(&serde_json::json!({"v": 1, "state": "playing", "transport": {"first_frame_ms": 1, "latency_method": "unavailable"}})).unwrap()),
+        ("ladder", serde_json::to_vec(&probe_body()).unwrap()),
+        ("ladder", b"[not json".to_vec()),
+        ("ladder", serde_json::to_vec(&big).unwrap()),
+        ("report", b"[not json".to_vec()),
+        ("report", big.to_string().into_bytes()),
+    ];
+    for (revoke, (file, body)) in [true, false]
+        .into_iter()
+        .flat_map(|r| bodies.clone().into_iter().map(move |b| (r, b)))
+    {
+        let rig = rig();
+        let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{doc}");
+        let (token, id) = (token_of(&doc), doc["id"].as_str().unwrap().to_owned());
+        let (_, unknown_file) = fetch(&rig, &format!("/cast/{token}/nope-0.m4s")).await;
+        let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let request = held_public_post(
+            &format!("/cast/{token}/{file}"),
+            body,
+            polled_tx,
+            release_rx,
+        );
+        let router = rig.router.clone();
+        let call = tokio::spawn(async move { send(&router, request).await });
+        polled_rx.await.unwrap();
+        if revoke {
+            let r = send(
+                &rig.router,
+                delete(&format!("/api/v1/cast/streams/{id}"), SCOPED),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        } else {
+            rig.routing
+                .live
+                .lock()
+                .unwrap()
+                .outputs
+                .get_mut("cast-1")
+                .unwrap()
+                .bus = "source:secret-cam".to_owned();
+        }
+        release_tx.send(()).unwrap();
+        let response = call.await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{file} revoke={revoke}"
+        );
+        assert_eq!(
+            body_bytes(response).await,
+            unknown_file,
+            "{file} revoke={revoke}: the generic body"
+        );
+        assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+    }
+}
+
+/// The preflight of a token route runs the shared check too: a dead token
+/// gets the generic 404, a live one the 204 with the methods.
+#[tokio::test]
+async fn the_preflight_runs_the_shared_token_check() {
+    let rig = rig();
+    let (_, doc) = create(&rig, OPERATOR_TOKEN, serde_json::json!({})).await;
+    let (token, id) = (token_of(&doc), doc["id"].as_str().unwrap().to_owned());
+    let preflight = |t: String, file: &'static str| {
+        public("OPTIONS", &format!("/cast/{t}/{file}"))
+            .header(header::ORIGIN, "https://cast.conspect.studio")
+            .body(Body::empty())
+            .unwrap()
+    };
+    for file in ["ladder", "report", "master.m3u8"] {
+        assert_eq!(
+            send(&rig.router, preflight(token.clone(), file))
+                .await
+                .status(),
+            StatusCode::NO_CONTENT,
+            "{file}"
+        );
+        let r = send(&rig.router, preflight("C".repeat(43), file)).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND, "{file}");
+        assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            r.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://cast.conspect.studio"
+        );
+    }
+    send(
+        &rig.router,
+        delete(&format!("/api/v1/cast/streams/{id}"), OPERATOR_TOKEN),
+    )
+    .await;
+    assert_eq!(
+        send(&rig.router, preflight(token, "ladder")).await.status(),
+        StatusCode::NOT_FOUND,
+        "revoked"
+    );
 }

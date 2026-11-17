@@ -2055,6 +2055,14 @@ enum RunnableOutput {
         default_dir: bool,
         /// The pipeline's outbound epoch (`EXT-X-PROGRAM-DATE-TIME`).
         epoch: multiview_output::SharedEpoch,
+        /// Which audio the cast stream carries (#418): the program and/or
+        /// discrete tracks, resolved like an HLS output's.
+        audio: multiview_output::AudioSelection,
+        /// Audio slot 0's language: the program rendition's `LANGUAGE` and
+        /// menu label (#418).
+        program_language: Option<String>,
+        /// The output's subtitle slots, when it declares any (#418).
+        subtitles: Option<CastSubtitles>,
     },
     /// A WebRTC program output (`webrtc` WHEP-serve / `whip_push`): a **mux-free**
     /// sink that re-stamps each coded [`EncodedPacket`] into an
@@ -2457,6 +2465,10 @@ pub struct Pipeline {
     /// like any source's audio). Built only for media players whose default asset
     /// declares a vamp window; empty when this run did not opt into program audio.
     player_audio_ingest_plans: Vec<crate::audio::PlayerAudioPlan>,
+    /// `media_player` source id -> its player id (ADR-M012), for sources whose
+    /// id differs from the player's. The player's audio rides the bus once,
+    /// under the player id; switcher audio-follow resolves through this map.
+    player_aliases: std::collections::HashMap<String, String>,
     /// Per-source **AES67 / ST 2110-30** audio RX plans (#103, ADR-0033/T013):
     /// how to bind + receive each AES67 multicast PCM source. The drive starts one
     /// supervised RX thread per plan (a peer of the audio decode threads) that
@@ -2510,6 +2522,9 @@ pub struct Pipeline {
     /// Per runnable output (same order): a live format reset may reach it
     /// (#342 B3 review M-1: HLS with TS segments only).
     output_live_reset: Vec<bool>,
+    /// Per runnable output (same order): its passthrough (P0) eligibility
+    /// (#344 D2b: HLS with TS segments, slot-0 H.264/HEVC, a known format).
+    output_passthrough: Vec<crate::output_routing::PassEligibility>,
     output_audio_tracks: Vec<Vec<usize>>,
     /// Outputs that EXPLICITLY declared an audio selection (per output: the id
     /// and its full declared track list). Drives the run-time truthful binding:
@@ -2518,7 +2533,7 @@ pub struct Pipeline {
     declared_audio_outputs: Vec<(String, Vec<usize>)>,
     /// The runnable outputs declared in the config.
     outputs: Vec<RunnableOutput>,
-    /// The HLS outputs' subtitle slots (slice F #345): route tables + cue
+    /// The HLS and cast outputs' subtitle slots (slice F #345, #418): route tables + cue
     /// feeds, sampled by the bake consumer.
     subtitle_outputs: Vec<SubtitleOutputPlan>,
     /// The bake-consumer push handles for the configured AES67 outputs (#103),
@@ -3192,6 +3207,12 @@ impl Pipeline {
             Vec::with_capacity(config.sources.len());
 
         for source in &config.sources {
+            // ADR-M012: a `media_player` source opens nothing itself. It binds
+            // cells/buses to its player, whose boot below owns the ingest
+            // thread; the alias is resolved after that boot.
+            if matches!(source.kind, SourceKind::MediaPlayer { .. }) {
+                continue;
+            }
             let rails = wants(&source.id);
             // AES67 stays as it was: it is a local multicast join with no
             // catalogue entry, so demand does not manage it.
@@ -3397,6 +3418,9 @@ impl Pipeline {
         for (id, audio_store) in media_player_boot.audio_stores {
             audio_stores.insert(id, audio_store);
         }
+        // ADR-M012: each `media_player` source resolves to its player's store.
+        let player_aliases = media_player_source_aliases(config);
+        bind_media_player_sources(&player_aliases, &mut stores);
 
         // WHIP ingest wiring (ADR-T014, `webrtc-native`): one shared publisher
         // rendezvous registry the control plane's WhipProvider writes to and each
@@ -3502,6 +3526,7 @@ impl Pipeline {
         let mut output_video_keys = Vec::with_capacity(outputs.len());
         let mut output_inband_sets = Vec::with_capacity(outputs.len());
         let mut output_live_reset = Vec::with_capacity(outputs.len());
+        let mut output_passthrough = Vec::with_capacity(outputs.len());
         let mut output_audio_tracks = Vec::with_capacity(outputs.len());
         let mut declared_audio_outputs: Vec<(String, Vec<usize>)> = Vec::new();
         for output in &outputs {
@@ -3567,16 +3592,24 @@ impl Pipeline {
                 .find(|item| item.id() == output.id())
                 .is_some_and(|item| matches!(item, multiview_config::Output::LlHls { .. }));
             output_inband_sets.push(!ll_hls && inband_parameter_changes_ok(output));
-            // A cast stream carries the program audio only (track 0).
-            let cast_audio = multiview_output::AudioSelection::default();
             // Only a TS-segment HLS sink rebuilds its muxer at a flagged
             // change (#342 B3 review M-1).
             output_live_reset.push(!ll_hls && matches!(output, RunnableOutput::Hls { .. }));
+            output_passthrough.push(passthrough_eligibility(
+                declared,
+                !ll_hls && matches!(output, RunnableOutput::Hls { .. }),
+                requested,
+                (width, height),
+                cfg.cadence,
+                bit_rate,
+                canvas_color.output_tag(),
+                key,
+            ));
             let audio_selection = match output {
                 RunnableOutput::File { sink, .. }
                 | RunnableOutput::Hls { sink, .. }
                 | RunnableOutput::Push { sink, .. } => Some(sink.audio_selection()),
-                RunnableOutput::Cast { .. } => Some(&cast_audio),
+                RunnableOutput::Cast { audio, .. } => Some(audio),
                 #[cfg(feature = "webrtc-native")]
                 RunnableOutput::WebRtc { .. } => None,
                 #[cfg(feature = "ndi-bindings")]
@@ -3688,11 +3721,15 @@ impl Pipeline {
 
         // Every configured source is catalogued, demanded or not; the stores of
         // booted sources are shared so a later lease reuses them.
+        // A `media_player` source is an alias of a player channel the player
+        // boot owns: demand never starts or stops it (no catalogue entry).
         let catalogue = crate::source_rails::catalogue(
-            config
-                .sources
-                .iter()
-                .filter(|source| !matches!(source.kind, SourceKind::Aes67 { .. })),
+            config.sources.iter().filter(|source| {
+                !matches!(
+                    source.kind,
+                    SourceKind::Aes67 { .. } | SourceKind::MediaPlayer { .. }
+                )
+            }),
             &stores,
         );
         let demand_config = crate::source_demand::demand_config(config);
@@ -3748,6 +3785,7 @@ impl Pipeline {
             #[cfg(feature = "webrtc-native")]
             egress_registry,
             audio_stores,
+            player_aliases,
             audio_routing: config.audio.clone(),
             discrete_track_inputs,
             audio_route: Arc::new(multiview_framestore::SwapCell::empty()),
@@ -3794,6 +3832,7 @@ impl Pipeline {
             output_video_keys,
             output_inband_sets,
             output_live_reset,
+            output_passthrough,
             output_audio_tracks,
             declared_audio_outputs,
             outputs,
@@ -4200,7 +4239,18 @@ impl Pipeline {
         );
         let reformat_open =
             reformat_opener(self.encode_cfg.clone(), self.rendition_configs.clone());
-        let (mut router, handle) = crate::output_routing::OutputRouter::new_with_openers(
+        let pass_hooks = crate::output_routing::PassHooks {
+            open: passthrough_opener(
+                self.rendition_configs.clone(),
+                self.encode_cfg.cadence,
+                Arc::clone(&self.epoch_anchor),
+            ),
+            traits: Arc::new(|id: &str| {
+                crate::passthrough_tap::lookup(id)
+                    .and_then(|t| t.stream().map(|s| s.traits.clone()))
+            }),
+        };
+        let (mut router, handle) = crate::output_routing::OutputRouter::new_with_passthrough(
             crate::output_routing::RouterConfig {
                 cadence: self.encode_cfg.cadence,
                 gop: self.encode_cfg.gop.max(1),
@@ -4212,6 +4262,7 @@ impl Pipeline {
                 max_aux_canvases: self.max_aux_canvases,
                 formats: self.output_formats.clone(),
                 live_reset: self.output_live_reset.clone(),
+                passthrough: self.output_passthrough.clone(),
                 boot_retry: self.boot_retry,
             },
             crate::output_routing::AuxWiring {
@@ -4228,12 +4279,16 @@ impl Pipeline {
             },
             open,
             Some(reformat_open),
+            Some(pass_hooks),
         )
         .map_err(spawn_err)?;
         // Atomic sets (#308) pick their adoption tick after the clock's last
         // composed tick: a wait-free atomic load, never a lock on the clock.
         if let Some(control) = self.switcher_control.as_ref() {
             router.set_switcher_clock(control.applied_tick_cell());
+            // K4 (review H3): one Clean / DSK gate shared by the switcher,
+            // the routing handle (plan) and the router (drain admission).
+            router.set_clean_gate(control.clean_gate());
         }
         let run_outputs = self.run_outputs(binding_ids, audio_tracks);
         // Slice F part F2: the run's subtitle route tables, keyed by output
@@ -4256,6 +4311,12 @@ impl Pipeline {
                 .with_dsk_defined(!self.switcher_keyers.is_empty())
                 .with_subtitles(subtitle_tables, Arc::clone(&subtitle_tick)),
         );
+        // K4: the switcher's gate, so a run-time `keyer_set` defining a DSK
+        // and a Clean take are admitted against the same counted word.
+        let handle = match self.switcher_control.as_ref() {
+            Some(control) => Arc::new((*handle).clone().with_clean_gate(control.clean_gate())),
+            None => handle,
+        };
         enqueue_boot_takes(&handle, &self.boot_output_feeds, &self.boot_audio_takes);
         // Review INV-1: the run's subtitle routing ends with the run (every
         // exit path drops this guard), so a take can no longer re-point an
@@ -4483,6 +4544,15 @@ impl Pipeline {
                 &self.switcher_keyers,
             ));
             self.keyer_demand = Some(keyers);
+        }
+        // K4: a run with an M/E can define its first DSK at run time
+        // (`keyer_set`), so the switcher always gets a `keyer` demand set.
+        if self.keyer_demand.is_none() && self.switcher_me.is_some() {
+            self.keyer_demand =
+                Some(manager.consumer_set(multiview_engine::ConsumerClass::Keyer, Rails::VIDEO));
+        }
+        if let (Some(control), Some(set)) = (&self.switcher_control, &self.keyer_demand) {
+            control.set_keyer_demand(set.clone());
         }
         self.demand_sets = Some((layout, audio));
         self.demand = Some(manager.clone());
@@ -5179,6 +5249,8 @@ impl Pipeline {
                 self.output_inband_sets.insert(0, true);
                 // The internal `program.ts` anchor is a file: never reset.
                 self.output_live_reset.insert(0, false);
+                self.output_passthrough
+                    .insert(0, crate::output_routing::PassEligibility::NotSupported);
                 self.output_audio_tracks
                     .insert(0, hls_audio.unwrap_or_default());
             }
@@ -5237,6 +5309,18 @@ impl Pipeline {
         self.consumer_stall_for_test = Some((at, stall));
     }
 
+    /// The engine side of each subtitle feed (its counters included), one
+    /// per output with subtitle slots (HLS or cast), in configured order.
+    #[cfg(all(test, feature = "gpl-codecs"))]
+    pub(crate) fn subtitle_feeds_for_test(
+        &self,
+    ) -> Vec<(String, multiview_output::hls::SubtitleFeed)> {
+        self.subtitle_outputs
+            .iter()
+            .map(|plan| (plan.output_id.clone(), plan.feed.clone()))
+            .collect()
+    }
+
     /// Tell the pipeline the engine's state directory: a cast output with no
     /// configured `dir` writes to `<state dir>/cast/<id>`. Call before the
     /// run starts (nothing is created here).
@@ -5281,6 +5365,7 @@ impl Pipeline {
                     height: encode.map_or(0, |cfg| cfg.height),
                     fps: self.cadence,
                     codec: encode.map_or_else(String::new, |cfg| cfg.codec_name.clone()),
+                    epoch: self.epoch.clone(),
                 })
             })
             .collect()
@@ -5871,9 +5956,10 @@ impl Pipeline {
             // The `[audio]` routes decide membership/gain/mute (ADR-0059 §4);
             // with none declared every store rides at unity.
             let mut channels = std::collections::HashMap::new();
-            for (id, gain) in program_bus_gains(
+            for (id, gain) in program_bus_gains_aliased(
                 self.audio_stores.keys().map(String::as_str),
                 self.audio_routing.as_ref(),
+                &self.player_aliases,
             ) {
                 if let Some(store) = self.audio_stores.get(id.as_str()) {
                     let point = bus.add_source(id.clone(), Arc::clone(store), gain);
@@ -5882,6 +5968,7 @@ impl Pipeline {
             }
             self.audio_route.store(Some(Arc::new(
                 crate::audio::AudioControlHandle::from_sources(self.audio_stores.clone(), channels)
+                    .with_aliases(self.player_aliases.clone())
                     .with_sample_rate(cfg.sample_rate)
                     // Every configured source may be routed live: routing one
                     // is what makes it a consumer.
@@ -8471,6 +8558,185 @@ fn reformat_opener(
     })
 }
 
+/// The passthrough (P0) eligibility of one runnable output (#344 D2b): an
+/// HLS output with TS segments whose slot-0 codec is H.264 or HEVC (HEVC has
+/// no repeat AU: an underrun bridges to the slate). The slot is the
+/// output's own format (canvas or `[outputs.format]`), the run cadence, the
+/// canvas colour, 8-bit 4:2:0 progressive, the slot-0 bit rate as ceiling,
+/// and the HLS segment length as the longest GOP. Anything else is
+/// `passthrough-not-supported-on-medium`.
+#[allow(clippy::too_many_arguments)]
+// reason: one output's already-resolved facts, called once per output at plan build.
+fn passthrough_eligibility(
+    declared: Option<&Output>,
+    ts_hls: bool,
+    codec_token: &str,
+    (width, height): (u32, u32),
+    cadence: Rational,
+    bit_rate: usize,
+    colour: multiview_core::color::ColorInfo,
+    settings: usize,
+) -> crate::output_routing::PassEligibility {
+    use multiview_config::CodecFamily;
+    use multiview_output::passthrough::match_rules::{PassCodec, Scan};
+    use multiview_output::passthrough::SlotSpec;
+    let not = crate::output_routing::PassEligibility::NotSupported;
+    let Some(Output::Hls { segment_ms, .. }) = declared else {
+        return not;
+    };
+    if !ts_hls {
+        return not;
+    }
+    let (codec, max_profile, max_level) = match CodecFamily::of(codec_token) {
+        // The slot's encoder is High at any level the encoder picks: High
+        // 5.1 is the ceiling a decoder for the slot must handle.
+        Some(CodecFamily::H264) => (PassCodec::H264, 100, 51),
+        Some(CodecFamily::Hevc) => (PassCodec::Hevc, 1, 153),
+        _ => return not,
+    };
+    let Some(colour) = slot_colour(colour) else {
+        return not;
+    };
+    // Segment length in ticks (default 2 s): a segment boundary must find
+    // an IDR within it.
+    let ms = u64::from(segment_ms.unwrap_or(2_000).max(1));
+    let num = u64::try_from(cadence.num).unwrap_or(0);
+    let den = u64::try_from(cadence.den).unwrap_or(1).max(1);
+    let max_gop_ticks = ms.saturating_mul(num) / den.saturating_mul(1_000);
+    if max_gop_ticks == 0 {
+        return not;
+    }
+    crate::output_routing::PassEligibility::Eligible {
+        slot: SlotSpec {
+            codec,
+            max_profile,
+            max_level,
+            width,
+            height,
+            fps: cadence,
+            scan: Scan::Progressive,
+            colour,
+            bit_depth: 8,
+            chroma: 1,
+            bitrate_ceiling_kbps: u64::try_from(bit_rate / 1000).unwrap_or(u64::MAX).max(1),
+            max_gop_ticks,
+            b_frames_allowed: true,
+        },
+        settings,
+    }
+}
+
+/// The ITU-T H.273 code points of the slot's colour (`None` when an axis is
+/// unspecified: an untagged slot never matches).
+fn slot_colour(
+    c: multiview_core::color::ColorInfo,
+) -> Option<multiview_output::passthrough::match_rules::ColourTags> {
+    use multiview_core::color::{
+        ColorPrimaries, ColorRange, MatrixCoefficients, TransferCharacteristic,
+    };
+    let primaries = match c.primaries {
+        ColorPrimaries::Bt709 => 1,
+        ColorPrimaries::Bt601_625 => 5,
+        ColorPrimaries::Bt601_525 => 6,
+        ColorPrimaries::Bt2020 => 9,
+        _ => return None,
+    };
+    let transfer = match c.transfer {
+        TransferCharacteristic::Bt709 => 1,
+        TransferCharacteristic::Bt601 => 6,
+        TransferCharacteristic::Bt2020 => 14,
+        TransferCharacteristic::Srgb => 13,
+        TransferCharacteristic::Pq => 16,
+        TransferCharacteristic::Hlg => 18,
+        _ => return None,
+    };
+    let matrix = match c.matrix {
+        MatrixCoefficients::Bt709 => 1,
+        MatrixCoefficients::Bt601 => 6,
+        MatrixCoefficients::Bt2020Ncl => 9,
+        MatrixCoefficients::Rgb => 0,
+        _ => return None,
+    };
+    let range = match c.range {
+        ColorRange::Limited => 0,
+        ColorRange::Full => 1,
+        _ => return None,
+    };
+    Some(multiview_output::passthrough::match_rules::ColourTags {
+        primaries: Some(primaries),
+        transfer: Some(transfer),
+        matrix: Some(matrix),
+        range: Some(range),
+    })
+}
+
+/// The passthrough key opener (#344 D2b), run on the `routing-open` thread:
+/// subscribes the source's tap, bakes the format slate with the output's
+/// own encoder settings (the encoder is dropped after the bake: no session
+/// is held) and builds the key with its own matcher. A bake failure (for
+/// example no H.264 encoder linked) is the open's error: the candidate is
+/// not opened and the readback says why.
+fn passthrough_opener(
+    configs: Vec<EncodeConfig>,
+    cadence: Rational,
+    origin: crate::timing_status::EpochAnchorSlot,
+) -> crate::output_routing::PassOpenFn {
+    use multiview_ffmpeg::idr::CodecKind;
+    Box::new(move |req| {
+        let cfg = configs
+            .get(req.settings)
+            .ok_or_else(|| "unknown rendition settings".to_owned())?;
+        let tap = crate::passthrough_tap::lookup(&req.source)
+            .ok_or_else(|| "source has no compressed tap".to_owned())?;
+        let codec = match req.slot.codec {
+            multiview_output::passthrough::match_rules::PassCodec::H264 => CodecKind::H264,
+            multiview_output::passthrough::match_rules::PassCodec::Hevc => CodecKind::Hevc,
+            _ => return Err("slot codec has no passthrough".to_owned()),
+        };
+        let black = Nv12Image::solid(
+            cfg.width,
+            cfg.height,
+            16,
+            128,
+            128,
+            multiview_core::color::ColorInfo::default(),
+        )
+        .map_err(|e| e.to_string())?;
+        let slate = crate::passthrough_live::bake_slate(cfg, &black, codec)?;
+        let reader = tap
+            .tap()
+            .subscribe()
+            .ok_or_else(|| "the source's tap has no free consumer".to_owned())?;
+        let origin = Arc::clone(&origin);
+        let now: crate::passthrough_live::NowNs = Box::new(move || {
+            origin
+                .load()
+                .and_then(|run| u64::try_from(run.time().now_nanos()).ok())
+                .unwrap_or(0)
+        });
+        let traits_tap = Arc::clone(&tap);
+        let live = crate::passthrough_live::PassthroughLive::new(
+            crate::passthrough_live::PassthroughSpec {
+                cadence,
+                codec,
+                stream_params: None,
+            },
+            reader,
+            &slate,
+            now,
+        )
+        .ok_or_else(|| "empty slate".to_owned())?
+        .with_matcher(
+            req.slot.clone(),
+            Box::new(move || traits_tap.stream().map(|s| s.traits.clone())),
+        )
+        .with_slate_move_points(false);
+        let status = live.status();
+        let live: Box<dyn crate::output_routing::LiveEncoder> = Box::new(live);
+        Ok((live, status))
+    })
+}
+
 /// The routing opener (ADR-0108, #342): opens a live encoder for a rendition
 /// settings index. A Program/Clean key at a non-canvas format converts on its
 /// own worker (never erroring: it repeats or blacks). A routed source/PVW
@@ -9160,6 +9426,9 @@ fn consumer_main<D: WindowDelivery>(
             encoder.codec_params().codec_config_bytes(),
             route_gain,
         );
+        if let Some(handle) = audio_route.clone() {
+            router.set_audio_aliases(Arc::new(move || handle.aliases()));
+        }
     }
     let mut audio_worker = match audio_encoder.take() {
         Some(encoder) => {
@@ -9351,7 +9620,7 @@ fn consumer_main<D: WindowDelivery>(
         };
         let overlaid = baker.bake(&item)?;
         router.publish_program(item.tick_index, &overlaid);
-        // Slice F (#345): sample every HLS subtitle slot at this tick, off the
+        // Slice F (#345, #418): sample every HLS/cast subtitle slot at this tick, off the
         // clock (one empty check when no output declares a subtitle slot).
         subtitles.tick(item.tick_index);
         // NO-FALTER: fill any ticks this consumer missed (a transient stall
@@ -9571,7 +9840,11 @@ fn consumer_main<D: WindowDelivery>(
                     .ok_or_else(|| PipelineError::Engine("audio track bus missing".to_owned()))?;
                 #[cfg(not(feature = "overlay"))]
                 let track_bus = bus;
-                discrete_track_samples(track_bus, &selected_tracks, block.frame_count())
+                let aliases = audio_route
+                    .as_deref()
+                    .map(crate::audio::AudioControlHandle::aliases)
+                    .unwrap_or_default();
+                discrete_track_samples(track_bus, &selected_tracks, &aliases, block.frame_count())
             };
             #[cfg(test)]
             router.tap_program_audio(item.tick_index, &block);
@@ -9683,18 +9956,22 @@ fn consumer_main<D: WindowDelivery>(
 /// pre-mix block, with exactly the program block's `frames`. A source with no
 /// block this tick (or a block of another length) yields `None` = silence, so the
 /// track's clock never skips.
-fn discrete_track_samples(
+/// A track input naming a `media_player` alias (ADR-M012) carries its
+/// player's channel.
+fn discrete_track_samples<S: std::hash::BuildHasher>(
     bus: &multiview_audio::program::ProgramBus,
     track_inputs: &[String],
+    aliases: &std::collections::HashMap<String, String, S>,
     frames: usize,
 ) -> Vec<Option<Vec<f32>>> {
     let inputs = bus.input_tracks();
     track_inputs
         .iter()
         .map(|input_id| {
+            let channel = aliases.get(input_id).unwrap_or(input_id);
             inputs
                 .iter()
-                .find(|(id, _)| *id == input_id.as_str())
+                .find(|(id, _)| *id == channel.as_str())
                 .map(|(_, b)| *b)
                 .filter(|b| b.frame_count() == frames)
                 .map(|b| b.interleaved().to_vec())
@@ -9922,8 +10199,24 @@ fn run_one_output(
             dir,
             default_dir: _,
             epoch,
+            audio: selection,
+            program_language,
+            subtitles,
         } => Ok(run_cast_output(
-            &id, gate, &dir, epoch, &rx, params, time_base, audio,
+            CastRun {
+                id: &id,
+                gate,
+                dir: &dir,
+                epoch,
+                selection: &selection,
+                program_language,
+                subtitles,
+            },
+            &rx,
+            params,
+            time_base,
+            audio,
+            tracks,
         )),
         #[cfg(feature = "webrtc-native")]
         RunnableOutput::WebRtc { id: _, sink, label } => {
@@ -10361,24 +10654,150 @@ where
     }
 }
 
+/// What a cast output's sink needs besides the encoders' parameters.
+struct CastRun<'a> {
+    id: &'a str,
+    gate: Arc<crate::cast_output::CastGate>,
+    dir: &'a Path,
+    epoch: multiview_output::SharedEpoch,
+    selection: &'a multiview_output::AudioSelection,
+    program_language: Option<String>,
+    subtitles: Option<CastSubtitles>,
+}
+
+/// A cast output's subtitle slots for one run (#418): the renditions the
+/// master lists and the sink side of the bake consumer's cue feed, shared by
+/// every packager generation of the run.
+#[derive(Clone)]
+struct CastSubtitles {
+    renditions: Vec<multiview_output::hls::SubtitleRendition>,
+    feed: Arc<multiview_output::hls::SubtitleFeedReceiver>,
+}
+
+/// The cast packager's description of one AAC stream, from its encoder.
+/// `None` when the time base is not `1/sample_rate` (never the AAC encoder's).
+fn cast_audio_config(
+    params: &StreamCodecParameters,
+    time_base: Rational,
+) -> Option<multiview_output::hls::cast::CastAudioConfig> {
+    let sample_rate = (time_base.num == 1)
+        .then(|| u32::try_from(time_base.den).ok())
+        .flatten()?;
+    let asc = params.codec_config_bytes();
+    // AudioSpecificConfig: 5 bits object type, 4 bits rate index, 4 bits
+    // channel configuration. Stereo (the program bus) when absent.
+    let channels = asc
+        .as_deref()
+        .and_then(|bytes| bytes.get(1))
+        .map(|byte| u16::from((byte >> 3) & 0x0F))
+        .filter(|channels| *channels > 0)
+        .unwrap_or(multiview_config::output_format::SLOT_AUDIO_CHANNELS);
+    Some(multiview_output::hls::cast::CastAudioConfig {
+        time_base,
+        sample_rate,
+        channels,
+        bit_rate: params.opened_bit_rate().or_else(|| params.bit_rate()),
+        audio_specific_config: asc,
+    })
+}
+
+/// One cast audio rendition per selected stream (#418), in order: the
+/// program (when selected and encoded) then each selected discrete track;
+/// the first is `DEFAULT=YES`. Returns them with the stream → rendition map.
+fn cast_audio_renditions(
+    selection: &multiview_output::AudioSelection,
+    program_language: Option<&str>,
+    program: Option<&(StreamCodecParameters, Rational)>,
+    tracks: &[(StreamCodecParameters, Rational)],
+) -> (
+    Vec<multiview_output::hls::cast::CastAudioRendition>,
+    crate::cast_output::CastAudioRoutes,
+) {
+    use multiview_output::hls::cast::{CastAudioRendition, MAX_CAST_AUDIO_RENDITIONS};
+    // Config validation refuses exactly what the packager cannot carry.
+    const _: () = assert!(MAX_CAST_AUDIO_RENDITIONS == multiview_config::MAX_CAST_AUDIO_RENDITIONS);
+    let mut renditions: Vec<CastAudioRendition> = Vec::new();
+    let mut routes = crate::cast_output::CastAudioRoutes {
+        program: None,
+        tracks: vec![None; tracks.len()],
+    };
+    if selection.program {
+        if let Some(config) = program.and_then(|(p, tb)| cast_audio_config(p, *tb)) {
+            routes.program = Some(renditions.len());
+            renditions.push(CastAudioRendition {
+                config,
+                // The menu label stays "Program"; the language goes in LANGUAGE.
+                name: "Program".to_owned(),
+                language: program_language.map(str::to_owned),
+                default: false,
+            });
+        }
+    }
+    for track in &selection.tracks {
+        if renditions.len() >= MAX_CAST_AUDIO_RENDITIONS {
+            // Defence only: config validation refuses a cast output carrying
+            // more (#418 review INV418-1), so this never fires on a valid run.
+            tracing::warn!(
+                selected = usize::from(selection.program) + selection.tracks.len(),
+                max = MAX_CAST_AUDIO_RENDITIONS,
+                "cast: audio selection exceeds the cast rendition limit; extra tracks dropped"
+            );
+            break;
+        }
+        let index = usize::from(track.index);
+        let Some(config) = tracks
+            .get(index)
+            .and_then(|(p, tb)| cast_audio_config(p, *tb))
+        else {
+            continue;
+        };
+        if let Some(slot) = routes.tracks.get_mut(index) {
+            if slot.is_some() {
+                continue;
+            }
+            *slot = Some(renditions.len());
+        }
+        renditions.push(CastAudioRendition {
+            config,
+            name: track
+                .title
+                .clone()
+                .unwrap_or_else(|| format!("Track {}", track.index)),
+            language: track.language.clone(),
+            default: false,
+        });
+    }
+    if let Some(first) = renditions.first_mut() {
+        first.default = true;
+    }
+    (renditions, routes)
+}
+
 /// Run a cast output's sink (ADR-0111) over its fan-out channel.
 /// **Infallible**: a cast output can never fail the run.
 ///
 /// The packager's video rendition is described by the encoder that feeds
 /// this output (its real size, bit rate and parameter sets), never by the
-/// canvas: an output with its own format is encoded at that format.
-#[allow(clippy::too_many_arguments)] // Each argument is one distinct input of the sink thread.
+/// canvas: an output with its own format is encoded at that format. Each
+/// selected audio stream is one audio rendition (#418).
 fn run_cast_output(
-    id: &str,
-    gate: Arc<crate::cast_output::CastGate>,
-    dir: &Path,
-    epoch: multiview_output::SharedEpoch,
+    run: CastRun<'_>,
     rx: &Receiver<LeasedPacket>,
     params: &StreamCodecParameters,
     time_base: Rational,
     audio: Option<&(StreamCodecParameters, Rational)>,
+    tracks: &[(StreamCodecParameters, Rational)],
 ) -> SinkRunOutcome {
-    use multiview_output::hls::cast::{CastAudioConfig, CastVideoConfig};
+    use multiview_output::hls::cast::CastVideoConfig;
+    let CastRun {
+        id,
+        gate,
+        dir,
+        epoch,
+        selection,
+        program_language,
+        subtitles,
+    } = run;
     let (width, height) = params.video_dimensions().unwrap_or((0, 0));
     let video = CastVideoConfig {
         time_base,
@@ -10387,30 +10806,12 @@ fn run_cast_output(
         bit_rate: params.opened_bit_rate().or_else(|| params.bit_rate()),
         extradata: params.codec_config_bytes(),
     };
-    let audio = audio.and_then(|(audio_params, audio_tb)| {
-        // The audio time base is `1/sample_rate` (the AAC encoder's).
-        let sample_rate = (audio_tb.num == 1)
-            .then(|| u32::try_from(audio_tb.den).ok())
-            .flatten()?;
-        let asc = audio_params.codec_config_bytes();
-        // AudioSpecificConfig: 5 bits object type, 4 bits rate index, 4 bits
-        // channel configuration. Stereo (the program bus) when absent.
-        let channels = asc
-            .as_deref()
-            .and_then(|bytes| bytes.get(1))
-            .map(|byte| u16::from((byte >> 3) & 0x0F))
-            .filter(|channels| *channels > 0)
-            .unwrap_or(multiview_config::output_format::SLOT_AUDIO_CHANNELS);
-        Some(CastAudioConfig {
-            time_base: *audio_tb,
-            sample_rate,
-            channels,
-            bit_rate: audio_params
-                .opened_bit_rate()
-                .or_else(|| audio_params.bit_rate()),
-            audio_specific_config: asc,
-        })
-    });
+    let (audio, audio_routes) =
+        cast_audio_renditions(selection, program_language.as_deref(), audio, tracks);
+    let (subtitles, subtitle_feed) = subtitles.map_or_else(
+        || (Vec::new(), None),
+        |subs| (subs.renditions, Some(subs.feed)),
+    );
     let setup = crate::cast_output::CastSetup {
         id: id.to_owned(),
         dir: dir.to_path_buf(),
@@ -10418,6 +10819,9 @@ fn run_cast_output(
         epoch,
         video,
         audio,
+        audio_routes,
+        subtitles,
+        subtitle_feed,
     };
     let report =
         crate::cast_output::run_cast_sink(setup, rx, &|packet| params.is_decoder_ready_rap(packet));
@@ -13579,7 +13983,7 @@ struct BuiltOutputs {
     /// shares the existing per-sink thread + end-of-program lifecycle — but it
     /// consumes the canvas tap below, never the packets.
     packet: Vec<RunnableOutput>,
-    /// The HLS outputs' subtitle slots (slice F #345).
+    /// The HLS and cast outputs' subtitle slots (slice F #345, #418).
     subtitles: Vec<SubtitleOutputPlan>,
     /// DRM/KMS display heads, started as raw-frame sinks at stream start.
     #[cfg(feature = "display-kms")]
@@ -14213,31 +14617,10 @@ fn build_hls_output(
     // Slice F (#345): WebVTT subtitle renditions for a TS-segment HLS output
     // (config refuses them on LL-HLS), fed by the bake consumer's sampler.
     let mut plan = None;
-    if let (Output::Hls { .. }, Some(slots)) = (output, output.slots()) {
-        if !slots.subtitle.is_empty() {
-            let renditions = slots
-                .subtitle
-                .iter()
-                .enumerate()
-                .map(|(i, slot)| multiview_output::hls::SubtitleRendition {
-                    name: slot.effective_name(i),
-                    language: slot.language.clone(),
-                })
-                .collect();
-            let (feed, rx) = multiview_output::hls::subtitle_feed();
+    if matches!(output, Output::Hls { .. }) {
+        if let Some((renditions, rx, built)) = subtitle_slots_plan(output) {
             sink = sink.with_subtitles(renditions, rx);
-            plan = Some(SubtitleOutputPlan {
-                output_id: output.id(),
-                routes: crate::subtitle_slots::subtitle_routes(
-                    slots
-                        .subtitle
-                        .iter()
-                        .map(|slot| slot.source.clone())
-                        .collect(),
-                ),
-                feed,
-                slots: slots.subtitle.len(),
-            });
+            plan = Some(built);
         }
     }
     Ok((
@@ -14250,7 +14633,44 @@ fn build_hls_output(
     ))
 }
 
-/// One HLS output's subtitle slots for the run (slice F #345): its route
+/// An output's subtitle slots for the run (slice F #345; cast #418): the
+/// `WebVTT` renditions its sink lists, the sink side of the cue feed and the
+/// [`SubtitleOutputPlan`] the bake consumer's sampler (and the live re-patch,
+/// keyed by output id) drives. `None` when the output declares no slot.
+fn subtitle_slots_plan(
+    output: &Output,
+) -> Option<(
+    Vec<multiview_output::hls::SubtitleRendition>,
+    multiview_output::hls::SubtitleFeedReceiver,
+    SubtitleOutputPlan,
+)> {
+    let slots = output.slots().filter(|slots| !slots.subtitle.is_empty())?;
+    let renditions = slots
+        .subtitle
+        .iter()
+        .enumerate()
+        .map(|(i, slot)| multiview_output::hls::SubtitleRendition {
+            name: slot.effective_name(i),
+            language: slot.language.clone(),
+        })
+        .collect();
+    let (feed, rx) = multiview_output::hls::subtitle_feed();
+    let plan = SubtitleOutputPlan {
+        output_id: output.id(),
+        routes: crate::subtitle_slots::subtitle_routes(
+            slots
+                .subtitle
+                .iter()
+                .map(|slot| slot.source.clone())
+                .collect(),
+        ),
+        feed,
+        slots: slots.subtitle.len(),
+    };
+    Some((renditions, rx, plan))
+}
+
+/// One output's subtitle slots for the run (slice F #345; HLS or cast): its route
 /// table (slot → source, re-pointed live by the patch API), the engine side
 /// of its sink's cue feed and its slot count.
 #[derive(Clone)]
@@ -14458,6 +14878,17 @@ fn build_outputs(
             // while a cast stream is active.
             Output::Cast { id, dir, .. } => {
                 let default_state = multiview_control::boot_model::state_dir_for(Path::new(""));
+                let (cast_subtitles, plan) = subtitle_slots_plan(output)
+                    .map(|(renditions, feed, plan)| {
+                        (
+                            CastSubtitles {
+                                renditions,
+                                feed: Arc::new(feed),
+                            },
+                            plan,
+                        )
+                    })
+                    .unzip();
                 runnable.push(RunnableOutput::Cast {
                     id: id.clone(),
                     gate: Arc::new(crate::cast_output::CastGate::new()),
@@ -14467,7 +14898,12 @@ fn build_outputs(
                     ),
                     default_dir: dir.is_none(),
                     epoch: epoch.clone(),
+                    // Resolved by `apply_output_audio_selections`.
+                    audio: multiview_output::AudioSelection::default(),
+                    program_language: None,
+                    subtitles: cast_subtitles,
                 });
+                subtitles.extend(plan);
             }
             Output::Rtmp { url, .. } => {
                 runnable.push(build_push_output(output, PushProtocol::Rtmp, url, "rtmp"));
@@ -15114,18 +15550,12 @@ fn output_audio_selection(
     output: &Output,
     tracks: &[DeclaredTrack],
 ) -> multiview_output::AudioSelection {
-    // `slots.audio`, when declared, is the output's selection (#342).
-    let Some(selection) = output.effective_audio() else {
-        return multiview_output::AudioSelection::default();
-    };
+    // `slots.audio`, when declared, is the output's selection (#342); the
+    // resolution is shared with the control plane's cast-token authorization
+    // (#418 review ABUSE-2), so both agree on what an output carries.
+    // No selection resolves to the program only (the default).
     let names: Vec<&str> = tracks.iter().map(|t| t.name.as_str()).collect();
-    let (program, mut chosen) = selection.resolve(&names);
-    let capacity = output.audio_capability().discrete_capacity;
-    let auto_capped = selection.mode == multiview_config::OutputAudioMode::Auto
-        && capacity != multiview_config::TrackCapacity::Unlimited;
-    if auto_capped || capacity == multiview_config::TrackCapacity::AtMost(0) {
-        chosen.clear();
-    }
+    let (program, chosen) = output.carried_audio(&names);
     multiview_output::AudioSelection {
         program,
         tracks: tracks
@@ -15143,6 +15573,32 @@ fn output_audio_selection(
     }
 }
 
+/// A cast output's audio selection (#418): [`output_audio_selection`] (the
+/// HLS rules), where an audio slot's `language` wins over its track route's,
+/// plus slot 0's language (the program rendition's).
+fn cast_audio_selection(
+    output: &Output,
+    tracks: &[DeclaredTrack],
+) -> (multiview_output::AudioSelection, Option<String>) {
+    let mut selection = output_audio_selection(output, tracks);
+    let slots = output.slots().map_or(&[][..], |s| s.audio.as_slice());
+    for slot in slots.iter().skip(1) {
+        let (Some(name), Some(language)) = (slot.track.as_deref(), slot.language.as_ref()) else {
+            continue;
+        };
+        for chosen in &mut selection.tracks {
+            if tracks
+                .get(usize::from(chosen.index))
+                .is_some_and(|t| t.name == name)
+            {
+                chosen.language = Some(language.clone());
+            }
+        }
+    }
+    let program_language = slots.first().and_then(|slot| slot.language.clone());
+    (selection, program_language)
+}
+
 /// Apply each configured output's audio selection to its muxing runnable
 /// (matched by stable output id).
 fn apply_output_audio_selections(
@@ -15155,8 +15611,19 @@ fn apply_output_audio_selections(
             RunnableOutput::File { id, sink, .. }
             | RunnableOutput::Hls { id, sink, .. }
             | RunnableOutput::Push { id, sink, .. } => (id.as_str(), sink),
-            // Program audio only: nothing to select.
-            RunnableOutput::Cast { .. } => continue,
+            // #418: a cast stream carries the selection like HLS, with the
+            // audio slots' languages.
+            RunnableOutput::Cast {
+                id,
+                audio,
+                program_language,
+                ..
+            } => {
+                if let Some(output) = outputs.iter().find(|o| o.id() == *id) {
+                    (*audio, *program_language) = cast_audio_selection(output, tracks);
+                }
+                continue;
+            }
             #[cfg(feature = "webrtc-native")]
             RunnableOutput::WebRtc { .. } => continue,
             #[cfg(feature = "ndi-bindings")]
@@ -15700,6 +16167,17 @@ fn ingest_plan_for(
                     .to_owned(),
             });
         }
+        // ADR-M012: a media-player source never opens anything; the build
+        // aliases it to its player's store (`bind_media_player_sources`) and the
+        // control drain does the same live. Reaching here is a wiring bug.
+        SourceKind::MediaPlayer { player } => {
+            return Err(PipelineError::Ingest {
+                id: source.id.clone(),
+                reason: format!(
+                    "media_player source aliases player {player:?}; it has no ingest of its own"
+                ),
+            });
+        }
         // `SourceKind` is `#[non_exhaustive]`; a future kind is unsupported here
         // until explicitly wired (never silently mishandled).
         _ => {
@@ -15778,6 +16256,48 @@ fn map_eof_policy(policy: multiview_config::media::EofPolicy) -> crate::player::
         // `HoldLastFrame` (the default) and any future `#[non_exhaustive]` variant
         // this build does not know about both hold the last-good frame.
         _ => P::HoldLastFrame,
+    }
+}
+
+/// `media_player` source id -> player id for every such source (ADR-M012).
+fn media_player_source_aliases(
+    config: &MultiviewConfig,
+) -> std::collections::HashMap<String, String> {
+    config
+        .sources
+        .iter()
+        .filter_map(|source| match &source.kind {
+            SourceKind::MediaPlayer { player } => Some((source.id.clone(), player.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Resolve each `media_player` source id to its player's frame store, so cells,
+/// switcher buses and routing crosspoints naming the source sample the player
+/// channel the player boot owns. Nothing is opened. A player that did not boot
+/// (journal owned elsewhere, bad cadence) gets a never-fed store: the source
+/// reads as no-signal and the build still succeeds. A source whose id equals
+/// its player's is the player's own entry (identity alias).
+fn bind_media_player_sources(
+    aliases: &std::collections::HashMap<String, String>,
+    stores: &mut HashMapStores,
+) {
+    for (source, player) in aliases {
+        if source == player && stores.contains_key(player) {
+            continue;
+        }
+        let store = stores.get(player).map_or_else(
+            || {
+                tracing::warn!(
+                    source = %source, player = %player,
+                    "media_player source bound to a player that did not boot; it reads no-signal"
+                );
+                crate::source_rails::empty_store(source)
+            },
+            Arc::clone,
+        );
+        stores.insert(source.clone(), store);
     }
 }
 
@@ -15926,7 +16446,18 @@ fn build_media_player_boot_with_state(
             }
         };
 
-        let (tile_w, tile_h) = cell_pixel_size(layout, &player.id)
+        // Cells bind the player directly or through a `media_player` source
+        // alias (ADR-M012): size to the per-axis supremum over both.
+        let (tile_w, tile_h) = config
+            .sources
+            .iter()
+            .filter(|source| {
+                matches!(&source.kind, SourceKind::MediaPlayer { player: p } if *p == player.id)
+            })
+            .map(|source| source.id.as_str())
+            .chain(std::iter::once(player.id.as_str()))
+            .filter_map(|id| cell_pixel_size(layout, id))
+            .reduce(|(aw, ah), (bw, bh)| (aw.max(bw), ah.max(bh)))
             .unwrap_or((config.canvas.width, config.canvas.height));
         let store = Arc::new(TileStore::new(
             player.id.clone(),
@@ -18444,7 +18975,13 @@ fn ingest_loop(plan: &IngestPlan, stop: &AtomicBool) {
     // for one (ADR-0039 decision 10, amended) — so this is unreachable there.
     #[cfg(feature = "srt-libsrt")]
     let _srt_listener = match &plan.location {
-        SourceLocation::Url(url) if multiview_output::sink::is_srt_listener_url(url) => {
+        // Below the libsrt security floor no bridge is started at all (its
+        // thread could only retry a refusal that never clears); the open below
+        // reports the reason instead.
+        SourceLocation::Url(url)
+            if multiview_output::sink::is_srt_listener_url(url)
+                && multiview_srt_sys::listener_floor_check().is_ok() =>
+        {
             crate::srt_ingest::acquire(url).ok()
         }
         _ => None,
@@ -19615,6 +20152,11 @@ fn open_and_stream(
             // is unreachable in that build and compiled out.
             #[cfg(feature = "srt-libsrt")]
             let open_url = if multiview_output::sink::is_srt_listener_url(&open_url) {
+                // Security floor (GHSA-m96h-3rc9-xx6h, ADR-0114 decision 4): on
+                // a libsrt below 1.5.7 fail this open with the
+                // `srt-libsrt-too-old` reason (both versions), which the
+                // reconnect bracket logs against the source and backs off.
+                multiview_srt_sys::listener_floor_check().map_err(|e| e.to_string())?;
                 let reader = crate::srt_ingest::acquire(&open_url)?.open_reader()?;
                 let url = reader.url().to_owned();
                 _srt_reader = Some(reader);
@@ -21873,9 +22415,23 @@ impl LiveStamper {
 /// (linear). Every other store still joins the bus at zero gain so its discrete
 /// track is metered (mute ≠ unroute; an operator routes by the meter). With no
 /// routes, every store rides at unity. Sorted by id.
+#[cfg(test)]
 pub(crate) fn program_bus_gains<'a>(
     ids: impl Iterator<Item = &'a str>,
     routing: Option<&multiview_config::AudioRouting>,
+) -> Vec<(String, f64)> {
+    program_bus_gains_aliased(ids, routing, &std::collections::HashMap::new())
+}
+
+/// [`program_bus_gains`] where a route may name a `media_player` source alias
+/// (ADR-M012): `aliases` maps alias id -> player id, and the player's single
+/// bus channel takes the first included, unmuted route naming either the
+/// player or one of its aliases (exactly the unaliased rule). One channel, one
+/// gain: a player is never mixed twice however many aliases route it.
+pub(crate) fn program_bus_gains_aliased<'a, S: std::hash::BuildHasher>(
+    ids: impl Iterator<Item = &'a str>,
+    routing: Option<&multiview_config::AudioRouting>,
+    aliases: &std::collections::HashMap<String, String, S>,
 ) -> Vec<(String, f64)> {
     let mut ids: Vec<&str> = ids.collect();
     ids.sort_unstable();
@@ -21888,9 +22444,13 @@ pub(crate) fn program_bus_gains<'a>(
             // Every input is on the bus so it is METERED (an operator picks what
             // to route by its meter), but only an included, unmuted route is
             // MIXED: everything else rides at zero program gain.
+            let names = |r: &&multiview_config::AudioRoute| {
+                r.input_id == id || aliases.get(&r.input_id).is_some_and(|p| p == id)
+            };
             let gain = routes
                 .iter()
-                .find(|r| r.input_id == id && r.include_in_program_bus && !r.mute)
+                .filter(names)
+                .find(|r| r.include_in_program_bus && !r.mute)
                 .map_or(0.0, |r| {
                     10f64.powf(f64::from(r.gain_db.clamp(-96.0, 24.0)) / 20.0)
                 });
@@ -26880,6 +27440,168 @@ loop_default = true
 /// publish + hold path must share the decoded frame by `Arc` handle, never copy
 /// the NV12 pixel planes per frame. Pure store + image logic (no libav).
 #[cfg(test)]
+/// Issue #474 / ADR-M012: a `media_player` source binds a cell (and any
+/// bus/crosspoint naming it) to its player channel, opening nothing.
+mod media_player_source_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::Pipeline;
+    use multiview_config::MultiviewConfig;
+    use std::sync::Arc;
+
+    fn config(source_id: &str) -> MultiviewConfig {
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "30000/1001"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr", "1fr"]
+rows = ["1fr"]
+areas = ["a b"]
+[[sources]]
+id = "{source_id}"
+kind = "media_player"
+player = "vt-1"
+[[sources]]
+id = "cam"
+kind = "bars"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "{source_id}"
+[[cells]]
+id = "cell_b"
+area = "b"
+[cells.source]
+input_id = "cam"
+[[media_players]]
+id = "vt-1"
+[[outputs]]
+kind = "hls"
+path = "/tmp/media-player-source.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##
+        );
+        let config = MultiviewConfig::load_from_toml(&doc).expect("parse");
+        config.validate().expect("validates");
+        config
+    }
+
+    #[test]
+    fn a_media_player_source_builds_and_its_cell_samples_the_player_store() {
+        let _budget = crate::player::budget_test_guard();
+        let pipeline = Pipeline::build(&config("vt-a")).expect("media_player source builds");
+        let alias = pipeline.stores.get("vt-a").expect("alias store registered");
+        let player = pipeline
+            .stores
+            .get("vt-1")
+            .expect("player store registered");
+        assert!(
+            Arc::ptr_eq(alias, player),
+            "the source id resolves to the player's own TileStore"
+        );
+        // Opens nothing: the only ingest plan under either id is the player's.
+        assert!(pipeline.ingest_plans.iter().all(|plan| plan.id != "vt-a"));
+        assert!(pipeline
+            .ingest_plans
+            .iter()
+            .any(|plan| plan.id == "vt-1" && plan.player.is_some()));
+        assert!(
+            !pipeline.catalogue.load().contains_key("vt-a"),
+            "demand never manages the alias"
+        );
+        // The solved layout's cell binds the source id, which the drive's
+        // store map resolves to the player's store.
+        let bound = pipeline
+            .layout
+            .cells
+            .iter()
+            .find_map(|cell| cell.source.as_deref().filter(|id| *id == "vt-a"))
+            .expect("a cell binds the media_player source");
+        assert!(Arc::ptr_eq(&pipeline.stores[bound], player));
+        assert_eq!(
+            pipeline.player_aliases.get("vt-a").map(String::as_str),
+            Some("vt-1")
+        );
+        // The player tile is sized from the alias-bound cell, not the canvas.
+        let plan = pipeline
+            .ingest_plans
+            .iter()
+            .find(|plan| plan.id == "vt-1")
+            .unwrap();
+        assert_eq!((plan.tile_w, plan.tile_h), (32, 64));
+    }
+
+    #[test]
+    fn a_source_sharing_its_player_id_is_the_player_channel() {
+        let _budget = crate::player::budget_test_guard();
+        let pipeline = Pipeline::build(&config("vt-1")).expect("own-id binding builds");
+        assert!(pipeline.stores.contains_key("vt-1"));
+        assert_eq!(
+            pipeline
+                .ingest_plans
+                .iter()
+                .filter(|plan| plan.id == "vt-1")
+                .count(),
+            1,
+            "exactly one producer: the player's"
+        );
+    }
+
+    /// Review C3: a configured route naming the alias gives the player's
+    /// channel (the only one on the bus for it) the route's gain at startup.
+    #[test]
+    fn a_configured_route_through_the_alias_gains_the_player_channel() {
+        let _budget = crate::player::budget_test_guard();
+        let mut doc = config("vt-a").to_toml().unwrap();
+        doc.push_str(
+            "\n[audio]\nsample_rate_hz = 48000\n[[audio.routes]]\ninput_id = \"vt-a\"\n\
+             channels = { kind = \"stereo\" }\ninclude_in_program_bus = true\ngain_db = -6.0\n",
+        );
+        let config = MultiviewConfig::load_from_toml(&doc).expect("parse");
+        config.validate().expect("an alias route validates");
+        let pipeline = Pipeline::build(&config).expect("builds");
+        assert!(
+            pipeline.audio_stores.contains_key("vt-1")
+                && !pipeline.audio_stores.contains_key("vt-a"),
+            "one bus channel per player, keyed by the player"
+        );
+        let gains = super::program_bus_gains_aliased(
+            pipeline.audio_stores.keys().map(String::as_str),
+            pipeline.audio_routing.as_ref(),
+            &pipeline.player_aliases,
+        );
+        let vt1 = gains
+            .iter()
+            .find(|(id, _)| id == "vt-1")
+            .expect("vt-1 on the bus")
+            .1;
+        assert!((vt1 - 10f64.powf(-6.0 / 20.0)).abs() < 1e-9, "{gains:?}");
+        assert!(
+            gains.iter().all(|(id, _)| id != "vt-a"),
+            "never mixed twice"
+        );
+    }
+
+    #[test]
+    fn a_player_that_did_not_boot_degrades_the_source_to_no_signal() {
+        let mut stores = super::HashMapStores::new();
+        let aliases = std::collections::HashMap::from([("vt-a".to_owned(), "vt-1".to_owned())]);
+        super::bind_media_player_sources(&aliases, &mut stores);
+        let store = stores.get("vt-a").expect("alias still registered");
+        assert!(!store.is_primed(), "a never-fed store reads no-signal");
+    }
+}
+
+#[cfg(test)]
 mod media_player_handle_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -30381,6 +31103,9 @@ loop_default = true
             assert_eq!(code, 202, "{raw}");
             let failed = poll(v["operation"].as_u64().unwrap()).await;
             assert_eq!(failed["state"], "failed", "{failed}");
+            // Issue #474: the failure is typed, and its detail never leaks a path.
+            assert!(failed["reason"].is_string(), "{failed}");
+            assert!(!failed["detail"].as_str().unwrap().contains('/'), "{failed}");
             assert_eq!(handle.control_bus.load().clip_epoch, epoch_a, "failed load keeps A");
             let still = match store.read_at(anchor_a) {
                 TileRead::Fresh { frame } | TileRead::Held { frame, .. } => frame.y_plane()[0],
@@ -31423,6 +32148,14 @@ loop_default = true
         let slot = Arc::clone(&rig.runtime.audio_commit);
         let closer = Arc::clone(&slot);
         slot.before_claim_for_test(Box::new(move || {
+            // The ingest claims on every poll after its PREPARE put, and the
+            // live audio thread acknowledges on its own cadence: on a loaded
+            // host the first claim can precede the ack (#478, #497). Park the
+            // ingest (bounded) until the ack lands, so the close is exactly
+            // "after the PREPARE ack, before the claim takes the gate".
+            wait("the audio rail acknowledged PREPARE", &|| {
+                closer.is_prepared(closer.pending_generation())
+            });
             assert!(
                 closer.is_prepared(closer.pending_generation()),
                 "closed after the PREPARE ack"

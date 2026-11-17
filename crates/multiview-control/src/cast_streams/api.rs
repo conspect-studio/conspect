@@ -2,7 +2,10 @@
 //! never across an `.await`.
 
 use super::reauth::Need;
-use super::registry::{Claim, ClaimError, Ended, Entry, Registry, ReportError, Slot, StreamView};
+use super::registry::{
+    Admitted, Claim, ClaimError, Ended, Entry, LadderError, Registry, ReportError, SinkMark, Slot,
+    StreamView,
+};
 use super::{
     bounded_user_agent, token, CastFetches, CastStreams, ReceiverFetch, ReceiverReport,
     CREATE_BURST, CREATE_REFILL, MAX_LIFETIME, MAX_LIMITED_PRINCIPALS, MAX_STREAMS,
@@ -103,10 +106,24 @@ pub struct SlotView {
 }
 
 impl CastStreams {
-    /// Expire streams and end lingers: the outputs to deactivate.
+    /// Expire streams and end lingers: the outputs to deactivate. Without
+    /// the engine's sink status no superseded grant is forgotten
+    /// ([`Self::sweep_with`]).
     pub fn sweep(&self) -> Vec<Ended> {
         let now = self.now_ms();
-        self.lock().sweep(now)
+        self.lock().sweep(now, None)
+    }
+
+    /// [`Self::sweep`] with `sinks`, the engine status of every cast
+    /// output (`None`: unavailable): a superseded grant set is forgotten
+    /// only once its output's sink provably replaced its media (#418 review
+    /// ABUSE-HISTORY-R4).
+    pub(crate) fn sweep_with(
+        &self,
+        sinks: Option<&std::collections::HashMap<String, SinkMark>>,
+    ) -> Vec<Ended> {
+        let now = self.now_ms();
+        self.lock().sweep(now, sinks)
     }
 
     /// Admit one stream creation by `principal` (burst [`CREATE_BURST`],
@@ -179,7 +196,7 @@ impl CastStreams {
     ) -> Result<Claim, ClaimError> {
         let now = self.now_ms();
         let mut inner = self.lock();
-        inner.sweep(now);
+        inner.sweep(now, None);
         if inner.entries.len() >= MAX_STREAMS {
             return Err(ClaimError::Capacity);
         }
@@ -226,6 +243,7 @@ impl CastStreams {
             principal: None,
             origin: None,
             generation: None,
+            ladder: super::ladder::LadderState::default(),
         });
         Ok(Claim { id, token, first })
     }
@@ -262,8 +280,10 @@ impl CastStreams {
     }
 
     /// The gate of output `config_id` for arming a token (created at a
-    /// fresh generation on first use).
-    pub(crate) fn arm_snapshot(&self, config_id: &str) -> Arm {
+    /// fresh generation on first use); `sink`: the output's engine status
+    /// now (`None`: unavailable, no superseded grant is forgotten).
+    pub(crate) fn arm_snapshot(&self, config_id: &str, sink: Option<SinkMark>) -> Arm {
+        let now = self.now_ms();
         let mut inner = self.lock();
         // No gate (over [`super::MAX_GATES`]): nothing is cleared and
         // arming finds no gate either, so the creation is refused.
@@ -272,9 +292,12 @@ impl CastStreams {
                 generation: 0,
                 needs: None,
             },
-            |gate| Arm {
-                generation: gate.generation,
-                needs: gate.cleared_needs(),
+            |gate| {
+                gate.prune(now, sink.as_ref());
+                Arm {
+                    generation: gate.generation,
+                    needs: gate.cleared_needs(),
+                }
             },
         )
     }
@@ -368,11 +391,13 @@ impl CastStreams {
     /// section: a new generation, the change carried (what the output may
     /// now carry, until an outcome settles it), every armed token
     /// re-authorized for it and moved to the new generation or revoked.
-    /// Nothing to do on an output without streams. Returns the revoked.
+    /// Nothing to do on an output without streams. `sink`: the output's
+    /// engine status now (`None`: unavailable). Returns the revoked.
     pub(crate) fn commit(
         &self,
         config_id: &str,
         change: Change,
+        sink: Option<SinkMark>,
         check: Check<'_>,
     ) -> Vec<(OwnedStream, &'static str)> {
         let now = self.now_ms();
@@ -388,8 +413,13 @@ impl CastStreams {
             Self::recheck(&mut inner, config_id, None, false, check, &mut revoked, now);
             return revoked;
         };
+        gate.prune(now, sink.as_ref());
         while gate.carry.len() >= super::MAX_CARRY {
-            gate.carry.pop_front();
+            // Forgotten, not settled: its media may still be on air or
+            // retained, so its grants stay required (ABUSE-HISTORY-R4).
+            if let Some(old) = gate.carry.pop_front() {
+                gate.retire(old.needs, now, sink.as_ref());
+            }
         }
         gate.carry.push_back(super::registry::Carry {
             op: change.op,
@@ -397,7 +427,8 @@ impl CastStreams {
             needs: change.needs,
         });
         // Every token at the new generation is authorized for EVERYTHING
-        // the output may carry now (the invariant of [`super::registry::Gate`]).
+        // the output may carry now or still serves (the invariant of
+        // [`super::registry::Gate`]).
         let needs = gate.cleared_needs();
         Self::recheck(
             &mut inner,
@@ -415,7 +446,9 @@ impl CastStreams {
     /// [`ChangeMode`]). When the armed tokens were not already authorized
     /// for all of it (or on [`ChangeMode::Recheck`]), every one is
     /// re-authorized in the same critical section — at a new generation
-    /// when the needs are new. Returns the revoked.
+    /// when the needs are new. `sink`: the output's engine status now
+    /// (`None`: unavailable). Returns the revoked.
+    #[allow(clippy::too_many_arguments)] // One critical section's inputs.
     pub(crate) fn observe(
         &self,
         config_id: &str,
@@ -423,6 +456,7 @@ impl CastStreams {
         bus: &str,
         needs: Option<Vec<Need>>,
         mode: ChangeMode,
+        sink: Option<SinkMark>,
         check: Check<'_>,
     ) -> Vec<(OwnedStream, &'static str)> {
         let now = self.now_ms();
@@ -438,16 +472,21 @@ impl CastStreams {
             Self::recheck(&mut inner, config_id, None, false, check, &mut revoked, now);
             return revoked;
         };
+        gate.prune(now, sink.as_ref());
         let covered = match (&needs, gate.cleared_needs()) {
             (Some(needs), Some(cleared)) => needs.iter().all(|n| cleared.contains(n)),
             _ => false,
         };
+        // What is settled or carried here moves to the history, not away:
+        // its media may stay servable until the sink replaced it
+        // (ABUSE-HISTORY-R4). Only narrowing on the history's own expiry.
         if mode == ChangeMode::Outcome {
-            gate.settle(op);
+            gate.settle(op, now, sink.as_ref());
         }
-        gate.settled = Some((bus.to_owned(), needs));
+        gate.replace_settled((bus.to_owned(), needs), now, sink.as_ref());
         if !covered || mode == ChangeMode::Recheck {
-            // What the output may carry now, under the current grants.
+            // What the output may carry now or still serves, under the
+            // current grants.
             let all = gate.cleared_needs();
             Self::recheck(
                 &mut inner,
@@ -460,6 +499,17 @@ impl CastStreams {
             );
         }
         revoked
+    }
+
+    /// Whether every armed token on `config_id` is authorized for all of
+    /// `needs` (the media path's check of the subtitle readback, #418).
+    #[must_use]
+    pub(crate) fn covers(&self, config_id: &str, needs: &[Need]) -> bool {
+        self.lock()
+            .gates
+            .get(config_id)
+            .and_then(super::registry::Gate::cleared_needs)
+            .is_some_and(|cleared| needs.iter().all(|n| cleared.contains(n)))
     }
 
     /// Whether every armed token on `config_id` is authorized for the
@@ -494,6 +544,17 @@ impl CastStreams {
             .iter()
             .filter(|e| e.config_id == config_id && !e.expired(now) && inner.servable(e))
             .count()
+    }
+
+    /// TEST SEAM: the superseded grant sets output `config_id` still
+    /// requires (#418 review ABUSE-HISTORY-R4).
+    #[cfg(any(test, feature = "_test-seams"))]
+    #[must_use]
+    pub fn history_len(&self, config_id: &str) -> usize {
+        self.lock()
+            .gates
+            .get(config_id)
+            .map_or(0, |g| g.history.len())
     }
 
     /// The generation of output `config_id` (`None`: no gate; tests).
@@ -591,10 +652,12 @@ impl CastStreams {
     }
 
     /// What a public request with `token` may be served (ABUSE-1): the
-    /// stream id and output config id of a live token armed at its output's
-    /// CURRENT generation, else `None` (the same 404 as an unknown token).
+    /// stream id, output config id and generation of a live token armed at
+    /// its output's CURRENT generation, else `None` (the same 404 as an
+    /// unknown token). Callers go through [`super::reauth::admit`], which runs
+    /// the re-authorization barrier first.
     #[must_use]
-    pub fn serve(&self, token: &str) -> Option<(String, String)> {
+    pub fn serve(&self, token: &str) -> Option<Admitted> {
         if !token::well_formed(token) {
             return None;
         }
@@ -602,9 +665,98 @@ impl CastStreams {
         let inner = self.lock();
         let at = inner.find(token, now)?;
         let entry = inner.entries.get(at)?;
-        inner
-            .servable(entry)
-            .then(|| (entry.id.clone(), entry.config_id.clone()))
+        if !inner.servable(entry) {
+            return None;
+        }
+        Some(Admitted {
+            stream_id: entry.id.clone(),
+            config_id: entry.config_id.clone(),
+            generation: entry.generation?,
+        })
+    }
+
+    /// Take one ladder call on stream `id` (the caller admitted its token):
+    /// one per [`super::ladder::LADDER_REFILL_MS`], burst
+    /// [`super::ladder::LADDER_BURST`]. Run BEFORE the body is validated, so
+    /// an invalid call costs its sender the same.
+    ///
+    /// # Errors
+    /// [`LadderError`].
+    pub fn admit_ladder(&self, id: &str) -> Result<(), LadderError> {
+        let now = self.now_ms();
+        let mut inner = self.lock();
+        let entry = inner
+            .entries
+            .iter_mut()
+            .find(|e| e.id == id && !e.expired(now))
+            .ok_or(LadderError::Unknown)?;
+        if entry.ladder.admit(now) {
+            Ok(())
+        } else {
+            Err(LadderError::TooSoon)
+        }
+    }
+
+    /// Record an answered ladder call on stream `id`: its probe (a full
+    /// call), the rung offered and the receiver's `failed`. A stream with a
+    /// live push attachment counts the call as a playlist fetch for its
+    /// liveness (ADR-0114 decision 5.5).
+    ///
+    /// # Errors
+    /// [`LadderError::Unknown`] when the stream is gone.
+    pub fn record_ladder(
+        &self,
+        id: &str,
+        request: super::ladder::LadderRequest,
+        offered: Option<&str>,
+    ) -> Result<(), LadderError> {
+        let now = self.now_ms();
+        let mut inner = self.lock();
+        let entry = inner
+            .entries
+            .iter_mut()
+            .find(|e| e.id == id && !e.expired(now))
+            .ok_or(LadderError::Unknown)?;
+        if let Some(probe) = request.probe {
+            entry.ladder.probe = Some(probe);
+        }
+        if let Some(rung) = offered {
+            entry.ladder.offered(rung, request.failed, now);
+        }
+        Self::push_liveness(entry, now);
+        Ok(())
+    }
+
+    /// A stream with a live push attachment is live as long as its receiver
+    /// keeps calling (decision 5.5); without one, only a playlist fetch is.
+    fn push_liveness(entry: &mut Entry, now: u64) {
+        if entry.ladder.push_attachments > 0 {
+            entry.last_playlist_ms = Some(now);
+        }
+    }
+
+    /// Register a push attachment (`moq`, `webrtc`, `srt`) on stream `id`: from
+    /// now on a ladder call or report keeps its token live. No rung of this
+    /// build attaches; the later rungs call this. `false`: no such stream.
+    pub fn attach_push(&self, id: &str) -> bool {
+        let now = self.now_ms();
+        let mut inner = self.lock();
+        let Some(entry) = inner
+            .entries
+            .iter_mut()
+            .find(|e| e.id == id && !e.expired(now))
+        else {
+            return false;
+        };
+        entry.ladder.push_attachments = entry.ladder.push_attachments.saturating_add(1);
+        true
+    }
+
+    /// End a push attachment of stream `id` (see [`Self::attach_push`]).
+    pub fn detach_push(&self, id: &str) {
+        if let Some(entry) = self.lock().entries.iter_mut().find(|e| e.id == id) {
+            entry.ladder.push_attachments = entry.ladder.push_attachments.saturating_sub(1);
+        }
     }
 
     /// Count a successful fetch on stream `id`; a playlist moves it to
@@ -654,10 +806,14 @@ impl CastStreams {
         }
         inner.last_report_ms.insert(id, now);
         if let Some(entry) = inner.entries.get_mut(at) {
+            if let Some(transport) = super::ladder::parse_transport_report(&report) {
+                entry.ladder.reported(transport, now);
+            }
             entry.last_report = Some(ReceiverReport {
                 received_unix_ms: now,
                 report,
             });
+            Self::push_liveness(entry, now);
         }
         Ok(())
     }

@@ -43,8 +43,8 @@ use multiview_ffmpeg::idr::{self, CodecKind, NalFraming, ParameterSetScan, RapPa
 use multiview_ffmpeg::EncodedPacket;
 use multiview_output::passthrough::clock::MAX_DRAIN_PER_TICK;
 use multiview_output::passthrough::{
-    BridgeReason, ClockState, Emission, PassthroughClock, RepeatSource, SlateLoop, SlotGate, TapAu,
-    TapReader, MAX_AU_BYTES,
+    BridgeReason, ClockState, Emission, MatchMiss, PassthroughClock, RepeatSource, SlateLoop,
+    SlotGate, SlotSpec, SourceTraits, StreamMeter, TapAu, TapReader, MAX_AU_BYTES,
 };
 
 use crate::output_routing::LiveEncoder;
@@ -100,7 +100,7 @@ impl PassthroughState {
 }
 
 /// The bridge reason codes on [`PassthroughStatus::reason`] (0 = none).
-fn reason_code(reason: BridgeReason) -> u8 {
+pub(crate) fn reason_code(reason: BridgeReason) -> u8 {
     match reason {
         BridgeReason::NotArmed => 1,
         BridgeReason::AwaitingIdr => 2,
@@ -141,8 +141,9 @@ pub fn reason_from_code(code: u8) -> Option<BridgeReason> {
 pub struct PassthroughStatus {
     state: AtomicU8,
     reason: AtomicU8,
-    /// Ticks between the emitted AU's source time and the tick (the clock's
-    /// jitter-buffer depth at emission; 0 on the slate).
+    /// Ticks between the emitted AU's arrival (its source time on the run's
+    /// clock) and the tick it is emitted on (D2b: exact, from the AU's own
+    /// `arrival_ns`; a repeat keeps the previous AU's; 0 on the slate).
     delay_ticks: AtomicU32,
     /// The last tick emitted.
     last_tick: AtomicU64,
@@ -160,6 +161,66 @@ pub struct PassthroughStatus {
     pub param_changes: AtomicU64,
     /// AUs dropped by drift corrections.
     pub drift_drops: AtomicU64,
+    /// The match verdict of the key's meter (D2b): 0 = not evaluated (no
+    /// matcher), 1 = matches, else a [`MatchMiss`] code ([`miss_code`]).
+    verdict: AtomicU8,
+    /// Runs may start only at a tick at or after this one (D2b router
+    /// control; 0 = always, `u64::MAX` = never). A run start is a move
+    /// point, so the router lets one happen only after it asked the
+    /// dispatcher for the move (a run that started earlier is never one).
+    allow_from: AtomicU64,
+    /// Consecutive on-time ticks seen by the clock's stability probe.
+    stable: AtomicU32,
+    /// The parameter generation of the last run (0 = none yet).
+    run_gen: AtomicU64,
+    /// The parameter generation of the newest AU drained.
+    latest_gen: AtomicU64,
+    /// Re-arm requests (D2b): the key drops a run nobody reads so that the
+    /// next strict IDR starts a new run (a move point).
+    rearm: AtomicU64,
+}
+
+/// The wire code of a [`MatchMiss`] on [`PassthroughStatus`] (2..).
+#[must_use]
+pub const fn miss_code(miss: MatchMiss) -> u8 {
+    match miss {
+        MatchMiss::NotCfr => 2,
+        MatchMiss::CodecDiffers => 3,
+        MatchMiss::ProfileAbove => 4,
+        MatchMiss::LevelAbove => 5,
+        MatchMiss::SizeDiffers => 6,
+        MatchMiss::RateDiffers => 7,
+        MatchMiss::ScanDiffers => 8,
+        MatchMiss::ColourDiffers => 9,
+        MatchMiss::DepthOrChroma => 10,
+        MatchMiss::GopTooLong => 11,
+        MatchMiss::BitrateAbove => 12,
+        MatchMiss::BFramesNotAllowed => 13,
+        MatchMiss::NoStrictRap => 14,
+        MatchMiss::NotEnoughHistory => 15,
+    }
+}
+
+/// The [`MatchMiss`] of a [`miss_code`].
+#[must_use]
+pub const fn miss_from_code(code: u8) -> Option<MatchMiss> {
+    Some(match code {
+        2 => MatchMiss::NotCfr,
+        3 => MatchMiss::CodecDiffers,
+        4 => MatchMiss::ProfileAbove,
+        5 => MatchMiss::LevelAbove,
+        6 => MatchMiss::SizeDiffers,
+        7 => MatchMiss::RateDiffers,
+        8 => MatchMiss::ScanDiffers,
+        9 => MatchMiss::ColourDiffers,
+        10 => MatchMiss::DepthOrChroma,
+        11 => MatchMiss::GopTooLong,
+        12 => MatchMiss::BitrateAbove,
+        13 => MatchMiss::BFramesNotAllowed,
+        14 => MatchMiss::NoStrictRap,
+        15 => MatchMiss::NotEnoughHistory,
+        _ => return None,
+    })
 }
 
 impl PassthroughStatus {
@@ -185,6 +246,55 @@ impl PassthroughStatus {
     #[must_use]
     pub fn last_tick(&self) -> u64 {
         self.last_tick.load(Ordering::Acquire)
+    }
+
+    /// The meter's verdict: `None` before the first evaluation (or with no
+    /// matcher), `Some(Ok(()))` when the source matches the slot.
+    #[must_use]
+    pub fn verdict(&self) -> Option<Result<(), MatchMiss>> {
+        match self.verdict.load(Ordering::Acquire) {
+            0 => None,
+            1 => Some(Ok(())),
+            code => Some(Err(
+                miss_from_code(code).unwrap_or(MatchMiss::NotEnoughHistory)
+            )),
+        }
+    }
+
+    /// Let runs start from tick `tick` on (`u64::MAX`: none).
+    pub fn allow_runs_from(&self, tick: u64) {
+        self.allow_from.store(tick, Ordering::Release);
+    }
+
+    /// Ask the key to end its current run and wait for the next strict IDR
+    /// (a fresh run start, i.e. a move point). Only for a key no output
+    /// reads: the router never re-arms a subscribed key.
+    pub fn request_rearm(&self) {
+        self.rearm.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The tick runs may start from.
+    #[must_use]
+    pub fn runs_allowed_from(&self) -> u64 {
+        self.allow_from.load(Ordering::Acquire)
+    }
+
+    /// Consecutive on-time ticks of the source (the clock's probe).
+    #[must_use]
+    pub fn stable_ticks(&self) -> u32 {
+        self.stable.load(Ordering::Acquire)
+    }
+
+    /// The parameter generation of the last run (0 = none).
+    #[must_use]
+    pub fn run_gen(&self) -> u64 {
+        self.run_gen.load(Ordering::Acquire)
+    }
+
+    /// The parameter generation of the newest AU the key drained.
+    #[must_use]
+    pub fn latest_gen(&self) -> u64 {
+        self.latest_gen.load(Ordering::Acquire)
     }
 }
 
@@ -326,15 +436,29 @@ pub struct PassthroughSpec {
 /// The slot gate a key uses until D2b's router supplies the match verdict:
 /// parameters match when the key is told so ([`PassthroughLive::set_matching`]),
 /// and the matched slate is the format slate, ready from open.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct KeyGate {
     /// `params_gen` values that match the slot (`None` = every generation).
     matching: Option<u64>,
+    /// This tick's meter verdict (`true` with no matcher).
+    verdict_ok: bool,
+    /// Whether a run may start this tick ([`PassthroughStatus::allow_runs_from`]).
+    allowed: bool,
+}
+
+impl Default for KeyGate {
+    fn default() -> Self {
+        Self {
+            matching: None,
+            verdict_ok: true,
+            allowed: true,
+        }
+    }
 }
 
 impl SlotGate for KeyGate {
     fn matches(&self, gen: u64) -> bool {
-        self.matching.is_none_or(|m| m == gen)
+        self.allowed && self.verdict_ok && self.matching.is_none_or(|m| m == gen)
     }
     fn matched_slate_ready(&self, _gen: u64) -> bool {
         true
@@ -420,6 +544,32 @@ impl Iterator for PrimedDrain<'_> {
 /// A source of monotonic nanoseconds for the clock (the run's time source).
 pub type NowNs = Box<dyn Fn() -> u64 + Send>;
 
+/// The current stream traits of the key's source (wait-free; `None` while
+/// the source has no connection).
+pub type TraitsFn = Box<dyn Fn() -> Option<SourceTraits> + Send>;
+
+/// The D2b match rules on the key's own worker: every drained AU feeds the
+/// meter, and the shared predicate (`evaluate_relaxed`) is re-run at most once per
+/// [`VERDICT_EVERY`] ticks (bounded work per tick).
+struct Matcher {
+    slot: SlotSpec,
+    traits: TraitsFn,
+    meter: StreamMeter,
+    last_eval: Option<u64>,
+    /// The parameter generation the meter measures (a new one, a reconnect
+    /// included, restarts the measurement from scratch).
+    meter_gen: Option<u64>,
+    /// The generation whose full verdict passed once. For it, and only for
+    /// it, `not-cfr` is not a miss: a stall leaves a DTS gap in the 10 s
+    /// window, and the clock's own 30 / 300 on-time ticks decide the return
+    /// (§12.5). Every other rule (GOP, strict RAPs, bitrate, B-frames,
+    /// traits) is checked on every evaluation (review R1-M-1).
+    matched_gen: Option<u64>,
+}
+
+/// Ticks between two verdict evaluations.
+pub const VERDICT_EVERY: u64 = 5;
+
 /// The passthrough routing key. See the [module docs](self).
 pub struct PassthroughLive {
     cadence: Rational,
@@ -436,7 +586,23 @@ pub struct PassthroughLive {
     stream_params: Option<multiview_ffmpeg::StreamCodecParameters>,
     /// The next tick `encode` must see (strictly increasing).
     next: Option<u64>,
+    /// The match rules (D2b; `None` = the gate's `matching` only).
+    matcher: Option<Matcher>,
+    /// Whether a slate IDR is a move point (D2a default `true`; the router's
+    /// keys move only at run starts).
+    slate_raps: bool,
+    /// The last re-arm request served.
+    rearm_seen: u64,
+    /// The arrival time of the AUs drained recently (bounded: the clock
+    /// holds at most `JITTER_MAX` plus one tick's drain), to find the
+    /// emitted AU's source time by identity.
+    arrivals: std::collections::VecDeque<(Arc<[u8]>, u64)>,
+    /// The delay of the last emitted source AU (a repeat keeps it).
+    last_delay: u32,
 }
+
+/// Arrival entries kept ([`PassthroughLive::arrivals`]).
+const ARRIVALS: usize = multiview_output::passthrough::clock::JITTER_MAX + MAX_DRAIN_PER_TICK;
 
 impl std::fmt::Debug for PassthroughLive {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -497,7 +663,35 @@ impl PassthroughLive {
             now_ns,
             stream_params: spec.stream_params,
             next: None,
+            matcher: None,
+            slate_raps: true,
+            rearm_seen: 0,
+            arrivals: std::collections::VecDeque::with_capacity(ARRIVALS + 1),
+            last_delay: 0,
         })
+    }
+
+    /// Evaluate the §12.5 match rules on this key's own meter against `slot`
+    /// (D2b): a run starts only while they pass. The verdict is published
+    /// on the status ([`PassthroughStatus::verdict`]).
+    #[must_use]
+    pub fn with_matcher(mut self, slot: SlotSpec, traits: TraitsFn) -> Self {
+        self.matcher = Some(Matcher {
+            slot,
+            traits,
+            meter: StreamMeter::new(),
+            last_eval: None,
+            meter_gen: None,
+            matched_gen: None,
+        });
+        self
+    }
+
+    /// Whether the slate's IDR is a move point (default `true`).
+    #[must_use]
+    pub fn with_slate_move_points(mut self, on: bool) -> Self {
+        self.slate_raps = on;
+        self
     }
 
     /// The key's lock-free status.
@@ -529,8 +723,17 @@ impl PassthroughLive {
     }
 
     /// One tick: exactly one packet stamped `dts == tick`.
+    #[allow(clippy::too_many_lines)]
+    // reason: the one per-tick sequence (re-arm, drain, meter, gate, clock,
+    // status, emission); each step is a few lines and order-dependent.
     fn tick(&mut self, tick: u64) -> Result<EncodedPacket, PipelineError> {
         let now = (self.now_ns)();
+        let rearm = self.status.rearm.load(Ordering::Acquire);
+        if rearm != self.rearm_seen {
+            self.rearm_seen = rearm;
+            self.clock.disarm();
+            self.clock.arm();
+        }
         // Every drained AU primes the repeat builder of its generation first
         // (bounded: the clock takes at most MAX_DRAIN_PER_TICK per tick).
         let mut primed = PrimedDrain {
@@ -544,6 +747,58 @@ impl PassthroughLive {
             *slot = Some(au);
             n += 1;
         }
+        for au in drained.iter().take(n).filter_map(Option::as_ref) {
+            self.arrivals
+                .push_back((Arc::clone(&au.data), au.arrival_ns));
+            if self.arrivals.len() > ARRIVALS {
+                self.arrivals.pop_front();
+            }
+        }
+        if let Some(last) = drained.get(n.wrapping_sub(1)).and_then(Option::as_ref) {
+            self.status
+                .latest_gen
+                .store(last.params_gen, Ordering::Release);
+        }
+        if let Some(m) = self.matcher.as_mut() {
+            for au in drained.iter().take(n).filter_map(Option::as_ref) {
+                if m.meter_gen != Some(au.params_gen) {
+                    m.meter_gen = Some(au.params_gen);
+                    m.meter = StreamMeter::new();
+                    m.matched_gen = None;
+                    // Re-evaluate at once: never act on the old verdict.
+                    m.last_eval = None;
+                }
+                m.meter
+                    .push(au.dts, au.pts, au.data.len(), au.strict_idr, au.time_base);
+            }
+            if m.last_eval
+                .is_none_or(|t| tick.saturating_sub(t) >= VERDICT_EVERY)
+            {
+                m.last_eval = Some(tick);
+                let relaxed = m.matched_gen.is_some() && m.matched_gen == m.meter_gen;
+                // Only the CFR rule is relaxed (a stall's gap); every other
+                // rule runs (review R2-M-1a).
+                let verdict = (m.traits)().map_or(Err(MatchMiss::NotEnoughHistory), |traits| {
+                    multiview_output::passthrough::evaluate_relaxed(
+                        &traits, &m.meter, &m.slot, relaxed,
+                    )
+                });
+                if verdict.is_ok() && m.matched_gen.is_none() {
+                    m.matched_gen = m.meter_gen;
+                }
+                // Review R2-M-1b: a source that stops matching while a run
+                // is on air ends the run onto the slate on this tick (the
+                // gate keeps it off runs until it matches again).
+                if verdict.is_err() && self.clock.state() == ClockState::Passthrough {
+                    self.clock.disarm();
+                    self.clock.arm();
+                }
+                self.gate.verdict_ok = verdict.is_ok();
+                let code = verdict.map_or_else(miss_code, |()| 1);
+                self.status.verdict.store(code, Ordering::Release);
+            }
+        }
+        self.gate.allowed = tick >= self.status.allow_from.load(Ordering::Acquire);
         let emission = self.clock.on_tick(
             tick,
             now,
@@ -557,8 +812,9 @@ impl PassthroughLive {
         s.stalls.store(c.stalls, Ordering::Relaxed);
         s.param_changes.store(c.param_changes, Ordering::Relaxed);
         s.drift_drops.store(c.drift_drops, Ordering::Relaxed);
+        s.stable.store(self.clock.stable_ticks(), Ordering::Release);
         s.last_tick.store(tick, Ordering::Release);
-        let depth = u32::try_from(self.clock.last_depth()).unwrap_or(u32::MAX);
+        let period_ns = period_ns(self.cadence);
         let (packet, state, reason, delay) = match emission {
             Emission::Au {
                 data,
@@ -566,7 +822,7 @@ impl PassthroughLive {
                 pts,
                 keyframe,
                 run_start,
-                ..
+                params_gen,
             } => {
                 self.on_slate = false;
                 if run_start
@@ -575,12 +831,21 @@ impl PassthroughLive {
                 {
                     self.raps.record(dts);
                 }
+                if run_start {
+                    s.run_gen.store(params_gen, Ordering::Release);
+                }
                 s.aus.fetch_add(1, Ordering::Relaxed);
+                // Exact source-time delay: ticks since this AU arrived.
+                if let Some(&(_, arrived)) =
+                    self.arrivals.iter().find(|(d, _)| Arc::ptr_eq(d, &data))
+                {
+                    self.last_delay = delay_ticks(now, arrived, period_ns);
+                }
                 (
                     Self::packet(&data, dts, pts, keyframe),
                     PassthroughState::Passthrough,
                     0,
-                    depth,
+                    self.last_delay,
                 )
             }
             Emission::Repeat { data, dts, pts } => {
@@ -590,7 +855,7 @@ impl PassthroughLive {
                     Self::packet(&data, dts, pts, false),
                     PassthroughState::Repeat,
                     0,
-                    depth,
+                    self.last_delay,
                 )
             }
             Emission::Bridge { dts, pts, reason } => {
@@ -607,9 +872,15 @@ impl PassthroughLive {
                         reason: "slate stamp".to_owned(),
                     })?;
                 s.slate_ticks.fetch_add(1, Ordering::Relaxed);
-                if au.keyframe {
+                if au.keyframe && self.slate_raps {
                     self.raps.record(au.dts);
                 }
+                // While the verdict fails, that is why it bridges.
+                let reason = if self.gate.verdict_ok {
+                    reason
+                } else {
+                    BridgeReason::ParametersNoLongerMatch
+                };
                 (
                     Self::packet(&au.data, au.dts, au.pts, au.keyframe),
                     PassthroughState::Slate,
@@ -623,6 +894,26 @@ impl PassthroughLive {
         s.delay_ticks.store(delay, Ordering::Release);
         Ok(packet)
     }
+}
+
+/// One output tick in nanoseconds (integer, rounded down; 0 for a degenerate
+/// cadence).
+fn period_ns(cadence: Rational) -> u64 {
+    let (num, den) = (i128::from(cadence.num), i128::from(cadence.den));
+    if num <= 0 || den <= 0 {
+        return 0;
+    }
+    u64::try_from(1_000_000_000 * den / num).unwrap_or(0)
+}
+
+/// Whole ticks from `arrived` to `now` (rounded to the nearest tick, 0 when
+/// it arrived in the future or the period is unknown).
+fn delay_ticks(now: u64, arrived: u64, period_ns: u64) -> u32 {
+    if period_ns == 0 {
+        return 0;
+    }
+    let age = now.saturating_sub(arrived);
+    u32::try_from(age.saturating_add(period_ns / 2) / period_ns).unwrap_or(u32::MAX)
 }
 
 impl VideoEncodeWorker for PassthroughLive {
@@ -1149,7 +1440,15 @@ mod tests {
             ])
             .arg("testsrc2=size=160x120:rate=25")
             .args(["-frames:v", &frames.to_string(), "-pix_fmt", "yuv420p"])
-            .args(["-c:v", "libx264", "-preset", "veryfast", "-x264-params"])
+            .args([
+                "-threads",
+                "1",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-x264-params",
+            ])
             .arg("aud=1:keyint=10:min-keyint=10:scenecut=0:bframes=0:repeat-headers=1")
             .args(["-f", "h264"])
             .arg(&path)
@@ -1287,5 +1586,545 @@ mod tests {
         assert!(run.iter().any(|(s, _)| *s == PassthroughState::Repeat));
         let frames = decoded_frames(run.iter().map(|(_, au)| au.as_slice()));
         assert_eq!(frames, run.len(), "every AU and repeat decodes");
+    }
+
+    fn matched_key() -> (CompressedTap, PassthroughLive, Arc<AtomicU64>) {
+        use multiview_output::passthrough::match_rules::{ColourTags, PassCodec, Scan};
+        let tags = ColourTags {
+            primaries: Some(1),
+            transfer: Some(1),
+            matrix: Some(1),
+            range: Some(0),
+        };
+        let slot = SlotSpec {
+            codec: PassCodec::H264,
+            max_profile: 100,
+            max_level: 51,
+            width: 16,
+            height: 16,
+            fps: CADENCE,
+            scan: Scan::Progressive,
+            colour: tags,
+            bit_depth: 8,
+            chroma: 1,
+            bitrate_ceiling_kbps: 50,
+            max_gop_ticks: 60,
+            b_frames_allowed: true,
+        };
+        let traits = SourceTraits {
+            codec: PassCodec::H264,
+            profile: 100,
+            constraint_flags: 0,
+            level: 31,
+            width: 16,
+            height: 16,
+            frame_rate: CADENCE,
+            scan: Scan::Progressive,
+            colour: tags,
+            bit_depth: 8,
+            chroma: 1,
+        };
+        let tap = CompressedTap::new();
+        let reader = tap.subscribe().unwrap();
+        let now = Arc::new(AtomicU64::new(0));
+        let clock_now = Arc::clone(&now);
+        let live = PassthroughLive::new(
+            PassthroughSpec {
+                cadence: CADENCE,
+                codec: CodecKind::H264,
+                stream_params: None,
+            },
+            reader,
+            &slate(),
+            Box::new(move || clock_now.load(Ordering::Acquire)),
+        )
+        .unwrap()
+        .with_matcher(slot, Box::new(move || Some(traits.clone())));
+        (tap, live, now)
+    }
+
+    /// Feed frame `k` (IDR every 30 unless `no_idr`, `pad` extra bytes) and
+    /// encode tick `k`.
+    fn feed_tick(
+        tap: &CompressedTap,
+        live: &mut PassthroughLive,
+        now: &AtomicU64,
+        k: u64,
+        (pad, no_idr, gen): (usize, bool, u64),
+    ) {
+        now.store(k * TICK_NS, Ordering::Release);
+        let key = !no_idr && k % 30 == 0;
+        let mut data = if key { idr_au(SPS_A, 1) } else { p_au(1) };
+        data.extend(std::iter::repeat_n(0x55_u8, pad));
+        let dts = i64::try_from(k).unwrap() * FRAME;
+        tap.offer(TapAu {
+            data: Arc::from(data),
+            dts,
+            pts: dts,
+            time_base: Rational::new(1, 90_000),
+            strict_idr: key,
+            reference: true,
+            params_gen: gen,
+            arrival_ns: k * TICK_NS,
+        });
+        let canvas = Arc::new(
+            Nv12Image::solid(
+                2,
+                2,
+                16,
+                128,
+                128,
+                multiview_core::color::ColorInfo::default(),
+            )
+            .unwrap(),
+        );
+        live.encode(BakedTick { tick: k, canvas }).unwrap();
+    }
+
+    /// Review R1-M-1: after the verdict first passed, the measured rules
+    /// still hold: a source whose bitrate rises above the ceiling, or that
+    /// stops sending IDRs, stops matching; a DTS gap (a stall) alone does
+    /// not; a new parameter generation is measured again from scratch.
+    #[test]
+    fn the_verdict_keeps_checking_bitrate_gop_and_raps_after_it_passed() {
+        let (tap, mut live, now) = matched_key();
+        let status = live.status();
+        for k in 0..300 {
+            feed_tick(&tap, &mut live, &now, k, (0, false, 1));
+        }
+        assert_eq!(status.verdict(), Some(Ok(())), "matched after 10 s");
+        // A stall: 20 frames missing. The gap alone keeps the match.
+        for k in 320..400 {
+            feed_tick(&tap, &mut live, &now, k, (0, false, 1));
+        }
+        assert_eq!(status.verdict(), Some(Ok(())), "a DTS gap is not a miss");
+        // Bitrate far above 50 kbit/s for 12 s: no longer matches.
+        for k in 400..700 {
+            feed_tick(&tap, &mut live, &now, k, (4_000, false, 1));
+        }
+        assert_eq!(
+            status.verdict(),
+            Some(Err(MatchMiss::BitrateAbove)),
+            "the bitrate is still checked"
+        );
+        // Back to a low rate (12 s) matches again; then no IDR for 3 s.
+        for k in 700..1000 {
+            feed_tick(&tap, &mut live, &now, k, (0, false, 1));
+        }
+        assert_eq!(status.verdict(), Some(Ok(())));
+        for k in 1000..1100 {
+            feed_tick(&tap, &mut live, &now, k, (0, true, 1));
+        }
+        assert_eq!(status.verdict(), Some(Err(MatchMiss::GopTooLong)));
+        // A new parameter generation starts the measurement over.
+        for k in 1100..1110 {
+            feed_tick(&tap, &mut live, &now, k, (0, false, 2));
+        }
+        assert_eq!(status.verdict(), Some(Err(MatchMiss::NotEnoughHistory)));
+    }
+
+    /// Review R2-M-1b: a verdict that fails while a run is on air ends the
+    /// run onto the slate on the same tick (never keeps passing a source
+    /// that no longer matches); the run returns only once it matches again.
+    #[test]
+    fn a_failing_verdict_ends_the_run_onto_the_slate() {
+        let (tap, mut live, now) = matched_key();
+        let status = live.status();
+        for k in 0..300 {
+            feed_tick(&tap, &mut live, &now, k, (0, false, 1));
+        }
+        assert_eq!(status.state(), PassthroughState::Passthrough);
+        let mut failed_at = None;
+        for k in 300..700 {
+            feed_tick(&tap, &mut live, &now, k, (4_000, false, 1));
+            if failed_at.is_none() && status.verdict().is_some_and(|v| v.is_err()) {
+                failed_at = Some(k);
+                assert_eq!(
+                    status.state(),
+                    PassthroughState::Slate,
+                    "tick {k}: the slate on the tick the verdict failed"
+                );
+                assert_eq!(status.reason(), Some(BridgeReason::ParametersNoLongerMatch));
+            } else if failed_at.is_some() {
+                assert_eq!(status.state(), PassthroughState::Slate, "tick {k}");
+            }
+        }
+        assert!(failed_at.is_some(), "the bitrate rule failed");
+        // Back under the ceiling: it matches again and a new run starts.
+        for k in 700..1100 {
+            feed_tick(&tap, &mut live, &now, k, (0, false, 1));
+        }
+        assert_eq!(status.verdict(), Some(Ok(())));
+        assert_eq!(status.state(), PassthroughState::Passthrough);
+    }
+
+    /// Review R2-M-1a: after a stall gap (the window is not CFR), a source
+    /// whose bitrate rises above the ceiling in the SAME window stops
+    /// matching: relaxing CFR never skips the rules after it.
+    #[test]
+    fn a_gap_never_hides_a_later_rule() {
+        let (tap, mut live, now) = matched_key();
+        let status = live.status();
+        for k in 0..300 {
+            feed_tick(&tap, &mut live, &now, k, (0, false, 1));
+        }
+        assert_eq!(status.verdict(), Some(Ok(())));
+        // A gap, then heavy frames while the gap is still in the window.
+        for k in 320..400 {
+            feed_tick(&tap, &mut live, &now, k, (4_000, false, 1));
+        }
+        assert_eq!(
+            status.verdict(),
+            Some(Err(MatchMiss::BitrateAbove)),
+            "the gap does not hide the bitrate rule"
+        );
+    }
+
+    /// #344 D2b: the published delay is the emitted AU's exact source-time
+    /// age: frame k arrives on tick k and a run starts `TARGET_DEPTH` ticks
+    /// later, so a steady run publishes exactly `TARGET_DEPTH`.
+    #[test]
+    fn the_published_delay_is_the_emitted_aus_source_age() {
+        let (log, _, status) = run(
+            120,
+            Script {
+                stall: 0..0,
+                change: u64::MAX,
+            },
+        );
+        assert_eq!(log.last().unwrap().state, PassthroughState::Passthrough);
+        assert_eq!(
+            u64::from(status.delay_ticks()),
+            multiview_output::passthrough::clock::TARGET_DEPTH
+        );
+    }
+
+    /// #344 D2b (f), end to end with real media: a libx264 file (made by the
+    /// ffmpeg CLI: 29.97 fps, GOP 30, no B-frames, 160x120) is demuxed by
+    /// libav into the real `TapWriter`; a real `PassthroughLive` (its own
+    /// matcher on, slate baked by libx264 when linked) emits one packet per
+    /// tick at the 30000/1001 cadence, through a source stall; the packets
+    /// are muxed to live TS HLS by the real segment sink; `ffprobe` reads
+    /// the segments: every video packet's DTS delta is exactly one tick
+    /// (3003 at 90 kHz), and the passthrough AUs are the source AUs
+    /// byte for byte. Without libx264 (CI's LGPL image) the slate bake must
+    /// fail (no key opens: the documented no-slate behaviour, the output
+    /// stays on its encoded path); the rest runs on a slate cut from the
+    /// fixture's own first GOP so the muxing and cadence are still proven.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    // reason: one end-to-end scenario (fixture, demux, key, mux, probe).
+    fn hls_p0_end_to_end_dts_is_one_tick_and_aus_are_the_source_bytes() {
+        struct Feed(std::vec::IntoIter<EncodedPacket>);
+        impl multiview_output::sink::PacketSource for Feed {
+            fn next_packet(&mut self) -> multiview_output::Result<Option<EncodedPacket>> {
+                Ok(self.0.next())
+            }
+        }
+        use multiview_output::passthrough::match_rules::{ColourTags, PassCodec, Scan};
+        const FPS: Rational = Rational::new(30_000, 1_001);
+        const TICK: u64 = 33_366_667; // ns, rounded
+        multiview_ffmpeg::ensure_initialized().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.ts");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg("testsrc2=size=160x120:rate=30000/1001:duration=30")
+            .args([
+                "-pix_fmt", "yuv420p", "-threads", "1", "-c:v", "libx264", "-preset", "veryfast",
+            ])
+            .args([
+                "-x264-params",
+                "keyint=30:min-keyint=30:scenecut=0:bframes=0:repeat-headers=1:colorprim=bt709:transfer=bt709:colormatrix=bt709:range=tv",
+            ])
+            .args([
+                "-color_primaries",
+                "bt709",
+                "-color_trc",
+                "bt709",
+                "-colorspace",
+                "bt709",
+            ])
+            .args(["-color_range", "tv", "-b:v", "300k", "-f", "mpegts"])
+            .arg(&src)
+            .status()
+            .expect("spawn ffmpeg (the CLI has libx264 in CI)");
+        assert!(status.success());
+        // Demux every video packet into the real tap writer.
+        let mut input = ffmpeg_next::format::input(&src).unwrap();
+        let stream = input
+            .streams()
+            .best(ffmpeg_next::media::Type::Video)
+            .unwrap();
+        let index = stream.index();
+        let params = stream.parameters();
+        let (codec, framing) = multiview_ffmpeg::stream_framing(&params).unwrap();
+        let raw = multiview_ffmpeg::video_stream_facts(&params);
+        let mux_params =
+            multiview_ffmpeg::StreamCodecParameters::from_parameters(&params, Some((160, 120)));
+        let facts = crate::passthrough_tap::OpenFacts {
+            codec,
+            framing,
+            time_base: multiview_ffmpeg::from_ff_rational(stream.time_base()),
+            frame_rate: FPS,
+            profile: raw.profile,
+            level: raw.level,
+            width: raw.width,
+            height: raw.height,
+            color_primaries: raw.color_primaries,
+            color_trc: raw.color_trc,
+            color_space: raw.color_space,
+            color_range: raw.color_range,
+            field_order: raw.field_order,
+            bits_per_raw_sample: raw.bits_per_raw_sample,
+            extradata: raw.extradata,
+            extradata_oversize: raw.extradata_oversize,
+        };
+        drop(params);
+        let tap = Arc::new(crate::passthrough_tap::SourceTap::new());
+        let reader = tap.tap().subscribe().unwrap();
+        let arrival = Arc::new(AtomicU64::new(0));
+        let a = Arc::clone(&arrival);
+        let mut writer = crate::passthrough_tap::TapWriter::connect(
+            Arc::clone(&tap),
+            facts,
+            Box::new(move || Some(a.load(Ordering::Acquire))),
+        );
+        let packets: Vec<(Vec<u8>, i64, i64, bool)> = input
+            .packets()
+            .filter(|(s, _)| s.index() == index)
+            .map(|(_, p)| {
+                (
+                    p.data().unwrap().to_vec(),
+                    p.dts().unwrap(),
+                    p.pts().unwrap(),
+                    p.is_key(),
+                )
+            })
+            .collect();
+        assert!(packets.len() >= 890, "{} packets", packets.len());
+        // The slate: libx264 when linked; otherwise the documented failure.
+        let slot_cfg = multiview_output::sink::EncodeConfig {
+            codec_name: "libx264".to_owned(),
+            width: 160,
+            height: 120,
+            format: ffmpeg_next::format::Pixel::YUV420P,
+            cadence: FPS,
+            gop: 30,
+            bit_rate: 300_000,
+            audio: None,
+            cuda_ordinal: None,
+        };
+        let black = Nv12Image::solid(
+            160,
+            120,
+            16,
+            128,
+            128,
+            multiview_core::color::ColorInfo::default(),
+        )
+        .unwrap();
+        let baked = bake_slate(&slot_cfg, &black, CodecKind::H264);
+        let x264 = ffmpeg_next::encoder::find_by_name("libx264").is_some();
+        let slate = if x264 {
+            baked.expect("libx264 linked: the slate bakes")
+        } else {
+            assert!(baked.is_err(), "no libx264: the bake fails (no key opens)");
+            // A stand-in slate for the mux check: the fixture's first GOP.
+            let mut gop = Vec::new();
+            for (data, ..) in packets.iter().take(30) {
+                gop.push(
+                    idr::to_annex_b(data, framing, MAX_AU_BYTES)
+                        .unwrap()
+                        .to_vec(),
+                );
+            }
+            FormatSlate::new(gop, CodecKind::H264).unwrap()
+        };
+        let now = Arc::new(AtomicU64::new(0));
+        let n2 = Arc::clone(&now);
+        let tags = ColourTags {
+            primaries: Some(1),
+            transfer: Some(1),
+            matrix: Some(1),
+            range: Some(0),
+        };
+        let slot = SlotSpec {
+            codec: PassCodec::H264,
+            max_profile: 100,
+            max_level: 51,
+            width: 160,
+            height: 120,
+            fps: FPS,
+            scan: Scan::Progressive,
+            colour: tags,
+            bit_depth: 8,
+            chroma: 1,
+            bitrate_ceiling_kbps: 2_000,
+            max_gop_ticks: 60,
+            b_frames_allowed: true,
+        };
+        let traits_tap = Arc::clone(&tap);
+        let mut live = PassthroughLive::new(
+            PassthroughSpec {
+                cadence: FPS,
+                codec: CodecKind::H264,
+                stream_params: None,
+            },
+            reader,
+            &slate,
+            Box::new(move || n2.load(Ordering::Acquire)),
+        )
+        .unwrap()
+        .with_matcher(
+            slot,
+            Box::new(move || traits_tap.stream().map(|s| s.traits.clone())),
+        )
+        .with_slate_move_points(false);
+        let status = live.status();
+        live.start_at(0);
+        // Frame k arrives on tick k, except a 15-frame stall at 370 (after
+        // the first match: 10 s of history is 300 frames).
+        let canvas = Arc::new(
+            Nv12Image::solid(
+                2,
+                2,
+                16,
+                128,
+                128,
+                multiview_core::color::ColorInfo::default(),
+            )
+            .unwrap(),
+        );
+        let ticks = u64::try_from(packets.len()).unwrap();
+        let mut out = Vec::new();
+        let mut emitted: Vec<(PassthroughState, Vec<u8>)> = Vec::new();
+        for t in 0..ticks {
+            let t_ns = t * TICK;
+            now.store(t_ns, Ordering::Release);
+            arrival.store(t_ns, Ordering::Release);
+            if !(370..385).contains(&t) {
+                let (data, dts, pts, key) = &packets[usize::try_from(t).unwrap()];
+                writer.on_packet(data, Some(*dts), Some(*pts), *key);
+            }
+            let p = live
+                .encode(BakedTick {
+                    tick: t,
+                    canvas: Arc::clone(&canvas),
+                })
+                .unwrap();
+            assert_eq!(p.len(), 1, "tick {t}: one packet");
+            assert_eq!(p[0].dts(), Some(i64::try_from(t).unwrap()));
+            emitted.push((status.state(), p[0].payload().unwrap().to_vec()));
+            out.extend(p);
+        }
+        assert_eq!(
+            status.verdict(),
+            Some(Ok(())),
+            "the real source matches its slot"
+        );
+        assert!(
+            status.runs.load(Ordering::Relaxed) >= 2,
+            "a run, a stall and a return"
+        );
+        assert!(status.stalls.load(Ordering::Relaxed) >= 1);
+        // Passthrough AU bytes are the source AU bytes (Annex B, as the
+        // tap re-frames; TS input is Annex B already).
+        let source: std::collections::HashSet<Vec<u8>> = packets
+            .iter()
+            .map(|(d, ..)| idr::to_annex_b(d, framing, MAX_AU_BYTES).unwrap().to_vec())
+            .collect();
+        let passed: Vec<&Vec<u8>> = emitted
+            .iter()
+            .filter(|(s, _)| *s == PassthroughState::Passthrough)
+            .map(|(_, d)| d)
+            .collect();
+        assert!(passed.len() > 300, "{} AUs passed through", passed.len());
+        assert!(
+            passed.iter().all(|d| source.contains(*d)),
+            "every passthrough AU equals a source AU byte for byte"
+        );
+        // The whole emitted sequence (slate, source runs, slate across the
+        // stall, the return run) is decodable by libav as one stream.
+        assert_eq!(
+            decoded_frames(emitted.iter().map(|(_, d)| d.as_slice())),
+            emitted.len(),
+            "every emitted packet (slate and source) decodes"
+        );
+        // Mux to live TS HLS and probe the segments.
+        // Only ever inside the test's own fresh temp dir.
+        let hls = dir.path().join("hls");
+        std::fs::create_dir_all(&hls).unwrap();
+        let sink = multiview_output::sink::PacketMuxSink::segment_live(
+            &hls,
+            "seg",
+            hls.join("index.m3u8"),
+            1_000,
+            multiview_output::SharedEpoch::new(),
+        );
+        sink.run(&mut Feed(out.into_iter()), &mux_params, live.time_base())
+            .unwrap();
+        // The segments the published media playlist lists (complete ones).
+        let playlist = std::fs::read_dir(&hls)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.starts_with("video-g")
+                        && std::path::Path::new(n)
+                            .extension()
+                            .is_some_and(|x| x.eq_ignore_ascii_case("m3u8"))
+                })
+            })
+            .unwrap_or_else(|| hls.join("index.m3u8"));
+        let text = std::fs::read_to_string(&playlist).unwrap();
+        let segs: Vec<std::path::PathBuf> = text
+            .lines()
+            .filter(|l| {
+                !l.starts_with('#')
+                    && std::path::Path::new(l)
+                        .extension()
+                        .is_some_and(|x| x.eq_ignore_ascii_case("ts"))
+            })
+            .map(|l| hls.join(l))
+            .collect();
+        assert!(segs.len() >= 20, "{segs:?}");
+        // Probed as a player reads them, as one stream (a segment cut short
+        // at a run start is too small for ffprobe alone to find the stream).
+        let joined = dir.path().join("joined.ts");
+        let mut bytes = Vec::new();
+        for seg in &segs {
+            bytes.extend(std::fs::read(seg).unwrap());
+        }
+        std::fs::write(&joined, bytes).unwrap();
+        let o = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries"])
+            .args(["packet=dts", "-of", "csv=p=0"])
+            .arg(&joined)
+            .output()
+            .expect("spawn ffprobe");
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let dts: Vec<i64> = String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|l| l.trim().trim_end_matches(',').parse::<i64>().ok())
+            .collect();
+        // The listed segments cover the run (window 1000 keeps all; the
+        // last, still open segment may be unlisted).
+        assert!(
+            u64::try_from(dts.len()).unwrap() + 2 * 30 >= ticks,
+            "{} of {ticks} packets in the listed segments",
+            dts.len()
+        );
+        for w in dts.windows(2) {
+            assert_eq!(w[1] - w[0], 3003, "DTS delta = one tick at 90 kHz: {w:?}");
+        }
     }
 }

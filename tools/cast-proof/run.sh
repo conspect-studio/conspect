@@ -3,8 +3,9 @@
 #   ./run.sh [--engine <multiview binary>] [--validator <cast_validate binary>] [--out <dir>] [--size WxH]
 #            [--cores N] [--seconds 60] [--serial | --parallel]
 #   ./run.sh --reference [run-all.sh options]   the ffmpeg reference stream + the harness's own server (fault tests)
-# Starts `multiview run` on a generated config (two bars sources, one HLS output, one cast output), a TLS proxy in
-# front of its control listener (Chrome needs an https receiver page), then checks (a)-(g). Exit code = number of
+# Starts `multiview run` on a generated config (two bars sources, a caption file source, one HLS output, one cast
+# output with 2 audio + 1 subtitle slot), a TLS proxy in front of its control listener (Chrome needs an https
+# receiver page), then checks (a)-(h). Exit code = number of
 # failed required checks. Every wait is bounded; everything started is killed and verified with pgrep.
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"; root="$(cd "$here/../.." && pwd)"
@@ -21,7 +22,7 @@ W="${size%x*}"; H="${size#*x}"
 # two browsers at once starve the encoder, so serial is the default there; parallel saves ~70 s on a big host.
 if [ -z "$serial" ]; then if [ -n "$cores" ] || [ -n "${CI:-}" ]; then serial=1; else serial=0; fi; fi
 [[ "$W" =~ ^[0-9]+$ && "$H" =~ ^[0-9]+$ ]] || { echo "--size must be WxH" >&2; exit 2; }
-[ -x "$engine" ] || { echo "engine binary not found: $engine (cargo build -p multiview-cli --features gpl-codecs)" >&2; exit 2; }
+[ -x "$engine" ] || { echo "engine binary not found: $engine (cargo build -p multiview-cli --features gpl-codecs,overlay)" >&2; exit 2; }
 [ -x "$validator" ] || { echo "validator not found: $validator (cargo build -p multiview-output --example cast_validate)" >&2; exit 2; }
 mkdir -p "$out"; out="$(cd "$out" && pwd)"
 pin=(); if [ -n "$cores" ]; then pin=(taskset -c "0-$((cores - 1))"); fi
@@ -50,7 +51,13 @@ timeout 60 node "$here/check-browser.mjs" || exit 93
 port="$(python3 -c 'import socket;s=socket.socket(socket.AF_INET6);s.bind(("::1",0));print(s.getsockname()[1])')"
 api="http://[::1]:$port"
 
-# --- (setup) the engine: canvas WxH at 30000/1001, two bars sources side by side on Program, HLS + cast outputs
+# --- (setup) the caption source of (h): video + 880 Hz tone + subrip cues "CAP <n> T=<2n>" (gen-captions.sh)
+timeout 180 "$here/gen-captions.sh" "$run_dir/captions.mkv" 1500 || { echo "gen-captions.sh failed" >&2; exit 92; }
+
+# --- (setup) the engine: canvas WxH at 30000/1001, two bars sources side by side on Program, HLS + cast outputs.
+# The cast output (#418) carries audio slot 0 = the program (en, NAME "Program"), slot 1 = the track "commentary"
+# (the caption file's 880 Hz tone; de, "Commentary") and one subtitle slot "English"/en patched to the caption
+# file `cc`, which no cell shows: the engine decodes it for its captions and its audio route all the same.
 cat > "$run_dir/cast.toml" <<EOF
 schema_version = 1
 [canvas]
@@ -72,6 +79,12 @@ kind = "bars"
 [[sources]]
 id = "b"
 kind = "bars"
+[[sources]]
+id = "cc"
+kind = "file"
+path = "$run_dir/captions.mkv"
+[sources.captions]
+mode = "auto"
 [[cells]]
 id = "cell_a"
 area = "a"
@@ -91,6 +104,30 @@ codec = "h264"
 kind = "cast"
 id = "cast-1"
 dir = "$run_dir/cast"
+[[outputs.slots.audio]]
+language = "en"
+[[outputs.slots.audio]]
+track = "commentary"
+language = "de"
+[[outputs.slots.subtitle]]
+name = "English"
+language = "en"
+source = "cc"
+[audio]
+sample_rate_hz = 48000
+[[audio.routes]]
+input_id = "a"
+channels = { kind = "stereo" }
+include_in_program_bus = true
+[[audio.routes]]
+input_id = "b"
+channels = { kind = "stereo" }
+include_in_program_bus = true
+[[audio.routes]]
+input_id = "cc"
+channels = { kind = "stereo" }
+target_track = "commentary"
+title = "Commentary"
 [control]
 listen = "[::1]:$port"
 EOF
@@ -121,10 +158,16 @@ run() {   # run <log name> <timeout s> <command...>: bounded, logged, never abor
   grep -E '^(RESULT|exit=)' "$log" | cut -c1-200
 }
 specs=()
+# probe.js unit checks (ADR-0114 slice 2): no browser
+run probe-unit 60 node "$here/test-probe-unit.mjs"
+specs+=("probe-unit=$out/probe-unit.log")
 node "$here/stream-health.mjs" "$S$media" > "$out/stream-health-before.json" 2>/dev/null
 # (a) the validator on the engine's cast directory
 { "$validator" "$run_dir/cast"; rc=$?; echo "RESULT {\"test\":\"validator\",\"pass\":$([ $rc = 0 ] && echo true || echo false),\"failed\":[$([ $rc = 0 ] || echo "\"cast_validate exit $rc\"")],\"parts\":[]}"; echo "exit=$rc"; } > "$out/validator.log" 2>&1
 specs+=("a-validator=$out/validator.log")
+# (a') receiver.js helpers that need no browser (report size in UTF-8 bytes)
+run test-receiver-unit 60 node "$here/test-receiver-unit.mjs"
+specs+=("a2-receiver-unit=$out/test-receiver-unit.log")
 # (b) Shaka 4.15.56, SDK default config, and (c) the real receiver SDK + the engine-served receiver: side by side
 if [ "$serial" = 1 ]; then
   run test-shaka $((seconds * 2 + 180)) node "$here/test-shaka.mjs" "$S$path" --seconds "$seconds" --sequential 1
@@ -139,6 +182,9 @@ specs+=("b-shaka-engine=$out/test-shaka.log" "c-receiver-engine=$out/test-receiv
 # is cross-origin to the engine (its CORS headers, for real)
 run test-receiver-default 300 node "$here/test-receiver-default.mjs" "$S$path" --seconds 30 --variants fmp4
 specs+=("d-default-receiver-engine=$out/test-receiver-default.log")
+# (h) tracks (#418): the validator's renditions + cues, Shaka (SDK defaults) audio switch + text, CAF receiver tracks
+run test-engine-tracks 280 node "$here/test-engine-tracks.mjs" --api "$api" --origin "$S" --stream "$id" --path "$path" --cast-dir "$run_dir/cast" --validator "$validator"
+specs+=("h-tracks-engine=$out/test-engine-tracks.log")
 node "$here/stream-health.mjs" "$S$media" > "$out/stream-health-after.json" 2>/dev/null   # (e)-(f) revoke this token
 # (e)-(g) takes during playback, revoke + restart, authz
 run test-engine 300 node "$here/test-engine.mjs" --api "$api" --origin "$S" --stream "$id" --path "$path" --cast-dir "$run_dir/cast" --validator "$validator" --width "$W" --proxy-log "$out/proxy.jsonl"

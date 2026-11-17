@@ -23,6 +23,7 @@
 //! Isolation (invariant #10): one short `Mutex`, never held across an
 //! `.await`; nothing here touches an engine channel.
 
+pub mod ladder;
 pub mod lifecycle;
 pub(crate) mod reauth;
 mod registry;
@@ -34,7 +35,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use registry::Registry;
-pub use registry::{Claim, ClaimError, Ended, ReportError, StreamView};
+pub(crate) use registry::SinkMark;
+pub use registry::{Admitted, Claim, ClaimError, Ended, LadderError, ReportError, StreamView};
 
 /// A never-fetched token expires this long after creation.
 pub const PENDING_TTL: Duration = Duration::from_secs(90);
@@ -66,6 +68,37 @@ pub const MAX_REVOKED: usize = 2 * MAX_STREAMS;
 /// Committed, unsettled feed changes remembered per output (oldest
 /// forgotten first, which only narrows what its tokens are served).
 pub const MAX_CARRY: usize = 8;
+/// The least time a superseded feed's grants stay required, in ms (#418
+/// review ABUSE-HISTORY-R4). A floor, never the expiry on its own: a
+/// superseded grant set is forgotten only once this has elapsed AND its
+/// output's sink provably replaced everything servable from that time
+/// (`registry::SinkMark`: a new generation, an inactive output, or
+/// [`RETIRE_SEGMENTS`] more video segments). A stalled sink therefore keeps
+/// it, however long. 2 x 10 x 4 s = 80 s of retained media at the nominal
+/// cadence, plus slack: 120 s.
+pub const MEDIA_RETENTION_MS: u64 = 120_000;
+/// The packager's playlist window (`multiview-cli` `cast_output::CAST_WINDOW`,
+/// which this crate cannot name; pinned by value in
+/// `retire_segments_match_the_packager_retention`).
+pub const CAST_WINDOW: u64 = 10;
+/// Video segments the packager publishes, after a mark, before every file
+/// servable at that mark is gone: it lists `CAST_WINDOW` segments and keeps
+/// the files of `2 * CAST_WINDOW` (`multiview_output::hls::cast`
+/// `retire_old_files`: `on_disk.len() > window * 2` unlinks the oldest
+/// segment with its audio and `.vtt` files, after each published video
+/// segment), and one more covers the segment being written at the mark.
+/// After that many, no `seg-*`/`sub*` file of the marked era is on disk and
+/// no playlist lists one.
+pub const RETIRE_SEGMENTS: u64 = 2 * CAST_WINDOW + 1;
+/// Superseded-feed grant sets remembered per output (an overflow merges
+/// into the oldest entry, never dropping a need early).
+pub const MAX_HISTORY: usize = MAX_CARRY;
+/// Distinct grants remembered across ALL of one output's superseded-feed
+/// grant sets (#418 review INV418-FINAL-1). Past it the history collapses
+/// to one undeterminable entry (`needs: None`: fails closed — new tokens are
+/// refused and rechecks revoke) that keeps the latest retention and sink
+/// mark, so it still expires normally.
+pub const MAX_HISTORY_NEEDS: usize = 256;
 /// Output authorization gates kept (one per cast output in practice).
 pub const MAX_GATES: usize = 64;
 /// The background sweep period (a lazy sweep also runs on every API call).
@@ -161,6 +194,8 @@ pub struct CastStreams {
     sweeper: std::sync::atomic::AtomicBool,
     /// The registered custom receiver app id (8 upper-case hex characters).
     app_id: Mutex<Option<String>>,
+    /// The rungs `[cast] ladder` enables, best first (ADR-0114).
+    ladder: Mutex<Vec<String>>,
     #[cfg(any(test, feature = "_test-seams"))]
     before_arm: Mutex<Option<ArmHook>>,
     #[cfg(any(test, feature = "_test-seams"))]
@@ -197,6 +232,7 @@ impl CastStreams {
             clock,
             sweeper: std::sync::atomic::AtomicBool::new(false),
             app_id: Mutex::new(None),
+            ladder: Mutex::new(vec!["hls".to_owned()]),
             #[cfg(any(test, feature = "_test-seams"))]
             before_arm: Mutex::new(None),
             #[cfg(any(test, feature = "_test-seams"))]
@@ -217,6 +253,21 @@ impl CastStreams {
     #[must_use]
     pub fn receiver_app_id(&self) -> Option<String> {
         self.app_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Set the rungs `[cast] ladder` enables, best first (already
+    /// validated).
+    pub fn set_ladder(&self, ladder: Vec<String>) {
+        *self.ladder.lock().unwrap_or_else(PoisonError::into_inner) = ladder;
+    }
+
+    /// The rungs `[cast] ladder` enables, best first.
+    #[must_use]
+    pub fn ladder(&self) -> Vec<String> {
+        self.ladder
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()

@@ -570,9 +570,9 @@ impl RunBackend {
     /// The number of reusable CPU band-scratch allocations since construction.
     /// The count may grow during warmup/resizes but stays constant across steady-
     /// state ticks (efficiency finding #6). For the GPU backend this is its
-    /// persistent per-frame CPU fallback's count (keyed frames until the GPU
-    /// key path lands, ADR-0113 K1); the GPU exposes its own surface-pool
-    /// counter.
+    /// persistent per-frame CPU fallback's count (a genuine GPU failure, or a
+    /// keyed frame past the GPU layer limit, ADR-0113 K1); the GPU exposes its
+    /// own surface-pool counter.
     #[doc(hidden)]
     #[must_use]
     pub fn scratch_alloc_count(&self) -> u64 {

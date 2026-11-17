@@ -66,8 +66,17 @@ export function streamUrl(path: string): string {
   return `${window.location.origin}${path}`;
 }
 
-/** The LOAD for a cast stream (fields per the stream doc; LIVE; fMP4). */
-export function buildLoadRequest(stream: CastStream, title: string): ChromeCastLoadRequest {
+/**
+ * The LOAD for a cast stream (fields per the stream doc; LIVE; fMP4).
+ * `trackPrefs` carries the operator's remembered audio/text choice
+ * (`{audioLanguage,audioName,textLanguage,textName}`) so a video switch on
+ * the same session keeps the language the receiver honours on LOAD.
+ */
+export function buildLoadRequest(
+  stream: CastStream,
+  title: string,
+  trackPrefs: Record<string, unknown> = {},
+): ChromeCastLoadRequest {
   const chromeCast = window.chrome?.cast;
   if (chromeCast === undefined) {
     throw new Error('chrome.cast is unavailable.');
@@ -83,7 +92,7 @@ export function buildLoadRequest(stream: CastStream, title: string): ChromeCastL
   // The doc names the formats in lower case (`fmp4`), as CAF's enum values are.
   media.hlsSegmentFormat = stream.hls_segment_format;
   media.hlsVideoSegmentFormat = stream.hls_video_segment_format;
-  media.customData = { title };
+  media.customData = { title, ...trackPrefs };
   const metadata = new chromeCast.media.GenericMediaMetadata();
   metadata.metadataType = chromeCast.media.MetadataType.GENERIC;
   metadata.title = title;

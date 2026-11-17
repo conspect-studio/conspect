@@ -954,6 +954,36 @@ pub struct SwitcherOperation {
     pub error: Option<String>,
 }
 
+/// A downstream keyer's state or definition changed (ADR-0113 §8, K4), topic
+/// `switcher`, envelope `id` = the keyer object id (`<program>/<keyer>`).
+/// Lossless, emitted only on committed state changes, never per ramp tick.
+/// Delivered only to principals that may read the M/E, the program and the
+/// keyer object; `fill` and `key` are replaced with `"redacted"` for a
+/// principal that may not read that source (the per-client projection).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwitcherKeyer {
+    /// M/E id the keyer is keyed on.
+    pub me: String,
+    /// Program the keyer belongs to.
+    pub program: String,
+    /// Keyer object id, `<program>/<keyer>` (e.g. `main/dsk1`).
+    pub keyer: String,
+    /// The committed output tick of the change.
+    pub tick: u64,
+    /// On air after the change.
+    pub on_air: bool,
+    /// Drawing a frozen last-good pair past its loss trigger.
+    pub stale: bool,
+    /// Why it changed: `operator`, `tie`, `on-at-start`, `source-lost`,
+    /// `source-recovered` or `definition`.
+    pub reason: String,
+    /// Fill source id (or `"redacted"`).
+    pub fill: String,
+    /// Key source id (or `"redacted"`); absent for a self key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
 /// The terminal outcome of one output feed take, or an unrequested fallback
 /// (ADR-0108 §6.2, topic [`crate::topic::Topic::Outputs`]). Lossless; delivered
 /// only to principals that may read the output (`AuthzScope::Object(output)`).
@@ -1809,6 +1839,17 @@ pub enum AuthzScope<'a> {
         /// entries only).
         output: &'a str,
     },
+    /// A keyer row (ADR-0113 §8, K4): the M/E object grant, the namespaced
+    /// program grant **and** the keyer object grant (`<program>/<keyer>`),
+    /// exactly as `GET /api/v1/switcher/{me}` filters `keyers[]`.
+    Keyer {
+        /// M/E resource id (object axis).
+        me: &'a str,
+        /// Program grant (`program:<id>` on the output axis).
+        program: &'a str,
+        /// Keyer object id (object axis).
+        keyer: &'a str,
+    },
 }
 
 /// The discriminated payload of every frame: control frames and data events.
@@ -1967,6 +2008,11 @@ pub enum Event {
     /// correlation. Lossless; a rejected operation never masquerades as applied.
     #[serde(rename = "switcher.operation")]
     SwitcherOperation(SwitcherOperation),
+    /// A downstream keyer changed (ADR-0113 §8, K4; topic `switcher`,
+    /// envelope `id` = keyer object id). Lossless; scoped by M/E, program and
+    /// keyer object, with unreadable source ids redacted per client.
+    #[serde(rename = "switcher.keyer")]
+    SwitcherKeyer(SwitcherKeyer),
     /// A media player's discrete transport state changed (topic `switcher`,
     /// envelope `id` = player id). A **lossless** lifecycle event kept in the
     /// replay ring ([`Event::is_conflated`] is `false`): cued / playing / paused /
@@ -2072,6 +2118,7 @@ impl Event {
             Self::SalvoTaken(_) => "salvo.taken",
             Self::SalvoCancelled(_) => "salvo.cancelled",
             Self::SwitcherOperation(_) => "switcher.operation",
+            Self::SwitcherKeyer(_) => "switcher.keyer",
             Self::MediaPlayerState(_) => "media.player_state",
             Self::GraphicsChannelState(_) => "graphics.channel_state",
             Self::CatalogueLinkStatus(_) => "catalogue.link_status",
@@ -2136,6 +2183,11 @@ impl Event {
             Self::SwitcherOperation(e) => AuthzScope::ObjectAndProgram {
                 object: &e.me,
                 program: &e.program,
+            },
+            Self::SwitcherKeyer(e) => AuthzScope::Keyer {
+                me: &e.me,
+                program: &e.program,
+                keyer: &e.keyer,
             },
             // A set outcome is delivered per destination with that
             // destination's scope (#308): an output on both of its axes, the

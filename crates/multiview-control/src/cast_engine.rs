@@ -20,7 +20,9 @@ pub struct CastOutputStatus {
     /// The master playlist and enough segments for a receiver to start are
     /// published.
     pub ready: bool,
-    /// The activation's generation (0 when inactive).
+    /// The generation in the names of the media files served now (#418
+    /// review r7: the running packager's, else one no file carries; it only
+    /// ever increases). Only files of this generation are served.
     pub generation: u64,
     /// Video segments published for this generation.
     pub video_segments: u64,
@@ -29,6 +31,10 @@ pub struct CastOutputStatus {
     /// The last error, if any. An output whose directory is not usable
     /// carries the reason here and cannot be activated.
     pub last_error: Option<String>,
+    /// The output is disabled for the run (its directory is unusable, or
+    /// its stream files could not be removed): nothing of it is served and
+    /// superseded grants never expire through it (#418 review r7).
+    pub disabled: bool,
     /// Encoded picture width in pixels.
     pub width: u32,
     /// Encoded picture height in pixels.
@@ -37,6 +43,20 @@ pub struct CastOutputStatus {
     pub fps_num: u32,
     /// Frame rate denominator.
     pub fps_den: u32,
+}
+
+/// One pair of the run's outbound presentation epoch (ADR-0114 decision 2,
+/// "Engine media time on each rung"): engine media time `E` (the output PTS
+/// in microseconds, tick-derived, one timeline per run) and the wall time
+/// the epoch maps it to, the same map that stamps `EXT-X-PROGRAM-DATE-TIME`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CastClock {
+    /// The epoch's step generation (changes when the epoch is stepped).
+    pub epoch_generation: u64,
+    /// Engine media time (µs).
+    pub media_us: i64,
+    /// Its wall time (µs since the Unix epoch).
+    pub wall_unix_us: i64,
 }
 
 /// Why the engine refused a cast request.
@@ -77,6 +97,15 @@ pub trait CastEngine: Send + Sync {
     /// # Errors
     /// [`CastEngineError`] when there is no run or no such output.
     fn deactivate(&self, id: &str) -> Result<(), CastEngineError>;
+
+    /// One epoch pair of output `id` at the wall time `wall_now_unix_ns`:
+    /// `None` when the run has no validated epoch (nothing is invented), or
+    /// no such output. A lock-free (or nanosecond-held) read of the cell the
+    /// sampler writes at about 1 Hz: never waits on the data plane.
+    fn clock(&self, id: &str, wall_now_unix_ns: i64) -> Option<CastClock> {
+        let _ = (id, wall_now_unix_ns);
+        None
+    }
 }
 
 /// A shared [`CastEngine`].

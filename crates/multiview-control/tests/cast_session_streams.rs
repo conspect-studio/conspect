@@ -114,6 +114,7 @@ impl CastEngine for FakeCast {
             video_segments: if active { 9 } else { 0 },
             dropped_packets: 0,
             last_error: None,
+            disabled: false,
             width: 640,
             height: 360,
             fps_num: 25,

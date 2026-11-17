@@ -14,11 +14,11 @@ use std::time::{Duration, Instant};
 
 use multiview_core::time::Rational;
 use multiview_core::wallclock::WallClockRef;
-use multiview_output::hls::cast::{CastAudioConfig, CastVideoConfig};
+use multiview_output::hls::cast::{CastAudioConfig, CastAudioRendition, CastVideoConfig};
 use multiview_output::hls::cast_check::{check_cast_dir, CastCheckReport};
 use multiview_output::SharedEpoch;
 
-use super::runner::{CastInput, CastInputKind, CastRunner, CastSetup};
+use super::runner::{CastAudioRoutes, CastInput, CastInputKind, CastRunner, CastSetup};
 use super::{
     claim_cast_dir, inspect_cast_dir, prepare_cast_dir, unix_nanos, CastDirState, CastGate,
     CastGateError, CAST_DIR_MARKER,
@@ -84,13 +84,22 @@ fn setup(dir: &Path, gate: &Arc<CastGate>, epoch: SharedEpoch, audio: bool) -> C
             bit_rate: Some(4_000_000),
             extradata: None,
         },
-        audio: audio.then_some(CastAudioConfig {
-            time_base: AUDIO_TB,
-            sample_rate: 48_000,
-            channels: 2,
-            bit_rate: Some(128_000),
-            audio_specific_config: None,
-        }),
+        audio: audio
+            .then_some(CastAudioRendition::program(CastAudioConfig {
+                time_base: AUDIO_TB,
+                sample_rate: 48_000,
+                channels: 2,
+                bit_rate: Some(128_000),
+                audio_specific_config: None,
+            }))
+            .into_iter()
+            .collect(),
+        audio_routes: CastAudioRoutes {
+            program: audio.then_some(0),
+            tracks: Vec::new(),
+        },
+        subtitles: Vec::new(),
+        subtitle_feed: None,
     }
 }
 
@@ -153,7 +162,7 @@ impl Stream {
             let data = aac_frame(self.next_audio);
             runner.handle_at(
                 CastInput {
-                    kind: CastInputKind::Audio,
+                    kind: CastInputKind::Audio(0),
                     pts: self.next_audio * 1024,
                     dts: self.next_audio * 1024,
                     keyframe: false,
@@ -209,7 +218,8 @@ fn listed_generation(dir: &Path) -> u64 {
 fn the_gate_activates_once_per_stream_with_a_new_generation_each_time() {
     let gate = CastGate::new();
     assert_eq!(gate.activation(), None);
-    assert!(!gate.status().active && gate.status().generation == 0);
+    // #418 review r7: never 0, even before any activation.
+    assert!(!gate.status().active && gate.status().generation != 0);
     let first = gate.activate(true).unwrap();
     assert!(first > 0);
     assert_eq!(gate.activation(), Some((first, true)));
@@ -222,15 +232,23 @@ fn the_gate_activates_once_per_stream_with_a_new_generation_each_time() {
     let second = gate.activate(false).unwrap();
     assert!(second > first, "{second} > {first}");
     assert_eq!(gate.activation(), Some((second, false)));
-    // Progress belongs to one generation only.
-    gate.begin_generation(second);
+    // Progress belongs to one generation only; #418 review r7: the status
+    // reports the file generation only, never the activation id or 0, and
+    // every installed generation is fresh (strictly increasing).
+    let before = gate.status().generation;
+    let files = gate.install_files(second).unwrap();
+    assert!(files > before && files != second);
     gate.publish_progress(5, 5, true);
     let status = gate.status();
-    assert!(status.ready && status.video_segments == 5 && status.generation == second);
+    assert!(status.ready && status.video_segments == 5 && status.generation == files);
+    // A packager of an activation that is no longer active never starts.
+    assert_eq!(gate.install_files(first), None);
     gate.deactivate();
     let third = gate.activate(true).unwrap();
     let status = gate.status();
-    assert!(!status.ready && status.video_segments == 0 && status.generation == third);
+    assert!(!status.ready && status.generation > files && status.generation != third);
+    gate.install_no_files();
+    assert!(gate.status().generation > status.generation);
     // Generations are unique across gates too (file names never collide).
     let other = CastGate::new().activate(true).unwrap();
     assert!(other > third);
@@ -437,7 +455,8 @@ fn inactive_writes_nothing_and_a_preroll_activation_publishes_a_full_window_at_o
     stream.frame(&mut runner, 690, now);
     let status = gate.status();
     assert!(status.active && status.ready, "{status:?}");
-    assert_eq!(status.generation, generation);
+    // #418 review r7: the packager's own file generation, not the id.
+    assert!(status.generation > generation, "{status:?}");
     assert!((9..=10).contains(&status.video_segments), "{status:?}");
     assert_eq!(status.audio_segments, status.video_segments);
     let report = validated(&dir);
@@ -445,7 +464,7 @@ fn inactive_writes_nothing_and_a_preroll_activation_publishes_a_full_window_at_o
     assert_eq!(report.audio_segments, report.video_segments);
     assert_eq!(report.codecs, "avc1.640028,mp4a.40.2");
     assert_eq!(report.discontinuities, 0);
-    assert_eq!(listed_generation(&dir), generation);
+    assert_eq!(listed_generation(&dir), status.generation);
     // The window starts 20 to 21 s before the activation, at an IDR.
     let behind = seconds(frame_ns(690)) - report.first_video_start;
     assert!((19.9..=21.1).contains(&behind), "{behind}");
@@ -496,7 +515,8 @@ fn deactivation_empties_the_directory_and_a_new_activation_is_a_new_generation()
     let first = gate.activate(true).unwrap();
     stream.run(&mut runner, 300..600, now);
     validated(&dir);
-    assert_eq!(listed_generation(&dir), first);
+    assert_eq!(listed_generation(&dir), gate.status().generation);
+    assert!(listed_generation(&dir) > first);
     std::fs::write(dir.join("notes.txt"), b"keep").unwrap();
 
     // Deactivate: the next packet removes every stream file (and only those).
@@ -521,7 +541,9 @@ fn deactivation_empties_the_directory_and_a_new_activation_is_a_new_generation()
     stream.frame(&mut runner, 1500, now);
     let report = validated(&dir);
     assert!(gate.status().ready && (9..=10).contains(&report.video_segments));
-    assert_eq!(listed_generation(&dir), third);
+    let third_files = gate.status().generation;
+    assert!(third > second && third_files > third);
+    assert_eq!(listed_generation(&dir), third_files);
     assert_eq!(report.discontinuities, 0);
     // A deactivation and a new activation between two packets (the sink
     // never saw the inactive state) is still a new stream.
@@ -529,14 +551,16 @@ fn deactivation_empties_the_directory_and_a_new_activation_is_a_new_generation()
     let fourth = gate.activate(false).unwrap();
     stream.run(&mut runner, 1501..1900, now);
     let report = validated(&dir);
-    assert_eq!(listed_generation(&dir), fourth);
+    assert!(fourth > third);
+    assert_eq!(listed_generation(&dir), gate.status().generation);
+    assert!(listed_generation(&dir) > third_files);
     let first_frame = report.first_video_start * 30_000.0 / 1001.0;
     assert!(first_frame >= 1501.0, "{first_frame}");
     let names = files(&dir);
     assert!(
         !names
             .iter()
-            .any(|name| name.contains(&format!("-{third}-"))),
+            .any(|name| name.contains(&format!("-{third_files}-"))),
         "{names:?}"
     );
     // End of run: nothing of the stream is left.
@@ -707,6 +731,10 @@ fn a_packager_error_restarts_a_new_generation_at_most_once_per_second() {
         Vec::<String>::new(),
         "a failed stream leaves no files"
     );
+    // While failed, the status names a generation no file carries: the
+    // purged files of the failed packager are never served (#418 review
+    // ABUSE-HISTORY-R4).
+    assert!(status.generation > generation, "{status:?}");
 
     // With the clock standing still nothing restarts at all.
     let frozen = start + Duration::from_secs(61);
@@ -724,8 +752,11 @@ fn a_packager_error_restarts_a_new_generation_at_most_once_per_second() {
     let report = validated(&dir);
     let status = gate.status();
     assert!(status.ready && report.video_segments >= 5, "{status:?}");
-    assert_eq!(status.generation, generation, "the activation is the same");
+    assert_eq!(gate.activation().map(|(g, _)| g), Some(generation));
+    // #418 review ABUSE-HISTORY-R4: the status reports the generation of
+    // the files served now (the restarted packager's), not the activation's.
     assert!(listed_generation(&dir) > generation, "new file names");
+    assert_eq!(status.generation, listed_generation(&dir));
     assert_eq!(report.discontinuities, 0);
 }
 
@@ -741,9 +772,10 @@ fn a_move_onto_other_parameter_sets_writes_a_new_init_and_one_discontinuity() {
     let mut runner = CastRunner::new(setup(&dir, &gate, SharedEpoch::new(), true));
     let mut stream = Stream::new(true);
     let now = Instant::now();
-    let generation = gate.activate(false).unwrap();
+    gate.activate(false).unwrap();
     stream.other_encoder_from = Some(240);
     stream.run(&mut runner, 0..480, now);
+    let generation = gate.status().generation;
     let report = validated(&dir);
     assert_eq!(report.discontinuities, 1, "{report:?}");
     assert_eq!(gate.status().restarts, 0);
@@ -774,4 +806,166 @@ fn a_move_onto_other_parameter_sets_writes_a_new_init_and_one_discontinuity() {
         1,
         "{audio}"
     );
+}
+
+/// #418 review ABUSE-HISTORY-R4 + r7 INV418-R7-1: a retired segment that
+/// cannot be unlinked fails the packager; its purge cannot remove it either,
+/// so the output is DISABLED for the run: no new generation is ever written
+/// (undeletable files cannot accumulate across restarts, and no purge
+/// rescans them), the status reports a generation no file carries and
+/// `disabled`, and the output refuses activation with the reason.
+#[test]
+fn a_file_the_purge_cannot_remove_disables_the_output() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("cast-1");
+    let gate = Arc::new(CastGate::new());
+    let mut runner = CastRunner::new(setup(&dir, &gate, SharedEpoch::new(), true));
+    let mut stream = Stream::new(true);
+    let start = Instant::now();
+    let at = |index: i64| start + Duration::from_millis(u64::try_from(index).unwrap() * 1001 / 30);
+    gate.activate(false).unwrap();
+    stream.run(&mut runner, 0..300, at(0));
+    let generation = gate.status().generation;
+    assert_eq!(listed_generation(&dir), generation);
+    let oldest = files(&dir)
+        .into_iter()
+        .find(|name| name.starts_with(&format!("seg-v-{generation}-")))
+        .unwrap();
+    let pinned = dir.join(&oldest);
+    std::fs::remove_file(&pinned).unwrap();
+    std::fs::create_dir(&pinned).unwrap();
+    std::fs::write(pinned.join("pinned"), b"x").unwrap();
+    for index in 300..2400 {
+        stream.frame(&mut runner, index, at(index));
+    }
+    let status = gate.status();
+    assert!(gate.is_disabled() && status.disabled, "{status:?}");
+    assert!(!status.active && !status.ready, "{status:?}");
+    assert_eq!(status.restarts, 0, "never restarted: {status:?}");
+    assert!(status.generation > generation, "{status:?}");
+    let error = status.last_error.clone().unwrap();
+    assert!(
+        error.contains("could not remove its stream files") && error.contains("cast-1"),
+        "{error}"
+    );
+    // Only the undeletable entry is left: nothing of a new generation.
+    assert_eq!(files(&dir), std::slice::from_ref(&oldest));
+    // From now on nothing is written and nothing more is published.
+    let frozen = gate.status().generation;
+    for index in 2400..3000 {
+        stream.frame(&mut runner, index, at(index));
+    }
+    runner.poll();
+    assert_eq!(files(&dir), [oldest]);
+    assert_eq!(gate.status().generation, frozen);
+    assert!(matches!(
+        gate.activate(false),
+        Err(CastGateError::Disabled(reason)) if reason == error
+    ));
+}
+
+/// #418 review r7: every packager start (the activation's and each restart)
+/// installs a FRESH file generation in the gate BEFORE it writes a file, and
+/// a failure installs one no file carries first. The status therefore never
+/// reports the activation id, never 0, and never goes back to an earlier
+/// generation (the reviewer's A -> B -> A is impossible): observed at the
+/// transition itself, paused right after each store.
+#[test]
+fn every_packager_start_publishes_a_fresh_generation_before_any_file() {
+    use std::sync::Mutex;
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("cast-1");
+    let gate = Arc::new(CastGate::new());
+    let mut runner = CastRunner::new(setup(&dir, &gate, SharedEpoch::new(), true));
+    let mut stream = Stream::new(true);
+    stream.no_sets = true;
+    let start = Instant::now();
+    let at = |index: i64| start + Duration::from_millis(u64::try_from(index).unwrap() * 1001 / 30);
+    let activation = gate.activate(false).unwrap();
+    let seen: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(vec![gate.status().generation]));
+    let record = Arc::clone(&seen);
+    let weak = Arc::downgrade(&gate);
+    let watched = dir.clone();
+    gate.set_transition_hook(Some(Arc::new(move || {
+        let gate = weak.upgrade().unwrap();
+        let status = gate.status();
+        assert!(
+            status.generation != 0 && status.generation != activation,
+            "{status:?}"
+        );
+        assert!(!status.ready && status.video_segments == 0, "{status:?}");
+        // No file of the generation just installed exists yet.
+        let tag = format!("-{}-", status.generation);
+        assert!(
+            !files(&watched).iter().any(|name| name.contains(&tag)),
+            "{:?}",
+            files(&watched)
+        );
+        record.lock().unwrap().push(status.generation);
+    })));
+    // Failing (no parameter sets), then healing: several restarts.
+    for index in 0..1200 {
+        stream.frame(&mut runner, index, at(index));
+        let generation = gate.status().generation;
+        assert!(generation != 0 && generation != activation);
+    }
+    stream.no_sets = false;
+    for index in 1200..1800 {
+        stream.frame(&mut runner, index, at(index));
+    }
+    let status = gate.status();
+    assert!(status.ready && status.restarts >= 2, "{status:?}");
+    assert_eq!(listed_generation(&dir), status.generation);
+    gate.deactivate();
+    runner.poll();
+    let seen = seen.lock().unwrap().clone();
+    // Activation start + (fail + restart) per failure + stop.
+    assert!(seen.len() >= 6, "{seen:?}");
+    assert!(
+        seen.windows(2).all(|w| w[0] < w[1]),
+        "strictly fresh: {seen:?}"
+    );
+    assert!(gate.status().generation > *seen.last().unwrap());
+    assert!(!seen.contains(&activation));
+}
+
+/// ADR-0114 decision 2: the ladder's clock pair is one point of the run's
+/// outbound epoch (the map `EXT-X-PROGRAM-DATE-TIME` is stamped from), in
+/// microseconds; `None` before the sampler anchored it, and its generation
+/// moves with a stepped epoch.
+#[test]
+fn the_ladder_clock_pair_is_a_point_of_the_outbound_epoch() {
+    let epoch = SharedEpoch::new();
+    assert_eq!(
+        super::clock_pair(&epoch, 1_000),
+        None,
+        "no epoch: nothing invented"
+    );
+    // Tick 0 (media 0 ns) was shown at wall 1_794_705_000 s.
+    let wall0 = 1_794_705_000_000_000_000_i64;
+    epoch.set(WallClockRef::new(wall0, 0, Rational::new(1_000_000_000, 1)));
+    let now = wall0 + 5_400_000_123_456; // 5400.000123456 s later
+    let pair = super::clock_pair(&epoch, now).unwrap();
+    assert_eq!(pair.epoch_generation, 0);
+    assert_eq!(
+        pair.media_us, 5_400_000_123,
+        "media time truncated to whole microseconds"
+    );
+    assert_eq!(pair.wall_unix_us, 1_794_705_000_000_000 + 5_400_000_123);
+    // The pair is exact under the map: wall(media) for that media time.
+    epoch.set_stepped(WallClockRef::new(
+        wall0 + 2_000_000_000,
+        0,
+        Rational::new(1_000_000_000, 1),
+    ));
+    let stepped = super::clock_pair(&epoch, now).unwrap();
+    assert_eq!(stepped.epoch_generation, 1, "a step moves the generation");
+    assert_eq!(stepped.media_us, 5_398_000_123);
+    assert_eq!(
+        stepped.wall_unix_us - stepped.media_us,
+        1_794_705_002_000_000
+    );
+    // A degenerate rate gives no pair.
+    epoch.set(WallClockRef::new(wall0, 0, Rational::new(0, 0)));
+    assert_eq!(super::clock_pair(&epoch, now), None);
 }

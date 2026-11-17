@@ -13,8 +13,8 @@ use std::path::Path;
 use multiview_core::time::Rational;
 use multiview_core::wallclock::WallClockRef;
 use multiview_output::hls::cast::{
-    is_packager_file_name, purge_dir, AudioUnit, CastAudioConfig, CastPackager, CastPackagerConfig,
-    CastVideoConfig, VideoUnit,
+    is_packager_file_name, purge_dir, AudioUnit, CastAudioConfig, CastAudioRendition, CastPackager,
+    CastPackagerConfig, CastVideoConfig, VideoUnit,
 };
 use multiview_output::hls::cast_check::{check_cast_dir, CastCheckReport};
 use multiview_output::hls::cmaf;
@@ -100,6 +100,16 @@ fn aac_frame(index: i64, adts: bool) -> Vec<u8> {
 const VIDEO_TB: Rational = Rational::new(1001, 30_000);
 const AUDIO_TB: Rational = Rational::new(1, 48_000);
 
+fn audio_config() -> CastAudioConfig {
+    CastAudioConfig {
+        time_base: AUDIO_TB,
+        sample_rate: 48_000,
+        channels: 2,
+        bit_rate: Some(192_000),
+        audio_specific_config: None,
+    }
+}
+
 fn config(dir: &Path, audio: bool) -> CastPackagerConfig {
     CastPackagerConfig {
         dir: dir.to_path_buf(),
@@ -113,13 +123,12 @@ fn config(dir: &Path, audio: bool) -> CastPackagerConfig {
             bit_rate: Some(6_000_000),
             extradata: None,
         },
-        audio: audio.then_some(CastAudioConfig {
-            time_base: AUDIO_TB,
-            sample_rate: 48_000,
-            channels: 2,
-            bit_rate: Some(192_000),
-            audio_specific_config: None,
-        }),
+        audio: audio
+            .then(|| CastAudioRendition::program(audio_config()))
+            .into_iter()
+            .collect(),
+        subtitles: Vec::new(),
+        subtitle_feed: None,
         epoch: None,
         wall_anchor: None,
     }
@@ -141,7 +150,7 @@ struct Feeder {
 
 impl Feeder {
     fn new(config: CastPackagerConfig) -> Self {
-        let audio = config.audio.is_some();
+        let audio = !config.audio.is_empty();
         Self {
             packager: CastPackager::new(config).unwrap(),
             framing: Framing::AnnexB,
@@ -168,10 +177,13 @@ impl Feeder {
 
     fn audio_frame(&mut self, index: i64) -> multiview_output::Result<()> {
         let data = aac_frame(index, self.adts);
-        self.packager.push_audio(AudioUnit {
-            pts: index * 1024,
-            data: &data,
-        })
+        self.packager.push_audio(
+            0,
+            AudioUnit {
+                pts: index * 1024,
+                data: &data,
+            },
+        )
     }
 
     /// Push the audio frames that start before `video_index` plus a skew
@@ -345,7 +357,9 @@ fn purge_dir_removes_only_files_the_packager_writes() {
         std::os::unix::fs::symlink(&target, dir.path().join("seg-v-5-0.m4s")).unwrap();
     }
     assert!(files(dir.path()).len() > 20);
-    purge_dir(dir.path());
+    // A directory (and on Unix a symlink) with a packager name is left: not
+    // clean (#418 review r7).
+    assert!(!purge_dir(dir.path()));
     let mut expected: Vec<String> = foreign.iter().map(|name| (*name).to_owned()).collect();
     expected.push("seg-v-9-9.m4s".to_owned());
     #[cfg(unix)]
@@ -1016,7 +1030,7 @@ fn the_audio_config_comes_from_the_configuration_then_adts_then_rate_and_channel
     // configuration claims 6 channels; the header says AAC-LC 48 kHz stereo).
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = config(dir.path(), true);
-    cfg.audio.as_mut().unwrap().channels = 6;
+    cfg.audio[0].config.channels = 6;
     let mut feeder = Feeder::new(cfg);
     feeder.adts = true;
     feeder.run(0..200).unwrap();
@@ -1026,7 +1040,7 @@ fn the_audio_config_comes_from_the_configuration_then_adts_then_rate_and_channel
     // A supplied config wins over the ADTS header (HE-AAC v1 signalling).
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = config(dir.path(), true);
-    cfg.audio.as_mut().unwrap().audio_specific_config = Some(vec![0x2B, 0x11, 0x88, 0x00]);
+    cfg.audio[0].config.audio_specific_config = Some(vec![0x2B, 0x11, 0x88, 0x00]);
     let mut feeder = Feeder::new(cfg);
     feeder.adts = true;
     feeder.run(0..200).unwrap();
@@ -1371,10 +1385,72 @@ fn an_adts_stream_at_another_rate_than_configured_is_refused() {
     // AAC-LC 44.1 kHz stereo header on a rendition configured for 48 kHz.
     let frame = [0xFF, 0xF1, 0x50, 0x80, 0x01, 0x7F, 0xFC, 9, 8, 7, 6];
     let error = packager
-        .push_audio(AudioUnit {
-            pts: 0,
-            data: &frame,
-        })
+        .push_audio(
+            0,
+            AudioUnit {
+                pts: 0,
+                data: &frame,
+            },
+        )
         .unwrap_err();
     assert!(error.to_string().contains("44100"), "{error}");
+}
+
+/// #418 review ABUSE-HISTORY-R4: a retired file that cannot be unlinked
+/// (here: a non-empty directory took the oldest segment's name, so the
+/// unlink fails with something other than "not found" — deterministic, as
+/// root too) fails the push: the caller replaces the packager under a NEW
+/// file generation instead of leaving retired bytes servable under this one.
+#[test]
+fn a_failed_unlink_of_a_retired_segment_fails_the_packager() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut feeder = Feeder::new(config(dir.path(), true));
+    feeder.run(0..361).unwrap();
+    let oldest = dir.path().join("seg-v-7-0.m4s");
+    assert!(oldest.is_file());
+    std::fs::remove_file(&oldest).unwrap();
+    std::fs::create_dir(&oldest).unwrap();
+    std::fs::write(oldest.join("pinned"), b"x").unwrap();
+    // A missing file is fine: the oldest audio segment already went away.
+    std::fs::remove_file(dir.path().join("seg-a-7-0.m4s")).unwrap();
+    let mut failed = None;
+    for index in 361..1800 {
+        if let Err(error) = feeder.run(index..index + 1) {
+            failed = Some((index, error.to_string()));
+            break;
+        }
+    }
+    let (index, error) = failed.expect("the unlink failure is an error");
+    assert!(error.contains("unlinking retired"), "{error}");
+    assert!(error.contains("seg-v-7-0.m4s"), "{error}");
+    // It fails when sequence 0 leaves the 2 x window retention: on the
+    // keyframe that publishes sequence 20 (frame 21 x 60), not earlier.
+    assert_eq!(index, 21 * 60, "{error}");
+    assert_eq!(feeder.packager.published().video_segments, 21);
+    // The record is kept: the following packager cleanup still names it.
+    assert!(oldest.join("pinned").is_file());
+}
+
+/// #418 review r7 INV418-R7-1: `purge_dir` reports whether every
+/// packager-named entry is gone, and its scan is bounded: a directory with
+/// more than `PURGE_SCAN_LIMIT` entries is never reported clean.
+#[test]
+fn purge_dir_reports_leftovers_and_bounds_its_scan() {
+    use multiview_output::hls::cast::PURGE_SCAN_LIMIT;
+    let dir = tempfile::tempdir().unwrap();
+    assert!(purge_dir(&dir.path().join("absent")), "missing = clean");
+    std::fs::write(dir.path().join("seg-v-3-0.m4s"), b"x").unwrap();
+    std::fs::write(dir.path().join("notes.txt"), b"keep").unwrap();
+    assert!(purge_dir(dir.path()));
+    assert!(dir.path().join("notes.txt").exists());
+    // A packager-named entry that cannot be unlinked (a directory).
+    std::fs::create_dir(dir.path().join("seg-v-3-1.m4s")).unwrap();
+    assert!(!purge_dir(dir.path()));
+    std::fs::remove_dir(dir.path().join("seg-v-3-1.m4s")).unwrap();
+    assert!(purge_dir(dir.path()));
+    // Past the scan bound: not clean, whatever the rest holds.
+    for i in 0..PURGE_SCAN_LIMIT {
+        std::fs::write(dir.path().join(format!("other-{i}")), b"").unwrap();
+    }
+    assert!(!purge_dir(dir.path()));
 }

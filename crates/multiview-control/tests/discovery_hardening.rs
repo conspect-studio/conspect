@@ -399,6 +399,15 @@ async fn attached_idempotency_key_replays_the_running_scan_op() {
     let op3 = scan_op(&h.router, Some("att-key")).await;
     assert_eq!(op3, op1, "the replayed key echoes the running scan's op");
 
+    // The browse runs on the blocking pool: under load it may not have
+    // started 50 ms after the 202 (#446). Wait (bounded) for it to start,
+    // then require that it stays the only one.
+    for _ in 0..250 {
+        if calls.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(calls.load(Ordering::SeqCst), 1, "still exactly one browse");
     release.store(true, Ordering::SeqCst);

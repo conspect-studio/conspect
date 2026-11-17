@@ -31,7 +31,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::audio::{OutputAudio, OutputAudioMode, PROGRAM_TRACK};
+use crate::audio::{OutputAudio, OutputAudioMode, TrackCapacity, PROGRAM_TRACK};
 use crate::error::ConfigError;
 use crate::schema::{Canvas, Fps, Output};
 
@@ -52,6 +52,12 @@ pub const MAX_SLOT_BITRATE_KBPS: u32 = 1_000_000;
 
 /// Most subtitle slots an output may declare (slice F, #345).
 pub const MAX_SUBTITLE_SLOTS: usize = 8;
+
+/// Most audio renditions a cast stream carries (ADR-0111, #418): the program
+/// (when carried) plus every selected discrete track. Equal to the cast
+/// packager's `MAX_CAST_AUDIO_RENDITIONS`; a selection that resolves to more
+/// is refused at validation (never silently truncated by the engine).
+pub const MAX_CAST_AUDIO_RENDITIONS: usize = 16;
 /// Longest accepted subtitle slot language tag, in characters.
 pub const MAX_SUBTITLE_LANGUAGE_LEN: usize = 35;
 /// Longest accepted subtitle slot menu name, in characters.
@@ -571,19 +577,22 @@ impl Output {
                 subtitle_medium_formats: NO_SUBTITLES,
                 subtitle_formats: NO_SUBTITLES,
             },
-            // A cast stream is one H.264 video rendition and one audio
-            // rendition (CMAF). It is a packet sink like HLS, so the Program
-            // is converted to its format. The cast packager carries no
-            // subtitles (ADR-0111).
+            // A cast stream is one H.264 video rendition plus up to
+            // MAX_CAST_AUDIO_RENDITIONS CMAF audio renditions (program
+            // included, the packager's bound) and N WebVTT subtitle
+            // renditions (ADR-0111, #418);
+            // the receiver plays one audio and shows at most one subtitle at a
+            // time. It is a packet sink like HLS, so the Program is converted
+            // to its format.
             Output::Cast { .. } => SlotCapability {
                 video_max: 1,
-                audio_max: Some(1),
+                audio_max: Some(MAX_CAST_AUDIO_RENDITIONS),
                 video_codecs: H264_ONLY,
                 raw_video: false,
                 format_convertible: true,
-                subtitle_max: 0,
-                subtitle_medium_formats: NO_SUBTITLES,
-                subtitle_formats: NO_SUBTITLES,
+                subtitle_max: MAX_SUBTITLE_SLOTS,
+                subtitle_medium_formats: WEBVTT,
+                subtitle_formats: WEBVTT,
             },
             Output::Ndi { .. } | Output::Display { .. } => SlotCapability {
                 video_max: 1,
@@ -625,6 +634,30 @@ impl Output {
             }
             _ => self.audio().cloned(),
         }
+    }
+
+    /// The audio this output actually carries, resolved against the
+    /// document's `declared` discrete tracks (route order, the program bus
+    /// excluded) exactly as the engine selects it: whether the program is
+    /// carried, and the carried discrete tracks in declared order. No
+    /// selection = the program only; `auto` adds tracks only where the
+    /// transport's capacity is unlimited; a transport without discrete
+    /// tracks carries none. The single source of truth for the engine's
+    /// per-output selection and the control plane's authorization of what
+    /// a cast stream publishes (#418 review ABUSE-2).
+    #[must_use]
+    pub fn carried_audio<'a>(&self, declared: &[&'a str]) -> (bool, Vec<&'a str>) {
+        let Some(selection) = self.effective_audio() else {
+            return (true, Vec::new());
+        };
+        let (program, mut chosen) = selection.resolve(declared);
+        let capacity = self.audio_capability().discrete_capacity;
+        let auto_capped =
+            selection.mode == OutputAudioMode::Auto && capacity != TrackCapacity::Unlimited;
+        if auto_capped || capacity == TrackCapacity::AtMost(0) {
+            chosen.clear();
+        }
+        (program, chosen)
     }
 }
 
@@ -720,6 +753,28 @@ pub fn validate_output_format(
     }
     if let Some(format) = output.format() {
         validate_format(output, cap, format, canvas)?;
+    }
+    validate_cast_audio(output, discrete_tracks)
+}
+
+/// A cast stream carries at most [`MAX_CAST_AUDIO_RENDITIONS`] audio
+/// renditions (#418 review INV418-1): the program plus the selected tracks,
+/// after resolving `auto` / `tracks` / `slots.audio` against the declared
+/// tracks. Refused here so the engine never drops a selected track.
+fn validate_cast_audio(output: &Output, discrete_tracks: &[&str]) -> Result<(), ConfigError> {
+    if !matches!(output, Output::Cast { .. }) {
+        return Ok(());
+    }
+    let (program, tracks) = output.carried_audio(discrete_tracks);
+    let count = usize::from(program) + tracks.len();
+    if count > MAX_CAST_AUDIO_RENDITIONS {
+        return Err(unsupported(
+            output,
+            &format!(
+                "carries {count} audio rendition(s) (program + selected tracks); a cast stream \
+                 carries at most {MAX_CAST_AUDIO_RENDITIONS}: select fewer tracks"
+            ),
+        ));
     }
     Ok(())
 }

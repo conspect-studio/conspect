@@ -298,11 +298,22 @@ msgstr ""
 msgid "{option} (custom — preserved)"
 msgstr ""
 
+#. placeholder {0}: feed.layout
+#. placeholder {0}: feed.source
+#: src/cast/castLabels.ts:51
+#: src/cast/castLabels.ts:52
+msgid "{outputId} ({0})"
+msgstr ""
+
+#: src/cast/castLabels.ts:49
+msgid "{outputId} ({bus})"
+msgstr ""
+
 #: src/devices/lastSeen.tsx:53
 msgid "{seconds} s ago"
 msgstr ""
 
-#: src/cast/castLabels.ts:38
+#: src/cast/castLabels.ts:39
 msgid "{seconds} s behind live"
 msgstr ""
 
@@ -855,7 +866,7 @@ msgstr ""
 msgid "Accept the publisher's audio (Opus)"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:1129
+#: src/pages/WindyFillDialog.tsx:1174
 msgid "Accepted"
 msgstr ""
 
@@ -1599,6 +1610,7 @@ msgid "Attached automatically"
 msgstr ""
 
 #: src/app/navigation.tsx:58
+#: src/cast/ActiveCastCard.tsx:182
 #: src/components/broadcast/BroadcastShell.tsx:34
 #: src/components/broadcast/library/Chips.tsx:139
 #: src/pages/approved/PatchMatrix.tsx:895
@@ -1665,7 +1677,7 @@ msgstr ""
 msgid "Audio mixer"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:1167
+#: src/pages/WindyFillDialog.tsx:1220
 msgid "audio present"
 msgstr ""
 
@@ -2058,7 +2070,7 @@ msgstr ""
 msgid "Buffering on {0}"
 msgstr ""
 
-#: src/cast/castLabels.ts:18
+#: src/cast/castLabels.ts:19
 msgid "Buffering…"
 msgstr ""
 
@@ -2149,7 +2161,7 @@ msgstr ""
 #: src/pages/SalvosPage.tsx:433
 #: src/pages/SystemActionsPage.tsx:151
 #: src/pages/TallyPage.tsx:432
-#: src/pages/WindyFillDialog.tsx:1186
+#: src/pages/WindyFillDialog.tsx:1239
 #: src/resources/CrudPage.tsx:380
 #: src/resources/CrudPage.tsx:425
 msgid "Cancel"
@@ -2269,11 +2281,11 @@ msgstr ""
 
 #: src/pages/approved/MediaSurface.tsx:29
 #: src/pages/approved/MediaSurface.tsx:118
-#: src/pages/WindyFillDialog.tsx:1238
+#: src/pages/WindyFillDialog.tsx:1291
 msgid "Capture"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:646
+#: src/pages/WindyFillDialog.tsx:691
 msgid "Capture a bounded Windy weather view and load it into this player."
 msgstr ""
 
@@ -2281,11 +2293,11 @@ msgstr ""
 msgid "Capture and the clip library listing are unavailable until their backend contracts ship."
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:1102
+#: src/pages/WindyFillDialog.tsx:1147
 msgid "Capture job"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:887
+#: src/pages/WindyFillDialog.tsx:932
 msgid "Capture mode"
 msgstr ""
 
@@ -2334,7 +2346,7 @@ msgstr ""
 msgid "Cast devices never join a synchronized canvas (their latency is multiple seconds and uncontrolled). Use a display node or a vendor decoder for synchronized walls."
 msgstr ""
 
-#: src/cast/castLabels.ts:24
+#: src/cast/castLabels.ts:25
 msgid "Cast failed"
 msgstr ""
 
@@ -2363,7 +2375,7 @@ msgstr ""
 msgid "Cast receivers seen on the network (untrusted hints)."
 msgstr ""
 
-#: src/cast/castLoad.ts:125
+#: src/cast/castLoad.ts:134
 msgid "Cast session error."
 msgstr ""
 
@@ -2373,6 +2385,11 @@ msgstr ""
 
 #: src/pages/CastPage.tsx:250
 msgid "Cast session stopped"
+msgstr ""
+
+#: src/cast/DeskCastButton.tsx:54
+#: src/cast/DeskCastButton.tsx:55
+msgid "Cast settings"
 msgstr ""
 
 #: src/pages/docs/SyncHelpPage.tsx:58
@@ -2387,7 +2404,7 @@ msgstr ""
 msgid "Cast to this"
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:48
+#: src/cast/ActiveCastCard.tsx:89
 msgid "Casting from this browser"
 msgstr ""
 
@@ -2540,7 +2557,7 @@ msgstr ""
 msgid "Checked from this server."
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:660
+#: src/pages/WindyFillDialog.tsx:705
 msgid "Checking capture capabilities…"
 msgstr ""
 
@@ -2605,7 +2622,7 @@ msgstr ""
 msgid "Choose light, dark, or follow the system."
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:52
+#: src/cast/ActiveCastCard.tsx:93
 msgid "Choosing a device…"
 msgstr ""
 
@@ -2701,6 +2718,7 @@ msgstr ""
 msgid "Clauses"
 msgstr ""
 
+#: src/cast/castLabels.ts:48
 #: src/pages/approved/PatchMatrix.tsx:520
 #: src/pages/LayoutsPage.tsx:120
 msgid "Clean"
@@ -2767,9 +2785,49 @@ msgstr ""
 msgid "Clip"
 msgstr ""
 
+#: src/pages/WindyFillDialog.tsx:637
+msgid "Clip carries an alpha plane"
+msgstr ""
+
+#: src/pages/WindyFillDialog.tsx:641
+msgid "Clip could not be parsed"
+msgstr ""
+
+#: src/pages/WindyFillDialog.tsx:635
+msgid "Clip declares no frame rate"
+msgstr ""
+
+#: src/pages/WindyFillDialog.tsx:631
+msgid "Clip frame rate does not match the canvas"
+msgstr ""
+
+#: src/pages/WindyFillDialog.tsx:645
+msgid "Clip has no video stream"
+msgstr ""
+
+#: src/pages/WindyFillDialog.tsx:633
+msgid "Clip is variable frame rate"
+msgstr ""
+
+#: src/pages/WindyFillDialog.tsx:647
+msgid "Clip length is unknown"
+msgstr ""
+
 #: src/pages/approved/MediaSurface.tsx:86
 #: src/pages/approved/MediaSurface.tsx:119
 msgid "Clip library"
+msgstr ""
+
+#: src/pages/WindyFillDialog.tsx:639
+msgid "Clip not found"
+msgstr ""
+
+#: src/pages/WindyFillDialog.tsx:643
+msgid "Clip open timed out"
+msgstr ""
+
+#: src/pages/WindyFillDialog.tsx:649
+msgid "Clip playout window is invalid"
 msgstr ""
 
 #: src/components/broadcast/library/TranscriptRangeEditor.tsx:492
@@ -2797,7 +2855,7 @@ msgstr ""
 #: src/iptv/BulkAddDialog.tsx:192
 #: src/iptv/SourceLinks.tsx:403
 #: src/iptv/SourceLinks.tsx:445
-#: src/pages/WindyFillDialog.tsx:1190
+#: src/pages/WindyFillDialog.tsx:1243
 msgid "Close"
 msgstr ""
 
@@ -3091,7 +3149,7 @@ msgstr ""
 msgid "Connecting"
 msgstr ""
 
-#: src/cast/castLabels.ts:14
+#: src/cast/castLabels.ts:15
 msgid "Connecting to the TV…"
 msgstr ""
 
@@ -3323,8 +3381,8 @@ msgstr ""
 msgid "Could not cancel the action"
 msgstr ""
 
-#: src/cast/castLoad.ts:135
-#: src/cast/castLoad.ts:138
+#: src/cast/castLoad.ts:144
+#: src/cast/castLoad.ts:147
 msgid "Could not cast to this device."
 msgstr ""
 
@@ -3823,7 +3881,7 @@ msgid "CUDA-enabled image (NVDEC / NVENC plus a wgpu compositor) for NVIDIA GPUs
 msgstr ""
 
 #: src/pages/MediaPlayersPage.tsx:403
-#: src/pages/WindyFillDialog.tsx:1039
+#: src/pages/WindyFillDialog.tsx:1084
 msgid "Cue"
 msgstr ""
 
@@ -3853,7 +3911,7 @@ msgstr ""
 msgid "Current"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:1045
+#: src/pages/WindyFillDialog.tsx:1090
 msgid "Current end-of-clip behaviour for this player: "
 msgstr ""
 
@@ -4242,7 +4300,7 @@ msgstr ""
 msgid "Detected: {0}"
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:51
+#: src/cast/ActiveCastCard.tsx:92
 #: src/devices/FromDevice.tsx:85
 #: src/pages/CapabilitiesPage.tsx:140
 msgid "Device"
@@ -4578,7 +4636,7 @@ msgstr ""
 
 #: src/components/broadcast/library/MetadataInspector.tsx:347
 #: src/events/SourceEventsButton.tsx:66
-#: src/pages/WindyFillDialog.tsx:1164
+#: src/pages/WindyFillDialog.tsx:1217
 msgid "Duration"
 msgstr ""
 
@@ -4883,7 +4941,7 @@ msgstr ""
 msgid "Encoder utilisation: ours over device total"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:971
+#: src/pages/WindyFillDialog.tsx:1016
 msgid "End hold (ms)"
 msgstr ""
 
@@ -5015,7 +5073,7 @@ msgstr ""
 msgid "Epoch"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:944
+#: src/pages/WindyFillDialog.tsx:989
 msgid "Equal"
 msgstr ""
 
@@ -5065,7 +5123,7 @@ msgstr ""
 msgid "Every input on the program mix is muted. Unmute at least one, or take them all off the mix."
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:875
+#: src/pages/WindyFillDialog.tsx:920
 msgid "Every N minutes (coming soon — no scheduler yet)"
 msgstr ""
 
@@ -5272,7 +5330,7 @@ msgstr ""
 
 #: src/pages/MediaPlayersPage.tsx:461
 #: src/pages/MediaPlayersPage.tsx:467
-#: src/pages/WindyFillDialog.tsx:643
+#: src/pages/WindyFillDialog.tsx:688
 msgid "Fill from web…"
 msgstr ""
 
@@ -5405,7 +5463,7 @@ msgstr ""
 msgid "Forward"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:796
+#: src/pages/WindyFillDialog.tsx:841
 msgid "FPS"
 msgstr ""
 
@@ -5413,7 +5471,7 @@ msgstr ""
 msgid "Fractions of the tile, so a static logo or lower-third cannot mask a black or frozen background."
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:953
+#: src/pages/WindyFillDialog.tsx:998
 msgid "Frame duration (ms)"
 msgstr ""
 
@@ -5444,11 +5502,11 @@ msgstr ""
 
 #: src/pages/MediaPlayersPage.tsx:263
 #: src/pages/MediaPlayersPage.tsx:359
-#: src/pages/WindyFillDialog.tsx:1165
+#: src/pages/WindyFillDialog.tsx:1218
 msgid "frames"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:815
+#: src/pages/WindyFillDialog.tsx:860
 msgid "Frames"
 msgstr ""
 
@@ -5958,7 +6016,7 @@ msgstr ""
 msgid "HTTP(S) management endpoint. Wrap IPv6 literals in brackets."
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:1068
+#: src/pages/WindyFillDialog.tsx:1113
 msgid "I accept the <0>Windy terms of use</0> ({WINDY_TERMS_VERSION})"
 msgstr ""
 
@@ -6483,7 +6541,7 @@ msgstr ""
 msgid "Latency, robustness, and scale pull against each other. Buffering is what absorbs network jitter and gives retransmission time to repair loss — so cutting the buffer cuts your protection with it. A 120 ms SRT window is snappy but fragile on a lossy link; a 2 s window rides out trouble at the cost of 2 s. Plain HTTP segments are the most robust and scalable delivery there is, and also the slowest."
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:718
+#: src/pages/WindyFillDialog.tsx:763
 msgid "Latitude"
 msgstr ""
 
@@ -6803,7 +6861,7 @@ msgstr ""
 
 #: src/pages/MediaPlayersPage.tsx:457
 #: src/pages/MediaPlayersPage.tsx:923
-#: src/pages/WindyFillDialog.tsx:1126
+#: src/pages/WindyFillDialog.tsx:1171
 msgid "Load"
 msgstr ""
 
@@ -6828,8 +6886,16 @@ msgstr ""
 msgid "Load candidates"
 msgstr ""
 
+#: src/pages/WindyFillDialog.tsx:663
+msgid "Load failed"
+msgstr ""
+
 #: src/components/broadcast/library/VTReferenceSummary.tsx:283
 msgid "Load from library…"
+msgstr ""
+
+#: src/pages/WindyFillDialog.tsx:659
+msgid "Load has no durable identity"
 msgstr ""
 
 #: src/events/JournalPanel.tsx:133
@@ -6918,7 +6984,7 @@ msgstr ""
 msgid "Loading media players…"
 msgstr ""
 
-#: src/cast/castLabels.ts:16
+#: src/cast/castLabels.ts:17
 msgid "Loading on the TV…"
 msgstr ""
 
@@ -7040,7 +7106,7 @@ msgstr ""
 
 #: src/iptv/Controls.tsx:275
 #: src/pages/graphics/DataView.tsx:350
-#: src/pages/WindyFillDialog.tsx:698
+#: src/pages/WindyFillDialog.tsx:743
 msgid "Location"
 msgstr ""
 
@@ -7074,7 +7140,7 @@ msgstr ""
 msgid "Long-running ops"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:734
+#: src/pages/WindyFillDialog.tsx:779
 msgid "Longitude"
 msgstr ""
 
@@ -7082,7 +7148,7 @@ msgstr ""
 msgid "Looking for Cast receivers…"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:882
+#: src/pages/WindyFillDialog.tsx:927
 msgid "Loop"
 msgstr ""
 
@@ -7250,7 +7316,7 @@ msgstr ""
 msgid "Max resolution"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:989
+#: src/pages/WindyFillDialog.tsx:1034
 msgid "Max steps"
 msgstr ""
 
@@ -7581,8 +7647,8 @@ msgstr ""
 msgid "Mute {label}"
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:80
-#: src/cast/ActiveCastCard.tsx:81
+#: src/cast/ActiveCastCard.tsx:121
+#: src/cast/ActiveCastCard.tsx:122
 msgid "Mute the TV"
 msgstr ""
 
@@ -7871,7 +7937,7 @@ msgstr ""
 msgid "No cast output is configured. Browser casting plays from a cast output: add one to the engine configuration and restart the engine."
 msgstr ""
 
-#: src/cast/castLoad.ts:129
+#: src/cast/castLoad.ts:138
 msgid "No Cast receiver is available on this network."
 msgstr ""
 
@@ -7897,6 +7963,10 @@ msgstr ""
 
 #: src/pages/approved/RoutingSurface.tsx:156
 msgid "No crosspoint grid: it needs both configured sources and known destinations (layout cells, audio discrete tracks). Use the typed selectors below."
+msgstr ""
+
+#: src/pages/WindyFillDialog.tsx:653
+msgid "No decodable frame"
 msgstr ""
 
 #: src/pages/approved/RoutingSurface.tsx:302
@@ -8266,7 +8336,7 @@ msgstr ""
 msgid "Nodes enrol with a keypair identity: the node proves itself with its key, not with a network address, so a node keeps its identity across DHCP changes and re-images. That is why the management address is optional for the <0>displaynode</0> driver — an enrolled node finds the controller and authenticates itself. After a network loss the node reconnects with its enrolled identity, re-pulls its stream, and re-converges its sync offset before un-muting its output."
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:1017
+#: src/pages/WindyFillDialog.tsx:1062
 msgid "Nominal total frames: {nominalFrames} (cap {MAX_NOMINAL_FRAMES})."
 msgstr ""
 
@@ -8332,7 +8402,7 @@ msgstr ""
 msgid "Not available on this server yet — tracked as issue #423. There is no server endpoint to import a URL into the media library."
 msgstr ""
 
-#: src/cast/castLabels.ts:10
+#: src/cast/castLabels.ts:11
 msgid "Not casting"
 msgstr ""
 
@@ -8527,6 +8597,7 @@ msgstr ""
 msgid "Observing: HLS cue/DATERANGE, SCTE-35 and timed ID3 are watched for this source."
 msgstr ""
 
+#: src/cast/ActiveCastCard.tsx:215
 #: src/components/TallyLampBadge.tsx:48
 #: src/pages/DataPage.tsx:207
 #: src/pages/MeshPage.tsx:144
@@ -8627,7 +8698,7 @@ msgstr ""
 msgid "on the Licence screen."
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:863
+#: src/pages/WindyFillDialog.tsx:908
 msgid "Once"
 msgstr ""
 
@@ -8901,7 +8972,7 @@ msgstr ""
 msgid "Over the layout drop zone."
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:678
+#: src/pages/WindyFillDialog.tsx:723
 msgid "Overlay"
 msgstr ""
 
@@ -9221,7 +9292,7 @@ msgstr ""
 
 #: src/components/broadcast/library/AssetAuditionControls.tsx:165
 #: src/pages/MediaPlayersPage.tsx:417
-#: src/pages/WindyFillDialog.tsx:1038
+#: src/pages/WindyFillDialog.tsx:1083
 msgid "Play"
 msgstr ""
 
@@ -9252,8 +9323,16 @@ msgid "Playback URLs are unavailable: this server does not provide them yet (bac
 msgstr ""
 
 #: src/pages/MediaPlayersPage.tsx:872
-#: src/pages/WindyFillDialog.tsx:655
+#: src/pages/WindyFillDialog.tsx:700
 msgid "Player"
+msgstr ""
+
+#: src/pages/WindyFillDialog.tsx:655
+msgid "Player audio rail unavailable"
+msgstr ""
+
+#: src/pages/WindyFillDialog.tsx:657
+msgid "Player journal refused the load"
 msgstr ""
 
 #: src/pages/approved/PatchMatrix.tsx:192
@@ -9261,7 +9340,7 @@ msgstr ""
 msgid "Players"
 msgstr ""
 
-#: src/cast/castLabels.ts:20
+#: src/cast/castLabels.ts:21
 #: src/pages/MediaPlayersPage.tsx:654
 msgid "Playing"
 msgstr ""
@@ -9310,15 +9389,15 @@ msgstr ""
 msgid "Précis"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:844
+#: src/pages/WindyFillDialog.tsx:889
 msgid "Premium (authenticated) capture"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:849
+#: src/pages/WindyFillDialog.tsx:894
 msgid "Premium Windy capture is not configured on this server; the public (unauthenticated) view is used."
 msgstr ""
 
-#: src/cast/castLabels.ts:12
+#: src/cast/castLabels.ts:13
 msgid "Preparing the stream…"
 msgstr ""
 
@@ -9335,7 +9414,8 @@ msgid "preview"
 msgstr ""
 
 #: src/cast/CastFeedPicker.tsx:36
-#: src/cast/DeskCastButton.tsx:12
+#: src/cast/castLabels.ts:48
+#: src/cast/DeskCastButton.tsx:25
 #: src/layout/components/GridLayoutEditor.tsx:552
 #: src/pages/approved/PatchMatrix.tsx:519
 #: src/pages/OutputFeedRow.tsx:178
@@ -9498,7 +9578,8 @@ msgid "PROG"
 msgstr ""
 
 #: src/cast/CastFeedPicker.tsx:34
-#: src/cast/DeskCastButton.tsx:12
+#: src/cast/castLabels.ts:48
+#: src/cast/DeskCastButton.tsx:25
 #: src/pages/approved/PatchMatrix.test.tsx:760
 #: src/pages/approved/PatchMatrix.tsx:518
 #: src/pages/MonitoringPage.tsx:210
@@ -9612,7 +9693,7 @@ msgstr ""
 msgid "Promote this ephemeral session to a permanent managed Cast device."
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:945
+#: src/pages/WindyFillDialog.tsx:990
 msgid "Proportional to radar time"
 msgstr ""
 
@@ -9708,11 +9789,11 @@ msgstr ""
 msgid "Queued remote actions you can cancel locally, and the immutable account audit trail."
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:690
+#: src/pages/WindyFillDialog.tsx:735
 msgid "Radar / storm"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:902
+#: src/pages/WindyFillDialog.tsx:947
 msgid "Radar steps"
 msgstr ""
 
@@ -9768,7 +9849,7 @@ msgstr ""
 msgid "Re-arm to the next occurrence (recurring daily)"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:1242
+#: src/pages/WindyFillDialog.tsx:1295
 msgid "Re-capture"
 msgstr ""
 
@@ -9813,7 +9894,7 @@ msgstr ""
 msgid "Ready"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:918
+#: src/pages/WindyFillDialog.tsx:963
 msgid "Realtime"
 msgstr ""
 
@@ -9928,7 +10009,7 @@ msgid "Referer header (optional)"
 msgstr ""
 
 #: src/events/JournalPanel.tsx:97
-#: src/pages/WindyFillDialog.tsx:858
+#: src/pages/WindyFillDialog.tsx:903
 msgid "Refresh"
 msgstr ""
 
@@ -10308,11 +10389,11 @@ msgstr ""
 msgid "Retry live preview"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:1153
+#: src/pages/WindyFillDialog.tsx:1198
 msgid "Retry load"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:1220
+#: src/pages/WindyFillDialog.tsx:1273
 msgid "Retry same request"
 msgstr ""
 
@@ -10966,7 +11047,7 @@ msgstr ""
 msgid "Set the receiver volume"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:1050
+#: src/pages/WindyFillDialog.tsx:1095
 msgid "Set this player to loop at end of clip in its configuration for a continuously-refreshed fill to play seamlessly."
 msgstr ""
 
@@ -11036,7 +11117,7 @@ msgstr ""
 msgid "Show selected channel"
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:120
+#: src/cast/ActiveCastCard.tsx:231
 msgid "Show something else"
 msgstr ""
 
@@ -11060,7 +11141,7 @@ msgstr ""
 msgid "Shown past the target. Blank uses the default “+”."
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:53
+#: src/cast/ActiveCastCard.tsx:94
 msgid "Shows"
 msgstr ""
 
@@ -11096,7 +11177,7 @@ msgstr ""
 msgid "Silence level (dBFS)"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:1167
+#: src/pages/WindyFillDialog.tsx:1220
 msgid "silent"
 msgstr ""
 
@@ -11105,7 +11186,7 @@ msgid "Silent (gated)"
 msgstr ""
 
 #: src/components/broadcast/library/MetadataInspector.tsx:368
-#: src/pages/WindyFillDialog.tsx:770
+#: src/pages/WindyFillDialog.tsx:815
 msgid "Size"
 msgstr ""
 
@@ -11364,7 +11445,7 @@ msgstr ""
 msgid "Start cast"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:1228
+#: src/pages/WindyFillDialog.tsx:1281
 msgid "Start new capture"
 msgstr ""
 
@@ -11403,7 +11484,7 @@ msgstr ""
 msgid "Starting: {startingPhase}"
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:55
+#: src/cast/ActiveCastCard.tsx:96
 #: src/pages/AlarmsPage.tsx:183
 #: src/pages/CastPage.tsx:392
 #: src/pages/DevicesPage.tsx:552
@@ -11493,7 +11574,7 @@ msgstr ""
 msgid "Stop {name}"
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:112
+#: src/cast/ActiveCastCard.tsx:153
 #: src/cast/CastButton.tsx:60
 #: src/cast/CastButton.tsx:61
 msgid "Stop casting"
@@ -11520,7 +11601,7 @@ msgstr ""
 msgid "Stopped"
 msgstr ""
 
-#: src/cast/castLabels.ts:22
+#: src/cast/castLabels.ts:23
 msgid "Stopping…"
 msgstr ""
 
@@ -11665,6 +11746,10 @@ msgstr ""
 
 #: src/pages/SourcesPage.tsx:729
 msgid "Subtitle track (id / language)"
+msgstr ""
+
+#: src/cast/ActiveCastCard.tsx:204
+msgid "Subtitles"
 msgstr ""
 
 #: src/pages/WindyFillDialog.tsx:589
@@ -12033,7 +12118,7 @@ msgstr ""
 
 #: src/pages/graphics/LibraryView.tsx:121
 #: src/pages/graphics/PlayoutView.tsx:469
-#: src/pages/WindyFillDialog.tsx:671
+#: src/pages/WindyFillDialog.tsx:716
 msgid "Template"
 msgstr ""
 
@@ -12139,23 +12224,23 @@ msgstr ""
 msgid "The building blocks of a Conspect deployment, and what each one does."
 msgstr ""
 
-#: src/cast/castLoad.ts:131
+#: src/cast/castLoad.ts:140
 msgid "The Cast receiver could not load the media."
 msgstr ""
 
-#: src/cast/castLoad.ts:133
+#: src/cast/castLoad.ts:142
 msgid "The Cast receiver could not play this stream. Check that the address uses HTTPS with a valid certificate."
 msgstr ""
 
-#: src/cast/castLoad.ts:127
+#: src/cast/castLoad.ts:136
 msgid "The Cast request timed out."
 msgstr ""
 
-#: src/cast/castController.ts:229
+#: src/cast/castController.ts:309
 msgid "The cast settings are still loading. Try again in a moment."
 msgstr ""
 
-#: src/cast/castController.ts:379
+#: src/cast/castController.ts:543
 msgid "The cast stream ended on the server (expired or stopped elsewhere)."
 msgstr ""
 
@@ -12276,7 +12361,7 @@ msgstr ""
 msgid "The engine dials the TV itself, so this only works when the engine and the TV share a network. A session can be saved as a permanent device. The session list refreshes on its own."
 msgstr ""
 
-#: src/cast/castLoad.ts:119
+#: src/cast/castLoad.ts:128
 msgid "The engine did not have the cast stream ready within 15 seconds. Try again; if it keeps failing, check the cast output on the Outputs page."
 msgstr ""
 
@@ -12496,7 +12581,7 @@ msgstr ""
 msgid "The previous command's outcome is unknown — repeating it could duplicate the command."
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:1207
+#: src/pages/WindyFillDialog.tsx:1260
 msgid "The previous request's outcome may be unknown (a network error) — \"Retry same request\" resends it unchanged."
 msgstr ""
 
@@ -12656,7 +12741,7 @@ msgstr ""
 msgid "The TV could not play the stream."
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:69
+#: src/cast/ActiveCastCard.tsx:110
 msgid "The TV has not reached this server. Check that the TV can open https://{host} (certificate, DNS, firewall)."
 msgstr ""
 
@@ -12717,7 +12802,7 @@ msgstr ""
 msgid "Theme: system. Switch to light."
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:1026
+#: src/pages/WindyFillDialog.tsx:1071
 msgid "Then"
 msgstr ""
 
@@ -12964,7 +13049,7 @@ msgstr ""
 msgid "This URL must start with http:// or https://."
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:1009
+#: src/pages/WindyFillDialog.tsx:1054
 msgid "This would capture {nominalFrames} frames, above the server's cap of {MAX_NOMINAL_FRAMES}. Lower max steps, frame duration or end hold."
 msgstr ""
 
@@ -13044,7 +13129,7 @@ msgstr ""
 msgid "Timezone offset (minutes from UTC)"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:932
+#: src/pages/WindyFillDialog.tsx:977
 msgid "Timing"
 msgstr ""
 
@@ -13091,6 +13176,11 @@ msgstr ""
 
 #: src/layout/components/CellsForm.tsx:393
 msgid "Top (%)"
+msgstr ""
+
+#. placeholder {0}: track.trackId
+#: src/cast/castTracks.ts:39
+msgid "Track {0}"
 msgstr ""
 
 #: src/pages/SourcesPage.tsx:805
@@ -13237,7 +13327,7 @@ msgstr ""
 msgid "Turning it on"
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:89
+#: src/cast/ActiveCastCard.tsx:130
 msgid "TV volume"
 msgstr ""
 
@@ -13351,7 +13441,7 @@ msgstr ""
 msgid "Unknown error"
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:29
+#: src/cast/ActiveCastCard.tsx:53
 msgid "Unknown feed"
 msgstr ""
 
@@ -13424,8 +13514,8 @@ msgstr ""
 msgid "Unmute {label}"
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:80
-#: src/cast/ActiveCastCard.tsx:81
+#: src/cast/ActiveCastCard.tsx:121
+#: src/cast/ActiveCastCard.tsx:122
 msgid "Unmute the TV"
 msgstr ""
 
@@ -13612,6 +13702,7 @@ msgstr ""
 msgid "Very low (~1 frame)"
 msgstr ""
 
+#: src/cast/ActiveCastCard.tsx:160
 #: src/components/broadcast/library/Chips.tsx:139
 #: src/pages/approved/PatchMatrix.tsx:894
 #: src/pages/OutputFeedRow.tsx:333
@@ -13624,6 +13715,10 @@ msgstr ""
 
 #: src/pages/approved/RoutingSurface.tsx:191
 msgid "Video cells"
+msgstr ""
+
+#: src/pages/WindyFillDialog.tsx:651
+msgid "Video decoder could not be opened"
 msgstr ""
 
 #: src/pages/OutputFeedRow.tsx:340
@@ -13814,7 +13909,7 @@ msgstr ""
 msgid "Weather is unavailable: this server does not provide it yet (backend not deployed)."
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:664
+#: src/pages/WindyFillDialog.tsx:709
 msgid "Web capture is not provisioned on this server."
 msgstr ""
 
@@ -14054,11 +14149,11 @@ msgstr ""
 msgid "Width and height must both be even numbers from 16 to 8192, at most 3840 × 2160 pixels in area."
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:691
+#: src/pages/WindyFillDialog.tsx:736
 msgid "Wind"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:923
+#: src/pages/WindyFillDialog.tsx:968
 msgid "Wind only supports realtime capture."
 msgstr ""
 
@@ -14066,7 +14161,7 @@ msgstr ""
 msgid "Window"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:789
+#: src/pages/WindyFillDialog.tsx:834
 msgid "Windy requires a minimum width of 1024px (desktop geometry)."
 msgstr ""
 
@@ -14207,7 +14302,7 @@ msgstr ""
 msgid "Zone width (0–1)"
 msgstr ""
 
-#: src/pages/WindyFillDialog.tsx:753
+#: src/pages/WindyFillDialog.tsx:798
 msgid "Zoom"
 msgstr ""
 

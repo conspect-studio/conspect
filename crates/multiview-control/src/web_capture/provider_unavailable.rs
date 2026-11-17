@@ -39,6 +39,11 @@ impl std::io::Read for ArtifactLease {
 }
 
 impl Provider {
+    /// Accepted for API parity with the unix provider; nothing is captured here.
+    #[must_use]
+    pub const fn with_canvas_cadence(self, _num: i64, _den: i64) -> Self {
+        self
+    }
     /// Honest runtime capabilities: no capture on this platform.
     #[must_use]
     pub fn capabilities(&self) -> serde_json::Value {
@@ -87,6 +92,7 @@ impl Provider {
                 credentials: None,
             }),
             capture: body.view.capture_options(),
+            output_cadence: None,
         };
         capture
             .validate()

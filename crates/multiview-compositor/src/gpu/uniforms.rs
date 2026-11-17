@@ -116,6 +116,252 @@ pub struct CompositeUniforms {
     pub background: [f32; 4],
 }
 
+/// `KeyParams::head[3]` bits 0-1: the key kind (`0` = no key).
+pub const KEY_KIND_BITS: u32 = 0b11;
+/// Key kind: linear (matte 1 with no key source, else the key's clamped Y).
+pub const KEY_KIND_LINEAR: u32 = 1;
+/// Key kind: luma (`clamp((y − clip) × gain, 0, 1)`).
+pub const KEY_KIND_LUMA: u32 = 2;
+/// Key kind: chroma (slice K7, ADR-C007 §3): the matte is computed in-shader
+/// from the fill's tile-gamut linear RGB distance to `KeyParams::chroma`,
+/// with the CPU-sanitized edge in `KeyParams::table[1..4]`.
+pub const KEY_KIND_CHROMA: u32 = 3;
+/// Chroma edge mode (`table[1]`): the matte is 0 for every distance.
+pub const CHROMA_EDGE_ZERO: u32 = 0;
+/// Chroma edge mode: the matte is 1 for every distance.
+pub const CHROMA_EDGE_ONE: u32 = 1;
+/// Chroma edge mode: a step, `d > clip` → 1, else 0 (an infinite gain).
+pub const CHROMA_EDGE_STEP: u32 = 2;
+/// Chroma edge mode: `clamp((d − clip) × gain, 0, 1)`, finite clip and gain.
+pub const CHROMA_EDGE_RAMP: u32 = 3;
+/// Invert the matte (a matte from a signal only; ignored by a linear self
+/// key). Already folded into the matte table; kept for inspection.
+pub const KEY_INVERT: u32 = 1 << 2;
+/// The key signal is a separate source resident at `head[0]` of `y_planes`.
+pub const KEY_HAS_SOURCE: u32 = 1 << 3;
+/// A source-space mask in `KeyParams::mask` applies.
+pub const KEY_HAS_MASK: u32 = 1 << 4;
+/// The matte comes from a signal: it is `mattes[table[0] + code]`, the
+/// 256-entry table of the signal's 8-bit Y code (review MEDIA-1).
+pub const KEY_HAS_TABLE: u32 = 1 << 5;
+/// Shift of the 2-bit scene group (`0` top, `1` both, `2` out, `3` in).
+pub const KEY_GROUP_SHIFT: u32 = 8;
+/// Entries of one matte table: one per 8-bit Y code.
+pub const MATTE_TABLE_LEN: usize = 256;
+
+/// Per-tile key and scene-group block (ADR-0113, design note §3.3), one entry
+/// per tile, parallel to `tiles`. Mirrors `KeyParams` in `composite.wgsl`.
+/// All zero is an ordinary `Top` tile with no key.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct KeyParams {
+    /// `[key_layer, key_w, key_h, flags]`: the key source's layer in the tile
+    /// Y array and its size (zero without a source), then the `KEY_*` bits.
+    pub head: [u32; 4],
+    /// `[base, 0, 0, 0]`: the first entry of this tile's matte table in the
+    /// `mattes` storage buffer (binding 7), valid under [`KEY_HAS_TABLE`].
+    /// A chroma key has no table: `[ref_codes, edge_mode, clip_bits,
+    /// gain_bits]`, where `ref_codes` packs the reference's fill codes
+    /// `y | cb << 8 | cr << 16` (see [`pack_chroma_codes`])
+    /// (`CHROMA_EDGE_*`, then the sanitized finite clip and gain as `f32`
+    /// bits; see [`chroma_edge`]).
+    pub table: [u32; 4],
+    /// `[x, y, w, h]` of the mask in fill-source pixels.
+    pub mask: [u32; 4],
+    /// `[kind, p | d, i, 0]` of the segment merge (`0` MIX, `1` DIP), weights
+    /// already clamped to `[0, 1]` with NaN read as 0.
+    pub merge: [f32; 4],
+    /// The opaque DIP colour (linear, canvas gamut), alpha 1.
+    pub dip_colour: [f32; 4],
+    /// `[r, g, b, 0]`: a chroma key's reference colour in the fill's
+    /// tile-gamut linear RGB, converted once per frame here
+    /// ([`crate::key::chroma_reference_linear`]); zero otherwise.
+    pub chroma: [f32; 4],
+}
+
+/// Pack a chroma reference's fill codes as the shader compares them:
+/// `y | cb << 8 | cr << 16`.
+#[must_use]
+pub fn pack_chroma_codes((y, cb, cr): (u8, u8, u8)) -> u32 {
+    u32::from(y) | (u32::from(cb) << 8) | (u32::from(cr) << 16)
+}
+
+/// Reduce a chroma key's `(clip, gain)` to a NaN- and infinity-free edge the
+/// shader evaluates exactly like [`crate::key::chroma_matte`] for every
+/// finite distance `d >= 0` (a shader may not honour NaN or infinity):
+/// `(mode, clip, gain)` with `mode` one of `CHROMA_EDGE_*`.
+///
+/// The oracle is `unit((d − flush(clip)) × max(gain, 0))` with a NaN gain read
+/// as 0, so: a NaN clip, a zero gain or a `+∞` clip is always 0; a `−∞` clip
+/// with a positive gain is always 1; an infinite gain is a step at the clip
+/// (`d == clip` is `0 × ∞` = NaN → 0, hence strictly greater); otherwise the
+/// finite ramp.
+#[must_use]
+pub fn chroma_edge(clip: f32, gain: f32) -> (u32, f32, f32) {
+    let clip = crate::key::flush_subnormal(clip);
+    let gain = crate::key::flush_subnormal(if gain.is_nan() { 0.0 } else { gain.max(0.0) });
+    if clip.is_nan() || gain == 0.0 || clip == f32::INFINITY {
+        return (CHROMA_EDGE_ZERO, 0.0, 0.0);
+    }
+    if clip == f32::NEG_INFINITY {
+        return (CHROMA_EDGE_ONE, 0.0, 0.0);
+    }
+    if gain == f32::INFINITY {
+        return (CHROMA_EDGE_STEP, clip, 0.0);
+    }
+    (CHROMA_EDGE_RAMP, clip, gain)
+}
+
+impl KeyParams {
+    /// Build the key/group block of `tile`. `key_layer` is the `y_planes`
+    /// layer its key source was uploaded to (`None` without a key source).
+    /// A matte from a signal (luma, or linear with a key source) appends its
+    /// 256-entry table to `mattes` (see [`push_matte_table`]) and records
+    /// its base.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnresolvedColor`] when the signal's range is unresolved
+    /// (exactly what the CPU oracle raises); [`Error::GpuLimit`] when the
+    /// table base overflows `u32`.
+    pub fn build(
+        tile: &crate::pipeline::Tile<'_>,
+        key_layer: Option<u32>,
+        mattes: &mut Vec<f32>,
+    ) -> Result<Self> {
+        use crate::key::KeyKind;
+        let mut out = Self::zeroed();
+        if let Some(key) = &tile.key {
+            let mut flags = match key.kind {
+                KeyKind::Linear => KEY_KIND_LINEAR,
+                KeyKind::Luma { .. } => KEY_KIND_LUMA,
+                KeyKind::Chroma { .. } => KEY_KIND_CHROMA,
+            };
+            if key.invert {
+                flags |= KEY_INVERT;
+            }
+            if let Some(mask) = key.mask {
+                flags |= KEY_HAS_MASK;
+                out.mask = [mask.x, mask.y, mask.w, mask.h];
+            }
+            if let KeyKind::Chroma {
+                reference,
+                clip,
+                gain,
+            } = key.kind
+            {
+                // Chroma keys the fill itself (ADR-C007 §3): no key source,
+                // no table; the reference is converted once per frame into
+                // the fill's linear space, as the oracle does per tile.
+                // The shader linearizes analytically, so the reference goes
+                // through the analytic front half (no LUT); a pixel with the
+                // reference's codes short-circuits to distance 0 in-shader
+                // (review K7 MEDIA-1).
+                let color = tile.image.color();
+                let codes = crate::key::chroma_reference_codes(reference, color)?;
+                let lin = crate::key::chroma_reference_linear(reference, color, None)?;
+                let (mode, clip, gain) = chroma_edge(clip, gain);
+                out.table = [
+                    pack_chroma_codes(codes),
+                    mode,
+                    clip.to_bits(),
+                    gain.to_bits(),
+                ];
+                out.chroma = [lin[0], lin[1], lin[2], 0.0];
+                out.head[3] = flags;
+                return Ok(out.with_group(tile));
+            }
+            let source = key.source.zip(key_layer);
+            if let Some((src, layer)) = source {
+                out.head[0] = layer;
+                out.head[1] = src.width();
+                out.head[2] = src.height();
+                flags |= KEY_HAS_SOURCE;
+            }
+            // The signal: the key source, else the fill (a luma self key). A
+            // linear self key has none (matte 1, invert ignored).
+            let signal = match (source, key.kind) {
+                (Some((src, _)), _) => Some(src),
+                (None, KeyKind::Luma { .. }) => Some(tile.image),
+                (None, _) => None,
+            };
+            if let Some(img) = signal {
+                let r = range::require_resolved(img.color().range)?;
+                let base = u32::try_from(mattes.len())
+                    .map_err(|_| Error::GpuLimit("matte table base overflows u32".to_owned()))?;
+                push_matte_table(mattes, key.kind, r, key.invert);
+                out.table[0] = base;
+                flags |= KEY_HAS_TABLE;
+            }
+            out.head[3] = flags;
+        }
+        Ok(out.with_group(tile))
+    }
+
+    /// Fold the tile's scene group and merge into the block.
+    fn with_group(mut self, tile: &crate::pipeline::Tile<'_>) -> Self {
+        use crate::key::{unit, SceneMember, SceneMerge, TileGroup};
+        let out = &mut self;
+        if let TileGroup::Scene { member, merge } = tile.group {
+            let g: u32 = match member {
+                SceneMember::Both => 1,
+                SceneMember::Out => 2,
+                SceneMember::In => 3,
+            };
+            out.head[3] |= g << KEY_GROUP_SHIFT;
+            match merge {
+                SceneMerge::Mix { p } => out.merge = [0.0, unit(p), 0.0, 0.0],
+                SceneMerge::Dip { colour, d, i } => {
+                    out.merge = [1.0, unit(d), unit(i), 0.0];
+                    out.dip_colour = [colour.r, colour.g, colour.b, 1.0];
+                }
+            }
+        }
+        self
+    }
+
+    /// The `y_planes` layer of the key source, or `None`.
+    #[must_use]
+    pub const fn key_layer(&self) -> Option<u32> {
+        if self.head[3] & KEY_HAS_SOURCE == 0 {
+            None
+        } else {
+            Some(self.head[0])
+        }
+    }
+}
+
+/// Append the 256-entry matte table of a signal-based key to `out`: entry `c`
+/// is the final matte (after invert) for 8-bit Y code `c` of a signal in
+/// `range`, computed with the CPU oracle's own functions
+/// ([`range::expand_luma`], then [`crate::key::luma_matte`] or
+/// [`crate::key::unit`]). The matte is a pure function of the code, so the
+/// shader's lookup is exact by construction: no step of a huge or infinite
+/// gain can flip on float fuzz (review MEDIA-1). Only `extend`s, so a pooled
+/// `out` reuses its capacity.
+pub fn push_matte_table(
+    out: &mut Vec<f32>,
+    kind: crate::key::KeyKind,
+    range: multiview_core::color::ColorRange,
+    invert: bool,
+) {
+    use crate::key::{luma_matte, unit, KeyKind};
+    out.extend((0..=u8::MAX).map(|c| {
+        let y = range::expand_luma(c, range);
+        let m = match kind {
+            KeyKind::Luma { clip, gain } => luma_matte(y, clip, gain),
+            // A chroma key never has a table (its matte depends on RGB);
+            // `KeyParams::build` never calls this for one.
+            KeyKind::Linear | KeyKind::Chroma { .. } => unit(y),
+        };
+        if invert {
+            1.0 - m
+        } else {
+            m
+        }
+    }));
+}
+
 /// Encode-pass uniform block. Mirrors `EncodeUniforms` in `encode.wgsl`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -289,7 +535,9 @@ impl TileParams {
         Ok(Self {
             placement: [dst_x, dst_y, src_w, src_h],
             dst_size: [dw, dh, 0, 0],
-            opacity_transfer: [opacity.clamp(0.0, 1.0), transfer.as_f32(), 0.0, 0.0],
+            // `unit` reads a NaN opacity (a keyer weight rides it) as 0, as the
+            // CPU oracle does; a NaN must never reach the shader's clamp.
+            opacity_transfer: [crate::key::unit(opacity), transfer.as_f32(), 0.0, 0.0],
             range: expand_range_params(tile_range),
             yuv2rgb0: yuv[0],
             yuv2rgb1: yuv[1],
@@ -388,5 +636,267 @@ impl EncodeUniforms {
             rgb2yuv2: rgb2yuv[2],
             range: compress_range_params(canvas.range),
         })
+    }
+}
+
+#[cfg(test)]
+mod key_params_tests {
+    #![allow(clippy::unwrap_used, clippy::float_cmp)]
+
+    use multiview_core::color::{
+        ColorInfo, ColorPrimaries, ColorRange, MatrixCoefficients, TransferCharacteristic,
+    };
+
+    use super::*;
+    use crate::key::{KeyMask, SceneMember, SceneMerge, TileGroup, TileKey};
+    use crate::pipeline::{Nv12Image, Tile};
+
+    fn img(w: u32, h: u32, range: ColorRange) -> Nv12Image {
+        let color = ColorInfo {
+            primaries: ColorPrimaries::Bt709,
+            transfer: TransferCharacteristic::Bt709,
+            matrix: MatrixCoefficients::Bt709,
+            range,
+        };
+        Nv12Image::solid(w, h, 100, 128, 128, color).unwrap()
+    }
+
+    #[test]
+    fn an_ordinary_tile_packs_all_zero() {
+        let a = img(4, 4, ColorRange::Limited);
+        let mut mattes = Vec::new();
+        let k = KeyParams::build(&Tile::placed(&a, 0, 0, 1.0), None, &mut mattes).unwrap();
+        assert_eq!(k, KeyParams::zeroed());
+        assert_eq!(mattes.len(), 0);
+        assert_eq!(core::mem::size_of::<KeyParams>(), 96);
+        // The linear self key has no signal, hence no table.
+        let t = Tile::placed(&a, 0, 0, 1.0).with_key(TileKey::linear().inverted(true));
+        let k = KeyParams::build(&t, None, &mut mattes).unwrap();
+        assert_eq!(k.head[3] & KEY_HAS_TABLE, 0);
+        assert_eq!(mattes.len(), 0);
+    }
+
+    #[test]
+    fn a_key_source_carries_its_own_size_layer_and_table() {
+        let fill = img(4, 4, ColorRange::Limited);
+        let key = img(8, 6, ColorRange::Full);
+        let t = Tile::placed(&fill, 0, 0, 1.0).with_key(
+            TileKey::luma(0.25, 2.0)
+                .with_source(&key)
+                .inverted(true)
+                .masked(KeyMask {
+                    x: 1,
+                    y: 2,
+                    w: 3,
+                    h: u32::MAX,
+                }),
+        );
+        let mut mattes = vec![0.5; 7];
+        let k = KeyParams::build(&t, Some(9), &mut mattes).unwrap();
+        assert_eq!(k.key_layer(), Some(9));
+        assert_eq!(&k.head[..3], &[9, 8, 6]);
+        let flags = k.head[3];
+        assert_eq!(flags & KEY_KIND_BITS, KEY_KIND_LUMA);
+        assert_ne!(flags & KEY_INVERT, 0);
+        assert_ne!(flags & KEY_HAS_MASK, 0);
+        assert_ne!(flags & KEY_HAS_TABLE, 0);
+        assert_eq!(k.table, [7, 0, 0, 0]);
+        assert_eq!(mattes.len(), 7 + MATTE_TABLE_LEN);
+        // Built with the KEY SOURCE's (full) range, inverted.
+        for c in 0..=u8::MAX {
+            let y = range::expand_luma(c, ColorRange::Full);
+            let want = 1.0 - crate::key::luma_matte(y, 0.25, 2.0);
+            assert_eq!(mattes[7 + usize::from(c)], want, "code {c}");
+        }
+        assert_eq!(k.mask, [1, 2, 3, u32::MAX]);
+    }
+
+    #[test]
+    fn the_matte_table_is_the_oracle_matte_for_every_code() {
+        let nan = f32::NAN;
+        let inf = f32::INFINITY;
+        let sub = -1e-40_f32;
+        assert!(sub.is_subnormal());
+        let clips = [0.2, 0.0, nan, inf, -inf, sub, -sub, 0.502_283_1];
+        let gains = [2.0, 1e30, inf, -inf, -1.0, 0.0, nan];
+        for range in [ColorRange::Limited, ColorRange::Full] {
+            for &clip in &clips {
+                for &gain in &gains {
+                    for invert in [false, true] {
+                        let fill = img(4, 4, range);
+                        let t = Tile::placed(&fill, 0, 0, 1.0)
+                            .with_key(TileKey::luma(clip, gain).inverted(invert));
+                        let mut mattes = Vec::new();
+                        let k = KeyParams::build(&t, None, &mut mattes).unwrap();
+                        assert_eq!(k.table[0], 0);
+                        assert_eq!(mattes.len(), MATTE_TABLE_LEN);
+                        for c in 0..=u8::MAX {
+                            let y = range::expand_luma(c, range);
+                            let m = crate::key::luma_matte(y, clip, gain);
+                            let want = if invert { 1.0 - m } else { m };
+                            let got = mattes[usize::from(c)];
+                            assert!(
+                                got.to_bits() == want.to_bits() && (0.0..=1.0).contains(&got),
+                                "{range:?} clip={clip} gain={gain} invert={invert} code={c}: \
+                                 {got} != {want}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Review MEDIA-1: a full-range black code, a negative subnormal clip
+        // and an infinite gain is matte 1 (a positive excess times +inf).
+        let mut mattes = Vec::new();
+        push_matte_table(
+            &mut mattes,
+            crate::key::KeyKind::Luma {
+                clip: sub,
+                gain: inf,
+            },
+            ColorRange::Full,
+            false,
+        );
+        assert_eq!(mattes[0], 1.0);
+        // Linear with a key source: unit(y) of the source's range.
+        let fill = img(4, 4, ColorRange::Full);
+        let key = img(4, 4, ColorRange::Limited);
+        let t = Tile::placed(&fill, 0, 0, 1.0).with_key(TileKey::linear().with_source(&key));
+        let mut mattes = Vec::new();
+        KeyParams::build(&t, Some(1), &mut mattes).unwrap();
+        assert_eq!(mattes[16], 0.0);
+        assert_eq!(mattes[235], 1.0);
+        assert_eq!(mattes[255], 1.0);
+        assert_eq!(mattes[0], 0.0);
+    }
+
+    #[test]
+    fn scene_merge_weights_are_clamped_and_nan_safe() {
+        let a = img(4, 4, ColorRange::Limited);
+        let g = |member, merge| {
+            KeyParams::build(
+                &Tile::placed(&a, 0, 0, 1.0).in_group(TileGroup::Scene { member, merge }),
+                None,
+                &mut Vec::new(),
+            )
+            .unwrap()
+        };
+        let k = g(SceneMember::Out, SceneMerge::Mix { p: f32::NAN });
+        assert_eq!(k.head[3] >> KEY_GROUP_SHIFT, 2);
+        assert_eq!(k.merge, [0.0, 0.0, 0.0, 0.0]);
+        let k = g(
+            SceneMember::In,
+            SceneMerge::Dip {
+                colour: crate::blend::LinearRgba::opaque(0.1, 0.2, 0.3),
+                d: 2.0,
+                i: -1.0,
+            },
+        );
+        assert_eq!(k.head[3] >> KEY_GROUP_SHIFT, 3);
+        assert_eq!(k.merge, [1.0, 1.0, 0.0, 0.0]);
+        assert_eq!(k.dip_colour, [0.1, 0.2, 0.3, 1.0]);
+        let k = g(SceneMember::Both, SceneMerge::Mix { p: 0.4 });
+        assert_eq!(k.head[3] >> KEY_GROUP_SHIFT, 1);
+        // A NaN tile opacity (a keyer weight) reads as 0, never a NaN lane.
+        let p = TileParams::build(
+            0,
+            0,
+            4,
+            4,
+            4,
+            4,
+            f32::NAN,
+            a.color(),
+            crate::pipeline::CanvasColor::default(),
+        )
+        .unwrap();
+        assert_eq!(p.opacity_transfer[0], 0.0);
+    }
+
+    /// The shader's chroma edge, written out in Rust exactly as
+    /// `composite.wgsl::chroma_matte` evaluates it.
+    fn shader_edge(d: f32, mode: u32, clip: f32, gain: f32) -> f32 {
+        match mode {
+            CHROMA_EDGE_ONE => 1.0,
+            CHROMA_EDGE_STEP => {
+                if d > clip {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            CHROMA_EDGE_RAMP => ((d - clip) * gain).clamp(0.0, 1.0),
+            _ => 0.0,
+        }
+    }
+
+    #[test]
+    fn the_chroma_edge_is_finite_and_equals_the_oracle_matte() {
+        let nan = f32::NAN;
+        let inf = f32::INFINITY;
+        let sub = 1e-40_f32;
+        let clips = [
+            0.0,
+            0.05,
+            0.2,
+            1.0,
+            -0.3,
+            nan,
+            inf,
+            -inf,
+            sub,
+            -sub,
+            f32::MAX,
+        ];
+        let gains = [1.0, 8.0, 1e30, f32::MAX, inf, -inf, -1.0, 0.0, nan, sub];
+        let ds = [0.0, sub, 0.01, 0.05, 0.05001, 0.1, 0.2, 0.5, 1.0, 1.7, 1e6];
+        for &clip in &clips {
+            for &gain in &gains {
+                let (mode, c, g) = chroma_edge(clip, gain);
+                assert!(c.is_finite() && g.is_finite(), "{clip} {gain}");
+                assert!(!c.is_subnormal() && !g.is_subnormal(), "{clip} {gain}");
+                for &d in &ds {
+                    let want = crate::key::chroma_matte(d, clip, gain);
+                    let got = shader_edge(d, mode, c, g);
+                    // By value: the oracle may yield -0.0 (a negative excess times a
+                    // zero gain), which is the same coverage.
+                    assert!(
+                        got == want,
+                        "d={d} clip={clip} gain={gain}: {got} != {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_chroma_key_packs_its_reference_and_edge_and_no_table() {
+        let fill = img(4, 4, ColorRange::Limited);
+        let key = img(4, 4, ColorRange::Full);
+        let t = Tile::placed(&fill, 0, 0, 1.0).with_key(
+            TileKey::chroma([0, 177, 64], 0.05, 8.0)
+                .with_source(&key)
+                .inverted(true),
+        );
+        let mut mattes = Vec::new();
+        let k = KeyParams::build(&t, None, &mut mattes).unwrap();
+        assert_eq!(mattes.len(), 0);
+        assert_eq!(k.head[3] & KEY_KIND_BITS, KEY_KIND_CHROMA);
+        assert_eq!(k.head[3] & (KEY_HAS_TABLE | KEY_HAS_SOURCE), 0);
+        assert_ne!(k.head[3] & KEY_INVERT, 0);
+        assert_eq!(k.key_layer(), None);
+        let codes = crate::key::chroma_reference_codes([0, 177, 64], fill.color()).unwrap();
+        assert_eq!(
+            k.table,
+            [
+                pack_chroma_codes(codes),
+                CHROMA_EDGE_RAMP,
+                0.05_f32.to_bits(),
+                8.0_f32.to_bits()
+            ]
+        );
+        assert_eq!(pack_chroma_codes((1, 2, 3)), 0x0003_0201);
+        let want = crate::key::chroma_reference_linear([0, 177, 64], fill.color(), None).unwrap();
+        assert_eq!(k.chroma, [want[0], want[1], want[2], 0.0]);
     }
 }

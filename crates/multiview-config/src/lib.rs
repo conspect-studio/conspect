@@ -32,6 +32,7 @@
 pub mod admission;
 pub mod api;
 pub mod audio;
+pub mod cast;
 pub mod cast_dir;
 pub mod catalogues;
 pub mod device;
@@ -127,8 +128,9 @@ pub use origin::{Origin, OriginParseError};
 pub use output_format::{
     is_output_rate, output_rate, validate_output_format, validate_subtitle_sources, Anchor,
     AudioSlot, CodecFamily, OutputFit, OutputFitMode, OutputFormat, OutputSlots, Scan,
-    SlotCapability, SubtitleFormat, SubtitleSlot, VideoSlot, MAX_OUTPUT_FPS, MAX_SLOT_BITRATE_KBPS,
-    MAX_SUBTITLE_SLOTS, MIN_OUTPUT_FPS, SLOT_FORMAT_UNSUPPORTED, SLOT_MEDIUM_MISMATCH,
+    SlotCapability, SubtitleFormat, SubtitleSlot, VideoSlot, MAX_CAST_AUDIO_RENDITIONS,
+    MAX_OUTPUT_FPS, MAX_SLOT_BITRATE_KBPS, MAX_SUBTITLE_SLOTS, MIN_OUTPUT_FPS,
+    SLOT_FORMAT_UNSUPPORTED, SLOT_MEDIUM_MISMATCH,
 };
 pub use placement::{DevicePin, MigrationPolicy, PinVendor, PlacementConfig, PlacementWeights};
 pub use playback::{
@@ -603,6 +605,11 @@ pub struct MultiviewConfig {
     /// `[events]`: retention bounds of the raw marker journal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<EventsConfig>,
+    /// `[cast]`: the cast transport ladder (ADR-0114): which rungs
+    /// `POST /cast/<token>/ladder` may offer. Absent ⇒ `["hls"]`; a default
+    /// section does not serialize.
+    #[serde(default, skip_serializing_if = "cast::CastConfig::is_default")]
+    pub cast: cast::CastConfig,
 }
 
 /// Shape-check the id a weather / graphics source references.
@@ -846,6 +853,7 @@ impl MultiviewConfig {
         if let Some(timing) = &self.timing {
             timing.validate()?;
         }
+        self.cast.validate()?;
 
         // Solving + the core structural check covers geometry (rects in 0..1,
         // positive extent, valid cadence) and grid wiring (areas resolve).
@@ -1112,6 +1120,21 @@ impl MultiviewConfig {
                     )));
                 }
                 _ => {}
+            }
+            // Source and player ids share one frame-store namespace (ADR-M012):
+            // a source may reuse a player's id only as that player's own binding.
+            if player_ids.contains(source.id.as_str()) {
+                let own_binding = matches!(
+                    &source.kind,
+                    SourceKind::MediaPlayer { player } if *player == source.id
+                );
+                if !own_binding {
+                    return Err(ConfigError::Validation(format!(
+                        "source {:?} reuses media player id {:?}: only a media_player source \
+                         bound to that same player may share its id",
+                        source.id, source.id
+                    )));
+                }
             }
         }
 
@@ -2008,19 +2031,6 @@ impl MultiviewConfig {
                 }
             }
             AudioFeed::Tracks(tracks) => {
-                // A cast stream has one audio rendition, the program audio
-                // (or the routed feed's own audio): no discrete track.
-                let is_cast = self
-                    .outputs
-                    .iter()
-                    .any(|o| matches!(o, Output::Cast { id, .. } if *id == xp.output));
-                if is_cast {
-                    return Err(ConfigError::Validation(format!(
-                        "output {:?}: a cast output carries the program audio only; discrete \
-                         audio tracks cannot be routed to it",
-                        xp.output
-                    )));
-                }
                 if tracks.is_empty() {
                     return Err(ConfigError::Validation(format!(
                         "output {:?}: an audio `tracks` feed needs at least one track",

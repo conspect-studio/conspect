@@ -364,7 +364,13 @@ where
     .with_warning_store(warnings);
     #[cfg(unix)]
     {
-        state = state.with_web_capture(multiview_control::web_capture_startup::from_environment()?);
+        // Every capture is conformed to the canvas cadence (exact rational) so
+        // the artifact loads into a media player, which accepts only that rate.
+        let cadence = config.canvas.fps.rational();
+        state = state.with_web_capture(
+            multiview_control::web_capture_startup::from_environment()?
+                .with_canvas_cadence(cadence.num, cadence.den),
+        );
     }
     #[cfg(feature = "moq-output")]
     if let Some(moq) = moq {
@@ -404,6 +410,8 @@ where
     // wins over `[control] cast_app_id`; an invalid value is a warning and
     // no custom receiver (the sender then uses the Default Media Receiver).
     state = state.with_cast_app_id(cast_app_id(config));
+    // `[cast] ladder` (ADR-0114): the rungs the ladder route may offer.
+    state = state.with_cast_ladder(config.cast.ladder.clone());
     // The running engine's cast outputs (ADR-0111): activation gates behind
     // a lock-free slot, so the control plane never waits on the engine.
     #[cfg(feature = "ffmpeg")]
@@ -2994,7 +3002,12 @@ impl CommandDrain {
                     )));
             }
             Command::UpsertSource { ref source, .. } => {
-                self.upsert_source(source, drive);
+                // ADR-M012: a media-player binding is a pure alias (no producer).
+                if let multiview_config::SourceKind::MediaPlayer { player } = &source.kind {
+                    self.upsert_media_player_source(source, player, drive);
+                } else if self.leave_alias_for_producer(&source.id, drive) {
+                    self.upsert_source(source, drive);
+                }
             }
             Command::RemoveSource { ref id, .. } => {
                 self.remove_source(id, drive);
@@ -3295,6 +3308,157 @@ impl CommandDrain {
         }
     }
 
+    /// Apply a `media_player` source upsert (ADR-M012) at the frame boundary:
+    /// a pure binding mutation that opens nothing. The source id is registered
+    /// with the drive as an alias of the player channel's store (the player's
+    /// own boot owns its ingest thread), the route key is set so routing and
+    /// switcher buses resolve it, and the working config mirrors it. A player
+    /// with no registered store (it did not boot) binds a never-fed store: the
+    /// source reads no-signal. An edit from a decoded/synthetic kind first asks
+    /// the hub to stop that producer — never when the id is a player's own,
+    /// whose producer is the player channel itself.
+    /// Before a producer kind is upserted under `id`: a declared player's id
+    /// is refused (its store is the player channel; a producer writing into it
+    /// would interleave frames with the player). When `id` was a
+    /// `media_player` alias, its drive entry — the player's shared store — is
+    /// unregistered so `upsert_source` allocates an independent store, and
+    /// its audio alias is withdrawn. Returns whether the upsert may proceed.
+    fn leave_alias_for_producer(
+        &mut self,
+        id: &str,
+        drive: &mut CompositorDrive<Nv12Image>,
+    ) -> bool {
+        if self.config.media_players.iter().any(|p| p.id == id) {
+            tracing::warn!(
+                source = %id,
+                "upsert_source refused: the id is a media player's channel; only a \
+                 media_player binding may share it"
+            );
+            return false;
+        }
+        let was_alias = self.config.sources.iter().any(|s| {
+            s.id == id && matches!(s.kind, multiview_config::SourceKind::MediaPlayer { .. })
+        });
+        if was_alias {
+            // Drop only this id's map entry: the player keeps its own entry
+            // (and store) under the player id.
+            drive.remove_store(id);
+            self.publish_alias(id, None);
+        }
+        true
+    }
+
+    /// Publish a `media_player` alias change to the program-audio consumer
+    /// (one bounded RCU; wait-free reads on the bake consumer), at the same
+    /// frame boundary that rebinds the alias's video.
+    #[cfg(feature = "ffmpeg")]
+    fn publish_alias(&self, alias: &str, player: Option<&str>) {
+        if let Some(handle) = self.audio_route.as_ref().and_then(|slot| slot.load()) {
+            handle.set_alias(alias, player);
+        }
+    }
+
+    /// Without `ffmpeg` there is no program-audio bus to inform.
+    #[cfg(not(feature = "ffmpeg"))]
+    #[allow(clippy::unused_self)] // reason: same signature as the ffmpeg build
+    const fn publish_alias(&self, _alias: &str, _player: Option<&str>) {}
+
+    fn upsert_media_player_source(
+        &mut self,
+        source: &multiview_config::Source,
+        player: &str,
+        drive: &mut CompositorDrive<Nv12Image>,
+    ) {
+        let id = source.id.clone();
+        if id != player && self.config.media_players.iter().any(|p| p.id == id) {
+            // Never overwrite another player's channel entry (config
+            // validation enforces the same rule at boot).
+            tracing::warn!(
+                source = %id, player = %player,
+                "media_player source refused: its id is another media player's channel"
+            );
+            return;
+        }
+        let replaced_producer = self.config.sources.iter().any(|s| {
+            s.id == id && !matches!(s.kind, multiview_config::SourceKind::MediaPlayer { .. })
+        });
+        let is_player_id = self.config.media_players.iter().any(|p| p.id == id);
+        // A NEW id is admitted under the same live source cap as a producer
+        // (review #477): an alias holds a drive binding and an audio alias.
+        if self.over_source_cap(&id) {
+            return;
+        }
+        if replaced_producer && !is_player_id {
+            self.teardown_replaced_producer(&id);
+        }
+        // A repoint (alias A -> B) replaces this id's entry with B's store; the
+        // previous player's own entry is never touched.
+        if id != player || drive.store(player).is_none() {
+            let store = drive.store(player).map_or_else(
+                || {
+                    tracing::warn!(
+                        source = %id, player = %player,
+                        "media_player source bound to a player with no channel; it reads no-signal"
+                    );
+                    Arc::new(multiview_framestore::TileStore::new(
+                        id.clone(),
+                        multiview_framestore::TileThresholds::default(),
+                        multiview_framestore::NoSignalPolicy::HoldForever,
+                    ))
+                },
+                Arc::clone,
+            );
+            drive.insert_store(id.clone(), store);
+        }
+        let stream = multiview_config::routing::StreamRef::best(
+            id.clone(),
+            multiview_core::stream::StreamKind::Video,
+        );
+        self.resolution.set_video_store_key(&stream, id.clone());
+        if id != player {
+            self.publish_alias(&id, Some(player));
+        }
+        match self.config.sources.iter_mut().find(|s| s.id == id) {
+            Some(slot) => *slot = source.clone(),
+            None => self.config.sources.push(source.clone()),
+        }
+        self.applied_media.insert(id.clone(), source.clone());
+        self.unapplied.remove(&id);
+    }
+
+    /// Stop the producer a `media_player` alias replaces under `id`, through
+    /// the same bounded bookkeeping as [`Self::remove_source`] (review #477):
+    /// a shed (`Full`) teardown of a hub-known producer is kept in
+    /// `pending_teardowns` and retried one per tick, never dropped. While
+    /// the retry is pending the id is both an alias and a pending teardown;
+    /// [`Self::over_source_cap`] counts it once.
+    fn teardown_replaced_producer(&mut self, id: &str) {
+        let Some(seam) = self.live_sources.clone() else {
+            return;
+        };
+        match seam.request_teardown(id) {
+            crate::live_sources::HubSubmit::Accepted => {
+                self.pending_teardowns.remove(id);
+            }
+            crate::live_sources::HubSubmit::Full => {
+                tracing::warn!(
+                    source = %id,
+                    "live-source hub queue full; the replaced producer's teardown is \
+                     retried each tick"
+                );
+                if self.applied_media.contains_key(id) {
+                    self.pending_teardowns.insert(id.to_owned());
+                }
+            }
+            crate::live_sources::HubSubmit::Gone => {
+                tracing::warn!(
+                    source = %id,
+                    "live-source hub gone; the replaced producer stops at run teardown"
+                );
+            }
+        }
+    }
+
     /// An upsert that changes only presentation or standing policy
     /// ([`multiview_config::Source::same_media`]) of a running source, on a run
     /// with no demand manager: there are no leases to re-read, so the running
@@ -3350,6 +3514,21 @@ impl CommandDrain {
     /// teardown (stop-flag raise + bounded join) and the preview-registry RCU
     /// to the off-thread hub. Removing an unknown id is a logged no-op.
     fn remove_source(&mut self, id: &str, drive: &mut CompositorDrive<Nv12Image>) {
+        if self.config.sources.iter().any(|s| {
+            s.id == id && matches!(s.kind, multiview_config::SourceKind::MediaPlayer { .. })
+        }) {
+            // ADR-M012: an alias owns no producer, so nothing is torn down. A
+            // source sharing its player's id leaves the player channel itself
+            // registered (transport still addresses it).
+            if !self.config.media_players.iter().any(|p| p.id == id) {
+                drive.remove_store(id);
+            }
+            self.publish_alias(id, None);
+            self.config.sources.retain(|s| s.id != id);
+            self.applied_media.remove(id);
+            self.unapplied.remove(id);
+            return;
+        }
         let Some(seam) = self.live_sources.clone() else {
             tracing::warn!(
                 source = %id,
@@ -3444,7 +3623,14 @@ impl CommandDrain {
     /// Held like a shed submit: re-apply once the hub has caught up.
     fn over_source_cap(&mut self, id: &str) -> bool {
         let known = self.applied_media.contains_key(id) || self.pending_teardowns.contains(id);
-        if known || self.applied_media.len() + self.pending_teardowns.len() < self.source_cap {
+        // Distinct ids: a `media_player` alias whose replaced producer's
+        // teardown is still pending is one id, counted once.
+        let pending_only = self
+            .pending_teardowns
+            .iter()
+            .filter(|p| !self.applied_media.contains_key(p.as_str()))
+            .count();
+        if known || self.applied_media.len() + pending_only < self.source_cap {
             return false;
         }
         tracing::warn!(

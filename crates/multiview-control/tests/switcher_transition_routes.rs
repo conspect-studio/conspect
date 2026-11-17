@@ -675,7 +675,15 @@ fn the_documented_transition_schema_is_a_tagged_union_matching_the_core_type() {
     use utoipa::OpenApi;
     let doc = serde_json::to_value(multiview_control::openapi::ApiDoc::openapi()).unwrap();
     let schemas = &doc["components"]["schemas"];
-    let request = &schemas["SwitcherRequest"]["properties"]["transition"];
+    // `SwitcherRequest` flattens the keyer fields (#389 K4), so its own
+    // properties sit in one `allOf` arm beside the `KeyerFields` ref.
+    let request = schemas["SwitcherRequest"]["allOf"]
+        .as_array()
+        .expect("SwitcherRequest is an allOf of its fields and KeyerFields")
+        .iter()
+        .map(|arm| &arm["properties"]["transition"])
+        .find(|t| !t.is_null())
+        .expect("one SwitcherRequest arm declares `transition`");
     let state = &schemas["SwitcherStateResponse"]["properties"]["transition"];
     assert!(
         request.to_string().contains("TransitionDescriptorDoc"),

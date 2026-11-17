@@ -72,6 +72,37 @@ id = "cast-1"
 dir = "%/cast"
 "##;
 
+/// #418: appended to [`CONFIG`] by [`Setup::tracks`]: the cast output gets
+/// two audio slots (the program and the discrete track `trk`, a third bars
+/// source's tone) and one `WebVTT` subtitle slot patched to `@_cc`, a source
+/// no cell shows (the caption store is attached by the test).
+const TRACKS: &str = r#"
+[[outputs.slots.audio]]
+[[outputs.slots.audio]]
+track = "trk"
+language = "fr"
+[[outputs.slots.subtitle]]
+name = "Captions"
+language = "en"
+source = "@_cc"
+[[sources]]
+id = "@_t"
+kind = "bars"
+[[sources]]
+id = "@_cc"
+kind = "bars"
+[audio]
+sample_rate_hz = 48000
+[[audio.routes]]
+input_id = "@_t"
+channels = { kind = "stereo" }
+target_track = "trk"
+title = "Commentary"
+"#;
+
+/// The text every known caption cue starts with ([`Captions::Known`]).
+const KNOWN_CUE: &str = "hello cast";
+
 /// Output time of `ticks` clock ticks, in seconds.
 fn secs(ticks: u64) -> f64 {
     f64::from(u32::try_from(ticks).unwrap()) / f64::from(u32::try_from(FPS).unwrap())
@@ -89,6 +120,9 @@ struct Ctl {
     /// Raised once the run returned (a fatal run ends before its last tick).
     ended: Arc<AtomicBool>,
     stop: StopSignal,
+    /// The engine side of the cast output's subtitle feed (with
+    /// [`Setup::tracks`]).
+    subtitle_feed: Option<multiview_output::hls::SubtitleFeed>,
 }
 
 impl Ctl {
@@ -179,7 +213,21 @@ struct Run {
     lines: Vec<String>,
     /// The cast directory (inside `_root`).
     cast_dir: PathBuf,
+    /// The cast output's subtitle feed counters (with [`Setup::tracks`]).
+    subtitle_stats: Option<Arc<multiview_output::hls::SubtitleStats>>,
     _root: tempfile::TempDir,
+}
+
+/// Caption cues published on `@_cc` before the run (needs `overlay`: without
+/// it the run resolves no caption text and the slot stays empty).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Captions {
+    None,
+    /// `"hello cast <i>"`, a new 2 s cue every 2 s for 300 s.
+    Known,
+    /// A new cue every output tick for 13 s, each padded with 8 KiB of
+    /// whitespace and a blank line (16x the per-cue text bound).
+    Hostile,
 }
 
 /// How a run is set up.
@@ -195,6 +243,10 @@ struct Setup {
     /// A run that ends in a fatal pipeline error returns it in
     /// [`Run::fatal`] instead of failing the test (negative controls only).
     keep_fatal: bool,
+    /// The cast output carries [`TRACKS`] (2 audio + 1 subtitle slot).
+    tracks: bool,
+    /// What captions `@_cc` carries (with `tracks`).
+    captions: Captions,
 }
 
 impl Setup {
@@ -205,6 +257,8 @@ impl Setup {
         default_dir: false,
         consumer_stall: None,
         keep_fatal: false,
+        tracks: false,
+        captions: Captions::None,
     };
     /// The production live policy: a full hot queue sheds (and counts), the
     /// clock never waits for the consumer.
@@ -250,11 +304,14 @@ where
     let root = tempfile::tempdir().unwrap();
     prepare(root.path());
     let default_dir = setup.default_dir;
-    let template = if default_dir {
+    let mut template = if default_dir {
         CONFIG.replace("dir = \"%/cast\"\n", "")
     } else {
         CONFIG.to_owned()
     };
+    if setup.tracks {
+        template.push_str(TRACKS);
+    }
     let toml = template
         .replace('@', prefix)
         .replace('%', root.path().to_str().unwrap());
@@ -269,6 +326,16 @@ where
         root.path().join("cast")
     };
     pipeline.enable_program_audio();
+    attach_captions(&mut pipeline, &format!("{prefix}_cc"), setup.captions);
+    let subtitle_feed = pipeline
+        .subtitle_feeds_for_test()
+        .into_iter()
+        .find(|(id, _)| id == "cast-1")
+        .map(|(_, feed)| feed);
+    assert_eq!(subtitle_feed.is_some(), setup.tracks);
+    let subtitle_stats = subtitle_feed
+        .as_ref()
+        .map(multiview_output::hls::SubtitleFeed::stats);
     if let Some((at, stall)) = setup.consumer_stall {
         pipeline.stall_consumer_once_for_test(at, stall);
     }
@@ -313,6 +380,7 @@ where
         let (ticks, stop, clock) = (Arc::clone(&ticks), stop.clone(), Arc::clone(&clock));
         let ended = Arc::clone(&ended);
         let (cast_slot, routing_slot) = (Arc::clone(&cast_slot), Arc::clone(&routing_slot));
+        let subtitle_feed = subtitle_feed.clone();
         std::thread::spawn(move || {
             let cast = wait_for("the cast output", Duration::from_secs(30), || {
                 cast_slot.load().first().cloned()
@@ -327,6 +395,7 @@ where
                 clock,
                 ended,
                 stop,
+                subtitle_feed,
             };
             control(&ctl);
         })
@@ -377,6 +446,7 @@ where
             rendition_configs,
             lines: Vec::new(),
             cast_dir,
+            subtitle_stats,
             _root: root,
         };
     };
@@ -390,9 +460,42 @@ where
         rendition_configs,
         lines: result.report.outputs,
         cast_dir,
+        subtitle_stats,
         _root: root,
     }
 }
+
+/// Publish `captions` into a caption store attached to source `id`.
+#[cfg(feature = "overlay")]
+fn attach_captions(pipeline: &mut Pipeline, id: &str, captions: Captions) {
+    use multiview_core::time::MediaTime;
+    let (count, step_ms, pad) = match captions {
+        Captions::None => return,
+        Captions::Known => (150, 2000, 0),
+        Captions::Hostile => (325, 40, 8 * 1024),
+    };
+    let store =
+        pipeline.attach_caption_store(id, Arc::new(crate::captions::CueStore::with_capacity(512)));
+    let pad = " ".repeat(pad);
+    for i in 0..count {
+        let (start, end) = (
+            MediaTime::from_nanos(i * step_ms * 1_000_000),
+            MediaTime::from_nanos((i + 1) * step_ms * 1_000_000),
+        );
+        let lines = if pad.is_empty() {
+            vec![format!("{KNOWN_CUE} {i}")]
+        } else {
+            vec![format!("cue {i}{pad}"), String::new(), format!("tail {i}")]
+        };
+        let cue = multiview_ffmpeg::caption::CaptionCue::try_text(start, end, lines, None)
+            .expect("text cue");
+        store.publish(start, end, cue);
+    }
+}
+
+/// Without `overlay` the run resolves no caption text: nothing to attach.
+#[cfg(not(feature = "overlay"))]
+fn attach_captions(_pipeline: &mut Pipeline, _id: &str, _captions: Captions) {}
 
 /// The stream file names in `dir`, sorted (the ownership marker excluded).
 fn files(dir: &Path) -> Vec<String> {
@@ -520,7 +623,11 @@ fn b0_preroll_publishes_a_full_window_at_once_and_no_preroll_starts_after_the_ac
         );
         assert_eq!(report.audio_segments, report.video_segments);
         assert_eq!(report.discontinuities, 0);
-        assert_eq!(listed_generation(ctl.dir()), generation);
+        // #418 review r7: the files carry the packager's own generation,
+        // which the status reports (not the activation id).
+        let files_generation = ctl.cast.gate.status().generation;
+        assert_ne!(files_generation, generation);
+        assert_eq!(listed_generation(ctl.dir()), files_generation);
         // It reaches back about 20 s before the activation.
         let behind = secs(at) - report.first_video_start;
         assert!((17.0..=21.5).contains(&behind), "{behind} s");
@@ -547,7 +654,9 @@ fn b0_preroll_publishes_a_full_window_at_once_and_no_preroll_starts_after_the_ac
             "first segment at {} s, activated at {activated_at} s",
             report.first_video_start
         );
-        assert_eq!(listed_generation(ctl.dir()), second);
+        let second_files = ctl.cast.gate.status().generation;
+        assert!(second_files > files_generation);
+        assert_eq!(listed_generation(ctl.dir()), second_files);
         ctl.stop.stop();
     });
     assert!(
@@ -588,6 +697,8 @@ fn b_an_activation_publishes_a_valid_stream_within_the_deadline() {
         // lifetime at 2x the nominal 2 s segment.
         assert_eq!(report.target_duration, 4);
         assert_eq!(report.discontinuities, 0);
+        // #418 review r7: the file names carry the packager's generation.
+        let generation = ctl.cast.gate.status().generation;
         let names = files(ctl.dir());
         for name in [
             "master.m3u8".to_owned(),
@@ -650,6 +761,7 @@ fn c_deactivation_empties_the_directory_and_reactivation_is_a_new_generation() {
         let first = ctl.cast.gate.activate(false).unwrap();
         ctl.wait_ready(Duration::from_secs(60));
         validated(ctl);
+        let first_files = ctl.cast.gate.status().generation;
         ctl.cast.gate.deactivate();
         wait_for("an empty directory", Duration::from_secs(5), || {
             files(ctl.dir()).is_empty().then_some(())
@@ -659,7 +771,9 @@ fn c_deactivation_empties_the_directory_and_reactivation_is_a_new_generation() {
             "the marker stays"
         );
         let status = ctl.cast.gate.status();
-        assert!(!status.active && !status.ready && status.generation == 0);
+        // #418 review r7: inactive, the status names a fresh generation no
+        // file carries (never 0, never an earlier one).
+        assert!(!status.active && !status.ready && status.generation > first_files);
         // Stays empty while inactive.
         ctl.run_seconds(12);
         assert_eq!(files(ctl.dir()), Vec::<String>::new());
@@ -670,7 +784,11 @@ fn c_deactivation_empties_the_directory_and_reactivation_is_a_new_generation() {
         // the buffered seconds can have provided them.
         ctl.wait_ready(Duration::from_secs(5));
         let report = validated(ctl);
-        assert_eq!(listed_generation(ctl.dir()), second);
+        assert_eq!(
+            listed_generation(ctl.dir()),
+            ctl.cast.gate.status().generation
+        );
+        assert!(listed_generation(ctl.dir()) > first_files);
         assert_eq!(report.media_sequence, 0, "a new stream");
         assert_eq!(report.discontinuities, 0);
         assert_eq!(first_slice_type(ctl.dir()), 5);
@@ -708,8 +826,10 @@ fn d_a_take_to_a_source_and_back_keeps_one_valid_stream_on_the_real_timeline() {
         let outcomes = ctl.routing.outcomes().expect("one outcome reader");
         // 12 s buffered, then a pre-roll activation: ready at once.
         ctl.wait_tick(12 * FPS);
-        let generation = ctl.cast.gate.activate(true).unwrap();
+        ctl.cast.gate.activate(true).unwrap();
         ctl.wait_ready(Duration::from_secs(5));
+        // #418 review r7: the packager's file generation.
+        let generation = ctl.cast.gate.status().generation;
         let keys_before = ctl.routing.snapshot().video_keys;
         let take = |op: &str, bus: PictureBus| {
             // FeedNotFresh is the correct refusal when the synthetic producer
@@ -851,6 +971,52 @@ struct ChaosSeen {
     /// place (the sink reached its hook) to the end of the run.
     progress: Vec<(i64, u64)>,
     status: Option<super::CastGateStatus>,
+    /// With [`Setup::tracks`]: hostile cues a test thread offered to the
+    /// cast output's subtitle feed while the fault was in place, and how
+    /// many the feed accepted.
+    flood: Option<Flood>,
+}
+
+/// What the cue flooder of a chaos run did.
+#[derive(Debug, Clone, Copy, Default)]
+struct Flood {
+    offered: u64,
+    accepted: u64,
+}
+
+/// Offer a hostile cue (8 KiB of text over three lines) to `feed` every
+/// millisecond until `stop` is raised, as a source with a pathological
+/// caption track would through the sampler (the feed bounds the text and
+/// never blocks). Returns what was offered and accepted.
+fn flood_cues(
+    feed: multiview_output::hls::SubtitleFeed,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<Flood> {
+    std::thread::spawn(move || {
+        let pad = " ".repeat(8 * 1024);
+        let mut flood = Flood::default();
+        let mut at = 0_i64;
+        while !stop.load(Ordering::Acquire) {
+            let start = multiview_core::time::MediaTime::from_nanos(at * 1_000_000);
+            at += 1;
+            let cue = multiview_output::hls::SubtitleCue {
+                slot: 0,
+                start,
+                end: multiview_core::time::MediaTime::from_nanos(at * 1_000_000),
+                lines: vec![
+                    format!("flood {at}{pad}"),
+                    String::new(),
+                    format!("tail {at}"),
+                ],
+            };
+            flood.offered += 1;
+            if feed.offer(cue) {
+                flood.accepted += 1;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        flood
+    })
 }
 
 /// Drive `CHAOS_TICKS` ticks set up as `setup`; at `CHAOS_AT` install `hook`
@@ -883,10 +1049,18 @@ fn chaos_run(
                         .recv_timeout(Duration::from_secs(30))
                         .expect("the cast sink reached its disk write");
                 }
+                let flood_stop = Arc::new(AtomicBool::new(false));
+                let flooder = ctl
+                    .subtitle_feed
+                    .clone()
+                    .map(|feed| flood_cues(feed, Arc::clone(&flood_stop)));
                 let progress = ctl.sample_progress(CHAOS_TICKS);
+                flood_stop.store(true, Ordering::Release);
+                let flood = flooder.map(|flooder| flooder.join().expect("flooder"));
                 let mut seen = record.lock().unwrap();
                 seen.progress = progress;
                 seen.status = Some(ctl.cast.gate.status());
+                seen.flood = flood;
             },
         )
     });
@@ -1000,6 +1174,59 @@ fn assert_unaffected(control: &(Run, ChaosSeen), run: &Run, seen: &ChaosSeen) {
     );
 }
 
+/// Frames the hot queue of a chaos run may shed beyond its control run's:
+/// one second of output. A fault that reaches the shared path costs far more
+/// (the negative controls' 1.2 s stall sheds or ends the run fatally).
+const RELATIVE_SHED_SLACK: u64 = FPS;
+
+/// As [`assert_unaffected`], with the shed count bounded RELATIVE to the
+/// control run instead of at zero: on a loaded host the control run itself
+/// may shed a few frames (no fault involved). Every other isolation check
+/// (every tick emitted, contiguous HLS video PTS, the control's HLS audio
+/// count, the clock's cadence while the fault is in place) is unchanged.
+fn assert_unaffected_relative(control: &(Run, ChaosSeen), run: &Run, seen: &ChaosSeen) {
+    let (control, control_seen) = control;
+    let not_shed = |violations: Vec<String>| -> Vec<String> {
+        violations
+            .into_iter()
+            .filter(|v| !v.starts_with("the hot queue shed"))
+            .collect()
+    };
+    assert_eq!(
+        not_shed(isolation_violations(
+            control,
+            CHAOS_TICKS,
+            None,
+            &control_seen.progress,
+            6
+        )),
+        Vec::<String>::new(),
+        "the control run"
+    );
+    assert!(
+        control.hls_audio_packets > 0,
+        "the run carries program audio"
+    );
+    assert_eq!(
+        not_shed(isolation_violations(
+            run,
+            CHAOS_TICKS,
+            Some(control.hls_audio_packets),
+            &seen.progress,
+            6
+        )),
+        Vec::<String>::new(),
+        "{:?}",
+        run.lines
+    );
+    assert!(
+        run.dropped <= control.dropped + RELATIVE_SHED_SLACK,
+        "the chaos run shed {} frame(s), the control run {}",
+        run.dropped,
+        control.dropped
+    );
+}
+
 /// (e) R3 chaos test, invariants #1 and #10: a cast sink whose disk write
 /// blocks forever costs the output clock zero ticks and the HLS output zero
 /// packets.
@@ -1097,8 +1324,10 @@ fn f_a_stalled_then_released_cast_sink_declares_the_gap_and_still_validates() {
             move |ctl| {
                 ctl.wait_tick(11 * FPS);
                 ctl.cast.gate.set_test_hook(Some(hook));
-                let generation = ctl.cast.gate.activate(true).unwrap();
+                ctl.cast.gate.activate(true).unwrap();
                 ctl.wait_ready(Duration::from_secs(5));
+                // #418 review r7: the packager's file generation.
+                let generation = ctl.cast.gate.status().generation;
                 let before = validated(ctl);
                 assert_eq!(before.discontinuities, 0);
                 stall.store(true, Ordering::Release);
@@ -1362,4 +1591,478 @@ fn a_foreign_directory_disables_the_cast_output_without_touching_it_or_the_run()
         engine.deactivate("cast-1"),
         Err(CastEngineError::NotRunning)
     );
+}
+
+/// The live set-up with the cast output's [`TRACKS`] and `captions`.
+const fn tracks_setup(captions: Captions) -> Setup {
+    Setup {
+        tracks: true,
+        captions,
+        ..Setup::LIVE
+    }
+}
+
+/// (g) #418: a cast output with two audio slots (the program and a discrete
+/// track) and one subtitle slot publishes a stream with two audio
+/// renditions and one `WebVTT` rendition that validates, and (with
+/// `overlay`, which resolves caption text) a known cue of the patched
+/// source shows up in a `.vtt` segment.
+#[test]
+fn g_audio_and_subtitle_slots_become_renditions_of_the_cast_stream() {
+    let setup = Setup {
+        policy: SendPolicy::BlockForExact,
+        ..tracks_setup(Captions::Known)
+    };
+    let run = drive_in(
+        "cast_g",
+        Until::Stop,
+        setup,
+        |_| {},
+        |ctl| {
+            ctl.wait_tick(2 * FPS);
+            ctl.cast.gate.activate(false).unwrap();
+            ctl.wait_ready(Duration::from_secs(60));
+            // #418 review r7: the packager's file generation.
+            let generation = ctl.cast.gate.status().generation;
+            let cue_in_vtt = || {
+                files(ctl.dir())
+                    .iter()
+                    .filter(|name| Path::new(name).extension().is_some_and(|ext| ext == "vtt"))
+                    .any(|name| {
+                        std::fs::read_to_string(ctl.dir().join(name))
+                            .is_ok_and(|text| text.contains(KNOWN_CUE))
+                    })
+            };
+            if cfg!(feature = "overlay") {
+                wait_for(
+                    "a known cue in a .vtt segment",
+                    Duration::from_secs(30),
+                    || cue_in_vtt().then_some(()),
+                );
+            }
+            let report = validated(ctl);
+            assert_eq!(
+                (report.audio_renditions, report.subtitle_renditions),
+                (2, 1),
+                "{report:?}"
+            );
+            assert!(report.video_segments >= 5 && report.has_audio, "{report:?}");
+            assert!(report.subtitle_segments >= 5, "{report:?}");
+            if cfg!(feature = "overlay") {
+                assert!(report.subtitle_cues > 0, "{report:?}");
+            }
+            let names = files(ctl.dir());
+            for name in [
+                "audio.m3u8".to_owned(),
+                "audio1.m3u8".to_owned(),
+                "subs0.m3u8".to_owned(),
+                format!("init-a1-{generation}-0.mp4"),
+                format!("seg-a1-{generation}-0.m4s"),
+                format!("sub0-{generation}-0.vtt"),
+            ] {
+                assert!(names.contains(&name), "{name} missing in {names:?}");
+            }
+            let master = std::fs::read_to_string(ctl.dir().join("master.m3u8")).unwrap();
+            for attribute in [
+                "NAME=\"Program\"",
+                "NAME=\"Commentary\"",
+                "LANGUAGE=\"fr\"",
+                "TYPE=SUBTITLES",
+                "NAME=\"Captions\"",
+                "LANGUAGE=\"en\"",
+                "SUBTITLES=\"subs\"",
+            ] {
+                assert!(master.contains(attribute), "{attribute} missing: {master}");
+            }
+            let status = ctl.cast.gate.status();
+            assert_eq!(
+                (status.dropped_packets, status.restarts),
+                (0, 0),
+                "{status:?}"
+            );
+            keep_copy(ctl, "g-tracks");
+            ctl.stop.stop();
+        },
+    );
+    // The HLS output next to it carries the program only, as before.
+    assert!(run.hls_audio_packets > 0);
+    let stats = run.subtitle_stats.unwrap();
+    assert_eq!(stats.feed_dropped(), 0, "a draining sink drops no cue");
+}
+
+/// (h) R3 chaos test #418, invariants #1 and #10: the cast output carries
+/// two audio renditions and a subtitle slot fed hostile captions (a new
+/// oversized cue every tick), and its sink wedges forever on its first disk
+/// write. Against a control run with the same tracks and captions and an
+/// inactive cast output: the clock emits every tick at its cadence, the
+/// HLS output gets exactly the control's packets, and the hot queue sheds
+/// at most one second of frames more than the control run did. The
+/// cue feed of the wedged sink drops and counts instead of growing (the
+/// feed is a bounded channel; the control run's inactive sink drains and
+/// discards it, so there nothing is dropped).
+#[test]
+fn h_a_wedged_cast_sink_with_tracks_and_hostile_captions_costs_the_clock_nothing() {
+    let control = chaos_run("cast_h0", tracks_setup(Captions::Hostile), None, None);
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let release_rx = Mutex::new(release_rx);
+    let hook: super::CastTestHook = Arc::new(move || {
+        let _ = entered_tx.try_send(());
+        let _ = release_rx.lock().unwrap().recv();
+    });
+    let (run, seen) = chaos_run(
+        "cast_h1",
+        tracks_setup(Captions::Hostile),
+        Some(hook),
+        Some(entered_rx),
+    );
+    assert_unaffected_relative(&control, &run, &seen);
+    let status = seen.status.unwrap();
+    assert!(status.active && !status.ready, "{status:?}");
+    assert!(status.dropped_packets > 0, "{status:?}");
+    let control_stats = control.0.subtitle_stats.as_ref().unwrap();
+    let wedged_stats = run.subtitle_stats.as_ref().unwrap();
+    let control_flood = control.1.flood.unwrap();
+    let flood = seen.flood.unwrap();
+    eprintln!(
+        "h: control frames={} dropped={} flood={control_flood:?} feed_dropped={} \
+         truncated={}; wedged frames={} dropped={} flood={flood:?} feed_dropped={} \
+         truncated={}; cast packets dropped={}",
+        control.0.frames,
+        control.0.dropped,
+        control_stats.feed_dropped(),
+        control_stats.truncated(),
+        run.frames,
+        run.dropped,
+        wedged_stats.feed_dropped(),
+        wedged_stats.truncated(),
+        status.dropped_packets
+    );
+    let capacity = u64::try_from(multiview_output::hls::subtitle::SUBTITLE_FEED_CAPACITY).unwrap();
+    // The control run's inactive cast sink drains and discards the feed:
+    // far more than one feed's worth of cues went in (the flooder runs for
+    // the whole sampled span, about 9 s at one cue per millisecond).
+    assert!(control_flood.offered > 4 * capacity, "{control_flood:?}");
+    assert!(
+        control_flood.accepted > 2 * capacity,
+        "an inactive cast sink drains and discards the cue feed: {control_flood:?}"
+    );
+    // The wedged sink drains nothing: the feed accepts at most its
+    // capacity (memory is bounded by the channel, whatever is offered) and
+    // drops and counts the rest.
+    assert!(flood.offered > 4 * capacity, "{flood:?}");
+    assert!(flood.accepted <= capacity, "the feed grew: {flood:?}");
+    assert!(
+        wedged_stats.feed_dropped() >= flood.offered - flood.accepted,
+        "every refused cue is counted: {flood:?}, {}",
+        wedged_stats.feed_dropped()
+    );
+    // The feed bounds the hostile text (8 KiB > 512 bytes) and counts it.
+    assert!(wedged_stats.truncated() > 0 && control_stats.truncated() > 0);
+    drop(release_tx);
+}
+
+/// One HTTP/1.1 request on a fresh connection: the status code (0 when the
+/// connection failed) and the response body. Plain std I/O: the flood
+/// threads are not tokio.
+fn http_call(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    auth: Option<&str>,
+    body: &str,
+) -> (u16, String) {
+    use std::io::{Read as _, Write as _};
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)) else {
+        return (0, String::new());
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let auth = auth.map_or_else(String::new, |token| {
+        format!("Authorization: Bearer {token}\r\n")
+    });
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: [::1]\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return (0, String::new());
+    }
+    let mut answer = Vec::new();
+    let _ = stream.read_to_end(&mut answer);
+    let answer = String::from_utf8_lossy(&answer).into_owned();
+    let status = answer.get(9..12).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let body = answer
+        .split_once("\r\n\r\n")
+        .map_or_else(String::new, |(_, b)| b.to_owned());
+    (status, body)
+}
+
+/// The body of a `201` create answer: the token path.
+fn create_stream(addr: std::net::SocketAddr, token: &str) -> String {
+    use std::io::{Read as _, Write as _};
+    let body = "{\"feed\":{\"bus\":\"program\"}}";
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    write!(
+        stream,
+        "POST /api/v1/cast/streams HTTP/1.1\r\nHost: [::1]\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).unwrap();
+    assert!(answer.starts_with("HTTP/1.1 201"), "{answer}");
+    let json = answer.split("\r\n\r\n").nth(1).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(json).unwrap();
+    doc["path"].as_str().unwrap().to_owned()
+}
+
+/// The control plane (the real router, served on `[::1]`) over this run's
+/// cast and routing slots, as `multiview run` wires it.
+fn serve_control(
+    cast: &CastOutputEntry,
+    routing: Arc<OutputRoutingHandle>,
+) -> (std::net::SocketAddr, tokio::runtime::Runtime) {
+    use multiview_control::auth::{ApiKeyStore, Principal, Role};
+    let config = multiview_config::MultiviewConfig::load_from_toml(
+        &CONFIG.replace('@', "cast_l").replace('%', "/nonexistent"),
+    )
+    .unwrap();
+    let mut keys = ApiKeyStore::new(b"chaos-pepper".to_vec());
+    keys.register(
+        "op",
+        "op-secret",
+        Principal {
+            key_id: "op".to_owned(),
+            role: Role::Operator,
+            scoped_object_ids: None,
+            scoped_output_ids: None,
+            scoped_discovery_domains: None,
+        },
+    );
+    let cast_slot = super::cast_outputs_slot();
+    cast_slot.store(Arc::new(vec![cast.clone()]));
+    let routing_slot = crate::output_routing::output_routing_slot();
+    routing_slot.store(Some(routing));
+    let publisher = Arc::new(multiview_engine::EnginePublisher::<
+        multiview_control::EngineStateSnapshot,
+        multiview_events::Event,
+    >::new(8));
+    let (commands, _rx) = multiview_control::command_bus(8);
+    let state = multiview_control::AppState::new(
+        publisher,
+        commands,
+        Arc::new(multiview_control::InMemoryRepository::new()),
+        Arc::new(keys),
+    )
+    .with_seeded_resources(multiview_control::seed_resources(&config).unwrap())
+    .with_base_document(serde_json::to_value(&config).unwrap())
+    .with_output_routing(Arc::new(
+        crate::output_routing_control::OutputRoutingAdapter::new(routing_slot),
+    ))
+    .with_cast_engine(Arc::new(super::CastEngineAdapter(cast_slot)));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("[::1]:0"))
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    runtime.spawn(multiview_control::serve(
+        listener,
+        state,
+        std::future::pending::<()>(),
+    ));
+    (addr, runtime)
+}
+
+/// What the ladder flood saw.
+#[derive(Default)]
+struct LadderFlood {
+    /// Status code -> count, over every flood call.
+    statuses: std::collections::BTreeMap<u16, u64>,
+    /// `200` answers.
+    answered: u64,
+    /// `200` answers that carried a clock pair (`clock` not null).
+    clocked: u64,
+    /// `404` answers to the LIVE token (must stay 0: the flood never kills it).
+    live_404: u64,
+    /// Epoch publishes the writer made during the flood.
+    epoch_writes: u64,
+    /// Cast video segments published when the flood began and ended.
+    segments: (u64, u64),
+}
+
+/// (l) R3 chaos test, invariants #1 and #10 (ADR-0114 slice 2): a flood of
+/// ladder calls (valid, invalid, oversized, unknown-token, over the rate)
+/// through the real control plane, on a live cast of the real pipeline,
+/// costs the output clock zero ticks and the HLS output zero packets. The
+/// same isolation assertions as (e), with the same control run and the
+/// negative controls (n) proving they see a shared stall.
+#[test]
+#[allow(clippy::too_many_lines)] // One linear chaos scenario: control plane, epoch writer, flood, assertions.
+fn l_a_ladder_flood_costs_the_clock_zero_ticks_and_the_hls_output_zero_packets() {
+    let control = chaos_run("cast_l0", Setup::LIVE, None, None);
+    let seen = Arc::new(Mutex::new((ChaosSeen::default(), LadderFlood::default())));
+    let record = Arc::clone(&seen);
+    let run = bounded(Duration::from_secs(120), move || {
+        drive_in(
+            "cast_l1",
+            Until::Ticks(CHAOS_TICKS),
+            Setup::LIVE,
+            |_| {},
+            move |ctl| {
+                let (addr, runtime) = serve_control(&ctl.cast, Arc::clone(&ctl.routing));
+                ctl.wait_tick(CHAOS_AT);
+                // The real create route activates the cast output.
+                let path = create_stream(addr, "op.op-secret");
+                let token = path.split('/').nth(2).unwrap().to_owned();
+                let stop = Arc::new(AtomicBool::new(false));
+                // The sampler's role, at 50 Hz instead of ~1 Hz (a step every
+                // 10th publish): the cell the cast packager reads and the
+                // ladder's clock pair reads is written throughout the flood.
+                let writer = {
+                    let (stop, epoch) = (Arc::clone(&stop), ctl.cast.epoch.clone());
+                    std::thread::spawn(move || {
+                        let mut writes = 0_u64;
+                        while !stop.load(Ordering::Acquire) {
+                            let map = multiview_core::wallclock::WallClockRef::new(
+                                1_794_705_000_000_000_000 + i64::try_from(writes).unwrap(),
+                                0,
+                                multiview_core::time::Rational::new(1_000_000_000, 1),
+                            );
+                            if writes % 10 == 9 {
+                                epoch.set_stepped(map);
+                            } else {
+                                epoch.set(map);
+                            }
+                            writes += 1;
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        writes
+                    })
+                };
+                let bodies = [
+                "{\"v\":1,\"receiver\":{\"kind\":\"web\"},\"caps\":{\"wt\":false,\"mse\":true,\"rvfc\":true,\"frames\":\"rvfc\"},\"clock\":{\"t0\":1}}".to_owned(),
+                "{\"v\":1,\"clock\":{\"t0\":1}}".to_owned(),
+                "{\"v\":1,\"caps\":{\"wt\":\"yes\"}}".to_owned(),
+                format!("{{\"v\":1,\"pad\":\"{}\"}}", "x".repeat(4000)),
+                "[not json".to_owned(),
+            ];
+                let segments_before = ctl.cast.gate.status().video_segments;
+                let flooders: Vec<_> = (0..8)
+                    .map(|i| {
+                        let (stop, token, bodies) =
+                            (Arc::clone(&stop), token.clone(), bodies.clone());
+                        std::thread::spawn(move || {
+                            let mut flood = LadderFlood::default();
+                            let mut n = i;
+                            while !stop.load(Ordering::Acquire) {
+                                n += 1;
+                                let live = n % 7 != 0;
+                                let target = if live { token.clone() } else { "C".repeat(43) };
+                                let (status, body) = http_call(
+                                    addr,
+                                    "POST",
+                                    &format!("/cast/{target}/ladder"),
+                                    None,
+                                    &bodies[n % bodies.len()],
+                                );
+                                *flood.statuses.entry(status).or_insert(0) += 1;
+                                if status == 200 {
+                                    flood.answered += 1;
+                                    let doc: serde_json::Value =
+                                        serde_json::from_str(&body).unwrap_or_default();
+                                    if doc["clock"]["media_us"].is_i64() {
+                                        flood.clocked += 1;
+                                    }
+                                }
+                                if status == 404 && live {
+                                    flood.live_404 += 1;
+                                }
+                            }
+                            flood
+                        })
+                    })
+                    .collect();
+                let progress = ctl.sample_progress(CHAOS_TICKS - 10);
+                let segments_after = ctl.cast.gate.status().video_segments;
+                let status = ctl.cast.gate.status();
+                stop.store(true, Ordering::Release);
+                let mut flood = LadderFlood::default();
+                for flooder in flooders {
+                    let one = flooder.join().unwrap();
+                    for (status, count) in one.statuses {
+                        *flood.statuses.entry(status).or_insert(0) += count;
+                    }
+                    flood.answered += one.answered;
+                    flood.clocked += one.clocked;
+                    flood.live_404 += one.live_404;
+                }
+                flood.epoch_writes = writer.join().unwrap();
+                flood.segments = (segments_before, segments_after);
+                let mut seen = record.lock().unwrap();
+                seen.0.progress = progress;
+                seen.0.status = Some(status);
+                seen.1 = flood;
+                runtime.shutdown_background();
+            },
+        )
+    });
+    let (seen, flood) = std::mem::take(&mut *seen.lock().unwrap());
+    let detail = format!(
+        "statuses {:?}, answered {}, clocked {}, live 404 {}, epoch writes {}, segments {:?}, gate {:?}",
+        flood.statuses,
+        flood.answered,
+        flood.clocked,
+        flood.live_404,
+        flood.epoch_writes,
+        flood.segments,
+        seen.status
+    );
+    assert_unaffected(&control, &run, &seen);
+    let total: u64 = flood.statuses.values().sum();
+    assert!(total >= 200, "the flood ran: {detail}");
+    assert!(flood.answered >= 1, "some calls were answered: {detail}");
+    assert_eq!(
+        flood.clocked, flood.answered,
+        "every answer carried the clock pair of the live epoch: {detail}"
+    );
+    assert!(
+        flood.epoch_writes >= 100,
+        "the epoch was written throughout: {detail}"
+    );
+    assert_eq!(
+        flood.live_404, 0,
+        "the live token stayed admitted: {detail}"
+    );
+    assert!(
+        flood.statuses.get(&429).copied().unwrap_or(0) > flood.answered,
+        "the per-token rate refused most of the flood: {detail}"
+    );
+    assert!(
+        flood.statuses.get(&404).copied().unwrap_or(0) > 0,
+        "unknown tokens: {detail}"
+    );
+    assert!(
+        flood.statuses.get(&400).copied().unwrap_or(0)
+            + flood.statuses.get(&413).copied().unwrap_or(0)
+            > 0
+            || flood.answered > 0,
+        "{detail}"
+    );
+    // The cast packager (which reads the same epoch cell) kept publishing.
+    assert!(
+        seen.status.as_ref().is_some_and(|s| s.active),
+        "the cast was live during the flood: {detail}"
+    );
+    assert!(
+        flood.segments.1 >= flood.segments.0 + 2,
+        "the cast packager published during the flood: {detail}"
+    );
+    assert!(run.cast_packets > 0, "the cast sink received packets");
 }
