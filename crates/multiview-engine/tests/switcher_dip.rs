@@ -781,8 +781,16 @@ impl<H: FrameControl> FrameControl for Stall<H> {
     }
 }
 
+/// The real-clock runs measure the clock's own cadence, so they never run
+/// concurrently with each other (#467): three floods, feeders and engine
+/// threads at once in one test binary would measure each other.
+static REAL_CLOCK: Mutex<()> = Mutex::new(());
+
 fn flood_on_a_real_clock(block: Block) -> RealRun {
     use multiview_engine::{MonotonicTimeSource, RealtimePacer};
+    let _serial = REAL_CLOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Pacing is measured from before the runtime seeds its first deadline
     // (review INV1-03), so setup time can only lengthen `elapsed`.
     let started = std::time::Instant::now();
@@ -850,7 +858,13 @@ fn flood_on_a_real_clock(block: Block) -> RealRun {
                 };
                 if handle.try_send(command).is_err() {
                     full.fetch_add(1, Ordering::Relaxed);
-                    std::thread::yield_now();
+                    // Back off 1 ms on a full mailbox (#467): the 64-slot
+                    // mailbox still refills far faster than the engine
+                    // drains it (at most 16 a 20 ms tick), so the flood is
+                    // undiminished, but a spinning generator no longer
+                    // competes on a small runner for the CPU whose cadence
+                    // this test measures.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 n += 1;
             }

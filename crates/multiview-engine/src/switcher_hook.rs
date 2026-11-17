@@ -187,6 +187,45 @@ impl<C> SwitcherFrameHook<C> {
 }
 
 impl<C> SwitcherFrameHook<C> {
+    /// This tick's mix step `(elapsed, duration, start, audio_remaining)`
+    /// and stinger clip player, if any (ADR-0104 §3, ADR-0112 §5).
+    #[allow(clippy::type_complexity)]
+    // reason: one private tuple consumed once by `before_compose`.
+    fn mix_step(&self, tick: Tick) -> (Option<(u32, u32, i128, u32)>, Option<&str>) {
+        let mut clip = None;
+        let mix = match self.driver.stinger_flight() {
+            Some((start, timing, player, _)) => {
+                let elapsed =
+                    u32::try_from((i128::from(tick.index) - start).max(0)).unwrap_or(u32::MAX);
+                if timing.clip_visible(elapsed) {
+                    clip = Some(player.as_str());
+                }
+                // Video weight (k + 1) / mix_rate; audio ramps over exactly
+                // the mix window's remaining frames, to its exclusive end
+                // `swap_at` (review SA-3), never one frame short.
+                timing.mix_frame(elapsed).map(|k| {
+                    (
+                        k.saturating_add(1),
+                        timing.mix_rate,
+                        start,
+                        timing.swap_at().saturating_sub(elapsed),
+                    )
+                })
+            }
+            None => self.driver.auto_window().map(|(start, rate)| {
+                let elapsed = (i128::from(tick.index) - start).clamp(0, i128::from(rate.get()));
+                let elapsed = u32::try_from(elapsed).unwrap_or(rate.get());
+                (
+                    elapsed,
+                    rate.get(),
+                    start,
+                    rate.get().saturating_sub(elapsed),
+                )
+            }),
+        };
+        (mix, clip)
+    }
+
     /// Publish the PGM/PVW sources to the decode sizing slots when they
     /// changed: a string compare per tick, one `Arc<str>` and a wait-free
     /// store only on a change.
@@ -240,14 +279,13 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         // AUTO dissolve: the outgoing source stays in the Program cell, the
         // incoming one is drawn above it at elapsed/duration in this same pass.
         // At the terminal tick the machine has swapped and the window is gone.
-        let mix = self.driver.auto_window().map(|(start, rate)| {
-            let elapsed = (i128::from(tick.index) - start).clamp(0, i128::from(rate.get()));
-            (
-                u32::try_from(elapsed).unwrap_or(rate.get()),
-                rate.get(),
-                start,
-            )
-        });
+        // A stinger (ADR-0112 §5) is a MIX over `mix_rate` frames from its
+        // trigger point (mix frame k at (k + 1) / mix_rate, so a one-frame
+        // mix is a cut), plus its clip on top while the clip window is open.
+        let (mix, clip) = self.mix_step(tick);
+        if drive.stinger_clip() != clip {
+            drive.set_stinger_clip(clip);
+        }
         // The style follows the machine's (frozen in-flight) descriptor; a
         // change re-codes the DIP colour once, never per tick.
         let style = match self.driver.transition() {
@@ -286,9 +324,10 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
             }
         }
         let result = match mix {
-            Some((elapsed, duration, start)) => {
-                drive.set_mix_overlay(Some((preview.as_str(), elapsed, duration, start)))
-            }
+            Some((elapsed, duration, start, audio)) => drive.set_mix_overlay_with_audio(
+                Some((preview.as_str(), elapsed, duration, start)),
+                audio,
+            ),
             None if drive.mix_overlay().is_some() => drive.set_mix_overlay(None),
             None => Ok(()),
         };
@@ -303,6 +342,7 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
             self.failed_tick = Some(tick.index);
             self.driver.reject_composed_tick(tick, &error);
             let _ = drive.set_mix_overlay(None);
+            drive.set_stinger_clip(None);
             // Review F2: the drive still holds the last committed keyer
             // draws (this tick never resolved), so an on-air DSK stays in
             // the frame exactly as committed. Only a tied keyer whose
@@ -409,6 +449,9 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         }
         self.driver.reject_composed_tick(tick, reason);
         let _ = drive.set_mix_overlay(None);
+        // As the before_compose rejection path: the rolled-back flight's clip
+        // leaves the drive too, and its epoch moves (#415).
+        drive.set_stinger_clip(None);
         // Review F2: this tick's `before_compose` swapped its draws in and
         // the committed ones out into `keyer_buf`; swap them back, then
         // settle them against the restored state.

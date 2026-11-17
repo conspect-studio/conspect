@@ -63,7 +63,9 @@ use multiview_framestore::TileStore;
 
 use crate::clock::Tick;
 use crate::error::{Error, Result};
-use crate::keyer::{DrawRole, KeyerDraw, KeyerFly, KeyerParams, TieEnvelope, MAX_KEYERS};
+use crate::keyer::{
+    DrawRole, KeyerDraw, KeyerFamily, KeyerFly, KeyerParams, TieEnvelope, MAX_KEYERS,
+};
 use crate::slate::{failover_slate_image, FailoverSlate};
 
 /// Scratch slots reserved for keyer tiles on every compose (fill and key per
@@ -157,6 +159,12 @@ pub struct MixOverlay {
     pub start: i128,
     /// How the step is drawn (dissolve, dip, ...).
     pub style: TransitionStyle,
+    /// Output ticks of Program audio crossfade left from this frame (this
+    /// one included) to the end of the take's window: `duration - elapsed`
+    /// for a MIX/DIP/WIPE, and the mix window's exclusive end minus this
+    /// frame for a stinger, whose `elapsed` is `k + 1` for its video weight
+    /// (review SA-3). The audio consumer ramps over exactly this budget.
+    pub audio_remaining: u32,
     /// The canvas `(width, height)` the step is drawn on (a WIPE mask is
     /// evaluated in canvas coordinates).
     pub canvas: (u32, u32),
@@ -388,6 +396,13 @@ pub struct CompositorDrive<T> {
     transition_fill: Option<(Rgb8, Arc<Nv12Image>)>,
     /// Odometer of `transition_fill` builds (the no-per-tick-allocation gate).
     transition_fill_builds: u64,
+    /// ADR-0112 §5: the stinger clip's media player, drawn as one more
+    /// full-canvas tile above every other tile (its own alpha, else opaque)
+    /// while its clip window is open. `None` outside a stinger clip.
+    /// The stinger clip's player store (ADR-0112 §5): an `Arc` of the
+    /// registered store, so starting a clip clones a pointer and never
+    /// allocates on the tick (review SA-5).
+    stinger_clip: Option<Arc<TileStore<T>>>,
     /// ADR-0113: this tick's downstream keyer draws (ascending z), set by the
     /// switcher frame hook. Drawn above the layout and the transition tiles
     /// in the same pass. All `None` without keyers (the steady state).
@@ -448,12 +463,44 @@ impl<T> CompositorDrive<T> {
             transition_style: TransitionStyle::Mix,
             transition_fill: None,
             transition_fill_builds: 0,
+            stinger_clip: None,
             keyers: Box::new([const { None }; MAX_KEYERS]),
             transition_background: true,
             transition_colour: LinearRgba::opaque(0.0, 0.0, 0.0),
             scene_epoch: 0,
             stores_generation: 0,
         })
+    }
+
+    /// Draw the stinger clip from `player`'s store on top of the next
+    /// composites (ADR-0112 §5), or stop with `None`. Pure state with no
+    /// allocation (review SA-5): the registered store's `Arc` is cloned.
+    /// Only a fresh frame is drawn; a stale or missing frame, or an
+    /// unregistered player (no store), draws nothing (never a slate on
+    /// Program), so this never fails.
+    pub fn set_stinger_clip(&mut self, player: Option<&str>) {
+        let next = player
+            .and_then(|player| self.stores.get(player))
+            .map(Arc::clone);
+        let same = match (&self.stinger_clip, &next) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            // What the composite draws changed (the clip tile), so a late
+            // GPU fallback result from before must not stand in for it
+            // (issue #415 review MC-1).
+            self.scene_epoch = self.scene_epoch.wrapping_add(1);
+        }
+        self.stinger_clip = next;
+    }
+
+    /// The stinger clip's player id, while a clip with a registered store is
+    /// drawn.
+    #[must_use]
+    pub fn stinger_clip(&self) -> Option<&str> {
+        self.stinger_clip.as_deref().map(TileStore::id)
     }
 
     /// Draw `source` as one full-canvas tile at `elapsed / duration` above
@@ -467,6 +514,22 @@ impl<T> CompositorDrive<T> {
     /// [`Error::Rebind`] if `source` has no registered store; the overlay is
     /// then cleared, never drawn from a guessed store.
     pub fn set_mix_overlay(&mut self, overlay: Option<(&str, u32, u32, i128)>) -> Result<()> {
+        let audio = overlay.map(|(_, elapsed, duration, _)| duration.saturating_sub(elapsed));
+        self.set_mix_overlay_with_audio(overlay, audio.unwrap_or(0))
+    }
+
+    /// [`Self::set_mix_overlay`] with the Program audio crossfade's remaining
+    /// tick budget given explicitly ([`MixOverlay::audio_remaining`]), for a
+    /// step whose video weight is not `elapsed / duration` of its audio
+    /// window (a stinger's mix, ADR-0112 §5).
+    ///
+    /// # Errors
+    /// As [`Self::set_mix_overlay`].
+    pub fn set_mix_overlay_with_audio(
+        &mut self,
+        overlay: Option<(&str, u32, u32, i128)>,
+        audio_remaining: u32,
+    ) -> Result<()> {
         let Some((source, elapsed, duration, start)) = overlay else {
             self.mix_overlay = None;
             return Ok(());
@@ -486,6 +549,7 @@ impl<T> CompositorDrive<T> {
                 mix.duration = duration;
                 mix.start = start;
                 mix.style = style;
+                mix.audio_remaining = audio_remaining;
                 mix.canvas = canvas;
             }
             slot => {
@@ -495,6 +559,7 @@ impl<T> CompositorDrive<T> {
                     duration,
                     start,
                     style,
+                    audio_remaining,
                     canvas,
                 });
             }
@@ -1045,10 +1110,10 @@ impl CompositorDrive<Nv12Image> {
         let cell_count = self.layout.cells.len();
         // A transition adds at most two full-canvas tiles (the DIP colour and
         // the incoming picture, or the WIPE incoming picture and its border
-        // band), so the pool is sized once for both. The
-        // keyer slots are always reserved (ADR-0113), so the pool never grows
-        // when a keyer goes on air.
-        scratch.begin(cell_count + 2 * usize::from(self.mix_overlay.is_some()) + KEYER_TILES);
+        // band) and a stinger one more (its clip); the keyer slots are always
+        // reserved (ADR-0113), so the pool never grows when a keyer goes on
+        // air.
+        scratch.begin(cell_count + self.overlay_tiles() + KEYER_TILES);
         let ComposeScratch {
             held,
             placements,
@@ -1095,9 +1160,14 @@ impl CompositorDrive<Nv12Image> {
         // this same pass. A missing frame is skipped (the outgoing picture shows
         // through), never a slate blended into Program.
         self.push_transition(scenes.as_ref(), now, canvas, held, placements);
-        // Keyers above everything, the transition included (ADR-0113 §3,
-        // render lists 3 and 4): USKs, then DSKs.
-        self.push_keyer_tiles(held, placements, scenes.map(|(merge, _)| merge));
+        // Keyers above the transition (ADR-0113 §3, render lists 3 and 4):
+        // the USKs belong to the M/E scene, so the stinger clip, which is part
+        // of the M/E transition (ADR-0112 §5), rolls over them and below the
+        // downstream keyers.
+        let merge = scenes.as_ref().map(|(merge, _)| *merge);
+        self.push_keyer_tiles(held, placements, merge, KeyerFamily::Usk);
+        self.push_stinger_clip(now, canvas.width, canvas.height, held, placements);
+        self.push_keyer_tiles(held, placements, merge, KeyerFamily::Dsk);
 
         // Hand the compositor the held images as owned `Arc`s plus each cell's
         // DESTINATION rect (no pixel copy): a GPU backend composites the frame
@@ -1349,13 +1419,7 @@ impl CompositorDrive<Nv12Image> {
         };
         // Only a fresh incoming frame is blended (SW2-02): a held stale frame
         // or a slate never fades into Program.
-        let fresh = self.stores.get(&mix.source).and_then(|store| {
-            let read = store.read_at(now);
-            match (read.state().is_live(), read.frame()) {
-                (true, Some(frame)) => Some(Arc::clone(frame)),
-                _ => None,
-            }
-        });
+        let fresh = self.fresh_frame(&mix.source, now);
         let mut mask = None;
         let mut band = None;
         let incoming = match mix.style {
@@ -1432,18 +1496,68 @@ impl CompositorDrive<Nv12Image> {
         }
     }
 
-    /// Append the keyer tiles (fill, then its key) to the pooled scratch, in
-    /// the ascending-z order the hook resolved. Refcount increments only; the
-    /// capacity was reserved by `begin` (`KEYER_TILES`), so this never grows
-    /// the pool. A zero or NaN weight contributes nothing.
+    /// `source`'s frame at `now` if it is fresh (live), else `None`: never a
+    /// held stale frame or a slate. Wait-free store read.
+    fn fresh_frame(&self, source: &str, now: MediaTime) -> Option<Arc<Nv12Image>> {
+        self.stores
+            .get(source)
+            .and_then(|store| Self::fresh_store_frame(store, now))
+    }
+
+    /// Full-canvas tiles drawn above the layout: two for a transition (a
+    /// DIP colour or WIPE band plus the incoming picture), one for a stinger
+    /// clip.
+    fn overlay_tiles(&self) -> usize {
+        2 * usize::from(self.mix_overlay.is_some()) + usize::from(self.stinger_clip.is_some())
+    }
+
+    /// The stinger clip (ADR-0112 §5): its fresh frame on top of the take,
+    /// through its own alpha plane when it carries one (the compositor's
+    /// per-pixel tile alpha), else opaque. A stale or missing frame is
+    /// skipped: Program shows the take beneath, never a slate.
+    fn push_stinger_clip(
+        &self,
+        now: MediaTime,
+        width: u32,
+        height: u32,
+        held: &mut Vec<Arc<Nv12Image>>,
+        placements: &mut Vec<Placement>,
+    ) {
+        if let Some(frame) = self
+            .stinger_clip
+            .as_deref()
+            .and_then(|store| Self::fresh_store_frame(store, now))
+        {
+            held.push(frame);
+            placements.push(Placement {
+                image_index: held.len().saturating_sub(1),
+                dst_x: 0,
+                dst_y: 0,
+                dst_w: width,
+                dst_h: height,
+                opacity: 1.0,
+                mask: None,
+                key: None,
+                group: None,
+            });
+        }
+    }
+
+    /// Append one family's keyer tiles (fill, then its key) to the pooled
+    /// scratch, in the ascending-z order the hook resolved. Called once for
+    /// the USKs and once for the DSKs, so a stinger clip can sit between them.
+    /// Refcount increments only; the capacity was reserved by `begin`
+    /// (`KEYER_TILES`), so this never grows the pool. A zero or NaN weight
+    /// contributes nothing.
     fn push_keyer_tiles(
         &self,
         held: &mut Vec<Arc<Nv12Image>>,
         placements: &mut Vec<Placement>,
         merge: Option<SceneMerge>,
+        family: KeyerFamily,
     ) {
         for draw in self.keyers.iter().flatten() {
-            if draw.weight.is_nan() || draw.weight <= 0.0 {
+            if draw.family != family || draw.weight.is_nan() || draw.weight <= 0.0 {
                 continue;
             }
             held.push(Arc::clone(&draw.fill));
@@ -1476,6 +1590,15 @@ impl CompositorDrive<Nv12Image> {
                     Some((member, merge))
                 }),
             });
+        }
+    }
+
+    /// A store's fresh frame at `now`, or `None` when it is not live.
+    fn fresh_store_frame(store: &TileStore<Nv12Image>, now: MediaTime) -> Option<Arc<Nv12Image>> {
+        let read = store.read_at(now);
+        match (read.state().is_live(), read.frame()) {
+            (true, Some(frame)) => Some(Arc::clone(frame)),
+            _ => None,
         }
     }
 

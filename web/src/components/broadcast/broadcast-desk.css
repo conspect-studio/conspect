@@ -190,6 +190,11 @@
 .bd-patterns button[aria-pressed=true]{border-color:#6aa6ff}
 .bd-wipe-preview .bd-wipe-thumb{width:64px;height:36px;border:1px solid var(--bd-line2);border-radius:2px}
 .bd-transition-params input[type=color]{width:48px;min-height:48px;padding:2px}
+.bd-stinger-params{display:flex;flex-wrap:wrap;gap:8px;align-items:center;inline-size:100%;margin:0;padding:8px;border:1px solid var(--bd-line2);border-radius:4px}
+.bd-stinger-params legend{padding-inline:4px;font-weight:700;color:var(--bd-text)}
+.bd-stinger-params label{display:flex;gap:6px;align-items:center;padding-block-end:0}
+.bd-stinger-params select{min-block-size:48px;min-inline-size:120px;background:var(--bd-bg2);color:var(--bd-text);border:1px solid var(--bd-line2);border-radius:4px;padding-inline:6px}
+.bd-stinger-params small{inline-size:100%;color:var(--bd-muted)}
 .bd-apply-transition{min-height:48px;padding:4px 10px;border:1px solid var(--bd-line2);border-radius:4px;background:var(--bd-bg3);color:var(--bd-text);font-weight:700}
 
 .bd-alarm-summary{min-height:72px;font-size:12px;color:var(--bd-muted)}
@@ -473,7 +478,7 @@
  .production-desk .bd-bus button .bd-idx{font-size:10px}
  .production-desk .bd-takes{margin:0;display:grid;grid-template-columns:auto 72px minmax(90px,1fr);gap:6px;align-self:start}
  .production-desk .bd-takes>button,.production-desk .bd-cut{min-height:48px;font-size:16px;font-weight:900;border-radius:6px}
- .production-desk .bd-transitions{display:grid;grid-template-columns:repeat(3,1fr);gap:2px}
+ .production-desk .bd-transitions{display:grid;grid-template-columns:repeat(4,1fr);gap:2px}
  .production-desk .bd-transitions button{min-width:36px;padding:2px;font-size:10px}
  .production-desk .bd-cutrow{min-width:0}
  .production-desk .bd-cut-src{display:none}

@@ -282,15 +282,19 @@ pub enum TransitionDescriptor {
         /// Transition duration in output frames.
         rate: FrameCount,
     },
-    /// A media transition rolling an alpha clip over the M/E (wave 3).
+    /// A media transition rolling a (usually alpha) clip over the M/E
+    /// (ADR-0112 §5). Every count is at most [`MAX_STINGER_FRAMES`].
     Stinger {
-        /// The bound media player's id.
+        /// The bound media player's id (a configured media player).
         player: SourceRef,
-        /// Frames the clip is pre-rolled before the take.
+        /// Output frames between the AUTO and the clip's first frame: the
+        /// player is cued and played on the AUTO's tick, and the clip window
+        /// opens `pre_roll` frames later (ADR-0112 §5).
         pre_roll: FrameCount,
-        /// The clip's length in frames.
+        /// The clip's length in frames: how long it is drawn over Program.
         clip_duration: FrameCount,
-        /// The frame the underlying mix starts on.
+        /// The clip frame the underlying mix starts on, counted from the
+        /// clip's first frame.
         trigger_point: FrameCount,
         /// The mix window in frames. `trigger_point + mix_rate <= clip_duration`
         /// is validated at arm time; `mix_rate = 1` is a hard cut point.
@@ -327,19 +331,25 @@ impl TransitionDescriptor {
                 trigger_point,
                 mix_rate,
                 clip_duration,
+                pre_roll,
                 ..
-            } => trigger_point
-                .get()
-                .checked_add(mix_rate.get())
-                .is_some_and(|sum| sum <= clip_duration.get()),
+            } => {
+                [*pre_roll, *clip_duration, *trigger_point, *mix_rate]
+                    .iter()
+                    .all(|count| count.get() <= MAX_STINGER_FRAMES)
+                    && trigger_point
+                        .get()
+                        .checked_add(mix_rate.get())
+                        .is_some_and(|sum| sum <= clip_duration.get())
+            }
             _ => true,
         }
     }
 
     /// Whether the Program drive renders this kind with these options
-    /// (ADR-0112): cut, mix, dip to a colour and a colour-bordered wipe
-    /// without flip-flop. A dip through a source, a source-filled border,
-    /// flip-flop, DVE and stinger are not rendered yet.
+    /// (ADR-0112): cut, mix, dip to a colour, a colour-bordered wipe without
+    /// flip-flop and a valid stinger (§5). A dip through a source, a
+    /// source-filled border, flip-flop and DVE are not rendered yet.
     #[must_use]
     pub fn is_rendered(&self) -> bool {
         match self {
@@ -350,7 +360,29 @@ impl TransitionDescriptor {
                 flip_flop,
                 ..
             } => border_fill_source.is_none() && !flip_flop,
+            Self::Stinger { .. } => self.is_valid(),
             _ => false,
+        }
+    }
+
+    /// A stinger's timing in output frames from the AUTO's tick
+    /// (ADR-0112 §5), or `None` for any other kind or an invalid stinger.
+    #[must_use]
+    pub fn stinger_timing(&self) -> Option<StingerTiming> {
+        match self {
+            Self::Stinger {
+                pre_roll,
+                clip_duration,
+                trigger_point,
+                mix_rate,
+                ..
+            } if self.is_valid() => Some(StingerTiming {
+                pre_roll: pre_roll.get(),
+                clip_duration: clip_duration.get(),
+                trigger_point: trigger_point.get(),
+                mix_rate: mix_rate.get(),
+            }),
+            _ => None,
         }
     }
 
@@ -379,6 +411,76 @@ impl TransitionDescriptor {
             | Self::DveSqueeze { rate, .. } => Some(*rate),
             Self::Stinger { clip_duration, .. } => Some(*clip_duration),
             _ => None,
+        }
+    }
+}
+
+/// Largest frame count a stinger carries in any field (ADR-0112 §5), the
+/// same bound the control API puts on an AUTO rate.
+pub const MAX_STINGER_FRAMES: u32 = 1000;
+
+/// A valid stinger's frame timing, counted in output frames from the AUTO's
+/// tick (ADR-0112 §5). Pure integer arithmetic.
+///
+/// - `[0, pre_roll)`: the player rolls, Program is unchanged.
+/// - the clip window `[pre_roll, pre_roll + clip_duration)`: the clip is drawn
+///   over Program; clip frame `c = elapsed - pre_roll`.
+/// - the underlying mix: clip frames `[trigger_point, trigger_point +
+///   mix_rate)`; mix frame `k` draws the incoming picture at
+///   `(k + 1) / mix_rate`, so `mix_rate = 1` is a cut on `trigger_point`.
+/// - the take (bus swap) on [`Self::swap_at`], the first frame after the mix
+///   window; the flight ends on [`Self::total`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StingerTiming {
+    /// Frames before the clip window opens.
+    pub pre_roll: u32,
+    /// The clip window's length.
+    pub clip_duration: u32,
+    /// The clip frame the mix starts on.
+    pub trigger_point: u32,
+    /// The mix window's length.
+    pub mix_rate: u32,
+}
+
+impl StingerTiming {
+    /// The flight's length: pre-roll plus the clip.
+    #[must_use]
+    pub const fn total(self) -> u32 {
+        self.pre_roll.saturating_add(self.clip_duration)
+    }
+
+    /// The elapsed frame the mix window opens on.
+    #[must_use]
+    pub const fn mix_start(self) -> u32 {
+        self.pre_roll.saturating_add(self.trigger_point)
+    }
+
+    /// The elapsed frame the take completes (Program and Preview swap): the
+    /// first frame after the mix window, never after the clip ends.
+    #[must_use]
+    pub const fn swap_at(self) -> u32 {
+        let swap = self.mix_start().saturating_add(self.mix_rate);
+        if swap < self.total() {
+            swap
+        } else {
+            self.total()
+        }
+    }
+
+    /// Whether the clip is drawn at `elapsed`.
+    #[must_use]
+    pub const fn clip_visible(self, elapsed: u32) -> bool {
+        elapsed >= self.pre_roll && elapsed < self.total()
+    }
+
+    /// The mix frame `k` in `0..mix_rate` at `elapsed`, or `None` outside
+    /// the mix window.
+    #[must_use]
+    pub const fn mix_frame(self, elapsed: u32) -> Option<u32> {
+        if elapsed >= self.mix_start() && elapsed < self.swap_at() {
+            Some(elapsed - self.mix_start())
+        } else {
+            None
         }
     }
 }

@@ -685,24 +685,35 @@ impl MixEffectsConfig {
     }
 
     /// A persisted selection must be one the engine accepts and renders: the
-    /// same rule as `SwitcherVerb::SetTransition` (ADR-0112).
-    fn validate_transition(&self) -> Result<(), ConfigError> {
+    /// same rule as `SwitcherVerb::SetTransition` (ADR-0112); a stinger must
+    /// name a configured media player (§5).
+    fn validate_transition(&self, players: &[&str]) -> Result<(), ConfigError> {
         let Some(transition) = &self.transition else {
             return Ok(());
         };
         if !transition.is_valid() {
             return Err(ConfigError::Validation(format!(
                 "switcher M/E {:?} transition has an out-of-range parameter \
-                 (dip rate >= 2 and switch point in (0, 1); wipe numbers in [0, 1])",
+                 (dip rate >= 2 and switch point in (0, 1); wipe numbers in [0, 1]; \
+                 stinger trigger_point + mix_rate <= clip_duration and every count <= 1000)",
                 self.id
             )));
         }
         if !transition.is_rendered() {
             return Err(ConfigError::Validation(format!(
                 "switcher M/E {:?} transition is unsupported: this engine renders cut, mix, \
-                 dip to a colour and wipe without flip_flop or border_fill_source",
+                 dip to a colour, wipe without flip_flop or border_fill_source, and stinger",
                 self.id
             )));
+        }
+        if let TransitionDescriptor::Stinger { player, .. } = transition {
+            if !players.contains(&player.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "switcher M/E {:?} stinger names {:?}, which is not a configured media player",
+                    self.id,
+                    player.as_str()
+                )));
+            }
         }
         Ok(())
     }
@@ -790,11 +801,17 @@ impl MixEffectsConfig {
 
 impl SwitcherConfig {
     /// Validate references and the first-slice N=1 admission boundary.
+    /// `players` are the configured media-player ids a stinger may name.
     ///
     /// # Errors
-    /// Invalid M/E names, missing sources/programs, or unsupported N>1 fail
-    /// closed instead of silently selecting another scene or program.
-    pub fn validate(&self, sources: &[&str], programs: &[&str]) -> Result<(), ConfigError> {
+    /// Invalid M/E names, missing sources/programs/players, or unsupported
+    /// N>1 fail closed instead of silently selecting another scene or program.
+    pub fn validate(
+        &self,
+        sources: &[&str],
+        programs: &[&str],
+        players: &[&str],
+    ) -> Result<(), ConfigError> {
         if self.mix_effects.len() > 1 {
             return Err(ConfigError::Validation(
                 "first-slice switcher supports exactly one M/E; multi-M/E is not active".into(),
@@ -825,7 +842,7 @@ impl SwitcherConfig {
                 }
             }
             me.validate_inputs(sources)?;
-            me.validate_transition()?;
+            me.validate_transition(players)?;
         }
         Ok(())
     }
@@ -956,6 +973,7 @@ mod tests {
     use super::*;
 
     const SOURCES: &[&str] = &["abc-news", "vt1", "bars"];
+    const PLAYERS: &[&str] = &["mp1"];
 
     fn input(number: u16, source: Option<&str>) -> MixerInput {
         MixerInput {
@@ -991,7 +1009,7 @@ mod tests {
             keyer_budget: None,
             extra: serde_json::Map::new(),
         }
-        .validate(SOURCES, &["main"])
+        .validate(SOURCES, &["main"], PLAYERS)
     }
 
     fn refused(me: MixEffectsConfig, needle: &str) {
@@ -1078,7 +1096,7 @@ mod tests {
             keyer_budget: None,
             extra: serde_json::Map::new(),
         }
-        .validate(&["abc-news", "vt1", "in:1"], &["main"])
+        .validate(&["abc-news", "vt1", "in:1"], &["main"], &[])
         .expect_err("ambiguous id")
         .to_string();
         assert!(error.contains("in:"), "{error}");
@@ -1180,8 +1198,13 @@ number = 3
             ),
             (
                 serde_json::json!({"kind": "stinger", "player": "mp1", "pre_roll": 1,
-                    "clip_duration": 30, "trigger_point": 5, "mix_rate": 10}),
-                "unsupported",
+                    "clip_duration": 30, "trigger_point": 25, "mix_rate": 10}),
+                "out-of-range",
+            ),
+            (
+                serde_json::json!({"kind": "stinger", "player": "mp1", "pre_roll": 1,
+                    "clip_duration": 1001, "trigger_point": 5, "mix_rate": 10}),
+                "out-of-range",
             ),
         ] {
             let mut bad = me();
@@ -1193,6 +1216,31 @@ number = 3
             "id = \"me1\"\nprogram = \"main\"\nprogram_source = \"a\"\npreview_source = \"b\"\n[transition]\nkind = \"spin\"\n"
         )
         .is_err());
+    }
+
+    /// ADR-0112 §5: a persisted stinger loads when it names a configured
+    /// media player and round-trips; an unknown player is refused.
+    #[test]
+    fn a_persisted_stinger_must_name_a_configured_media_player() {
+        let stinger = |player: &str| {
+            let mut me = me();
+            me.transition = Some(
+                serde_json::from_value(serde_json::json!({
+                    "kind": "stinger", "player": player, "pre_roll": 3,
+                    "clip_duration": 40, "trigger_point": 10, "mix_rate": 1
+                }))
+                .unwrap(),
+            );
+            me
+        };
+        check(stinger("mp1")).unwrap();
+        let text = toml::to_string(&stinger("mp1")).unwrap();
+        assert_eq!(
+            toml::from_str::<MixEffectsConfig>(&text).unwrap(),
+            stinger("mp1")
+        );
+        refused(stinger("vt1"), "not a configured media player");
+        refused(stinger("ghost"), "not a configured media player");
     }
 
     /// MED-P3-4: a persisted selection with an unknown field, a field of

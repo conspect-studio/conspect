@@ -740,6 +740,78 @@ fn usks_draw_below_dsks() {
     assert!(handle.snapshot().unwrap().keyers[0].unwrap().on_air && on_air(&handle, 1));
 }
 
+/// ADR-0112 §5 x ADR-0113 §3: the stinger clip is part of the M/E
+/// transition, so it rolls over the M/E scene (an on-air USK included) and
+/// stays below the downstream keyers. Draw order: USKs, the clip, DSKs.
+#[test]
+fn a_stinger_clip_covers_an_on_air_usk_and_stays_below_a_dsk() {
+    const LUMA_CLIP: u8 = 90;
+    let rig = Rig::new(&["a", "b", "gfx", "gfx2", "p"]);
+    // The USK fills the top-left quarter; the DSK the bottom-right one.
+    let (handle, mut hook, mut drive) = rig.build_usk(
+        &[dsk("dsk1", "gfx2", None, 0)].map(|mut d| {
+            d.fly = Some(multiview_config::KeyerRect {
+                x: 32,
+                y: 32,
+                w: 32,
+                h: 32,
+            });
+            d
+        }),
+        &[usk("usk1", "gfx", 1, Some(FLY))],
+        20.0,
+        "a",
+        "b",
+    );
+    let fresh_all = |index: u64| {
+        fresh(&rig, index);
+        rig.publish("p", LUMA_CLIP, index);
+    };
+    // Tick 0: the USK goes on with a CUT, the DSK goes on.
+    handle.try_send(cmd("arm", arm(false, &[1]))).unwrap();
+    handle.try_send(cmd("cut", SwitcherVerb::Cut)).unwrap();
+    handle
+        .try_send(cmd("dsk", SwitcherVerb::KeyerCut { keyer: 0, on: true }))
+        .unwrap();
+    fresh_all(0);
+    let frame = step(&mut hook, &mut drive, 0);
+    assert!(on_air(&handle, 1), "the USK is on air");
+    assert!(luma(&frame, 8, 8).abs_diff(LUMA_FILL) < 4, "USK drawn");
+    // Pre-roll 1, clip 8, trigger 2, mix 2: the clip is drawn from tick 2.
+    handle
+        .try_send(cmd(
+            "set",
+            transition(serde_json::json!({
+                "kind": "stinger", "player": "p", "pre_roll": 1,
+                "clip_duration": 8, "trigger_point": 2, "mix_rate": 2,
+            })),
+        ))
+        .unwrap();
+    handle
+        .try_send(cmd("auto", SwitcherVerb::Auto(rate(9))))
+        .unwrap();
+    let mut seen = 0;
+    for index in 1..=6 {
+        fresh_all(index);
+        let frame = step(&mut hook, &mut drive, index);
+        let clip_on = luma(&frame, 16, 48).abs_diff(LUMA_CLIP) < 4;
+        if clip_on {
+            seen += 1;
+            assert!(
+                luma(&frame, 8, 8).abs_diff(LUMA_CLIP) < 4,
+                "tick {index}: the opaque clip covers the on-air USK, got {}",
+                luma(&frame, 8, 8)
+            );
+            assert!(
+                luma(&frame, 48, 48).abs_diff(LUMA_K2) < 4,
+                "tick {index}: the DSK stays above the clip, got {}",
+                luma(&frame, 48, 48)
+            );
+        }
+    }
+    assert!(seen >= 3, "the clip was drawn on {seen} ticks");
+}
+
 /// Review K3-INV-1: an `arm` while a take is held by the fresh gate is
 /// refused (`take-held`), so the held CUT lands with the set it was
 /// admitted with: usk1 (cold) only, never usk2.

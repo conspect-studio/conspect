@@ -130,14 +130,36 @@ fn tick(driver: &mut SwitcherTickDriver, index: u64) {
     driver.commit_composed_tick(tick);
 }
 
+fn configured_players(ids: &[&str]) -> Arc<dyn multiview_control::ResourceRepository> {
+    let store = multiview_control::InMemoryMediaPlayerStore::new();
+    for id in ids {
+        multiview_control::ResourceRepository::create(
+            &store,
+            id,
+            multiview_control::ResourceInput {
+                name: (*id).to_owned(),
+                body: json!({ "id": id }),
+            },
+        )
+        .unwrap();
+    }
+    Arc::new(store)
+}
+
 fn rig() -> (Harness, SwitcherControl, SwitcherTickDriver) {
     let (handle, driver) = runtime();
     let h = harness_with(|state| {
         state
             .with_sources_store(configured_sources(&["a", "b"]))
+            .with_media_player_store(configured_players(&["vt1"]))
             .with_switcher(handle.clone())
     });
     (h, handle, driver)
+}
+
+fn stinger(player: &str) -> Value {
+    json!({"kind": "stinger", "player": player, "pre_roll": 2, "clip_duration": 30,
+        "trigger_point": 8, "mix_rate": 6})
 }
 
 fn set(transition: Value) -> Value {
@@ -262,7 +284,6 @@ async fn unrendered_kinds_and_options_are_typed_unsupported_transition_422s() {
     let (h, handle, mut driver) = rig();
     let mut outcomes = handle.outcomes();
     for (n, transition) in [
-        json!({"kind": "stinger", "player": "a", "pre_roll": 1, "clip_duration": 30, "trigger_point": 5, "mix_rate": 10}),
         json!({"kind": "dve_push", "direction": "left", "rate": 10}),
         json!({"kind": "wipe", "pattern": "box", "rate": 10, "flip_flop": true}),
         json!({"kind": "wipe", "pattern": "box", "rate": 10, "border_fill_source": "a"}),
@@ -273,7 +294,11 @@ async fn unrendered_kinds_and_options_are_typed_unsupported_transition_422s() {
     {
         let plan = send(
             &h.router,
-            post_json("/api/v1/switcher/plan", OPERATOR_TOKEN, &set(transition.clone())),
+            post_json(
+                "/api/v1/switcher/plan",
+                OPERATOR_TOKEN,
+                &set(transition.clone()),
+            ),
         )
         .await;
         assert!(problem_type(plan).await.ends_with("unsupported-transition"));
@@ -871,4 +896,350 @@ async fn a_replay_during_an_auto_returns_the_original_operation() {
         !ids.iter().any(|id| id == &op),
         "the replay queued nothing: {ids:?}"
     );
+}
+
+/// ADR-0112 §5: a stinger through a configured media player plans, queues
+/// with 202 and the engine applies it at a tick; GET reports it.
+#[tokio::test]
+async fn a_stinger_through_a_configured_player_plans_and_queues_with_202() {
+    let (h, handle, mut driver) = rig();
+    let mut outcomes = handle.outcomes();
+    let plan = send(
+        &h.router,
+        post_json(
+            "/api/v1/switcher/plan",
+            OPERATOR_TOKEN,
+            &set(stinger("vt1")),
+        ),
+    )
+    .await;
+    assert_eq!(plan.status(), StatusCode::OK);
+    let response = send(
+        &h.router,
+        command(&set(stinger("vt1")), OPERATOR_TOKEN, "s1"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let op = body_json(response).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    tick(&mut driver, 1);
+    let outcome = outcomes.try_recv().unwrap().event;
+    assert_eq!(outcome.operation_id, op);
+    assert!(outcome.completed && outcome.error.is_none(), "{outcome:?}");
+    let state = body_json(send(&h.router, get("/api/v1/switcher/me1", OPERATOR_TOKEN)).await).await;
+    assert_eq!(state["transition"], stinger("vt1"));
+}
+
+/// ADR-0112 §5: a stinger whose player is not a configured media player
+/// (a source id, or nothing at all) is a typed 422 on plan and command and
+/// queues nothing; an out-of-range stinger is `invalid-transition`.
+#[tokio::test]
+async fn a_stinger_through_an_unknown_player_is_a_typed_422() {
+    let (h, handle, mut driver) = rig();
+    let mut outcomes = handle.outcomes();
+    for (n, (transition, kind)) in [
+        (stinger("ghost"), "unknown-media-player"),
+        (stinger("a"), "unknown-media-player"),
+        (
+            json!({"kind": "stinger", "player": "vt1", "pre_roll": 2, "clip_duration": 10,
+                "trigger_point": 8, "mix_rate": 6}),
+            "invalid-transition",
+        ),
+        (
+            json!({"kind": "stinger", "player": "vt1", "pre_roll": 1001, "clip_duration": 30,
+                "trigger_point": 8, "mix_rate": 6}),
+            "invalid-transition",
+        ),
+        (
+            json!({"kind": "stinger", "player": "vt1", "pre_roll": 0, "clip_duration": 30,
+                "trigger_point": 8, "mix_rate": 6}),
+            "invalid-transition",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let plan = send(
+            &h.router,
+            post_json(
+                "/api/v1/switcher/plan",
+                OPERATOR_TOKEN,
+                &set(transition.clone()),
+            ),
+        )
+        .await;
+        assert!(problem_type(plan).await.ends_with(kind), "{transition}");
+        let take = send(
+            &h.router,
+            command(&set(transition.clone()), OPERATOR_TOKEN, &format!("x{n}")),
+        )
+        .await;
+        assert!(problem_type(take).await.ends_with(kind), "{transition}");
+    }
+    tick(&mut driver, 1);
+    assert!(outcomes.try_recv().is_err(), "a refusal queues nothing");
+}
+
+/// ADR-0112 §5 BOLA: the stinger's player is authorized like any reference,
+/// before the body is parsed or the player looked up, on both routes.
+#[tokio::test]
+async fn a_stinger_player_is_authorized_before_it_is_looked_up() {
+    let (h, handle, mut driver) = rig();
+    let mut outcomes = handle.outcomes();
+    for body in [set(stinger("vt1")), set(stinger("ghost"))] {
+        let plan = send(
+            &h.router,
+            post_json("/api/v1/switcher/plan", SCOPED_TOKEN, &body),
+        )
+        .await;
+        assert_eq!(plan.status(), StatusCode::FORBIDDEN);
+        let take = send(&h.router, command(&body, SCOPED_TOKEN, "b1")).await;
+        assert_eq!(take.status(), StatusCode::FORBIDDEN);
+    }
+    tick(&mut driver, 1);
+    assert!(outcomes.try_recv().is_err(), "nothing was queued");
+    let principal = |objects: &[&str]| Principal {
+        key_id: "case".into(),
+        role: Role::Operator,
+        scoped_object_ids: Some(objects.iter().map(|o| (*o).to_owned()).collect()),
+        scoped_output_ids: Some(vec!["program:main".into()]),
+        scoped_discovery_domains: None,
+    };
+    let req: SwitcherRequest = serde_json::from_value(set(stinger("vt1"))).unwrap();
+    assert!(matches!(
+        authorize_refs(&principal(&["me1"]), &req),
+        Err(ControlError::Forbidden(_))
+    ));
+    authorize_refs(&principal(&["me1", "vt1"]), &req).unwrap();
+}
+
+/// A rig whose router also knows `me-only`: an operator for me1/program:main
+/// and sources a, b, but denied the stinger player `vt1` (review SA-2). The
+/// driver rolls through a probe so a test can prove no roll happened.
+fn scoped_rig() -> (
+    Harness,
+    SwitcherControl,
+    SwitcherTickDriver,
+    multiview_engine::player_roll::PlayerRollReceiver,
+) {
+    let (handle, mut driver) = runtime();
+    driver.advertise_auto();
+    let (roll, rolls) = multiview_engine::player_roll::PlayerRollSender::channel(["vt1".into()]);
+    driver.set_player_roll(roll);
+    let h = harness_with(|state| {
+        let mut state = state
+            .with_sources_store(configured_sources(&["a", "b"]))
+            .with_media_player_store(configured_players(&["vt1"]))
+            .with_switcher(handle.clone());
+        Arc::get_mut(&mut state.api_keys)
+            .expect("the harness key store is uniquely owned before the router is built")
+            .register(
+                "me-only",
+                "me-only-secret-s2",
+                Principal {
+                    key_id: "me-only".into(),
+                    role: Role::Operator,
+                    scoped_object_ids: Some(
+                        ["me1", "a", "b"].into_iter().map(str::to_owned).collect(),
+                    ),
+                    scoped_output_ids: Some(vec!["program:main".to_owned()]),
+                    scoped_discovery_domains: None,
+                },
+            );
+        state
+    });
+    (h, handle, driver, rolls)
+}
+
+const ME_ONLY_TOKEN: &str = "me-only.me-only-secret-s2";
+
+fn auto_request(path: &str, token: &str, key: &str) -> Request<Body> {
+    let mut request = post_json(
+        path,
+        token,
+        &json!({ "me": "me1", "program": "main", "action": "auto", "duration_frames": 10 }),
+    );
+    request
+        .headers_mut()
+        .insert("Idempotency-Key", key.parse().unwrap());
+    request
+}
+
+/// SA-2 BOLA: principal A selects a stinger through player vt1; principal B,
+/// authorized for me1/program but denied vt1, cannot AUTO it: 403 on plan
+/// and command, nothing queued, no flight and no roll. A may still AUTO it.
+#[tokio::test]
+async fn an_auto_is_forbidden_when_the_selected_stinger_player_is_denied() {
+    let (h, handle, mut driver, mut rolls) = scoped_rig();
+    let mut outcomes = handle.outcomes();
+    let response = send(
+        &h.router,
+        command(&set(stinger("vt1")), OPERATOR_TOKEN, "sel"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    tick(&mut driver, 1);
+    while outcomes.try_recv().is_ok() {}
+    for path in ["/api/v1/switcher/plan", "/api/v1/switcher/commands/auto"] {
+        let response = send(&h.router, auto_request(path, ME_ONLY_TOKEN, "b-auto")).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+    tick(&mut driver, 2);
+    tick(&mut driver, 3);
+    assert!(outcomes.try_recv().is_err(), "nothing was queued");
+    let snapshot = handle.snapshot().unwrap();
+    assert!(!snapshot.in_flight);
+    assert_eq!(snapshot.completion_count, 0);
+    assert_eq!(rolls.try_recv(), None, "the denied player was not rolled");
+    // The same principal may AUTO a selection naming nothing it is denied.
+    let response = send(
+        &h.router,
+        command(
+            &set(json!({"kind": "mix", "rate": 5})),
+            OPERATOR_TOKEN,
+            "mix",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    tick(&mut driver, 4);
+    let response = send(
+        &h.router,
+        auto_request("/api/v1/switcher/commands/auto", ME_ONLY_TOKEN, "b-mix"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+}
+
+/// SA-2 race: A's stinger selection (player vt1) is already queued but not
+/// yet applied when B's AUTO is checked, so B passes against the published
+/// MIX selection and its AUTO queues behind A's selection. At the tick the
+/// selection changes first; the engine then refuses B's AUTO with the typed
+/// selection-changed outcome: no flight, no completion, no roll.
+#[tokio::test]
+async fn an_auto_whose_selection_changed_after_its_check_is_refused_by_the_engine() {
+    let (h, handle, mut driver, mut rolls) = scoped_rig();
+    let mut outcomes = handle.outcomes();
+    let response = send(
+        &h.router,
+        command(
+            &set(json!({"kind": "mix", "rate": 5})),
+            OPERATOR_TOKEN,
+            "mix",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    tick(&mut driver, 1);
+    while outcomes.try_recv().is_ok() {}
+    handle
+        .try_send(SwitcherCommand {
+            operation_id: "a-sel".into(),
+            scene_version: 1,
+            verb: SwitcherVerb::SetTransition(serde_json::from_value(stinger("vt1")).unwrap()),
+            expect: None,
+        })
+        .unwrap();
+    let response = send(
+        &h.router,
+        auto_request("/api/v1/switcher/commands/auto", ME_ONLY_TOKEN, "b-auto"),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::ACCEPTED,
+        "checked against MIX"
+    );
+    let b_op = body_json(response).await["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    tick(&mut driver, 2);
+    let mut done = HashMap::new();
+    while let Ok(item) = outcomes.try_recv() {
+        done.insert(item.event.operation_id.clone(), item.event.clone());
+    }
+    assert!(done["a-sel"].error.is_none(), "{done:?}");
+    let refused = &done[&b_op];
+    assert!(!refused.completed);
+    assert_eq!(
+        refused.error.as_deref(),
+        Some(multiview_engine::switcher_control::REFUSE_SELECTION_CHANGED)
+    );
+    tick(&mut driver, 3);
+    let snapshot = handle.snapshot().unwrap();
+    assert!(!snapshot.in_flight);
+    assert_eq!(snapshot.completion_count, 0);
+    assert_eq!(
+        rolls.try_recv(),
+        None,
+        "the unauthorized player was not rolled"
+    );
+}
+
+/// Review (stinger final, abuse lens): an accepted AUTO replayed with its
+/// original Idempotency-Key answers its original 202 even after another
+/// principal switched the selection to a stinger the caller may not see. The
+/// replay queues nothing and rolls nothing.
+#[tokio::test]
+async fn an_accepted_auto_replays_its_202_after_the_selection_changed() {
+    let (h, handle, mut driver, mut rolls) = scoped_rig();
+    let response = send(
+        &h.router,
+        command(
+            &set(json!({"kind": "mix", "rate": 5})),
+            OPERATOR_TOKEN,
+            "mix",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    tick(&mut driver, 1);
+    let first = send(
+        &h.router,
+        auto_request("/api/v1/switcher/commands/auto", ME_ONLY_TOKEN, "b-auto"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    let first = body_json(first).await;
+    // Let the accepted AUTO resolve at the engine (applied or refused: a
+    // replay must answer its original 202 either way).
+    let mut index = 2;
+    while index < 200 && (index < 4 || handle.snapshot().unwrap().in_flight) {
+        tick(&mut driver, index);
+        index += 1;
+    }
+    assert!(!handle.snapshot().unwrap().in_flight, "the AUTO resolved");
+    let response = send(
+        &h.router,
+        command(&set(stinger("vt1")), OPERATOR_TOKEN, "sel"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    tick(&mut driver, index);
+    let mut outcomes = handle.outcomes();
+    let replay = send(
+        &h.router,
+        auto_request("/api/v1/switcher/commands/auto", ME_ONLY_TOKEN, "b-auto"),
+    )
+    .await;
+    assert_eq!(
+        replay.status(),
+        StatusCode::ACCEPTED,
+        "a replay answers its original 202"
+    );
+    assert_eq!(body_json(replay).await, first, "the original operation");
+    tick(&mut driver, index + 1);
+    tick(&mut driver, index + 2);
+    assert!(outcomes.try_recv().is_err(), "the replay queued nothing");
+    assert_eq!(rolls.try_recv(), None, "the denied player was not rolled");
+    // A fresh key is still checked against the current selection.
+    let fresh = send(
+        &h.router,
+        auto_request("/api/v1/switcher/commands/auto", ME_ONLY_TOKEN, "b-new"),
+    )
+    .await;
+    assert_eq!(fresh.status(), StatusCode::FORBIDDEN);
 }

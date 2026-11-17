@@ -195,9 +195,11 @@ async fn faultable() -> (
         multiview_control::boot_model::current_desired_config(&state).unwrap(),
     )
     .unwrap();
-    multiview_control::boot_model::commit_desired(&state, initial, layouts)
-        .await
-        .unwrap();
+    Box::pin(multiview_control::boot_model::commit_desired(
+        &state, initial, layouts,
+    ))
+    .await
+    .unwrap();
     let fail = Arc::new(AtomicBool::new(false));
     let wrap = |store: &Arc<dyn ResourceRepository>| -> Arc<dyn ResourceRepository> {
         // The seeded stores are empty for these families in BOOT.

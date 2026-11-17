@@ -18,6 +18,7 @@ pub mod timing;
 
 pub use descriptor::{
     ArmedSet, DveDirection, KeySource, KeyType, KeyerDescriptor, KeyerMode, KeyerTransition,
-    PixelRect, Rgb8, SourceRef, TapPoint, TransitionDescriptor, WipePattern,
+    PixelRect, Rgb8, SourceRef, StingerTiming, TapPoint, TransitionDescriptor, WipePattern,
+    MAX_STINGER_FRAMES,
 };
 pub use timing::{progress, FrameCount, FrameCountError, Progress};

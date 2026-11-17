@@ -1,4 +1,4 @@
-# ADR-0112: DIP and WIPE on the M/E, rendered in the one Program drive
+# ADR-0112: DIP, WIPE and STINGER on the M/E, rendered in the one Program drive
 
 - **Status:** Accepted
 - **Area:** Core engine / Compositor / Web/API
@@ -116,6 +116,98 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
    border width/colour and a dip colour, a 50 % preview thumbnail, and an
    AUTO title naming the selected kind. AUTO still sends only its
    `duration_frames`. T-bar remains out of scope.
+5. **STINGER** (stinger PR A). A stinger is a media-player clip rolled over
+   Program while the take happens beneath it. `TransitionDescriptor::Stinger`
+   is rendered exactly when it is valid: `trigger_point + mix_rate <=
+   clip_duration` and every count (`pre_roll`, `clip_duration`,
+   `trigger_point`, `mix_rate`) at most `MAX_STINGER_FRAMES` = 1000 (the AUTO
+   bound). Its timing is integer frames from the AUTO's tick
+   (`StingerTiming`, elapsed `e`):
+   - **Pre-roll decision.** The AUTO's tick cues and plays the player, and
+     the clip window opens `pre_roll` frames later: `e` in `[0, pre_roll)` is
+     the player's run-up, Program unchanged. We chose this over cueing at
+     selection time because a selection is persisted and replayed at boot,
+     while a cue parks a shared player that other operators may be using;
+     rolling at AUTO keeps one operator action, one roll. The clip is drawn
+     only from a fresh frame, so `pre_roll` is the operator's budget for the
+     player's first frame to land; a late first frame only shortens the
+     visible clip, never the take.
+   - **Render.** The clip window is `[pre_roll, pre_roll + clip_duration)`;
+     the player's fresh frame is drawn full-canvas above every other tile in
+     the same composite pass, through its own alpha plane when it carries one
+     (the compositor's per-pixel tile alpha, ADR-0113), else opaque (an
+     opaque clip covers the frame). The underlying take is the existing MIX
+     overlay over the mix window, clip frames `[trigger_point, trigger_point +
+     mix_rate)`: mix frame `k` draws the incoming picture at `(k + 1) /
+     mix_rate`, so `mix_rate = 1` is a CUT on `trigger_point` and the last mix
+     frame is fully incoming. At most three full-canvas tiles above the cell
+     (outgoing cell, incoming, clip); the scratch pool is sized once for them.
+     Tile order (after ADR-0113): layout cells, then the transition tiles,
+     then the upstream keyers, then the stinger clip, then the downstream
+     keyers. The clip is part of the M/E transition, so it rolls over the
+     whole M/E scene, USKs included. A DSK sits over the M/E output; tied
+     DSKs ride the stinger's mix window (MIX envelope), hold their state
+     through pre-roll, and land on `swap_at` with the take.
+   - **Swap and end.** The take completes (Program/Preview swap, outcome
+     published, completion counted once) on `swap_at = pre_roll +
+     trigger_point + mix_rate`; the flight then stays in flight through the
+     clip tail and ends silently at `pre_roll + clip_duration`. The SW2-02
+     rule (never complete onto a source without a fresh frame) is checked at
+     `swap_at`. A CUT before the swap completes the take at once; a CUT or
+     T-bar in the clip tail ends the tail and is a new take. The machine's
+     flight carries a `swapped` flag; `take_window()` replaces
+     `auto_window()` for the take deadline.
+   - **The player never paces the take.** A stale, missing or unregistered
+     player frame is skipped (never a slate on Program) and the take
+     completes on schedule.
+   - **Roll.** `PlayerRollSender` (engine, `player_roll.rs`) is set on the
+     tick driver at boot by the CLI, beside `set_prime_stores`. On the
+     AUTO's tick the driver calls `roll(player)`: a lookup among the (at
+     most 64) ids registered at boot and one `fetch_or` of the player's bit
+     into a single preallocated `AtomicU64` pending mask — no allocation, no
+     lock, no syscall, no wait. A roll for a player whose bit is still
+     pending coalesces into it (counted); an unregistered player is dropped
+     (counted). `std::sync::mpsc::SyncSender::try_send` was rejected: its
+     bounded channel wakes the receiver through a mutex-protected waker, so a
+     descheduled worker could stall the tick (review SA-1). The tick never
+     wakes the worker (no `unpark`); a dedicated `stinger-roll` thread polls
+     the mask every 2 ms with `park_timeout`, swaps it to zero and runs the CLI
+     callback for each bit, well inside the smallest (one-frame) pre-roll. The
+     callback submits `Cue { frame: None }` then `Play` to the
+     player's existing bounded transport mailbox (ADR-0057/0097); a callback
+     panic is contained per roll. A worker that blocks or panics cannot
+     reach the clock.
+   - **Validation.** The control API authorizes `player` with the other
+     descriptor references (BOLA, before parsing), then refuses a player
+     that is not a configured media player with a typed 422
+     `unknown-media-player` on plan and command; an out-of-range stinger is
+     `invalid-transition`. AUTO renders the engine's selection, not the
+     request, so `plan` and `commands/auto` authorize the reference inside
+     the current selection (`snapshot.transition`: the stinger player, a dip
+     or border fill source) with the same per-object check, answering 403
+     before admission (review SA-2). The AUTO command then carries that
+     selection (`SwitcherVerb::AutoExpecting`) and the engine refuses it
+     with the typed `selection-changed` outcome when its selection differs
+     at the tick, so a concurrent selection change cannot swap an
+     unauthorized player into the flight. Config validation refuses a persisted stinger
+     whose player is not in `media_players`. `dip_source`,
+     `border_fill_source`, `flip_flop` and DVE stay refused.
+   - **Desk.** A STING key beside MIX/WIPE/DIP; the "Transition parameters"
+     popover gains a Stinger group (player from `GET /api/v1/media/players`,
+     pre-roll, clip, trigger, mix). STING is disabled with a reason when no
+     player is configured or the numbers are out of range. AUTO's title is
+     "AUTO STINGER over N frames" with N = pre-roll + clip.
+   - **PR B** adds alpha decode for clip assets (ProRes 4444 / VP9 alpha /
+     PNG sequence into the alpha plane). Until then a decoded clip is opaque
+     and covers Program for its window.
+   - **Audio.** Program audio follows the take's mix (the existing AUTO
+     crossfade over the mix window); the clip's own audio is not mixed in by
+     this PR. The mix overlay carries the audio budget separately from the
+     video weight (`MixOverlay::audio_remaining`, review SA-3): mix frame `k`
+     draws at `(k + 1) / mix_rate` but ramps audio over `swap_at - e` =
+     `mix_rate - k` ticks, so the crossfade starts on the first mix tick,
+     lasts exactly `mix_rate` ticks of samples and completes on the swap
+     boundary. MIX/DIP/WIPE keep `duration - elapsed`.
 
 ### 5. Stinger media — PR B: alpha decode (#391 subset)
 
@@ -258,6 +350,20 @@ tile. No switcher or drive code changes.
   selections and AUTOs cannot move the clock (chaos test
   `a_transition_command_flood_never_moves_the_output_clock`: 600 ticks, one
   frame per tick, zero repeats, full mailbox met, at most 16 commands a tick).
+- **#1/#10 (stinger, §5):** the clip is one more full-canvas tile, and a clip
+  start keeps the registered player store's `Arc` (a pointer clone, no copy
+  of the id, pinned by
+  `tests/switcher_stinger.rs::a_clip_start_reuses_the_registered_store_and_copies_nothing`); the player
+  roll is one wait-free `fetch_or` into a fixed 64-bit pending mask read by
+  an off-clock worker. Chaos test
+  `tests/switcher_stinger.rs::a_stinger_command_flood_never_moves_the_output_clock`
+  floods stinger selections/AUTOs/CUTs for 600 ticks with a roll worker that
+  never returns: one frame per tick, zero repeats, later rolls coalesce into
+  the pending bit. `a_suspended_roll_receiver_never_stalls_the_tick` holds
+  the receiver and never drains it for 300 ticks of repeated stingers: every
+  tick completes, one roll is pending and every later one is counted as
+  coalesced. `a_blocking_or_panicking_roll_never_affects_the_tick` pins the
+  per-frame output with a blocked and a panicking worker.
 
 ## Alternatives considered
 
@@ -272,5 +378,5 @@ tile. No switcher or drive code changes.
 - `TransitionDescriptor::Dip.dip_source` is now `Option`; documents that named
   a source still parse, and are refused at selection until a source dip is
   rendered.
-- Out of scope: T-bar on the desk, DVE push/squeeze, stinger rendering (the API
-  may accept and validate a stinger later), dip through a source.
+- Out of scope: T-bar on the desk, DVE push/squeeze, dip through a source,
+  stinger clip alpha decode (§5, PR B) and stinger clip audio.

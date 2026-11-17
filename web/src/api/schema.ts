@@ -10351,9 +10351,10 @@ export interface components {
          *     fields (and fields of another kind) refused. Durations (`rate`, …) are
          *     whole output frames, at least 1; colours are `"#rgb"`/`"#rrggbb"`.
          *     The control API selects only what the Program drive renders (`cut`,
-         *     `mix`, `dip` to a colour, `wipe` without `flip_flop`/`border_fill_source`)
-         *     with a rate of at most 1000 frames; the other kinds are documented
-         *     because the engine's descriptor carries them.
+         *     `mix`, `dip` to a colour, `wipe` without `flip_flop`/`border_fill_source`,
+         *     `stinger` through a configured media player) with a rate and stinger
+         *     frame counts of at most 1000 frames; the DVE kinds are documented because
+         *     the engine's descriptor carries them.
          */
         TransitionDescriptorDoc: {
             /** @enum {string} */
@@ -10433,26 +10434,28 @@ export interface components {
         } | {
             /**
              * Format: int32
-             * @description Clip length in frames.
+             * @description Clip length in frames: how long it is drawn over Program.
              */
             clip_duration: number;
             /** @enum {string} */
             kind: "stinger";
             /**
              * Format: int32
-             * @description Mix window in frames.
+             * @description Mix window in frames (`1` is a cut); `trigger_point + mix_rate <=
+             *     clip_duration`.
              */
             mix_rate: number;
-            /** @description The bound media player's id. */
+            /** @description A configured media player's id (`GET /api/v1/media/players`). */
             player: string;
             /**
              * Format: int32
-             * @description Pre-roll frames.
+             * @description Frames from the AUTO to the clip's first frame (the player is cued
+             *     and played on the AUTO's tick).
              */
             pre_roll: number;
             /**
              * Format: int32
-             * @description Frame the underlying mix starts on.
+             * @description Clip frame the underlying mix starts on.
              */
             trigger_point: number;
         };

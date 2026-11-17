@@ -6,7 +6,7 @@ use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use multiview_core::switcher::{FrameCount, SourceRef, TransitionDescriptor};
+use multiview_core::switcher::{FrameCount, SourceRef, TransitionDescriptor, MAX_STINGER_FRAMES};
 use multiview_engine::switcher_control::SwitcherSnapshot;
 use multiview_engine::switcher_control::{
     SelectionGuard, SwitcherCommand, SwitcherControl, SwitcherVerb,
@@ -72,11 +72,15 @@ pub struct SwitcherRequest {
     /// (rate >= 2, switch point strictly inside (0, 1)); `{"kind":"wipe",
     /// "pattern":"linear_edge"|"vertical"|"diagonal"|"box"|"circle","rate":N,
     /// "reverse":bool,"softness":0..1,"border_width":0..1,"border_color":"#rrggbb",
-    /// "position_xy":[0..1,0..1]}`. `rate` is 1..=1000 frames; AUTO replaces it
-    /// with its own `duration_frames`. Refused with `unsupported-transition`:
-    /// `stinger`, DVE kinds, a dip through a source, `flip_flop` and
-    /// `border_fill_source`; with `invalid-transition`: anything that does not
-    /// parse or is out of range.
+    /// "position_xy":[0..1,0..1]}`; `{"kind":"stinger","player":"<media player>",
+    /// "pre_roll":N,"clip_duration":N,"trigger_point":N,"mix_rate":N}`
+    /// (`trigger_point + mix_rate <= clip_duration`, ADR-0112 §5). `rate` and
+    /// every stinger count are 1..=1000 frames; AUTO replaces `rate` with its
+    /// own `duration_frames` (a stinger keeps its own timing). Refused with
+    /// `unsupported-transition`: DVE kinds, a dip through a source, `flip_flop`
+    /// and `border_fill_source`; with `unknown-media-player`: a stinger whose
+    /// player is not a configured media player; with `invalid-transition`:
+    /// anything that does not parse or is out of range.
     ///
     /// Parsed from raw JSON so a malformed descriptor is a typed 422; the
     /// documented shape is [`crate::openapi_schemas::TransitionDescriptorDoc`].
@@ -213,6 +217,30 @@ fn validate_me(req: &SwitcherRequest) -> ControlResult<()> {
     Ok(())
 }
 
+/// AUTO renders the engine's current selection, not anything in the
+/// request, so the references inside that selection (a stinger's player, a
+/// dip or border fill source) are authorized for the caller exactly like a
+/// request reference (review SA-2). Returns the selection the caller was
+/// authorized for; the AUTO carries it and the engine refuses the AUTO if
+/// its selection differs at the tick, so a concurrent selection change can
+/// never swap in an unauthorized reference.
+///
+/// # Errors
+/// 403 when the principal is denied a selection reference; 409 before the
+/// engine has published its first snapshot.
+fn authorize_selection(
+    principal: &Principal,
+    handle: &SwitcherControl,
+) -> ControlResult<TransitionDescriptor> {
+    let snapshot = handle.snapshot().ok_or_else(|| {
+        ControlError::Conflict("switcher has not published its transition selection yet".into())
+    })?;
+    if let Some(source) = snapshot.transition.source_ref() {
+        authorize_object(principal, source.as_str())?;
+    }
+    Ok(snapshot.transition.clone())
+}
+
 /// `source: "layout:<id>"` is the same request as `layout: "<id>"` (#307):
 /// normalized before authorization, so the layout id (not the engine key) is
 /// what is authorized and `validate_source_configured` never sees it.
@@ -233,13 +261,36 @@ fn normalize_layout_source(req: &mut SwitcherRequest) {
 /// rules (ADR-0112): typed 422 `invalid-transition` for a shape or number
 /// the machine refuses, `unsupported-transition` for a kind or option the
 /// Program drive does not render. The engine re-checks at the tick.
-fn parse_transition(req: &SwitcherRequest) -> Result<Option<TransitionDescriptor>, Box<Response>> {
+fn parse_transition(
+    state: &AppState,
+    req: &SwitcherRequest,
+) -> Result<Option<TransitionDescriptor>, Box<Response>> {
     let Some(value) = req.transition.as_ref() else {
         return Ok(None);
     };
     let invalid = |detail: String| Box::new(typed("invalid-transition", detail));
     let descriptor: TransitionDescriptor =
         serde_json::from_value(value.clone()).map_err(|e| invalid(e.to_string()))?;
+    if let TransitionDescriptor::Stinger { player, .. } = &descriptor {
+        // ADR-0112 §5: a stinger is rendered when its numbers are valid, so
+        // its numbers are checked first; its player must be a configured
+        // media player (the id was authorized in `authorize_refs`).
+        if !descriptor.is_valid() {
+            return Err(invalid(format!(
+                "a stinger needs trigger_point + mix_rate <= clip_duration and every \
+                 frame count at most {MAX_STINGER_FRAMES}"
+            )));
+        }
+        if state.media_players.get(player.as_str()).is_err() {
+            return Err(Box::new(typed(
+                "unknown-media-player",
+                format!(
+                    "stinger player {:?} is not a configured media player",
+                    player.as_str()
+                ),
+            )));
+        }
+    }
     if !descriptor.is_rendered() {
         return Err(Box::new(typed(
             "unsupported-transition",
@@ -309,6 +360,7 @@ fn verb(
     kind: &str,
     target: Option<&Target>,
     transition: Option<TransitionDescriptor>,
+    selection: Option<TransitionDescriptor>,
 ) -> ControlResult<SwitcherVerb> {
     let target = || {
         target
@@ -322,13 +374,16 @@ fn verb(
         "set_transition" => transition
             .map(SwitcherVerb::SetTransition)
             .ok_or_else(|| ControlError::Validation("transition required".into())),
-        "auto" => Ok(SwitcherVerb::Auto(
-            FrameCount::try_from(
+        "auto" => Ok(SwitcherVerb::AutoExpecting {
+            rate: FrameCount::try_from(
                 req.duration_frames
                     .ok_or_else(|| ControlError::Validation("duration_frames required".into()))?,
             )
             .map_err(|e| ControlError::Validation(e.to_string()))?,
-        )),
+            selection: selection.ok_or_else(|| {
+                ControlError::Conflict("AUTO has no authorized transition selection".into())
+            })?,
+        }),
         _ => Err(ControlError::NotFound {
             kind: "switcher-verb",
             id: kind.into(),
@@ -716,7 +771,7 @@ pub(crate) async fn plan_switcher(
     }
     validate_source_configured(&state, &req)?;
     validate_first_slice(&req, &req.action)?;
-    if let Err(response) = parse_transition(&req) {
+    if let Err(response) = parse_transition(&state, &req) {
         return Ok(*response);
     }
     let handle = engine(&state)?;
@@ -728,6 +783,9 @@ pub(crate) async fn plan_switcher(
         return Err(ControlError::Validation(
             "AUTO requires a same-epoch preview compositor and admitted transition budget".into(),
         ));
+    }
+    if req.action == "auto" {
+        authorize_selection(&principal, handle)?;
     }
     // A plan resolves a layout select exactly like a submit, but never
     // registers it.
@@ -796,7 +854,7 @@ pub(crate) async fn submit_switcher(
         );
     }
     validate_first_slice(&req, &kind)?;
-    let transition = match parse_transition(&req) {
+    let transition = match parse_transition(&state, &req) {
         Ok(transition) => transition,
         Err(response) => return Ok(*response),
     };
@@ -824,7 +882,6 @@ pub(crate) async fn submit_switcher(
         Err(response) => return Ok(*response),
     };
     let target_guard = authorize_target(&state, &principal, &req, target.as_ref())?;
-    let verb = verb(&req, &kind, target.as_ref(), transition)?;
     // P3R2-C: authorization of every EXPLICIT request field and static
     // validation are done; an EXISTING reservation is a replay and answers
     // its original 202 before the transient admission checks (buses, an
@@ -840,6 +897,16 @@ pub(crate) async fn submit_switcher(
     {
         return Ok(accepted(&op, kind));
     }
+    // SA-2: a fresh AUTO authorizes the transition selection it will render
+    // (a stinger's player, a dip or border fill source) and binds it into
+    // the command; the engine refuses it if the selection changes before
+    // its tick (selection-changed). Engine state, so after the replay.
+    let selection = if req.action == "auto" {
+        Some(authorize_selection(&principal, handle)?)
+    } else {
+        None
+    };
+    let verb = verb(&req, &kind, target.as_ref(), transition, selection)?;
     // Review AUTHZ-1: a NEW take toggles the armed keys; it is authorized
     // on them and bound to the arm set and definitions it was authorized
     // for. Review round 2 IDEMP-1: the armed set is engine state, not part

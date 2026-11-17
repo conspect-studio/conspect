@@ -1557,7 +1557,12 @@ impl MultiviewConfig {
                 .programs
                 .first()
                 .map_or(ProgramId::MAIN, |p| p.id.as_str());
-            switcher.validate(&sources, &[program_id])?;
+            let players: Vec<_> = self
+                .media_players
+                .iter()
+                .map(|player| player.id.as_str())
+                .collect();
+            switcher.validate(&sources, &[program_id], &players)?;
             // ADR-0113 §9: keyers are admitted at definition, on this canvas.
             switcher.validate_keyers(
                 &sources,

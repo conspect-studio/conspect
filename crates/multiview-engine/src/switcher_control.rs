@@ -93,12 +93,20 @@ pub const REFUSE_NOT_AN_INPUT: &str =
     "not-on-an-input: this M/E selects numbered inputs; select an input, not a source";
 /// Typed refusal: the transition kind or one of its options is not rendered.
 pub const REFUSE_UNSUPPORTED_TRANSITION: &str =
-    "unsupported-transition: this engine renders cut, mix, dip to a colour and wipe";
+    "unsupported-transition: this engine renders cut, mix, dip to a colour, wipe and stinger";
 
 /// Is `descriptor` a transition the Program drive renders (ADR-0112)?
 #[must_use]
 pub fn is_rendered_transition(descriptor: &TransitionDescriptor) -> bool {
     descriptor.is_rendered()
+}
+
+impl SwitcherVerb {
+    /// Is this an AUTO, bound to a selection or not?
+    #[must_use]
+    pub fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto(_) | Self::AutoExpecting { .. })
+    }
 }
 
 /// Typed refusal: an `arm` names a key that is not a defined upstream
@@ -109,11 +117,12 @@ pub const REFUSE_ARM_UNKNOWN_KEY: &str =
 /// Typed refusal: a select names an undeclared or unpatched input.
 pub const REFUSE_UNKNOWN_INPUT: &str = "unknown-slot: the input is not declared or not patched";
 
-/// Typed refusal (#307 review A1): what the command would put on a bus is not
-/// what the control plane authorized (a queued select or re-patch, or a
-/// stored-layout body edit, landed in between).
+/// Typed refusal: what the command would take is not what the control plane
+/// authorized. Either a queued select, re-patch or stored-layout body edit
+/// landed in between (#307 review A1), or an AUTO's transition selection
+/// changed between its admission and the tick (ADR-0112 §5, review SA-2).
 pub const REFUSE_SELECTION_CHANGED: &str =
-    "selection-changed: the Preview or input changed after this operation was authorized; re-plan";
+    "selection-changed: the Preview, input or transition selection changed after this operation was authorized; re-plan";
 
 /// What a command was authorized against (#307 review A1), checked at the
 /// tick it is applied (and again when a held take is replayed). `None`
@@ -168,6 +177,18 @@ pub enum SwitcherVerb {
     /// Begin an exact-duration automatic take on the next frame boundary,
     /// in the selected transition kind (ADR-0112 §3).
     Auto(FrameCount),
+    /// [`Self::Auto`] bound to the selection the control plane authorized
+    /// (review SA-2): the engine refuses it with
+    /// [`REFUSE_SELECTION_CHANGED`] when its selection is no longer exactly
+    /// `selection` at the tick, so a concurrent `SetTransition` can never
+    /// swap an unauthorized stinger player (or dip/border source) into the
+    /// caller's flight. The comparison is a borrow, never a clone.
+    AutoExpecting {
+        /// The AUTO's rate, as [`Self::Auto`].
+        rate: FrameCount,
+        /// The selection the caller was authorized for.
+        selection: TransitionDescriptor,
+    },
     /// Select the transition the next AUTO uses (ADR-0112 §3). Refused
     /// during a take and for a kind this engine does not render.
     SetTransition(TransitionDescriptor),
@@ -495,6 +516,7 @@ impl SwitcherControl {
             inputs_version: 0,
             published_inputs_version: 0,
             inputs_readback: handle.inputs.clone(),
+            player_roll: None,
             keyers: Box::default(),
             keyer_events: handle.keyer_events.clone(),
             keyer_counters: Arc::clone(&handle.keyer_counters),
@@ -787,6 +809,8 @@ pub struct SwitcherTickDriver {
     inputs_version: u64,
     published_inputs_version: u64,
     inputs_readback: LatestState<InputsReadback>,
+    /// Off-clock media-player roll for a stinger AUTO (ADR-0112 §5).
+    player_roll: Option<crate::player_roll::PlayerRollSender>,
     /// Downstream keyers (ADR-0113); empty unless [`Self::set_keyers`].
     /// Boxed: built once at attach, it keeps the fixed keyer state out of
     /// the driver (and so out of the output loop's future).
@@ -1057,6 +1081,14 @@ impl SwitcherTickDriver {
         self.primed_stores = Some(stores);
     }
 
+    /// Install the off-clock media-player roll a stinger AUTO uses to cue and
+    /// play its player (ADR-0112 §5), before the clock starts. Without one a
+    /// stinger still takes on schedule; its clip is drawn only if the player
+    /// happens to be publishing fresh frames.
+    pub fn set_player_roll(&mut self, roll: crate::player_roll::PlayerRollSender) {
+        self.player_roll = Some(roll);
+    }
+
     /// Register (or replace) one primed store at a frame boundary: a stored
     /// layout adopted as an M/E source (#307), with the body `revision` it
     /// composes (what a [`SelectionGuard::layout_revision`] is checked
@@ -1111,7 +1143,7 @@ impl SwitcherTickDriver {
             return false;
         };
         let incoming = match &command.verb {
-            SwitcherVerb::Cut | SwitcherVerb::Auto(_) => {
+            SwitcherVerb::Cut | SwitcherVerb::Auto(_) | SwitcherVerb::AutoExpecting { .. } => {
                 let preview = self.resolve(self.machine.preview());
                 if guard.preview.as_ref().is_some_and(|want| want != preview) {
                     return true;
@@ -1294,9 +1326,14 @@ impl SwitcherTickDriver {
         match verb {
             SwitcherVerb::SelectProgram(source) => Ok(self.machine.punch(source.clone())),
             SwitcherVerb::Cut => self.machine.cut().map_err(|e| e.to_string()),
-            SwitcherVerb::Auto(rate) => {
+            SwitcherVerb::Auto(rate) | SwitcherVerb::AutoExpecting { rate, .. } => {
                 if self.machine.is_in_flight() {
                     return Err("cannot start a second AUTO during an active take".into());
+                }
+                if let SwitcherVerb::AutoExpecting { selection, .. } = verb {
+                    if selection != self.machine.transition() {
+                        return Err(REFUSE_SELECTION_CHANGED.into());
+                    }
                 }
                 let Some(pair) = scenes else {
                     return Err("no active PGM/PVW scene provider".into());
@@ -1307,13 +1344,24 @@ impl SwitcherTickDriver {
                 }
                 // The flight renders its own descriptor (the selection at the
                 // AUTO's rate); the selection itself is unchanged (ADR-0112 §4).
-                validate_mix(&pair.program, &pair.preview)
+                let projection = validate_mix(&pair.program, &pair.preview)
                     .map_err(|e| e.to_string())
                     .and_then(|()| {
                         self.machine
                             .auto_with(descriptor, tick)
                             .map_err(|e| e.to_string())
-                    })
+                    })?;
+                // A stinger rolls its player now, through a bounded queue to
+                // an off-clock worker: this tick never waits for the player,
+                // and the take's timing never depends on it (ADR-0112 §5).
+                if projection.started {
+                    if let (Some(roll), Some((_, _, player, _))) =
+                        (&self.player_roll, self.machine.stinger_flight())
+                    {
+                        roll.roll(player);
+                    }
+                }
+                Ok(projection)
             }
             SwitcherVerb::SelectPreview(_)
             | SwitcherVerb::Patch(_)
@@ -1338,7 +1386,7 @@ impl SwitcherTickDriver {
         scenes: Option<Arc<ScenePair>>,
         tick: Tick,
     ) {
-        if matches!(verb, SwitcherVerb::Auto(_)) && !next.completed {
+        if verb.is_auto() && !next.completed {
             // Tied DSKs take part in this flight in a direction fixed now
             // (review F1).
             self.keyers.begin_tied_transition();
@@ -1442,6 +1490,20 @@ impl SwitcherTickDriver {
         self.machine.auto_window()
     }
 
+    /// The active stinger AUTO (ADR-0112 §5): anchor tick, timing, player
+    /// and whether its take already swapped the buses.
+    #[must_use]
+    pub fn stinger_flight(
+        &self,
+    ) -> Option<(
+        i128,
+        multiview_core::switcher::StingerTiming,
+        &SourceRef,
+        bool,
+    )> {
+        self.machine.stinger_flight()
+    }
+
     /// The descriptor the Program drive renders: the in-flight AUTO's own
     /// descriptor during a take, else the selection.
     #[must_use]
@@ -1504,8 +1566,9 @@ impl SwitcherTickDriver {
             self.stage();
         }
         // SW2-02: never complete an AUTO onto a source without a fresh frame.
-        if let Some((start, rate)) = self.machine.auto_window() {
-            let terminal = i128::from(tick.index) - start >= i128::from(rate.get());
+        // A stinger's take completes at the end of its mix window (§5).
+        if let Some((start, frames)) = self.machine.take_window() {
+            let terminal = i128::from(tick.index) - start >= i128::from(frames);
             let (_, preview) = self.resolved_selections();
             // A key-only transition (K3) puts no incoming picture on air.
             let background = self.machine.armed().background;
@@ -1800,10 +1863,11 @@ impl SwitcherTickDriver {
             }
             let scenes = self.scenes.latest();
             self.stage();
-            let take = matches!(
-                command.verb,
-                SwitcherVerb::SelectProgram(_) | SwitcherVerb::Cut | SwitcherVerb::Auto(_)
-            );
+            let take = command.verb.is_auto()
+                || matches!(
+                    command.verb,
+                    SwitcherVerb::SelectProgram(_) | SwitcherVerb::Cut
+                );
             let result: Result<Option<SwitcherProjection>, String> = if scenes
                 .as_ref()
                 .is_some_and(|pair| pair.version != command.scene_version)
@@ -1850,7 +1914,7 @@ impl SwitcherTickDriver {
                         .map(|()| Some(self.machine.sample(tick)))
                         .map_err(|e| e.to_string())
                 }
-            } else if matches!(command.verb, SwitcherVerb::Auto(_)) && self.machine.is_in_flight() {
+            } else if command.verb.is_auto() && self.machine.is_in_flight() {
                 Err("cannot start a second AUTO during an active take".into())
             } else if let SwitcherVerb::SelectProgram(source) = &command.verb {
                 if source == self.machine.program()
@@ -2144,7 +2208,7 @@ impl SwitcherTickDriver {
         // only the flight's surviving going-on participants (review round 2
         // G2), the same set `stage_take` lands.
         let in_flight = matches!(verb, SwitcherVerb::Cut) && self.active_auto.is_some();
-        let tied = !matches!(verb, SwitcherVerb::Cut | SwitcherVerb::Auto(_))
+        let tied = !(matches!(verb, SwitcherVerb::Cut) || verb.is_auto())
             || self.keyers.tied_going_on_fresh(tick, in_flight);
         Some(incoming && tied)
     }
