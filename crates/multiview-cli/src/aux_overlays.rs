@@ -52,9 +52,59 @@ const FREEZE_MIN_PRESENT: usize = 9;
 /// bounds a tick's bake work and the wanted-source set by construction.
 pub const MAX_BAKED_CELLS: usize = 64;
 
-/// The most source ids the baking layouts can bind (the wanted-set and
-/// published-snapshot bound): layouts × cells.
-pub const MAX_WANTED_SOURCES: usize = crate::routing_aux::MAX_PARALLEL_BAKES * MAX_BAKED_CELLS;
+/// The most source ids the wanted set (and the published snapshot) holds:
+/// every baking routed layout and M/E layout source × cells, plus the M/E
+/// layout keys themselves (`layout:<id>`, so the snapshot says which layout
+/// is on Program for the tally).
+pub const MAX_WANTED_SOURCES: usize = (crate::routing_aux::MAX_PARALLEL_BAKES
+    + multiview_engine::switcher_layouts::MAX_ME_LAYOUT_SOURCES)
+    * MAX_BAKED_CELLS
+    + multiview_engine::switcher_layouts::MAX_ME_LAYOUT_SOURCES;
+
+/// Collect `ids` into a wanted set of at most `cap` DISTINCT ids: a
+/// duplicate never consumes the cap (dedupe before truncation).
+#[must_use]
+pub fn collect_wanted<'a>(ids: impl IntoIterator<Item = &'a str>, cap: usize) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for id in ids {
+        if out.len() >= cap {
+            break;
+        }
+        if !out.contains(id) {
+            out.insert(id.to_owned());
+        }
+    }
+    out
+}
+
+/// Which sources a bake draws with a Program (red) or Preview (green)
+/// tally. Answered per tile per tick: implementations must not allocate.
+pub trait TallyLookup {
+    /// Whether `id` is on Program.
+    fn is_program(&self, id: &str) -> bool;
+    /// Whether `id` is on Preview.
+    fn is_preview(&self, id: &str) -> bool;
+}
+
+/// The direct tally: Program is the consumer's snapshot, Preview the M/E's
+/// PVW source id.
+#[derive(Debug, Clone, Copy)]
+pub struct DirectTally<'a> {
+    /// The consumer's latest signals.
+    pub signals: &'a AuxOverlaySignals,
+    /// The M/E's PVW source.
+    pub preview: Option<&'a str>,
+}
+
+impl TallyLookup for DirectTally<'_> {
+    fn is_program(&self, id: &str) -> bool {
+        self.signals.program.contains(id)
+    }
+
+    fn is_preview(&self, id: &str) -> bool {
+        self.preview == Some(id)
+    }
+}
 
 /// Content-fault detection for one routed layout, on the aux thread, from the
 /// frames its compose already read this tick (no second store read): black
@@ -295,6 +345,10 @@ pub struct AuxSignalsPublisher {
     /// The clock's aux-tick active flag: false while nothing is routed (the
     /// aux thread then never ticks, so `wanted` may be stale).
     active: Arc<AtomicBool>,
+    /// The aux tick channel's M/E layout flag (#307): raised while a stored
+    /// layout is registered as an M/E source, which also ticks the aux
+    /// thread (and may bake). `None`: no M/E layout sources.
+    me_active: Option<Arc<AtomicBool>>,
 }
 
 impl std::fmt::Debug for AuxSignalsPublisher {
@@ -320,7 +374,16 @@ impl AuxSignalsPublisher {
             wanted,
             sources,
             active,
+            me_active: None,
         }
+    }
+
+    /// Also count the aux thread as ticking while the M/E layout flag
+    /// `flag` is raised (an M/E layout source bakes with no routed feed).
+    #[must_use]
+    pub fn with_me_layout_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.me_active = Some(flag);
+        self
     }
 
     /// Publish the signals of exactly the wanted sources: meters and faults
@@ -352,10 +415,16 @@ impl AuxSignalsPublisher {
         self.publish(signals);
     }
 
-    /// Whether some active routed layout bakes overlays (two relaxed loads).
+    /// Whether some active routed layout or M/E layout source bakes
+    /// overlays (at most three relaxed loads).
     #[must_use]
     pub fn wanted(&self) -> bool {
-        self.active.load(Ordering::Relaxed) && self.wanted.load(Ordering::Relaxed)
+        let ticking = self.active.load(Ordering::Relaxed)
+            || self
+                .me_active
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed));
+        ticking && self.wanted.load(Ordering::Relaxed)
     }
 
     /// Publish the newest signals (wait-free store).
@@ -595,6 +664,29 @@ impl LayoutOverlayBake {
         signals: &AuxOverlaySignals,
         preview: Option<&str>,
     ) -> Arc<Nv12Image> {
+        self.bake_with_tally(
+            picture,
+            pts,
+            states,
+            frames,
+            signals,
+            &DirectTally { signals, preview },
+        )
+    }
+
+    /// [`Self::bake`] with the tally from `tally` (the aux thread's lookup
+    /// also counts a source inside an M/E layout source on Program or
+    /// Preview). Content faults still read `signals.program` directly: the
+    /// consumer's verdict covers only Program's own cells.
+    pub fn bake_with_tally(
+        &mut self,
+        picture: &Arc<Nv12Image>,
+        pts: MediaTime,
+        states: &[(Arc<str>, SourceState)],
+        frames: &[Option<Arc<Nv12Image>>],
+        signals: &AuxOverlaySignals,
+        tally: &dyn TallyLookup,
+    ) -> Arc<Nv12Image> {
         if self.layers.flags && !frames.is_empty() {
             self.faults.observe(states, frames, &self.index.first, pts);
         }
@@ -612,9 +704,9 @@ impl LayoutOverlayBake {
                 .filter(|(source, _)| &**source == id)
                 .map_or(SourceState::NoSignal, |(_, state)| *state);
             let on_program = signals.program.contains(id);
-            let tally = if on_program {
+            let tile_tally = if on_program || tally.is_program(id) {
                 TileTally::Program
-            } else if preview == Some(id) {
+            } else if tally.is_preview(id) {
                 TileTally::Preview
             } else {
                 TileTally::Off
@@ -635,7 +727,7 @@ impl LayoutOverlayBake {
                         on_program,
                     ),
                     activity: TileActivity::Ready,
-                    tally,
+                    tally: tile_tally,
                 },
             );
         }

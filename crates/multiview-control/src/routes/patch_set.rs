@@ -186,7 +186,19 @@ fn shape_set(req: &PatchRequest) -> Result<Shaped, Box<Response>> {
         on_air: req.on_air,
     });
     if let Some(mixer) = &mixer {
-        shape(mixer)?;
+        // A stored layout patched to a mixer input (#307) is registered as an
+        // M/E source, fenced, adopted (bounded wait) and guarded by its
+        // revision on the single-destination path only; a set enqueues its
+        // mixer half synchronously beside the router's half, so it is refused
+        // here, before any existence answer or key, rather than taken unguarded.
+        if shape(mixer)?.iter().any(|m| m.layout.is_some()) {
+            return Err(Box::new(problem(
+                422,
+                "unknown-source",
+                "a stored layout on a mixer input cannot be part of a multi-destination set; \
+                 patch the mixer input in its own POST /patch/take",
+            )));
+        }
     }
     let mut shaped = Vec::with_capacity(outputs.len());
     for (_, crosspoints) in outputs {
@@ -270,7 +282,14 @@ pub(crate) fn plan_set(
             Err(response) => return Ok(*response),
         };
         let snapshot = handle.snapshot();
-        let checked = match check(state, mixer, &inputs, snapshot.as_deref())? {
+        let checked = match check(
+            state,
+            principal,
+            mixer,
+            &inputs,
+            snapshot.as_deref(),
+            layouts,
+        )? {
             Ok(checked) => checked,
             Err(response) => return Ok(response),
         };
@@ -506,7 +525,14 @@ pub(crate) fn take_set(
             Err(response) => return Ok(Err(*response)),
         };
         let snapshot = handle.snapshot();
-        let checked = match check(state, mixer_req, &inputs, snapshot.as_deref())? {
+        let checked = match check(
+            state,
+            principal,
+            mixer_req,
+            &inputs,
+            snapshot.as_deref(),
+            layouts,
+        )? {
             Ok(checked) => checked,
             Err(response) => return Ok(Err(response)),
         };
@@ -677,6 +703,9 @@ pub(crate) fn take_set(
             operation_id: op.to_string(),
             scene_version: mixer.scene_version,
             verb,
+            // A set's mixer half never carries a `{layout}` member (refused
+            // by `shape_set`), so it has no layout revision to guard.
+            expect: None,
         };
         if !super::patch::admit_with_leases(state, handle, op.as_str(), leases, command) {
             state.patch_sets.release(key, &op);

@@ -82,16 +82,22 @@ pub struct KeyerFields {
     /// self key).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
-    /// `keyer_set`: `linear` or `luma` (`chroma` is refused until K7).
+    /// `keyer_set`: `linear`, `luma` or `chroma` (K7; needs `color`, refuses
+    /// a `key` source).
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(value_type = Option<String>))]
     pub key_type: Option<KeyerType>,
-    /// `keyer_set`: luma clip, `[0, 1]`.
+    /// `keyer_set`: luma clip on Y, or chroma clip on the linear-RGB
+    /// distance, `[0, 1]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clip: Option<f32>,
-    /// `keyer_set`: luma gain, finite and `>= 0`.
+    /// `keyer_set`: luma or chroma gain, finite and `>= 0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gain: Option<f32>,
+    /// `keyer_set`: chroma reference colour `#RRGGBB` (`type = chroma`
+    /// only); `""` clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
     /// `keyer_set`: invert the matte.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invert: Option<bool>,
@@ -153,6 +159,7 @@ impl KeyerFields {
             || self.key_type.is_some()
             || self.clip.is_some()
             || self.gain.is_some()
+            || self.color.is_some()
             || self.invert.is_some()
             || self.mask.is_some()
             || self.fly.is_some()
@@ -217,6 +224,19 @@ fn shape(kind: &str, fields: &KeyerFields, other_refs: bool) -> Result<String, B
         )));
     }
     for source in fields.sources() {
+        if multiview_config::switcher::KEYER_RESERVED_PREFIXES
+            .iter()
+            .any(|p| source.starts_with(p))
+        {
+            return Err(Box::new(typed(
+                422,
+                "keyer-source-not-a-source",
+                format!(
+                    "{source:?} uses a reserved prefix (layout:/bus:); keyer fill and key \
+                     name configured sources only (#307)"
+                ),
+            )));
+        }
         if source.starts_with(INPUT_REF_PREFIX) {
             return Err(Box::new(typed(
                 422,
@@ -467,6 +487,7 @@ fn new_definition(
         key_type: KeyerType::Linear,
         clip: 0.0,
         gain: 1.0,
+        color: None,
         invert: false,
         mask: None,
         fly: None,
@@ -654,6 +675,9 @@ fn merge(cfg: &mut DownstreamKeyerConfig, f: &KeyerFields) {
     if let Some(v) = f.gain {
         cfg.gain = v;
     }
+    if let Some(c) = &f.color {
+        cfg.color = (!c.is_empty()).then(|| c.clone());
+    }
     if let Some(v) = f.invert {
         cfg.invert = v;
     }
@@ -738,7 +762,7 @@ pub struct KeyerRow {
     pub fill: String,
     /// Key source id, `"redacted"`, or `null` (self key).
     pub key: Option<String>,
-    /// `linear` or `luma`.
+    /// `linear`, `luma` or `chroma`.
     #[serde(rename = "type")]
     pub key_type: &'static str,
     /// Destination rectangle, `null` = full canvas.
@@ -820,6 +844,7 @@ pub fn rows(
                 key: cfg.key.as_deref().map(|k| redact(principal, k)),
                 key_type: match cfg.key_type {
                     KeyerType::Luma => "luma",
+                    KeyerType::Chroma => "chroma",
                     _ => "linear",
                 },
                 fly: cfg.fly,
@@ -1088,6 +1113,9 @@ pub fn submit(
         operation_id: op.to_string(),
         scene_version,
         verb: checked.verb,
+        // A keyer verb names configured sources only (never a layout
+        // source): there is no layout revision to re-check (#307).
+        expect: None,
     };
     if handle.try_send(command).is_err() {
         state.idempotency.release(Some(key), &op);

@@ -36,9 +36,10 @@ reports `applied`):
 id = "usk1"                            # unique within the M/E; object id "me1/usk1"
 fill = "cam-3"                         # a source id (mixer inputs "in:<n>" are refused)
 key = "cam-3-matte"                    # optional; absent = self key
-type = "luma"                          # luma | linear | (chroma, slice K7)
-clip = 0.10                            # luma: [0,1] on post-range-expand Y
-gain = 4.0                             # luma: >= 0
+type = "luma"                          # luma | linear | chroma (slice K7)
+clip = 0.10                            # luma: [0,1] on post-range-expand Y; chroma: [0,1] on the distance
+gain = 4.0                             # luma, chroma: >= 0
+# color = "#00b140"                    # chroma only, required: the reference (fill's own R'G'B' codes)
 invert = false
 mask = { x = 0, y = 0, w = 1920, h = 1080 }   # fill-source pixels; optional
 fly = { x = 1280, y = 60, w = 576, h = 324 }  # canvas pixels, even, >= 16; optional = full canvas
@@ -58,8 +59,10 @@ on_at_start = false                    # the station bug: goes on at boot throug
 z = 1
 ```
 
-`premultiplied = true` and `type = "chroma"` are refused at validation with typed messages
-until their slices land. The `KeyType::DvePip { rect }` descriptor deserializes as
+`premultiplied = true` is refused at validation with a typed message until its slice lands.
+`type = "chroma"` (K7) needs `color` and keys the fill itself: a chroma key with a `key`
+source is refused (`chroma-key-source`), as is `color` on another type (§14 K7). The
+`KeyType::DvePip { rect }` descriptor deserializes as
 `type = "linear"` with `fly = rect`.
 
 Runtime state, per keyer, in the switcher tick driver: a fixed array allocated at attach (at most
@@ -95,10 +98,16 @@ matte      = linear, no key source : 1
              linear, key source    : clamp(Y_key_norm, 0, 1)
              luma                  : invert?(clamp((Y_norm − clip) × gain, 0, 1)),
                                      Y of the key source, else of the fill
+             chroma (K7)           : invert?(clamp((|rgb_tile − ref_tile| − clip) × gain, 0, 1)),
+                                     rgb_tile = the fill's linear RGB in its own gamut (after
+                                     step 3, before the step-4 primaries convert, ADR-C007 §3),
+                                     ref_tile = `color` quantized to the fill's (Y, Cb, Cr)
+                                     codes and decoded like a pixel, once per frame
 ```
 
 Y is post-range-expand code-value Y (step 1 of the pipeline), so steps 2–5 are unchanged and the
-alpha is premultiplied once (#8). Both kernels sample fill and key independently from the same
+alpha is premultiplied once (#8). The chroma distance reads the step-3 value both kernels already
+compute and only feeds alpha, so the step order is unchanged too. Both kernels sample fill and key independently from the same
 integer destination offset `(ddx, ddy)`:
 
 ```text
@@ -158,6 +167,11 @@ refilled in place like `key_params`); the shader rounds the texel to its integer
 it up at `table_base + code`. This is exact by construction: a huge or infinite gain makes the
 matte a step at the clip, and a shader evaluation of `(y − clip) × gain` could flip whole
 pixels on float fuzz (review MEDIA-1).
+
+A chroma matte depends on RGB, so it has no table: the shader computes it from the fill's
+step-3 linear RGB, the reference in `KeyParams.chroma` (converted on the CPU once per frame) and
+an edge the CPU reduces to finite numbers (`chroma_edge`: always 0, always 1, a step at the clip
+for an infinite gain, or the finite ramp), so no NaN or infinity reaches the shader (§14 K7).
 
 Nothing is borrowed from the fill's `TileParams`, so fill and key can differ in size and range.
 Layer count: at most 1 Program cell + 3 transition tiles + 6 keyers × 2 (fill, key) = 16 ≤ 64.
@@ -462,7 +476,7 @@ data plane). K5 is R2.
 | K4 (#389) | Control API: verbs, plan with scoped visibility, BOLA row filtering and redaction, persistence after `applied`, OpenAPI/AsyncAPI | K2 (K3 for `arm`) |
 | K5 (#390) | Desk: keyer strip, DSK controls, keyer panel, key tally on the wall | K4 |
 | K6 (#391) | Alpha media: media-player decode of ProRes 4444, qtrle, PNG/TGA and VP9 alpha into NV12+A; NDI alpha; the SW-11 import gate | K2 |
-| K7 (#392) | Chroma key (ADR-C007 domain) | K1 |
+| K7 (#392) | Chroma key (ADR-C007 domain); built, §14 | K1 |
 
 The backlog rows SW-9 (#35) and SW-10 (#36) are superseded by K1 and K2–K3. They predate the
 as-built drive and assume a render-plan resolver that was not built.
@@ -591,7 +605,8 @@ keyers.
 
 - **Config.** `[[switcher.downstream_keyers]]` and `switcher.keyer_budget` are typed fields of
   `SwitcherConfig` (named fields win over `flatten`, so they leave `extra`; other future keys still
-  round-trip there). `DownstreamKeyerConfig` is `deny_unknown_fields`. `type = "chroma"` and
+  round-trip there). `DownstreamKeyerConfig` is `deny_unknown_fields`. (K7 lifted the chroma refusal below; see
+  K7.) `type = "chroma"` and
   `premultiplied = true` parse only so validation can refuse them by name. `validate_keyers` runs
   from the document validation, where the canvas is known. It checks: at most 2 DSKs; unique ids
   and z; a declared program; fill and key are declared sources, `in:` refused; rate in 1..=300;
@@ -837,7 +852,7 @@ keyers.
     defaults.
   - **Validation.** The merged entry is checked with the config's own per-definition rules
     (`DownstreamKeyerConfig::validate_definition`, the same checks boot validation runs: source
-    exists, `chroma`/`premultiplied` refused by name, geometry, `max_source`, mask). The
+    exists, `premultiplied` refused by name (`chroma` too until K7), geometry, `max_source`, mask). The
     cross-keyer rules are then checked against the live set: unique z, at most 2 DSKs (409
     `capacity`), and the budget.
   - **Resolve.** The definition is resolved off the clock (`SwitcherControl::resolve_keyer`,
@@ -1055,3 +1070,90 @@ keyers.
 - **Concern.** The GET/events parity test drives the driver without the frame hook, so its
   `tally` is the background roles only. Keyer tally resolution is covered by the lib unit
   test on a constructed snapshot.
+
+### K7 (#392): chroma key
+
+- **Matte (ADR-C007 §3).** `KeyKind::Chroma {reference, clip, gain}`:
+  `m = clamp((d − clip) × gain, 0, 1)`, then optional invert, where `d` is the Euclidean
+  distance in the **fill's own-gamut linear RGB** between the fill pixel and the reference. The
+  reference is the operator's `#RRGGBB`, read as R'G'B' codes (`code / 255`), quantized once
+  per frame per tile onto the fill's own `(Y, Cb, Cr)` code grid (fill matrix and range,
+  `key::chroma_reference_codes`) and decoded through **the same** front half (steps 1-3) as
+  the fill's pixels (`key::chroma_reference_linear`; CPU: once per tile fold, with the LUTs
+  exactly when the pixels use them; GPU: in `KeyParams::build`). A pixel at the reference is matte 0
+  (keyed out); far colours are 1; the edge is monotonic in `d`. Clip/gain on the distance is
+  the luma key's shape, so operators get one mental model; clip and gain share the config
+  fields and bounds (`clip` in [0, 1], `gain` finite and `>= 0`).
+- **Pipeline order.** The CPU front half is split into `tile_yuv_to_tile_linear` (steps 1-3;
+  LUT twin in `LutSet`) and the step-4 primaries convert, which runs on that same value, so a
+  chroma tile's canvas-linear colour is unchanged and the #8 order is untouched; the matte only
+  multiplies into alpha at the single premultiply. The shader reads its existing `lin_tile`
+  (step 3) for the distance.
+- **Exact reference on every path (review K7 MEDIA-1).** A first cut linearized the reference
+  analytically while LUT composites linearized pixels by table, so a fill carrying exactly
+  the reference (full-range grey 128 vs `#808080`) at `clip = 0, gain = 1e9` was keyed out
+  without LUTs but kept whole with them, and the GPU differed from CPU+LUT by 110 codes.
+  Now the reference is a point on the fill's code grid decoded by the identical CPU path, so
+  equal codes give `d = 0` bit-exactly with and without LUTs. The shader packs the
+  reference codes (`KeyParams.table[0]`, `y | cb << 8 | cr << 16`) and short-circuits a
+  pixel with those codes to `d = 0`, so its transcendental EOTF cannot leave a residue either;
+  other pixels use the analytic reference against the shader's own `lin_tile`. A large gain
+  is therefore a sharp key that removes exactly the reference codes (`clip > 0` widens it to
+  nearby codes); off the reference the matte is still a clamp of `(d − clip) × gain`, whose
+  CPU/GPU agreement at a huge gain is bounded by the SSIM/PSNR gate, not bit-exact.
+- **Degenerate parameters are total.** `key::chroma_matte` flushes a subnormal clip or gain to 0
+  (a GPU may flush them) and reads a NaN or negative gain as 0 and a NaN distance as 0. The GPU
+  never sees a NaN or infinity: `uniforms::chroma_edge` reduces `(clip, gain)` to a mode and
+  finite numbers (`KeyParams.table[1..4]`), unit-tested equal to the oracle for every clip and
+  gain class (NaN, ±∞, subnormal, zero, negative, `f32::MAX`) and a range of distances.
+- **GPU.** `KEY_KIND_CHROMA` (3); `KeyParams` grows from 80 to 96 bytes with `chroma: vec4<f32>`
+  (the reference). No matte table, no key-source layer: `TileKey::signal_source` is `None` for
+  a chroma key, so a key source on one is never uploaded or read.
+- **Key source: refused.** Chroma keys the fill's own colour; a separate key has no colour to
+  measure. Config refuses it (`chroma-key-source`); the compositor ignores one if a caller
+  sets it.
+- **Config and API.** `DownstreamKeyerConfig.color` (`#RRGGBB` / `#RGB`,
+  `crate::parse_hex_color`), required by `chroma` (`chroma-color-required`, `chroma-color`)
+  and refused on other types (`chroma-color-without-chroma`). The boot preflight and the K4
+  `validate_definition` run the same checks. `keyer_set` takes `type = "chroma"` and `color`
+  (`""` clears it); GET rows report `type = "chroma"`. OpenAPI regenerated
+  (`cargo xtask gen-openapi`). The off-clock scene key (#415) compares the reference too.
+- **Cost.** Unchanged: a chroma key has no key source (one upload), and the shader adds a
+  distance and a clamp per covered pixel, the same order as the luma table lookup.
+- **Tests.**
+  - `key` unit tests (6): the exact reference is keyed out (and kept when inverted), a far
+    colour is 1, the edge is monotonic and bounded, degenerate parameters are total, a key
+    source is ignored and the mask applies, the reference is quantized to the fill's codes
+    and decoded exactly like a pixel.
+  - `uniforms` unit tests (2): `chroma_edge` equals the oracle for every parameter class; the
+    packing (kind, invert, no table, no source, reference, edge).
+  - `tests/keyers_chroma_cpu.rs` (8): goldens against an independent per-pixel computation
+    (green screen with several references, clip/gain and invert; the reference kernel equal);
+    the studio green keyed out with subject kept and a soft edge; the distance in the tile
+    gamut (a PQ/BT.2020 fill whose canvas-gamut matte would differ); opacity × mask × matte
+    premultiplied once; a key source ignored; degenerate parameters never poison the layers
+    beneath; a proptest that the tile-driven kernel equals the oracle at 1-4 threads, with
+    LUTs on and off and in a scene group; MEDIA-1: a fill carrying exactly the reference
+    (full-range grey, limited grey, a full-range light grey, PQ/BT.2020) keyed out at gain
+    1e9, `f32::MAX` and +∞ with and without LUTs (red before the fix).
+  - `tests/keyers_chroma_gpu.rs` (`wgpu`, 4): GPU vs CPU over 8 frames (soft edge, invert,
+    pure distance, upscaled masked full-range fill at weight 0.7, PQ/BT.2020 downscaled fill,
+    MIX group, NaN/±∞ parameters, step and `f32::MAX` gain); the exact reference keyed out on
+    the GPU; MEDIA-1: reference-code columns keyed out and neighbouring codes (127, 129)
+    kept at gain 1e9, `f32::MAX` and +∞, within |ΔY| ≤ 2 of the CPU with and without LUTs
+    (red before the fix: |ΔY| 110 against CPU+LUT); no CPU fallback and no GPU pool growth
+    over 30 frames. On lavapipe (llvmpipe 19,
+    Vulkan) the minima were SSIM 0.99997 and PSNR 63.3 dB, max |ΔY| 2.
+  - `multiview-config` (3): accept (with mask, invert, `#RGB`, the K4 per-definition check, the
+    same cost as a linear self key), the typed refusals and clip/gain bounds, a TOML round
+    trip. The K2a "chroma is refused" assertion was removed in its own commit.
+  - `multiview-engine` `keyer` unit test: config to `KeyKind::Chroma`, cost unchanged, a
+    missing colour is a typed error.
+  - `multiview-control` `tests/switcher_keyers.rs`: `keyer_set` with chroma is planned,
+    applied at the tick, persisted, re-validated after a TOML round trip and listed by GET;
+    the four bad shapes are 422 with their reasons.
+- **Not done.** Spill suppression (ADR-C007 and ADR-0056 do not ask for it; a chroma key
+  leaves green fringes on edges until a spill slice), an automatic reference picker, a
+  separate key-source chroma key, and USK chroma (USKs are K3). A dedicated chroma bench
+  figure is not recorded (`keyer_composite_bench` has no chroma case); the RTX 4060
+  calibration is still owed by the lead as for K1.

@@ -139,6 +139,7 @@ async fn run(
                                 operation_id: op.to_string(),
                                 scene_version: 1,
                                 verb: verb.clone(),
+                                expect: None,
                             })
                             .unwrap();
                         false
@@ -438,6 +439,7 @@ fn rejected_completion_tick_rolls_back_the_auto_and_refuses_it_once() {
             operation_id: "auto".into(),
             scene_version: 1,
             verb: SwitcherVerb::Auto(FrameCount::try_from(3).unwrap()),
+            expect: None,
         })
         .unwrap();
     for index in 0..3 {
@@ -506,6 +508,7 @@ fn rejected_start_tick_refuses_the_auto_once_and_leaves_no_flight() {
             operation_id: "auto".into(),
             scene_version: 1,
             verb: SwitcherVerb::Auto(FrameCount::try_from(5).unwrap()),
+            expect: None,
         })
         .unwrap();
     driver.drain_at_tick(tick(0));
@@ -555,6 +558,7 @@ fn rejected_tick_that_interrupts_an_auto_refuses_it_exactly_once() {
                 operation_id: id.into(),
                 scene_version: 1,
                 verb,
+                expect: None,
             })
             .unwrap();
     };

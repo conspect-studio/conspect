@@ -646,6 +646,7 @@ fn a_program_cut_lands_on_exactly_one_rate_output_frame() {
                     operation_id: op.clone(),
                     scene_version: crate::switcher_runtime::FIRST_SLICE_SCENE_VERSION,
                     verb: multiview_engine::switcher_control::SwitcherVerb::Cut,
+                    expect: None,
                 })
                 .unwrap();
             let start = Instant::now();

@@ -8,7 +8,7 @@ pub const ARTIFACT_STREAMS: usize = 2;
 /// Windy terms version attached to this built-in template.
 pub const WINDY_TERMS_VERSION: &str = "windy-2023-09-01";
 /// One authorized, bounded public Windy view. Premium needs a configured secret resolver.
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct CaptureBody {
@@ -24,7 +24,7 @@ pub struct CaptureBody {
     pub terms: Terms,
 }
 /// Site-specific bounded view.
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct View {
@@ -116,7 +116,7 @@ impl View {
     }
 }
 /// Explicit versioned site-terms acceptance.
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Terms {
