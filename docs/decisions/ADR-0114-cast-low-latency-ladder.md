@@ -340,7 +340,7 @@ same CORS as the report route.
     "wt": true, "mse": true,
     "vdec": "supported", "vdec_hw": true, "adec": "supported",
     "rtc": true, "rtc_h264": ["42e01f", "640c1f"], "rtc_opus": true,
-    "rvfc": true, "srt": null },
+    "rvfc": true, "frames": "rvfc", "srt": null },
   "need": { "subtitles": false, "audio": null },
   "skip": { "moq": 540 },
   "failed": null }
@@ -355,11 +355,14 @@ same CORS as the report route.
 - `rvfc`: `requestVideoFrameCallback` exists. Without it latency is measured from the playhead on HLS and MoQ
   and is unavailable on WebRTC (decision 2, "Engine media time on each rung").
 - `frames`: `"rvfc"`, `"quality"` (`getVideoPlaybackQuality`) or `null`: the counter of presented frames the
-  stall watchdog uses ("Cast media status", rule 1). With `null` the MoQ and WebRTC rungs are not offered.
+  stall watchdog uses ("Cast media status", rule 1). With `null`, or with the field absent, the MoQ and WebRTC
+  rungs are not offered.
 - `srt`: on Android TV, the libsrt version the app loaded; `null` in the Web Receiver.
 - `need`: what the session must carry (decision 2, Tracks).
 - `skip`: rungs in the device's failure memory, with the seconds left.
-- `failed`: on a later call, `{ "rung": "moq", "stage": "connect|first-frame|stall|latency", "ms": 3000 }`.
+- `failed`: on a later call, `{ "rung": "moq", "stage": "connect|first-frame|stall|latency|hook", "ms": 3000 }`.
+  `hook` is the WebRTC element hook that did not take ("Cast media status"); the engine accepts it like the
+  other stages and answers with the next rung.
 
 Every field is a claim by an unauthenticated device. The engine uses it only to leave rungs out. It never widens
 access because of it, and it validates sizes and types strictly (unknown fields ignored, wrong types 400).
@@ -555,8 +558,13 @@ Google can change that in any SDK release. Three rules follow:
    picture showed 0 frames per second. With whole fragments of noise appended on the MoQ path the playhead kept
    advancing at 1.00 x with 0 frames per second; CAF reported `BUFFERING` only 4.0 s after the noise began and
    never an error. The rule of decision 2, "no frame presented for 2 s", is therefore implemented by counting
-   presented frames (`requestVideoFrameCallback`, else `getVideoPlaybackQuality().totalVideoFrames`), never by
-   `currentTime` or by CAF's state. While the watchdog has fired and the picture is not back, the receiver's
+   presented frames, never by `currentTime` or by CAF's state. The counter is the number of
+   `requestVideoFrameCallback` callbacks, else `totalVideoFrames - droppedVideoFrames` of
+   `getVideoPlaybackQuality()`: `totalVideoFrames` alone also counts dropped frames (Cited:
+   [MDN](https://developer.mozilla.org/en-US/docs/Web/API/VideoPlaybackQuality/totalVideoFrames)), so a decoder
+   that drops every frame would keep it rising. The counter is read again from zero after each load, because
+   the element's counts restart then; a value lower than the last one starts a new count and is not progress.
+   Slice 4's tests include a stream whose frames are all dropped: the watchdog must fire. While the watchdog has fired and the picture is not back, the receiver's
    own report says `stalled`, because the Cast media status may still say `PLAYING`. A receiver with neither
    frame counter does not get these rungs: the probe gains `frames` (which counter exists) and the engine
    leaves the MoQ and WebRTC rungs out when it is absent.
@@ -1105,7 +1113,8 @@ decode, device Chrome, or a TV's delay: every rung needs the device test before 
 ### 9. Operator-only steps
 
 Nothing here is a decision. Each is an action only the operator's accounts or hands can perform. They go to the
-captain as one list; none blocks slices 0 to 5 from merging.
+captain as one list; none blocks slices 0 to 5 from merging, except step 5a: slices 4 and 5 build out their
+rung only after it.
 
 | # | Step | Needed for | When |
 | --- | --- | --- | --- |
