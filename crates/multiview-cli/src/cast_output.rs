@@ -641,6 +641,8 @@ struct LabelledOutput {
     tracks: Vec<(String, String, Option<usize>)>,
     track_inputs: Vec<Option<String>>,
     unrequested: Option<u64>,
+    /// The control-plane requests this labeller already used.
+    consumed: multiview_control::cast_streams::identity::Consumed,
 }
 
 impl CastLabeller {
@@ -670,6 +672,7 @@ impl CastLabeller {
                         .collect(),
                     track_inputs: Vec::new(),
                     unrequested: None,
+                    consumed: multiview_control::cast_streams::identity::Consumed::default(),
                 })
                 .collect(),
         }
@@ -719,13 +722,14 @@ impl CastLabeller {
             let first = out.unrequested.is_none();
             out.unrequested = Some(unrequested);
             let label = |labels: &multiview_control::cast_streams::identity::OutputLabels,
+                         consumed: &mut multiview_control::cast_streams::identity::Consumed,
                          id: u64| {
                 if first {
                     id
                 } else if forced {
                     engine_minted(id)
                 } else {
-                    labels.label(id)
+                    labels.label(id, consumed)
                 }
             };
             let video = router.cast_video_fingerprint(out.index);
@@ -736,7 +740,7 @@ impl CastLabeller {
                     out.labels.record(
                         &Component::Video,
                         if first { 0 } else { from },
-                        label(&out.labels, id),
+                        label(&out.labels, &mut out.consumed, id),
                     );
                 }
             }
@@ -747,7 +751,7 @@ impl CastLabeller {
                 out.labels.record(
                     &Component::Audio,
                     if first { 0 } else { from },
-                    label(&out.labels, id),
+                    label(&out.labels, &mut out.consumed, id),
                 );
             }
             if out.track_inputs.len() != out.tracks.len() {

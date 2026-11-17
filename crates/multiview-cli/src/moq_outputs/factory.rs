@@ -1387,9 +1387,16 @@ impl CastWindowGate {
                 self.attachment.fence();
                 return GateVerdict::Refuse;
             };
-            self.scratch.push((component, first));
-            if last != first {
-                self.scratch.push((component, last));
+            // Every tick the frame's samples cover (round 2: at 60 fps an AAC
+            // frame can cover three ticks; the middle one must clear too).
+            // Bounded: at most one more tick than a frame's samples per
+            // tick, a handful.
+            if last < first || last - first > 64 {
+                self.attachment.fence();
+                return GateVerdict::Refuse;
+            }
+            for tick in first..=last {
+                self.scratch.push((component, tick));
             }
         }
         let components = &self.components;
@@ -3256,8 +3263,14 @@ mod tests {
                 .with(&Component::Video, video_id("src:cam2"));
             c.attachment.set_clearance(cleared);
             c.labels.expect(&[video_id("src:cam2")]);
-            c.labels
-                .record(&Component::Video, 3, c.labels.label(video_id("src:cam2")));
+            c.labels.record(
+                &Component::Video,
+                3,
+                c.labels.label(
+                    video_id("src:cam2"),
+                    &mut multiview_control::cast_streams::identity::Consumed::default(),
+                ),
+            );
             let mut got = Vec::new();
             for tick in 1..=5 {
                 c.offer(tick);
@@ -3344,6 +3357,61 @@ mod tests {
             );
             assert_eq!(c.delivered(Duration::from_millis(300)), Vec::<u64>::new());
             assert!(c.attachment.is_fenced());
+        }
+
+        /// PR 516 review round 2, lens 1: at 60 fps an AAC frame (1024
+        /// samples) can cover three ticks; the middle one is judged too.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_three_tick_audio_packet_is_judged_on_every_tick() {
+            let registry = FeedRegistry::new(&[{
+                let mut b = binding("out-cast", 0, GENERATION, 1280, 720);
+                b.video.time_base = Rational::new(1, 60);
+                b.video.cadence = Rational::new(60, 1);
+                b
+            }])
+            .unwrap();
+            let labels = Arc::new(OutputLabels::new());
+            let cleared = audio_id("program");
+            labels.record(&Component::Video, 0, video_id("program"));
+            labels.record(&Component::Audio, 0, cleared);
+            labels.record(&Component::Audio, 9, engine_minted(audio_id("src:secret")));
+            labels.record(&Component::Audio, 10, cleared);
+            labels.set_labelled_through(1000);
+            let attachment = Arc::new(CastAttachment::new(
+                "stream",
+                "out-cast",
+                "moq",
+                Arc::clone(&labels),
+                Clearance::of(&[
+                    (Component::Video, video_id("program")),
+                    (Component::Audio, cleared),
+                ]),
+            ));
+            let (sink, mut windows) = Fence::channel(4);
+            let mut registry = registry;
+            let _feed = registry
+                .factory
+                .attach_cast(
+                    &global(),
+                    &WhepScope::Output("out-cast".into()),
+                    sink,
+                    Arc::clone(&attachment),
+                )
+                .unwrap();
+            // 48 kHz at 60 fps: 800 samples a tick. PTS 7168 is on the AAC
+            // grid (7 * 1024) and its frame ends at 8191: ticks 8, 9, 10.
+            let mut audio = Packet::copy(&[0x21, 0x10, 0x05]);
+            audio.set_pts(Some(7168));
+            audio.set_dts(Some(7168));
+            registry.producer_mut().offer_complete(
+                0,
+                GENERATION,
+                &[idr(8), EncodedPacket::from_audio_packet(audio)],
+                SPAN,
+                Instant::now(),
+            );
+            assert!(recv_within(&mut windows, Duration::from_millis(300)).is_none());
+            assert!(attachment.is_fenced(), "tick 9's identity was judged");
         }
 
         /// PR 516 review, lens 2: the cast lease's authority is the token's;
