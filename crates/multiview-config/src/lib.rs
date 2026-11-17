@@ -376,6 +376,27 @@ pub struct YoutubeSystemConfig {
     /// `"yt-dlp"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yt_dlp_path: Option<String>,
+    /// The address family `yt-dlp` resolves over (issue #498), for every
+    /// `youtube` source without its own `address_family`. Absent ⇒ `auto`.
+    /// The media fetch always follows the family the resolved URL is signed
+    /// for, whatever this says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address_family: Option<YoutubeAddressFamily>,
+}
+
+/// The address family a `youtube` source's `yt-dlp` resolve runs over (issue
+/// #498). `YouTube` can bot-check one family of a host and not the other.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum YoutubeAddressFamily {
+    /// The system default first; a run `YouTube` bot-checks is repeated once
+    /// over IPv4.
+    #[default]
+    Auto,
+    /// Always IPv4 (`yt-dlp -4`).
+    V4,
+    /// Always IPv6 (`yt-dlp -6`).
+    V6,
 }
 
 /// `[system.demand]`: how `on_demand` sources start and stop around their

@@ -552,6 +552,22 @@ export interface Subscribed {
   readonly topic: string;
 }
 
+/** A committed downstream keyer change; envelope id equals the keyer object id. */
+export interface SwitcherKeyer {
+  /** Fill source id, or `redacted`. */
+  readonly fill: string;
+  /** Key source id, or `redacted`; absent for a self key. */
+  readonly key?: string;
+  /** Keyer object id, `<program>/<keyer>`. */
+  readonly keyer: string;
+  readonly me: string;
+  readonly on_air: boolean;
+  readonly program: string;
+  readonly reason: "operator" | "tie" | "on-at-start" | "source-lost" | "source-recovered" | "definition";
+  readonly stale: boolean;
+  readonly tick: number;
+}
+
 /** Terminal outcome, emitted only at the engine output tick; envelope corr equals operation_id, id equals M/E id. */
 export interface SwitcherOperation {
   readonly completed: boolean;

@@ -2413,6 +2413,10 @@ pub struct Pipeline {
     /// ([`crate::control::command_drain_with_seams`]) can address every declared
     /// channel. Empty when no media players are configured.
     player_mailboxes: std::collections::HashMap<String, Arc<crate::player::TransportMailbox>>,
+    /// The media-player channels this run actually booted (a real store fed
+    /// by a player loop). A declared player that failed boot is absent: an
+    /// alias of it can never show a picture (review ship-1111 #4).
+    booted_players: Arc<std::collections::BTreeSet<String>>,
     /// The shared WHIP publisher rendezvous (ADR-T014): the control plane's
     /// `WhipProvider` writes a negotiated publisher into it and each webrtc
     /// source's `drive_webrtc` loop reads. Exposed to the run wiring via
@@ -2828,7 +2832,7 @@ struct IngestPlan {
     /// [`ingest_plan_for`]). The bridge thread is spawned in
     /// [`IngestSupervisor::start`].
     #[cfg(feature = "youtube")]
-    youtube_url_slot: Option<Arc<multiview_framestore::SwapCell<Option<Arc<String>>>>>,
+    youtube_url_slot: Option<Arc<YoutubeSlot>>,
     /// An explicit `yt-dlp` binary path for this run (ADR-0015 §6), stamped
     /// from the `MULTIVIEW_YOUTUBE_YT_DLP_PATH` environment variable or else
     /// `[system.youtube] yt_dlp_path` after build (like `ndi_accept_license`).
@@ -3057,6 +3061,16 @@ impl Pipeline {
         // their audio rails (issue #420).
         #[cfg(feature = "youtube")]
         crate::youtube_status::set_resolver_path(crate::youtube_resolver_path(config));
+        // The run's default resolve address family (issue #498).
+        #[cfg(feature = "youtube")]
+        crate::youtube_status::set_resolver_family(crate::youtube_status::family_from_config(
+            config
+                .system
+                .as_ref()
+                .and_then(|s| s.youtube.as_ref())
+                .and_then(|y| y.address_family)
+                .unwrap_or_default(),
+        ));
         // Fail-closed (#103): an AES67 PCM-audio source in a non-`aes67` build is a
         // config this binary cannot honour — reject it clearly up front, never wire
         // it dark (the same contract as a `display` source/output in a non-
@@ -3408,6 +3422,13 @@ impl Pipeline {
             player_state,
         );
         let player_mailboxes = media_player_boot.mailboxes;
+        // Players with a channel (a store) in this run: an alias of any other
+        // player can never show a picture, and its status says so.
+        let booted_players: std::collections::BTreeSet<String> = media_player_boot
+            .stores
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
         for (id, store) in media_player_boot.stores {
             stores.insert(id, store);
         }
@@ -3726,8 +3747,10 @@ impl Pipeline {
 
         // Every configured source is catalogued, demanded or not; the stores of
         // booted sources are shared so a later lease reuses them.
-        // A `media_player` source is an alias of a player channel the player
-        // boot owns: demand never starts or stops it (no catalogue entry).
+        // A `media_player` source is catalogued as an alias of its player's
+        // store (ADR-M012): demand reports and leases it like any source (its
+        // standing pin is its consumer), but never starts, stops or clears a
+        // producer — the player boot owns the channel.
         let catalogue = crate::source_rails::catalogue(
             config.sources.iter().filter(|source| {
                 !matches!(
@@ -3737,6 +3760,21 @@ impl Pipeline {
             }),
             &stores,
         );
+        for source in &config.sources {
+            if let SourceKind::MediaPlayer { player } = &source.kind {
+                let store = stores
+                    .get(&source.id)
+                    .map_or_else(|| crate::source_rails::empty_store(&source.id), Arc::clone);
+                let unavailable = (!booted_players.contains(player))
+                    .then(|| crate::source_rails::no_channel_reason(player));
+                crate::source_rails::catalogue_alias(
+                    &catalogue,
+                    source,
+                    &store,
+                    unavailable.as_deref(),
+                );
+            }
+        }
         let demand_config = crate::source_demand::demand_config(config);
         let boot_pins: Vec<(String, Vec<crate::source_demand::StandingPin>)> = config
             .sources
@@ -3785,6 +3823,7 @@ impl Pipeline {
             live_island: Arc::new(multiview_framestore::SwapCell::empty()),
             ingest_plans,
             player_mailboxes,
+            booted_players: Arc::new(booted_players),
             #[cfg(feature = "webrtc-native")]
             webrtc_registry,
             #[cfg(feature = "webrtc-native")]
@@ -4038,6 +4077,14 @@ impl Pipeline {
         &self,
     ) -> std::collections::HashMap<String, Arc<crate::player::TransportMailbox>> {
         self.player_mailboxes.clone()
+    }
+
+    /// The media-player channels this run booted, for the command drain's
+    /// `media_player` source binding (ADR-M012): an alias of any other player
+    /// reads no-signal and its switcher select is refused with the reason.
+    #[must_use]
+    pub fn booted_players(&self) -> Arc<std::collections::BTreeSet<String>> {
+        Arc::clone(&self.booted_players)
     }
 
     /// The shared per-source producer stop registry (ADR-W018): hand this to
@@ -4586,6 +4633,7 @@ impl Pipeline {
                 .consumer_set(multiview_engine::ConsumerClass::SubtitleRoute, Rails::VIDEO),
             manager,
             catalogue: Arc::clone(&self.catalogue),
+            booted_players: Arc::clone(&self.booted_players),
         })
     }
 
@@ -4692,8 +4740,9 @@ impl Pipeline {
                 if self.audio_stores.contains_key(id) {
                     continue;
                 }
+                // An alias's audio is its player's channel (routed by alias).
                 let entry = self.catalogue.load().get(id).cloned();
-                let Some(entry) = entry else {
+                let Some(entry) = entry.filter(|entry| !entry.is_alias()) else {
                     continue;
                 };
                 let lifecycle = if self.ingest_plans.iter().any(|plan| plan.id == *id) {
@@ -11591,10 +11640,11 @@ impl IngestSupervisor {
             // stops it too. Off the data plane — only ever WRITES the slot (inv
             // #1/#10). Only under the off-by-default `youtube` feature.
             #[cfg(feature = "youtube")]
-            if let SourceLocation::Youtube { watch_url } = &plan.location {
+            if let SourceLocation::Youtube { watch_url, family } = &plan.location {
                 if let Some(slot) = plan.youtube_url_slot.clone() {
                     let id = plan.id.clone();
                     let watch_url = watch_url.clone();
+                    let family = *family;
                     let yt_dlp_path = plan.youtube_yt_dlp_path.clone();
                     let rr_stop = Arc::new(AtomicBool::new(false));
                     let rr_exited = crate::live_sources::register_stop(
@@ -11615,6 +11665,7 @@ impl IngestSupervisor {
                         youtube_reresolve_thread(
                             &watch_url,
                             yt_dlp_path.as_deref(),
+                            family,
                             &slot,
                             &rr_thread_stop,
                         );
@@ -12125,6 +12176,37 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
         true
     }
 
+    fn catalogue_alias(
+        &self,
+        source: &Source,
+        store: &Arc<TileStore<Nv12Image>>,
+        unavailable: Option<String>,
+    ) -> bool {
+        let Some((catalogue, manager)) = &self.demand else {
+            return false;
+        };
+        crate::source_rails::catalogue_alias(catalogue, source, store, unavailable.as_deref());
+        manager.set_pins(&source.id, crate::source_demand::standing_pins(source));
+        // A repoint re-baselines readiness on the new player's store.
+        manager.restart(&source.id);
+        true
+    }
+
+    fn alias_removed(&self, id: &str, store: &Arc<TileStore<Nv12Image>>) {
+        if let Some((catalogue, manager)) = &self.demand {
+            // Only the alias that was bound to `store`: a stale (retried)
+            // unbind never removes a later definition under the same id.
+            if catalogue
+                .load()
+                .get(id)
+                .is_some_and(|entry| entry.is_alias() && Arc::ptr_eq(entry.store(), store))
+            {
+                crate::source_rails::catalogue_remove(catalogue, id);
+                manager.remove_source(id);
+            }
+        }
+    }
+
     fn invalidate_live_edit(&self, id: &str) -> bool {
         if !self.clear_on_remove {
             return false;
@@ -12137,6 +12219,13 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
         let Some(entry) = catalogue.load().get(id).cloned() else {
             return false;
         };
+        if entry.is_alias() {
+            // Leaving a `media_player` alias: its store is the player
+            // channel's and is never cleared; the new definition gets its own
+            // store from the drain and is catalogued right after this.
+            crate::source_rails::catalogue_remove(catalogue, id);
+            return false;
+        }
         // A media edit (the control plane refused it already if the source
         // was on a bus). The hub's teardown has stopped and awaited the old
         // producer; fence any detached writer with a fresh lifecycle, then
@@ -12234,9 +12323,11 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
         #[cfg(feature = "youtube")]
         crate::youtube_status::forget(id);
         let retired_store = self.demand.as_ref().and_then(|(catalogue, manager)| {
+            // An alias's store is its player channel's: never cleared here.
             let store = catalogue
                 .load()
                 .get(id)
+                .filter(|entry| !entry.is_alias())
                 .map(|entry| Arc::clone(entry.store()));
             crate::source_rails::catalogue_remove(catalogue, id);
             // Every pin it owns (standing and an operator Start) and every
@@ -12457,11 +12548,16 @@ impl LiveIngestSpawner {
         // keeps its master fresh exactly like a startup one (issue #420).
         #[cfg(feature = "youtube")]
         let youtube = match &plan.location {
-            SourceLocation::Youtube { watch_url } => {
+            SourceLocation::Youtube { watch_url, family } => {
                 plan.youtube_yt_dlp_path = crate::youtube_status::resolver_path();
-                plan.youtube_url_slot
-                    .clone()
-                    .map(|slot| (watch_url.clone(), slot, plan.youtube_yt_dlp_path.clone()))
+                plan.youtube_url_slot.clone().map(|slot| {
+                    (
+                        watch_url.clone(),
+                        *family,
+                        slot,
+                        plan.youtube_yt_dlp_path.clone(),
+                    )
+                })
             }
             _ => None,
         };
@@ -12469,8 +12565,20 @@ impl LiveIngestSpawner {
         let produced = spawn_ingest_producer(plan, registry)
             .map(|(stop, handle)| crate::live_sources::SpawnedProducer { stop, handle });
         #[cfg(feature = "youtube")]
-        if let (Some((watch_url, slot, path)), Some(producer)) = (youtube, produced.as_ref()) {
-            spawn_live_youtube_reresolve(&id, watch_url, slot, path, &producer.stop, registry);
+        if let (Some((watch_url, family, slot, path)), Some(producer)) =
+            (youtube, produced.as_ref())
+        {
+            spawn_live_youtube_reresolve(
+                &id,
+                YoutubeReresolve {
+                    watch_url,
+                    family,
+                    slot,
+                    yt_dlp_path: path,
+                },
+                &producer.stop,
+                registry,
+            );
         }
         #[cfg(not(feature = "youtube"))]
         let _ = id;
@@ -12485,14 +12593,26 @@ impl LiveIngestSpawner {
 /// it with the producer. A failed spawn only loses the proactive refresh: the
 /// decode thread still resolves on every reconnect.
 #[cfg(feature = "youtube")]
+struct YoutubeReresolve {
+    watch_url: String,
+    family: Option<multiview_config::YoutubeAddressFamily>,
+    slot: Arc<YoutubeSlot>,
+    yt_dlp_path: Option<String>,
+}
+
+#[cfg(feature = "youtube")]
 fn spawn_live_youtube_reresolve(
     id: &str,
-    watch_url: String,
-    slot: Arc<multiview_framestore::SwapCell<Option<Arc<String>>>>,
-    yt_dlp_path: Option<String>,
+    job: YoutubeReresolve,
     stop: &Arc<AtomicBool>,
     registry: &crate::live_sources::StopRegistry,
 ) {
+    let YoutubeReresolve {
+        watch_url,
+        family,
+        slot,
+        yt_dlp_path,
+    } = job;
     let exited =
         crate::live_sources::register_stop(registry, &format!("{id}/youtube-reresolve"), stop);
     let exit_guard = crate::live_sources::ExitGuard::new(&exited);
@@ -12501,7 +12621,13 @@ fn spawn_live_youtube_reresolve(
         .name(format!("multiview-yt-reresolve-{id}"))
         .spawn(move || {
             let _exit = exit_guard;
-            youtube_reresolve_thread(&watch_url, yt_dlp_path.as_deref(), &slot, &thread_stop);
+            youtube_reresolve_thread(
+                &watch_url,
+                yt_dlp_path.as_deref(),
+                family,
+                &slot,
+                &thread_stop,
+            );
         })
     {
         tracing::error!(error = %e, source = %id, "could not spawn youtube re-resolution thread; falling back to resolve-on-reconnect");
@@ -15934,6 +16060,13 @@ fn build_input_inventories(
     std::collections::BTreeMap::new()
 }
 
+/// The lock-free slot the proactive re-resolution loop publishes each fresh
+/// `YouTube` master into, with the address family its media fetch is pinned to
+/// (issue #498).
+#[cfg(feature = "youtube")]
+type YoutubeSlot =
+    multiview_framestore::SwapCell<Option<Arc<crate::youtube_status::ResolvedMaster>>>;
+
 /// Allocate the **swappable resolved-URL slot** for a `YouTube` source (IN-5b),
 /// or `None` for every other source kind.
 ///
@@ -15944,9 +16077,7 @@ fn build_input_inventories(
 /// a fresh URL already in hand (make-before-break), no cold resolve at the boundary
 /// (ADR-0015 P2–P4). Lock-free, written only by the loop (invariants #1/#10).
 #[cfg(feature = "youtube")]
-fn youtube_url_slot_for(
-    location: &SourceLocation,
-) -> Option<Arc<multiview_framestore::SwapCell<Option<Arc<String>>>>> {
+fn youtube_url_slot_for(location: &SourceLocation) -> Option<Arc<YoutubeSlot>> {
     match location {
         SourceLocation::Youtube { .. } => Some(Arc::new(multiview_framestore::SwapCell::empty())),
         _ => None,
@@ -16181,9 +16312,13 @@ fn ingest_plan_for(
         // degrades the tile on the ingest thread (invariants #1/#10). Only wired
         // under the off-by-default `youtube` feature.
         #[cfg(feature = "youtube")]
-        SourceKind::Youtube { url } => (
+        SourceKind::Youtube {
+            url,
+            address_family,
+        } => (
             SourceLocation::Youtube {
                 watch_url: url.clone(),
+                family: *address_family,
             },
             true,
         ),
@@ -16770,7 +16905,7 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
         // resolves once itself (see `audio_ingest_loop`). NDI audio is a
         // host-memory receive and rides silence on the bus for now.
         #[cfg(feature = "youtube")]
-        SourceKind::Youtube { url } => (url.clone(), true),
+        SourceKind::Youtube { url, .. } => (url.clone(), true),
         #[cfg(feature = "ndi")]
         SourceKind::Ndi { .. } => return None,
         // Any other (incl. NDI without the feature, future kinds): no audio path.
@@ -16785,7 +16920,17 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
         audio_only: false,
         http_headers: http_headers_for(&source.kind).to_ffmpeg(),
         youtube: is_youtube_kind(&source.kind),
+        youtube_family: youtube_family_of(&source.kind),
     })
+}
+
+/// A `YouTube` source's own resolve address family (issue #498); `None` for
+/// every other kind or when it has none.
+fn youtube_family_of(kind: &SourceKind) -> Option<multiview_config::YoutubeAddressFamily> {
+    match kind {
+        SourceKind::Youtube { address_family, .. } => *address_family,
+        _ => None,
+    }
 }
 
 /// Whether source-linked event observation (ADR-0183) should activate for this
@@ -17242,6 +17387,9 @@ enum SourceLocation {
     Youtube {
         /// The `YouTube` watch/live/channel URL bound by the config.
         watch_url: String,
+        /// The source's own resolve address family (issue #498); `None` uses
+        /// the run's `[system.youtube] address_family`.
+        family: Option<multiview_config::YoutubeAddressFamily>,
     },
     /// An **NDI®** source (ADR-0008 / IN-3), bound by its NDI source **name** (the
     /// name other NDI tools discover, e.g. `STUDIO (CAM 1)`). NDI ingest is a
@@ -17518,16 +17666,26 @@ pub(crate) fn resolve_hls_audio_url_with_headers(
     master_url: &str,
     headers: &multiview_ffmpeg::HttpHeaders,
 ) -> Option<String> {
-    if headers.is_empty() {
+    resolve_hls_audio_url_pinned(master_url, headers, crate::hls_fetch::IpPin::Any)
+}
+
+/// [`resolve_hls_audio_url_with_headers`] with the master fetch pinned to `ip`
+/// (a `YouTube` master, issue #498).
+pub(crate) fn resolve_hls_audio_url_pinned(
+    master_url: &str,
+    headers: &multiview_ffmpeg::HttpHeaders,
+    ip: crate::hls_fetch::IpPin,
+) -> Option<String> {
+    if headers.is_empty() && ip == crate::hls_fetch::IpPin::Any {
         return resolve_hls_audio_url_with(master_url, &crate::captions::LibavFetcher);
     }
-    tracing::debug!("audio pin: master fetch carries operator request headers");
+    tracing::debug!("audio pin: master fetch carries operator request headers or a family pin");
     resolve_hls_audio_url_with(
         master_url,
-        &HeaderPlaylistFetcher(crate::hls_fetch::RequestHeaders::new(
-            headers.user_agent(),
-            headers.referer(),
-        )),
+        &HeaderPlaylistFetcher(
+            crate::hls_fetch::RequestHeaders::new(headers.user_agent(), headers.referer())
+                .with_ip(ip),
+        ),
     )
 }
 
@@ -17605,22 +17763,27 @@ fn resolve_hls_variant_url_with(
 /// original `url` is returned unchanged. Best-effort: this never fails the open
 /// (invariants #1/#10) — a fall-through to the original URL still has the post-open
 /// discard + reconnect bracket as guards.
+///
+/// A family-pinned source (`ip` is not `Any`, a `YouTube` master, issue #498)
+/// fetches its master with the in-process fetcher pinned to that family; libav
+/// cannot be pinned.
 fn main_demuxer_open_url(
     url: &str,
     location: &SourceLocation,
     tile_h: u32,
     headers: &HttpHeaders,
+    ip: crate::hls_fetch::IpPin,
 ) -> String {
     if !is_hls_location(location) {
         return url.to_owned();
     }
-    let resolved = if headers.is_empty() {
+    let resolved = if headers.is_empty() && ip == crate::hls_fetch::IpPin::Any {
         resolve_hls_variant_url(url, Some(tile_h))
     } else {
         resolve_hls_variant_url_with(
             url,
             Some(tile_h),
-            &HeaderPlaylistFetcher(headers.request_headers()),
+            &HeaderPlaylistFetcher(headers.request_headers().with_ip(ip)),
         )
     };
     resolved.unwrap_or_else(|| url.to_owned())
@@ -19931,15 +20094,24 @@ fn timeline_pts(
 /// yt_dlp_path`, ADR-0015 §6) when configured, else the default (`"yt-dlp"` on
 /// `PATH`) — because the service user's `PATH` may not include where an operator
 /// installed it (e.g. `~/.local/bin`).
+///
+/// `family` is the source's own resolve address family (issue #498); `None`
+/// uses the run's `[system.youtube] address_family` (default `auto`).
 #[cfg(feature = "youtube")]
-fn youtube_resolver_config(yt_dlp_path: Option<&str>) -> multiview_input::youtube::ResolverConfig {
-    match yt_dlp_path {
+fn youtube_resolver_config(
+    yt_dlp_path: Option<&str>,
+    family: Option<multiview_config::YoutubeAddressFamily>,
+) -> multiview_input::youtube::ResolverConfig {
+    let config = match yt_dlp_path {
         Some(path) if !path.is_empty() => multiview_input::youtube::ResolverConfig::new(
             path,
             multiview_input::youtube::ResolverConfig::default().timeout,
         ),
         _ => multiview_input::youtube::ResolverConfig::default(),
-    }
+    };
+    config.with_family(crate::youtube_status::effective_family(
+        family.map(crate::youtube_status::family_from_config),
+    ))
 }
 
 /// Resolve a `YouTube` **watch** URL to a fresh live HLS master URL (ADR-0015),
@@ -19955,13 +20127,18 @@ fn youtube_resolver_config(yt_dlp_path: Option<&str>) -> multiview_input::youtub
 /// resolve failure (binary absent, timeout, extraction broke, or the stream is not
 /// live) is returned as a `String` error — the caller's reconnect bracket backs
 /// off and retries while the tile degrades; it is never a panic.
+///
+/// The returned [`ResolvedMaster`](crate::youtube_status::ResolvedMaster)
+/// carries the address family every request for the master must use (issue
+/// #498).
 #[cfg(feature = "youtube")]
 pub(crate) fn resolve_youtube_master(
     watch_url: &str,
     yt_dlp_path: Option<&str>,
+    family: Option<multiview_config::YoutubeAddressFamily>,
     stop: Option<&AtomicBool>,
-) -> Result<String, String> {
-    use multiview_input::youtube::reresolve::{ingest_url, ProcessResolver, Resolver};
+) -> Result<crate::youtube_status::ResolvedMaster, String> {
+    use multiview_input::youtube::reresolve::{ProcessResolver, Resolver};
 
     // A dedicated current-thread runtime for this one resolve. `yt-dlp`'s own hard
     // timeout (within `youtube_resolver_config`) bounds the await, so this never
@@ -19971,7 +20148,7 @@ pub(crate) fn resolve_youtube_master(
         .enable_all()
         .build()
         .map_err(|e| format!("youtube resolver runtime: {e}"))?;
-    let process = ProcessResolver::new(youtube_resolver_config(yt_dlp_path));
+    let process = ProcessResolver::new(youtube_resolver_config(yt_dlp_path, family));
     let master = runtime
         .block_on(async {
             // A stop abandons the resolve: dropping its future kills the
@@ -19984,7 +20161,9 @@ pub(crate) fn resolve_youtube_master(
         })
         .ok_or_else(|| "stopped".to_owned())?
         .map_err(|e| e.operator_message())?;
-    Ok(ingest_url(&master).to_owned())
+    Ok(crate::youtube_status::ResolvedMaster::from_resolved(
+        &master,
+    ))
 }
 
 /// Resolves once `stop` is raised (polled every 100 ms); never when `None`.
@@ -20018,11 +20197,11 @@ async fn wait_for_stop(stop: Option<&AtomicBool>) {
 /// unit-testable with no network/subprocess (the live resolve is gated separately).
 #[cfg(feature = "youtube")]
 fn youtube_open_url<F>(
-    slot: Option<&multiview_framestore::SwapCell<Option<Arc<String>>>>,
+    slot: Option<&YoutubeSlot>,
     resolve_inline: F,
-) -> Result<String, String>
+) -> Result<crate::youtube_status::ResolvedMaster, String>
 where
-    F: FnOnce() -> Result<String, String>,
+    F: FnOnce() -> Result<crate::youtube_status::ResolvedMaster, String>,
 {
     if let Some(fresh) = slot.and_then(multiview_framestore::SwapCell::load) {
         // The proactive loop has a fresh, make-before-break-resolved URL in hand.
@@ -20030,6 +20209,17 @@ where
     }
     // Cold start (slot empty) or no loop: resolve inline this once.
     resolve_inline()
+}
+
+/// Lock-free publish of the next-up master WITH its family pin (issue #498): a
+/// re-resolve that came back over the other family moves the pin with the URL.
+/// The decode thread reads it on its next (re)open. Cheap and non-blocking —
+/// the loop holds no lock.
+#[cfg(feature = "youtube")]
+fn publish_youtube_master(slot: &YoutubeSlot, fresh: &multiview_input::youtube::ResolvedHls) {
+    slot.store(Some(Arc::new(
+        crate::youtube_status::ResolvedMaster::from_resolved(fresh),
+    )));
 }
 
 /// Run the supervised **proactive** `YouTube` re-resolution loop on this thread
@@ -20055,11 +20245,12 @@ where
 fn youtube_reresolve_thread(
     watch_url: &str,
     yt_dlp_path: Option<&str>,
-    slot: &Arc<multiview_framestore::SwapCell<Option<Arc<String>>>>,
+    family: Option<multiview_config::YoutubeAddressFamily>,
+    slot: &Arc<YoutubeSlot>,
     stop: &AtomicBool,
 ) {
     use multiview_input::youtube::reresolve::{
-        run_reresolve_loop, ProcessResolver, ReresolveConfig, SystemUnixClock,
+        run_reresolve_loop_resolved, ProcessResolver, ReresolveConfig, SystemUnixClock,
     };
 
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -20081,19 +20272,17 @@ fn youtube_reresolve_thread(
         }
     };
 
-    let resolver = ProcessResolver::new(youtube_resolver_config(yt_dlp_path));
+    let resolver = ProcessResolver::new(youtube_resolver_config(yt_dlp_path, family));
     let clock = SystemUnixClock;
     let swap_slot = Arc::clone(slot);
-    let outcome = runtime.block_on(run_reresolve_loop(
+    let outcome = runtime.block_on(run_reresolve_loop_resolved(
         watch_url,
         ReresolveConfig::default(),
         &resolver,
         &clock,
         stop,
-        move |url: String| {
-            // Lock-free publish of the next-up master; the decode thread reads it on
-            // its next (re)open. Cheap + non-blocking — the loop holds no lock.
-            swap_slot.store(Some(Arc::new(url)));
+        move |fresh: &multiview_input::youtube::ResolvedHls| {
+            publish_youtube_master(&swap_slot, fresh);
         },
     ));
     if let Err(e) = outcome {
@@ -20139,20 +20328,38 @@ fn open_and_stream(
     // resolve failure returns `Err`, which the reconnect bracket backs off and
     // retries while the tile rides last-good → NO_SIGNAL.
     #[cfg(feature = "youtube")]
-    let resolved_youtube_url = match &plan.location {
-        SourceLocation::Youtube { watch_url } => {
+    let resolved_youtube = match &plan.location {
+        SourceLocation::Youtube { watch_url, family } => {
             let resolved = youtube_open_url(plan.youtube_url_slot.as_deref(), || {
-                resolve_youtube_master(watch_url, plan.youtube_yt_dlp_path.as_deref(), Some(stop))
+                resolve_youtube_master(
+                    watch_url,
+                    plan.youtube_yt_dlp_path.as_deref(),
+                    *family,
+                    Some(stop),
+                )
             });
             crate::youtube_status::record(&plan.id, resolved.as_ref().err().map(String::as_str));
             let resolved = resolved?;
             // Publish the master this connection opens so the audio rail opens
             // the SAME stream (issue #420), never a second `yt-dlp` run.
             crate::youtube_status::record_master(&plan.id, watch_url, &resolved);
+            if resolved.pin != crate::hls_fetch::IpPin::Any {
+                tracing::info!(source = %plan.id, family = resolved.pin.label(), "youtube: media fetch pinned to the address family the master is signed for");
+            }
             Some(resolved)
         }
         _ => None,
     };
+    // Issue #498: every origin request of a `YouTube` master (variant pin,
+    // playlist, segments) uses the family the master is signed for.
+    #[cfg(feature = "youtube")]
+    let ip_pin = resolved_youtube
+        .as_ref()
+        .map_or(crate::hls_fetch::IpPin::Any, |m| m.pin);
+    #[cfg(not(feature = "youtube"))]
+    let ip_pin = crate::hls_fetch::IpPin::Any;
+    #[cfg(feature = "youtube")]
+    let resolved_youtube_url = resolved_youtube.map(|m| m.url);
     // A resolved `YouTube` master opens through the SAME network-URL path as an
     // `hls` source (variant pin, loopback segment fetcher shared with the audio
     // rail, source-event bridge); `plan.location` stays the `YouTube` location so
@@ -20204,6 +20411,7 @@ fn open_and_stream(
                 &plan.location,
                 variant_height(plan),
                 &plan.http_headers,
+                ip_pin,
             );
             // libav cannot bind a dual-stack SRT listener: read the shared
             // bridge through a private socketpair (no listening socket). Without `srt-libsrt` a listener URL never reaches here —
@@ -20243,7 +20451,7 @@ fn open_and_stream(
                 } else {
                     (None, None)
                 };
-                let fetch_headers = plan.http_headers.request_headers();
+                let fetch_headers = plan.http_headers.request_headers().with_ip(ip_pin);
                 let start_result = if observer.is_some() {
                     crate::hls_fetch::HlsFetcher::start_with_observer(
                         &plan.id,
@@ -20269,11 +20477,24 @@ fn open_and_stream(
                         hls_fetcher = Some(fetcher);
                         local
                     }
+                    Err(err) if ip_pin != crate::hls_fetch::IpPin::Any => {
+                        // libav cannot hold the family pin across its own
+                        // segment requests, so a direct open of a pinned
+                        // `YouTube` master would fetch over the refused family
+                        // and 403 (issue #498). Back off and reconnect instead.
+                        return Err(format!("hls fetch over {} failed: {err}", ip_pin.label()));
+                    }
                     Err(err) => {
                         tracing::info!(source = %plan.id, error = %err, "hls fetch: not used, libav opens the origin");
                         open_url
                     }
                 }
+            } else if ip_pin != crate::hls_fetch::IpPin::Any {
+                return Err(format!(
+                    "a {}-pinned youtube master needs the hls fetcher ({} is set or the source is not live)",
+                    ip_pin.label(),
+                    crate::hls_fetch::DISABLE_ENV
+                ));
             } else {
                 open_url
             };
@@ -24350,9 +24571,10 @@ mod youtube_tests {
 
         // It is bound by the WATCH url (so it can re-resolve), not a manifest, and
         // it is `live` so the ingest loop reconnects + re-resolves forever.
-        let SourceLocation::Youtube { watch_url } = &plan.location else {
+        let SourceLocation::Youtube { watch_url, family } = &plan.location else {
             panic!("expected a Youtube location for a youtube source");
         };
+        assert_eq!(*family, None, "no own family: the run default applies");
         assert_eq!(watch_url, "https://www.youtube.com/watch?v=abcdEFGH123");
         assert!(plan.live, "a youtube live source must be live (reconnects)");
     }
@@ -24364,6 +24586,7 @@ mod youtube_tests {
         // blocking read rather than hanging the decode thread — invariant #1/#10).
         let location = SourceLocation::Youtube {
             watch_url: "https://www.youtube.com/watch?v=abcdEFGH123".to_owned(),
+            family: None,
         };
         let opts = ingest_open_options(&location);
         assert_eq!(
@@ -24417,18 +24640,30 @@ mod youtube_tests {
         // master into the slot, the (re)open uses IT and NEVER calls the inline
         // resolver — the tile reopens onto the next-up URL without a cold resolve.
         let slot = multiview_framestore::SwapCell::empty();
-        slot.store(Some(Arc::new(
-            "https://r1.googlevideo.com/fresh.m3u8?expire=9999".to_owned(),
-        )));
+        slot.store(Some(Arc::new(master(
+            "https://r1.googlevideo.com/fresh.m3u8?expire=9999",
+            crate::hls_fetch::IpPin::V4,
+        ))));
 
         let inline_called = std::cell::Cell::new(false);
         let chosen = youtube_open_url(Some(&slot), || {
             inline_called.set(true);
-            Ok("https://INLINE.example/should-not-be-used.m3u8".to_owned())
+            Ok(master(
+                "https://INLINE.example/should-not-be-used.m3u8",
+                crate::hls_fetch::IpPin::Any,
+            ))
         })
         .expect("a populated slot yields its url");
 
-        assert_eq!(chosen, "https://r1.googlevideo.com/fresh.m3u8?expire=9999");
+        assert_eq!(
+            chosen.url,
+            "https://r1.googlevideo.com/fresh.m3u8?expire=9999"
+        );
+        assert_eq!(
+            chosen.pin,
+            crate::hls_fetch::IpPin::V4,
+            "the slot's family pin rides with its url (issue #498)"
+        );
         assert!(
             !inline_called.get(),
             "a populated slot must NOT trigger an inline resolve (make-before-break)"
@@ -24440,15 +24675,21 @@ mod youtube_tests {
         // Cold start (slot empty, before the loop's first publish) OR no loop: the
         // (re)open resolves inline this once, so the very first open never waits on
         // the loop and a source with no running loop still works (IN-5 fallback).
-        let slot = multiview_framestore::SwapCell::<Option<Arc<String>>>::empty();
+        let slot = super::YoutubeSlot::empty();
         let inline_called = std::cell::Cell::new(false);
         let chosen = youtube_open_url(Some(&slot), || {
             inline_called.set(true);
-            Ok("https://r2.googlevideo.com/cold.m3u8?expire=8888".to_owned())
+            Ok(master(
+                "https://r2.googlevideo.com/cold.m3u8?expire=8888",
+                crate::hls_fetch::IpPin::Any,
+            ))
         })
         .expect("an empty slot falls back to the inline resolve");
 
-        assert_eq!(chosen, "https://r2.googlevideo.com/cold.m3u8?expire=8888");
+        assert_eq!(
+            chosen.url,
+            "https://r2.googlevideo.com/cold.m3u8?expire=8888"
+        );
         assert!(
             inline_called.get(),
             "an empty slot must fall back to the inline resolve"
@@ -24460,10 +24701,17 @@ mod youtube_tests {
         // When the slot is empty AND the inline resolve fails (binary absent /
         // extraction broke), the error propagates so the reconnect bracket backs
         // off and the tile degrades — never a panic, never a silent success.
-        let slot = multiview_framestore::SwapCell::<Option<Arc<String>>>::empty();
+        let slot = super::YoutubeSlot::empty();
         let err = youtube_open_url(Some(&slot), || Err("yt-dlp unavailable".to_owned()))
             .expect_err("an empty slot with a failing inline resolve must error");
         assert_eq!(err, "yt-dlp unavailable");
+    }
+
+    fn master(url: &str, pin: crate::hls_fetch::IpPin) -> crate::youtube_status::ResolvedMaster {
+        crate::youtube_status::ResolvedMaster {
+            url: url.to_owned(),
+            pin,
+        }
     }
 
     /// A scripted fake resolver for driving the bridge over the slot with no
@@ -24559,6 +24807,70 @@ mod youtube_tests {
         // (bounded, non-blocking — inv #10).
         let held = slot.load().expect("slot holds the latest master");
         assert_eq!(*held, second.manifest_url);
+    }
+
+    /// Issue #498: a re-resolve whose URL is signed for the other family moves
+    /// the media pin with it. The first master is signed for IPv6, the next
+    /// one (an `auto` resolve that `YouTube` bot-checked over IPv6 and that
+    /// succeeded over `-4`) for IPv4; the slot, through the production publish
+    /// closure, ends holding the IPv4 master pinned to IPv4.
+    #[tokio::test(start_paused = true)]
+    async fn reresolve_family_switch_moves_the_pin_with_the_url() {
+        use multiview_input::youtube::reresolve::run_reresolve_loop_resolved;
+        use multiview_input::youtube::ResolveFamily;
+        let v6 = ResolvedHls::new(
+            "https://m.googlevideo.com/api/manifest/hls_variant/expire/0/ip/2404%3A79c0%3A%3A1/index.m3u8",
+            LiveStatus::Live,
+            Some(0),
+        );
+        let v4 = ResolvedHls::new(
+            "https://m.googlevideo.com/api/manifest/hls_variant/expire/0/ip/103.135.99.52/index.m3u8",
+            LiveStatus::Live,
+            Some(0),
+        )
+        .with_resolved_over(ResolveFamily::V4);
+        let resolver = FakeResolver {
+            results: std::sync::Mutex::new(vec![Ok(v6), Ok(v4.clone())].into_iter().collect()),
+            calls: std::sync::atomic::AtomicU32::new(0),
+        };
+        let slot: Arc<super::YoutubeSlot> = Arc::new(multiview_framestore::SwapCell::empty());
+        let swap_slot = Arc::clone(&slot);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_loop = Arc::clone(&seen);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_loop = Arc::clone(&stop);
+        let clock = ManualClock::new(1000);
+        let cfg = ReresolveConfig {
+            lead: std::time::Duration::from_secs(1),
+            ttl_guard: std::time::Duration::from_secs(10),
+            error_burst_threshold: 100,
+        };
+        let handle = tokio::spawn(async move {
+            run_reresolve_loop_resolved(
+                "https://youtube.com/watch?v=v",
+                cfg,
+                &resolver,
+                &clock,
+                &stop_loop,
+                move |fresh| {
+                    super::publish_youtube_master(&swap_slot, fresh);
+                    let held = swap_slot.load().expect("published");
+                    seen_loop.lock().expect("seen").push(held.pin);
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        handle.await.expect("loop joins").expect("loop ok");
+        assert_eq!(
+            seen.lock().expect("seen").get(..2),
+            Some(&[crate::hls_fetch::IpPin::V6, crate::hls_fetch::IpPin::V4][..])
+        );
+        let held = slot.load().expect("slot holds the latest master");
+        assert_eq!(held.url, v4.manifest_url);
+        assert_eq!(held.pin, crate::hls_fetch::IpPin::V4);
     }
 
     #[tokio::test(start_paused = true)]
@@ -27558,6 +27870,36 @@ segment_ms = 1000
         config
     }
 
+    /// Ship-1111 review #4: a player that fails boot (its journal is owned
+    /// by another runtime) leaves no channel. Its identity alias still gets a
+    /// placeholder store under the player id, but it is not a booted player:
+    /// the catalogue marks the alias unavailable and the drain's booted set
+    /// excludes it, so a re-apply cannot clear the refusal.
+    #[cfg(feature = "ffmpeg")]
+    #[test]
+    fn an_identity_alias_of_a_player_that_failed_boot_is_unavailable() {
+        let _budget = crate::player::budget_test_guard();
+        let state = tempfile::tempdir().unwrap();
+        let holder = crate::player::BindingJournal::new(state.path(), "vt-1");
+        let _owned = holder.claim_runtime().expect("hold the journal");
+        let pipeline = Pipeline::build_with_player_state(&config("vt-1"), Some(state.path()))
+            .expect("a failed player never fails the build");
+        assert!(
+            pipeline.stores.contains_key("vt-1"),
+            "a placeholder store sits under the player id"
+        );
+        assert!(!pipeline.booted_players().contains("vt-1"));
+        let entry = pipeline.catalogue.load().get("vt-1").cloned().unwrap();
+        assert!(entry.is_alias());
+        assert!(
+            entry.unavailable().is_some_and(|r| r.contains("vt-1")),
+            "{:?}",
+            entry.unavailable()
+        );
+        let demand = pipeline.drain_demand();
+        assert!(demand.is_none(), "no demand before Pipeline::demand");
+    }
+
     #[test]
     fn a_media_player_source_builds_and_its_cell_samples_the_player_store() {
         let _budget = crate::player::budget_test_guard();
@@ -27577,10 +27919,13 @@ segment_ms = 1000
             .ingest_plans
             .iter()
             .any(|plan| plan.id == "vt-1" && plan.player.is_some()));
-        assert!(
-            !pipeline.catalogue.load().contains_key("vt-a"),
-            "demand never manages the alias"
-        );
+        // Catalogued as an alias of the player's store (ship-1111): demand
+        // reports and leases it, but never starts or stops a producer.
+        let entry = pipeline.catalogue.load().get("vt-a").cloned();
+        let entry = entry.expect("the alias is catalogued for demand");
+        assert!(entry.is_alias());
+        assert!(Arc::ptr_eq(entry.store(), player));
+        assert!(entry.unavailable().is_none(), "its player booted");
         // The solved layout's cell binds the source id, which the drive's
         // store map resolves to the player's store.
         let bound = pipeline
@@ -32925,10 +33270,13 @@ mod youtube_live_reresolve_tests {
         let slot = Arc::new(multiview_framestore::SwapCell::empty());
         super::spawn_live_youtube_reresolve(
             "ytlive",
-            "https://youtu.be/x".to_owned(),
-            slot,
-            // A missing binary: every resolve fails fast and the loop backs off.
-            Some("/nonexistent/multiview-test-yt-dlp".to_owned()),
+            super::YoutubeReresolve {
+                watch_url: "https://youtu.be/x".to_owned(),
+                family: None,
+                slot,
+                // A missing binary: every resolve fails fast and the loop backs off.
+                yt_dlp_path: Some("/nonexistent/multiview-test-yt-dlp".to_owned()),
+            },
             &stop,
             &registry,
         );

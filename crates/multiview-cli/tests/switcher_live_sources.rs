@@ -159,6 +159,8 @@ codec = "mpeg2video"
 segment_ms = 1000
 [system.youtube]
 yt_dlp_path = "{yt}"
+[[media_players]]
+id = "vt-1"
 [switcher]
 [[switcher.mix_effects]]
 id = "me1"
@@ -363,6 +365,90 @@ async fn switcher_run_adds_and_edits_network_sources_live_and_takes_them() {
             .await,
             "net2 edited live and ready again",
         );
+
+        // (2b) Windy VT (ship-1111): a NEW `media_player` source bound to a
+        // playing player is catalogued with standing demand, a PVW lease (what
+        // the switcher route takes) is granted, and the M/E puts it on PVW.
+        commands
+            .try_submit(upsert(serde_json::json!({
+                "id": "vt-1-src", "kind": "media_player", "player": "vt-1"
+            })))
+            .unwrap();
+        check(
+            eventually("vt-1-src catalogued", Duration::from_secs(10), || {
+                catalogue.load().contains_key("vt-1-src")
+            })
+            .await,
+            "vt-1-src catalogued live",
+        );
+        let vt_lease = {
+            use multiview_control::SourceDemandProvider as _;
+            multiview_cli::source_demand::ControlDemand::new(watch.clone(), catalogue.clone())
+                .switcher_preview_lease("vt-1-src", "switcher:me1:pvw")
+        };
+        check(vt_lease.is_some(), "a PVW lease on the VT alias is granted");
+        let player = catalogue
+            .load()
+            .get("vt-1-src")
+            .map(|entry| Arc::clone(entry.store()));
+        let feed_stop = Arc::new(AtomicBool::new(false));
+        if let Some(store) = player.clone() {
+            // The player plays: its channel publishes (as the player loop does).
+            let stop = Arc::clone(&feed_stop);
+            std::thread::spawn(move || {
+                let mut luma = 30_u8;
+                while !stop.load(Ordering::Acquire) {
+                    luma = luma.wrapping_add(3).max(20);
+                    let color =
+                        multiview_core::color::ColorInfo::default().resolve_defaults(64, 64);
+                    if let Ok(image) = Nv12Image::solid(64, 64, luma, 128, 128, color) {
+                        store.publish(image, multiview_core::time::MediaTime::ZERO);
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+        }
+        check(
+            eventually("vt-1-src ready", Duration::from_secs(10), || {
+                watch.status("vt-1-src").phase == DemandPhase::Ready
+            })
+            .await,
+            "the bound player is a ready source, not idle",
+        );
+        let mut outcomes = handle.outcomes();
+        handle
+            .try_send(SwitcherCommand {
+                operation_id: "pvw-vt".into(),
+                scene_version: 1,
+                verb: SwitcherVerb::SelectPreview(SourceRef::new("vt-1-src")),
+                expect: None,
+            })
+            .unwrap();
+        let done = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                match outcomes.recv().await {
+                    Ok(item) if item.event.operation_id == "pvw-vt" => return Some(item.event),
+                    Ok(_) => {}
+                    Err(_) => return None,
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        check(
+            done.as_ref()
+                .is_some_and(|o| o.completed && o.error.is_none()),
+            &format!("pvw-vt completed: {done:?}"),
+        );
+        check(
+            handle
+                .snapshot()
+                .is_some_and(|s| s.preview.as_str() == "vt-1-src"),
+            "Preview is the VT",
+        );
+        feed_stop.store(true, Ordering::Release);
+        drop(vt_lease);
 
         // (3) A NEW youtube source (fake yt-dlp) starts live.
         #[cfg(feature = "youtube")]

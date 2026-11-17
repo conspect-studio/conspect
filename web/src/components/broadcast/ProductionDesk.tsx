@@ -1,4 +1,5 @@
 import { busKeyReason, deskControlReason, tallyForSource } from './deskSafety';
+import { keyTallyForSource } from '../../api/keyers';
 import { Info, SlidersHorizontal, TriangleAlert } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, JSX } from 'react';
@@ -8,7 +9,7 @@ import { Link } from 'react-router-dom';
 import { commandSwitcher, getSwitcher, planSwitcher } from '../../api/switcher';
 import { WIPE_PATTERNS } from '../../api/switcher';
 import type { SwitcherAction, SwitcherRequest, TransitionDescriptor, WipePattern } from '../../api/switcher';
-import { newIdempotencyKey } from '../../api/operations';
+import { newIdempotencyKey, OperationApiError } from '../../api/operations';
 import { createApiClient } from '../../api/client';
 import { useLayouts } from '../../api/queries';
 import { useAlarms } from '../../api/alarmsQueries';
@@ -89,6 +90,16 @@ function tileDetail(detail: string | null | undefined): string | undefined {
   // Count code points, not UTF-16 units, so a truncation never splits a pair.
   const chars = Array.from(flat);
   return chars.length > TILE_DETAIL_MAX_CHARS ? `${chars.slice(0, TILE_DETAIL_MAX_CHARS).join('')}…` : flat;
+}
+
+/**
+ * The banner text of a refused switcher command: the problem title, then the
+ * engine's reason (RFC 9457 `detail`) when it gave one, so a refusal says why
+ * (e.g. a media player with no channel) instead of only "Conflict".
+ */
+function commandErrorText(err: Error): string {
+  const detail = err instanceof OperationApiError ? tileDetail(err.detail) : undefined;
+  return detail !== undefined && detail !== err.message ? `${err.message}: ${detail}` : err.message;
 }
 
 /**
@@ -284,7 +295,7 @@ function ProductionDeskBody(): JSX.Element {
     const plan = await planSwitcher(req);
     if (!plan.can_take) throw new Error(t`The engine refused this plan`);
     return submit(() => commandSwitcher(action, req, { idempotencyKey: newIdempotencyKey() }), { topic: 'switcher', resource: 'me1', event: 'switcher.operation', terminal: { kind: 'switcher-operation', me: 'me1' } });
-  }, onSuccess: (result) => { setOperationId(result.operationId); setGuard(result.operationId); setError(undefined); setFailure(undefined); }, onError: (err: Error) => { setError(err.message); setGuard(undefined); lock.current = false; } });
+  }, onSuccess: (result) => { setOperationId(result.operationId); setGuard(result.operationId); setError(undefined); setFailure(undefined); }, onError: (err: Error) => { setError(commandErrorText(err)); setGuard(undefined); lock.current = false; } });
   const disabled = !!reason || mutate.isPending || inFlight;
   const sameBuses = state.data !== undefined && state.data.preview_source === state.data.program_source;
   const framesValid = /^[0-9]+$/.test(frames) && Number(frames) >= 1 && Number(frames) <= 1000;
@@ -320,7 +331,7 @@ function ProductionDeskBody(): JSX.Element {
     <div className="bd-desk-grid">
       <PreviewMonitor program source={name(state.data?.program_source)} fresh={fresh && status === 'open'} />
       <PreviewMonitor program={false} source={name(state.data?.preview_source)} fresh={fresh && status === 'open'} />
-      <section className="bd-wall"><div className="bd-wall-heading"><h2><Trans>Multiview wall</Trans></h2><span><Trans>Select a source to Preview</Trans></span><Link className="bd-route-link bd-add-source-link" to="/sources?new=1" aria-label={t`Add a source — opens the New source dialog`}><Trans>Add source</Trans></Link><Link className="bd-route-link" to="/routing"><Trans>Route / patch</Trans></Link></div><div className="bd-wall-grid">{sources.data?.map((source) => { const keyReason = reason ?? busKeyReason('preview', source.id, state.data, demand.data?.get(source.id)?.phase); return <button type="button" className="bd-wall-tile" key={source.id} aria-disabled={disabled || keyReason !== undefined} aria-describedby={`desk-tally-${source.id} desk-signal-${source.id} desk-reason-${source.id}`} aria-label={t`Preview ${source.name}`} aria-pressed={tallyForSource(source.id, state.data, fresh && status === 'open') === 'preview'} title={keyReason} onClick={() => { if (!disabled && keyReason === undefined) request('select_preview', source.id); }} data-tile-state={tileForSource(tiles, source.id)?.state ?? 'unknown'} data-tally={tallyForSource(source.id, state.data, fresh && status === 'open')}><SourcePicture id={source.id} demand={demand.data?.get(source.id)} /><small id={`desk-tally-${source.id}`}>{tallyGlyph(tallyForSource(source.id, state.data, fresh && status === 'open'))}</small><b>{source.name}</b><span className="sr-only" id={`desk-reason-${source.id}`}>{keyReason}</span><span id={`desk-signal-${source.id}`}><TileLabel tile={tileForSource(tiles, source.id)} /></span></button>; })}</div><WallNote />{sources.isError || !sources.data?.length ? <p>{sources.isError ? t`Source catalog unavailable` : t`No source catalog available`}</p> : null}</section>
+      <section className="bd-wall"><div className="bd-wall-heading"><h2><Trans>Multiview wall</Trans></h2><span><Trans>Select a source to Preview</Trans></span><Link className="bd-route-link bd-add-source-link" to="/sources?new=1" aria-label={t`Add a source — opens the New source dialog`}><Trans>Add source</Trans></Link><Link className="bd-route-link" to="/routing"><Trans>Route / patch</Trans></Link></div><div className="bd-wall-grid">{sources.data?.map((source) => { const keyReason = reason ?? busKeyReason('preview', source.id, state.data, demand.data?.get(source.id)?.phase); const keyTally = fresh && status === 'open' ? keyTallyForSource(source.id, state.data?.keyers, state.data?.tally) : undefined; const keyBadge = keyTally === 'program' ? t`● PGM KEY` : keyTally === 'preview' ? t`▲ PVW KEY` : undefined; return <button type="button" className="bd-wall-tile" key={source.id} aria-disabled={disabled || keyReason !== undefined} aria-describedby={`desk-tally-${source.id} desk-signal-${source.id} desk-reason-${source.id}`} aria-label={t`Preview ${source.name}`} aria-pressed={tallyForSource(source.id, state.data, fresh && status === 'open') === 'preview'} title={keyReason} onClick={() => { if (!disabled && keyReason === undefined) request('select_preview', source.id); }} data-tile-state={tileForSource(tiles, source.id)?.state ?? 'unknown'} data-tally={tallyForSource(source.id, state.data, fresh && status === 'open')} data-key-tally={keyTally ?? 'none'}><SourcePicture id={source.id} demand={demand.data?.get(source.id)} /><small id={`desk-tally-${source.id}`}>{tallyGlyph(tallyForSource(source.id, state.data, fresh && status === 'open'))}{keyBadge !== undefined && <span data-testid={`tile-key-badge-${source.id}`}> · {keyBadge}</span>}</small><b>{source.name}</b><span className="sr-only" id={`desk-reason-${source.id}`}>{keyReason}</span><span id={`desk-signal-${source.id}`}><TileLabel tile={tileForSource(tiles, source.id)} /></span></button>; })}</div><WallNote />{sources.isError || !sources.data?.length ? <p>{sources.isError ? t`Source catalog unavailable` : t`No source catalog available`}</p> : null}</section>
       <section className="bd-switcher"><h2><Trans>M/E 1 — Switcher</Trans></h2>
         <div className="bd-buses">{(['preview', 'program'] as const).map((bus) => <div className={`bd-bus bd-bus-${bus}`} key={bus} role="group" aria-label={bus === 'program' ? t`PGM bus — direct taps always confirm` : t`PVW bus`}><b>{bus === 'program' ? 'PGM' : 'PVW'}</b><div>{sources.data?.map((source, index) => { const keyReason = reason ?? busKeyReason(bus, source.id, state.data, demand.data?.get(source.id)?.phase); return <button key={source.id} aria-label={source.name} disabled={disabled || keyReason !== undefined} data-key-reason={keyReason} title={keyReason ? `${source.name} — ${keyReason}` : source.name} aria-pressed={tallyForSource(source.id, state.data, fresh && status === 'open') === bus} onClick={() => { request(bus === 'program' ? 'select_program' : 'select_preview', source.id); }}><span className="bd-key-name">{sources.data.length > 12 ? Array.from(source.name).slice(0, 10).join('') : source.name}</span><i className="bd-idx" aria-hidden="true">{index + 1}</i></button>; })}{!sources.data?.length && <span><Trans>No sources available</Trans></span>}</div></div>)}</div>
         <div className="bd-takes"><div className="bd-transitions" role="group" aria-label={t`Transition type`}>{(['mix', 'wipe', 'dip'] as const).map((k) => <button key={k} disabled={disabled || transitionReason !== undefined} aria-pressed={kind === k} title={transitionReason ?? (k === 'mix' ? t`Select a MIX for the next AUTO` : k === 'wipe' ? t`Select a WIPE for the next AUTO` : t`Select a DIP for the next AUTO`)} onClick={() => { select(k); }}>{k.toUpperCase()}</button>)}</div><button className="bd-auto" disabled={disabled || autoReason !== undefined} title={autoReason ? `AUTO — ${autoReason}` : t`AUTO ${kindLabel} over ${frames} frames`} onClick={() => { request('auto'); }}>AUTO</button><div className="bd-cutrow"><button className="bd-cut" disabled={disabled || sameBuses} title={sameBuses ? t`CUT — Preview and Program carry the same source` : undefined} aria-describedby="bd-cut-src" onClick={() => { request('cut'); }}>CUT<span aria-hidden="true" className="bd-cut-src"> · {name(state.data?.preview_source) ?? t`source unknown`}</span></button><span id="bd-cut-src" className="sr-only">{t`Cuts to`} {name(state.data?.preview_source) ?? t`unknown source`}</span></div></div>

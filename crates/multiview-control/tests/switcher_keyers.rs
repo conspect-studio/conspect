@@ -1477,6 +1477,135 @@ async fn keyer_set_repointing_a_fill_moves_the_media_edit_guard_to_the_new_fill(
     );
 }
 
+/// K5-01/K5-04: `keyers[]` exposes the committed parameters (type, clip,
+/// gain, invert, mask, fly, `max_source`, loss, `loss_trigger`) and the GET
+/// carries the canvas and cadence. Parameters are not source ids, so a row
+/// the caller may read carries them unredacted, while the source ids stay
+/// redacted and an unreadable keyer row is still filtered (parity with the
+/// redaction test above).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_rows_carry_committed_params_and_the_canvas_with_the_same_redaction() {
+    let doc = DOC.replace(
+        "fill = \"gfx\"\nz = 1",
+        "fill = \"gfx\"\nkey = \"secret\"\ntype = \"luma\"\nclip = 0.25\ngain = 2.0\ninvert = true\n\
+         mask = { x = 2, y = 4, w = 30, h = 20 }\nfly = { x = 8, y = 8, w = 32, h = 32 }\n\
+         loss = \"hold_last_good\"\nloss_trigger = \"no_signal\"\nz = 1",
+    );
+    let (_dir, path) = temp_boot(&doc);
+    let rig = build(&path, &doc, false);
+    let get_for = |token: &'static str| {
+        let router = rig.router.clone();
+        async move { body_json(send(&router, get("/api/v1/switcher/me1", token)).await).await }
+    };
+    let admin = get_for(ADMIN).await;
+    assert_eq!(
+        (
+            &admin["canvas_width"],
+            &admin["canvas_height"],
+            &admin["fps_num"],
+            &admin["fps_den"]
+        ),
+        (&json!(64), &json!(64), &json!(25), &json!(1))
+    );
+    let row = &admin["keyers"][0];
+    assert_eq!(row["type"], "luma");
+    assert_eq!(row["clip"], 0.25);
+    assert_eq!(row["gain"], 2.0);
+    assert_eq!(row["invert"], true);
+    assert_eq!(row["mask"], json!({"x":2,"y":4,"w":30,"h":20}));
+    assert_eq!(row["fly"], json!({"x":8,"y":8,"w":32,"h":32}));
+    assert_eq!(row["max_source"], json!({"w":64,"h":64}));
+    assert_eq!(row["loss"], "hold_last_good");
+    assert_eq!(row["loss_trigger"], "no_signal");
+    assert_eq!(row["key"], "secret");
+    // FULL lacks `secret`, NO_FILL lacks `gfx`: same params, redacted ids.
+    for (token, fill, key) in [(FULL, "gfx", "redacted"), (NO_FILL, "redacted", "redacted")] {
+        let scoped = get_for(token).await;
+        let r = &scoped["keyers"][0];
+        assert_eq!(
+            (r["fill"].as_str(), r["key"].as_str()),
+            (Some(fill), Some(key))
+        );
+        for field in [
+            "type",
+            "clip",
+            "gain",
+            "invert",
+            "color",
+            "mask",
+            "fly",
+            "max_source",
+            "loss",
+            "loss_trigger",
+            "rate",
+        ] {
+            assert_eq!(r[field], row[field], "{field} for a scoped reader");
+        }
+        let text = scoped.to_string();
+        assert!(!text.contains("secret"), "{text}");
+    }
+    // An unreadable keyer row is filtered: its params never leak either.
+    assert_eq!(get_for(NO_KEYER).await["keyers"], json!([]));
+}
+
+/// K5-03/K5-04: an omitted `mask`/`fly` keeps the committed value; JSON
+/// `null` clears it (no mask; the full canvas), round-tripped through the
+/// engine tick and the GET.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mask_and_fly_null_clears_and_omitted_keeps() {
+    let (_dir, path) = temp_boot(DOC);
+    let mut rig = rig(&path);
+    let mut outcomes = rig.handle.outcomes();
+    let get_row = |rig: &Rig| {
+        let router = rig.router.clone();
+        async move {
+            body_json(send(&router, get("/api/v1/switcher/me1", FULL)).await).await["keyers"][0]
+                .clone()
+        }
+    };
+    let set = body(
+        "keyer_set",
+        json!({"keyer":"dsk1","mask":{"x":0,"y":0,"w":32,"h":32},"fly":{"x":0,"y":0,"w":16,"h":16}}),
+    );
+    assert_eq!(
+        command(&rig, FULL, "geo", &set).await.status(),
+        StatusCode::ACCEPTED
+    );
+    tick(&mut rig.driver, 1);
+    assert!(outcomes.try_recv().unwrap().event.completed);
+    let row = get_row(&rig).await;
+    assert_eq!(row["mask"], json!({"x":0,"y":0,"w":32,"h":32}));
+    assert_eq!(row["fly"], json!({"x":0,"y":0,"w":16,"h":16}));
+    // An unrelated edit (omitted mask/fly) keeps both.
+    let rate = body("keyer_set", json!({"keyer":"dsk1","rate":20}));
+    assert_eq!(
+        command(&rig, FULL, "rate", &rate).await.status(),
+        StatusCode::ACCEPTED
+    );
+    tick(&mut rig.driver, 2);
+    assert!(outcomes.try_recv().unwrap().event.completed);
+    let row = get_row(&rig).await;
+    assert_eq!(row["rate"], 20);
+    assert_eq!(row["mask"], json!({"x":0,"y":0,"w":32,"h":32}));
+    assert_eq!(row["fly"], json!({"x":0,"y":0,"w":16,"h":16}));
+    // Explicit null clears both: no mask, the full canvas.
+    let clear = body("keyer_set", json!({"keyer":"dsk1","mask":null,"fly":null}));
+    let planned = body_json(plan(&rig, FULL, &clear).await).await;
+    assert_eq!(planned["can_take"], true, "{planned}");
+    assert_eq!(
+        command(&rig, FULL, "clear", &clear).await.status(),
+        StatusCode::ACCEPTED
+    );
+    tick(&mut rig.driver, 3);
+    assert!(outcomes.try_recv().unwrap().event.completed);
+    let row = get_row(&rig).await;
+    assert!(row["mask"].is_null(), "{row}");
+    assert!(row["fly"].is_null(), "{row}");
+    let defs = rig.handle.keyer_definitions().unwrap();
+    let cfg = &defs.defs[0].as_ref().unwrap().config;
+    assert_eq!((cfg.mask, cfg.fly), (None, None));
+}
+
 /// K7 (#392): `keyer_set` accepts `type = "chroma"` with its reference
 /// `color`, applies it at the tick as a chroma key, persists it, and GET
 /// reports it; a chroma key without a colour, with a key source, or a stray
@@ -1558,4 +1687,5 @@ async fn a_chroma_keyer_set_applies_persists_and_refuses_bad_shapes() {
         .unwrap();
     let get = body_json(send(&rig.router, get("/api/v1/switcher/me1", FULL)).await).await;
     assert_eq!(get["keyers"][0]["type"], "chroma", "{get}");
+    assert_eq!(get["keyers"][0]["color"], "#00b140", "{get}");
 }

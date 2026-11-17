@@ -81,6 +81,10 @@ pub struct ResolvedHls {
     /// resolved URL, after which the CDN 403s. `None` when absent — the caller
     /// then falls back to the TTL upper-bound guard (ADR-0015 §4).
     pub expire_unix: Option<i64>,
+    /// The family the successful `yt-dlp` invocation was forced to
+    /// ([`ResolveFamily::Auto`] when it ran with the system default). Set by
+    /// the subprocess shell; [`parse_info_dict`] leaves it `Auto`.
+    pub resolved_over: ResolveFamily,
 }
 
 impl ResolvedHls {
@@ -101,7 +105,21 @@ impl ResolvedHls {
             manifest_url: manifest_url.into(),
             live_status,
             expire_unix,
+            resolved_over: ResolveFamily::Auto,
         }
+    }
+
+    /// Record the family the resolve ran over (see [`Self::resolved_over`]).
+    #[must_use]
+    pub fn with_resolved_over(mut self, family: ResolveFamily) -> Self {
+        self.resolved_over = family;
+        self
+    }
+
+    /// The family the media fetch of this master must use ([`media_family`]).
+    #[must_use]
+    pub fn media_family(&self) -> MediaFamily {
+        media_family(&self.manifest_url, self.resolved_over)
     }
 }
 
@@ -183,6 +201,7 @@ pub fn parse_info_dict(json: &str) -> Result<ResolvedHls, YoutubeError> {
         manifest_url,
         live_status,
         expire_unix,
+        resolved_over: ResolveFamily::Auto,
     })
 }
 
@@ -216,4 +235,117 @@ pub fn parse_expire(url: &str) -> Option<i64> {
     }
 
     None
+}
+
+/// The address family the `yt-dlp` **resolve** runs over (issue #498), the
+/// `[system.youtube] address_family` option.
+///
+/// `YouTube` may bot-check one family of a host and not the other (mda001:
+/// its IPv6 /64 answers "Sign in to confirm you're not a bot", its IPv4 does
+/// not). [`Self::Auto`] runs `yt-dlp` with the system default first and, on a
+/// bot check, retries that invocation once with `-4`; [`Self::V4`] / [`Self::V6`]
+/// always pass `-4` / `-6`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResolveFamily {
+    /// System default first; on a bot check, retry over IPv4.
+    #[default]
+    Auto,
+    /// Always resolve over IPv4 (`yt-dlp -4`).
+    V4,
+    /// Always resolve over IPv6 (`yt-dlp -6`).
+    V6,
+}
+
+impl ResolveFamily {
+    /// Parse the config/env spelling: `auto`, `v4`/`ipv4`, `v6`/`ipv6`
+    /// (ASCII case-insensitive, surrounding whitespace ignored). `None` for
+    /// anything else.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "v4" | "ipv4" => Some(Self::V4),
+            "v6" | "ipv6" => Some(Self::V6),
+            _ => None,
+        }
+    }
+
+    /// The `yt-dlp` flag that forces this family, `None` for [`Self::Auto`].
+    #[must_use]
+    pub const fn flag(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::V4 => Some("-4"),
+            Self::V6 => Some("-6"),
+        }
+    }
+}
+
+/// The address family a resolved source's **media** fetch must use (issue #498).
+///
+/// googlevideo signs a manifest for the client address that resolved it
+/// (`/ip/<addr>/` in the path, or `ip=<addr>` in the query) and answers 403 to
+/// a segment fetched from the other family. Every HTTP request for the source
+/// (variant pin, segment fetcher, audio rail) is pinned to this family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MediaFamily {
+    /// No pin: the system default (dual-stack, IPv6 preferred).
+    Any,
+    /// IPv4 only.
+    V4,
+    /// IPv6 only.
+    V6,
+}
+
+/// The client address a googlevideo URL is signed for: the `/ip/<addr>/` path
+/// segment, else an `ip=<addr>` query value (`%3A` decoded to `:`). `None` when
+/// absent or not an address. Pure, never panics.
+#[must_use]
+pub fn parse_signed_ip(url: &str) -> Option<std::net::IpAddr> {
+    let decode = |raw: &str| -> Option<std::net::IpAddr> {
+        raw.replace("%3A", ":")
+            .replace("%3a", ":")
+            .parse::<std::net::IpAddr>()
+            .ok()
+    };
+    let (path, query) = match url.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (url, None),
+    };
+    let path = path.split('#').next().unwrap_or(path);
+    let mut segments = path.split('/');
+    while let Some(segment) = segments.next() {
+        if segment == "ip" {
+            if let Some(ip) = segments.next().and_then(decode) {
+                return Some(ip);
+            }
+        }
+    }
+    let query = query?.split('#').next().unwrap_or_default();
+    query
+        .split('&')
+        .filter_map(|pair| pair.strip_prefix("ip="))
+        .find_map(decode)
+}
+
+/// The family a resolved master must be fetched over (issue #498): the family of
+/// the address the URL is signed for ([`parse_signed_ip`]); with no signed
+/// address, the family the resolve was forced to (`resolve`), else
+/// [`MediaFamily::Any`]. The URL wins over the setting because it is what the
+/// CDN checks: an `auto` resolve that fell back to `-4` yields an `/ip/<v4>`
+/// URL, and a re-resolve that returns the other family switches the pin with it.
+#[must_use]
+pub fn media_family(manifest_url: &str, resolve: ResolveFamily) -> MediaFamily {
+    match parse_signed_ip(manifest_url) {
+        Some(std::net::IpAddr::V4(_)) => MediaFamily::V4,
+        Some(std::net::IpAddr::V6(v6)) if v6.to_ipv4_mapped().is_some() => MediaFamily::V4,
+        Some(std::net::IpAddr::V6(_)) => MediaFamily::V6,
+        None => match resolve {
+            ResolveFamily::Auto => MediaFamily::Any,
+            ResolveFamily::V4 => MediaFamily::V4,
+            ResolveFamily::V6 => MediaFamily::V6,
+        },
+    }
 }

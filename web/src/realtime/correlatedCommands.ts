@@ -42,6 +42,13 @@ export const CORRELATED_COMMAND_KINDS: ReadonlySet<string> = new Set([
   'cut',
   'auto',
   'set_transition',
+  // Keyer verbs (K4) and `arm` (K3) answer on the same `switcher.operation`
+  // outcome, stamped with their operation id.
+  'keyer_cut',
+  'keyer_auto',
+  'keyer_tie',
+  'keyer_set',
+  'arm',
 ]);
 
 /** The `kind` an Idempotency-Key replay acceptance carries (original kind is not echoed). */

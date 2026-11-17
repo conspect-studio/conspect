@@ -422,6 +422,155 @@ fn settle_workers(r: &OutputRouter, bound: std::time::Duration) {
     }
 }
 
+/// No router call may cost this much: work plus waits, the bound before
+/// #501, now without host preemption.
+const ROUTER_COST_BOUND: std::time::Duration = std::time::Duration::from_millis(50);
+/// Nor run this long on a CPU (a healthy call uses ~1 ms in a debug build).
+const ROUTER_CPU_BOUND: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The router's cost over a span of calls (maxima per call).
+#[derive(Clone, Copy, Debug, Default)]
+struct RouterCost {
+    /// Largest upper bound on one call's own cost: its work plus its waits
+    /// (sleep, park, join, lock), without host preemption.
+    cost: std::time::Duration,
+    /// Largest on-CPU delta over one call: an extra cap only, accurate to one
+    /// scheduler tick (a running thread's own runtime is folded in at ticks).
+    on_cpu: std::time::Duration,
+    /// Calls over a bound only by the wall time of the harness's own
+    /// rejected after-call reads ([`ThreadTimes::tight_after`]): the
+    /// accounting is inconclusive for them, so they fail the test as such,
+    /// never as a router verdict, and never pass.
+    inconclusive: u64,
+}
+
+impl RouterCost {
+    /// Fold in one call, whose rejected after-call reads took `retakes` of
+    /// wall time (included in its cost: an upper bound stays one).
+    fn add(&mut self, call: Self, retakes: std::time::Duration) {
+        let over = call.cost >= ROUTER_COST_BOUND || call.on_cpu >= ROUTER_CPU_BOUND;
+        let over_without_retakes = call.cost.saturating_sub(retakes) >= ROUTER_COST_BOUND
+            || call.on_cpu.saturating_sub(retakes) >= ROUTER_CPU_BOUND;
+        if over && !over_without_retakes {
+            self.inconclusive += 1;
+            return;
+        }
+        self.cost = self.cost.max(call.cost);
+        self.on_cpu = self.on_cpu.max(call.on_cpu);
+        self.inconclusive += call.inconclusive;
+    }
+
+    /// Upper bounds on the cost of the one router call made between samples
+    /// `before` (taken at or after wall instant `wa`) and `after` (taken at
+    /// or before `wd`) (#501 reviews R2-R7).
+    ///
+    /// A thread's wall time is on-CPU + preempted + blocked. Both samples lie
+    /// inside `wa..wd`, so their run-delay delta is preemption inside that
+    /// interval, and `(wd - wa) - Δrun_delay` is its on-CPU plus blocked time
+    /// plus only the preemption between `wa` and the first sample and between
+    /// the second sample and `wd`. That is at least the call's work plus
+    /// waits whatever the host does (sound: a wait can never hide). It is
+    /// more by at most [`SAMPLE_WINDOW`] per side plus the reads' own CPU
+    /// time (~20 us each, retakes included): [`ThreadTimes::tight`] retakes
+    /// a read until it is that tight, or fails as inconclusive, so host
+    /// preemption cannot flake it either. Off Linux the wall time counts.
+    fn of(
+        before: Option<ThreadTimes>,
+        after: Option<ThreadTimes>,
+        wa: Instant,
+        wd: Instant,
+    ) -> Self {
+        let span = wd - wa;
+        let (Some(b), Some(a)) = (before, after) else {
+            return Self {
+                cost: span,
+                on_cpu: span,
+                inconclusive: 0,
+            };
+        };
+        Self {
+            cost: span.saturating_sub(a.queued.saturating_sub(b.queued)),
+            on_cpu: a.on_cpu.saturating_sub(b.on_cpu),
+            inconclusive: 0,
+        }
+    }
+}
+
+/// How long one sample read's wall window may take to count as tight (a
+/// healthy read is ~20 us); [`ThreadTimes::tight`] retakes it until it is.
+const SAMPLE_WINDOW: std::time::Duration = std::time::Duration::from_micros(100);
+
+/// How long [`ThreadTimes::tight`] keeps retaking a read before it reports
+/// the accounting inconclusive (a panic naming it): a non-tight sample is
+/// never used as if it were tight. Reaching it takes the host stalling every
+/// ~20 us read by over 100 us for this long.
+const SAMPLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The failure when no tight sample can be taken: the measurement is
+/// inconclusive, which is reported, never taken as a pass or a router cost.
+const INCONCLUSIVE: &str = "scheduler accounting inconclusive: every /proc/thread-self/schedstat read stalled > 100 us for 10 s";
+
+/// One sample of the calling thread's scheduler accounting (Linux,
+/// `/proc/thread-self/schedstat`: field 1 on-CPU ns, current to the last
+/// scheduler tick; field 2 `sched_info` run delay ns, i.e. time runnable but
+/// preempted, exact for every wait that has ended, which all have while the
+/// thread reads it; kept whether or not the `kernel.sched_schedstats`
+/// sysctl is on).
+#[derive(Clone, Copy)]
+struct ThreadTimes {
+    on_cpu: std::time::Duration,
+    queued: std::time::Duration,
+}
+
+impl ThreadTimes {
+    /// `None` off Linux or when unreadable.
+    fn sample() -> Option<Self> {
+        let stat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
+        let mut fields = stat.split_whitespace();
+        let on_cpu = fields.next()?.parse::<u64>().ok()?;
+        let queued = fields.next()?.parse::<u64>().ok()?;
+        Some(Self {
+            on_cpu: std::time::Duration::from_nanos(on_cpu),
+            queued: std::time::Duration::from_nanos(queued),
+        })
+    }
+
+    /// A sample taken within [`SAMPLE_WINDOW`] after the returned wall
+    /// instant (retaken while the host stalls the read; nothing else runs).
+    /// `None` off Linux.
+    fn tight() -> (Instant, Option<Self>) {
+        let deadline = Instant::now() + SAMPLE_DEADLINE;
+        loop {
+            let at = Instant::now();
+            let sample = Self::sample();
+            if sample.is_none() || at.elapsed() < SAMPLE_WINDOW {
+                return (at, sample);
+            }
+            assert!(Instant::now() < deadline, "{INCONCLUSIVE}");
+        }
+    }
+
+    /// A sample taken within [`SAMPLE_WINDOW`] before the returned wall
+    /// instant, and the wall time spent in rejected reads before it. Each
+    /// retake moves both later and stays inside the measured span, so it is
+    /// charged to the call (the cost stays an upper bound) and reported, so
+    /// a violation that only the retakes explain is classified inconclusive
+    /// ([`RouterCost::add`]).
+    fn tight_after() -> (Option<Self>, Instant, std::time::Duration) {
+        let started = Instant::now();
+        let deadline = started + SAMPLE_DEADLINE;
+        loop {
+            let from = Instant::now();
+            let sample = Self::sample();
+            let at = Instant::now();
+            if sample.is_none() || at - from < SAMPLE_WINDOW {
+                return (sample, at, from - started);
+            }
+            assert!(Instant::now() < deadline, "{INCONCLUSIVE}");
+        }
+    }
+}
+
 fn pts(t: u64) -> MediaTime {
     MediaTime::from_nanos(i64::try_from(t).unwrap() * 200_000_000)
 }
@@ -440,6 +589,9 @@ struct Harness {
     base_force: Arc<AtomicU64>,
     live: bool,
     max_router: std::time::Duration,
+    /// The router calls' own cost, never host preemption (see
+    /// [`RouterCost::of`]).
+    router_cost: RouterCost,
     /// The pre-bake canvas handed to `publish_clean` per tick (kept alive so
     /// pointer identity is meaningful).
     clean: Vec<(u64, Arc<Nv12Image>)>,
@@ -540,6 +692,7 @@ fn harness_full(
         base_force,
         live: true,
         max_router: std::time::Duration::ZERO,
+        router_cost: RouterCost::default(),
         clean: Vec::new(),
         aux_active,
         aux_sent,
@@ -621,11 +774,17 @@ impl Harness {
         self.clean.push((t, clean));
         // The baked Program picture, for a reformatted output's key (#342 B3).
         self.r.publish_program(t, &canvas());
-        let started = Instant::now();
+        // #501: the router's own cost, never the host's preemption (see
+        // [`ThreadTimes::tight`] and [`RouterCost::of`]).
+        let (wa, before) = ThreadTimes::tight();
+        let w1 = Instant::now();
         self.r
             .on_tick(t, pts(t), &mut self.d, &mut self.rec)
             .unwrap();
-        self.max_router = self.max_router.max(started.elapsed());
+        self.max_router = self.max_router.max(w1.elapsed());
+        let (after, wd, retakes) = ThreadTimes::tight_after();
+        self.router_cost
+            .add(RouterCost::of(before, after, wa, wd), retakes);
         // A live worker encodes within the tick period.
         std::thread::sleep(std::time::Duration::from_millis(2));
         settle_workers(&self.r, self.settle);
@@ -1025,84 +1184,198 @@ fn a_flapping_source_never_gets_a_take_while_not_fresh() {
     );
 }
 
-/// A live encoder whose `finish()` takes 3 s (test 6).
-struct SlowFinish(FakeEnc);
+/// A live encoder whose `finish()` blocks until the test releases it (test
+/// 6). `entered` / `exited` record where the close is, so the test proves
+/// causally that the router kept ticking while `finish()` was still running
+/// (#501): a router that waited on the close could not tick until `finish()`
+/// returned, and `finish()` returns only when the test releases it or, as a
+/// hang guard, after [`SLOW_FINISH_GUARD`].
+struct SlowFinish {
+    inner: FakeEnc,
+    entered: Arc<AtomicBool>,
+    exited: Arc<AtomicBool>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+/// How long a [`SlowFinish`] close waits for its release before it returns
+/// anyway, so a regression fails the test instead of hanging it.
+const SLOW_FINISH_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl VideoEncodeWorker for SlowFinish {
     fn encode(&mut self, item: BakedTick) -> Result<Vec<EncodedPacket>, PipelineError> {
-        self.0.encode(item)
+        self.inner.encode(item)
     }
     fn reorder_bound(&self) -> ReorderBound {
         ReorderBound::NoReorder
     }
     fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        self.entered.store(true, Ordering::SeqCst);
+        let _ = self
+            .release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv_timeout(SLOW_FINISH_GUARD);
+        self.exited.store(true, Ordering::SeqCst);
         Ok(Vec::new())
     }
     fn force_keyframe(&mut self) {
-        self.0.force_keyframe();
+        self.inner.force_keyframe();
     }
 }
 
 impl LiveEncoder for SlowFinish {
     fn start_at(&mut self, t0: u64) {
-        self.0.start_at(t0);
+        self.inner.start_at(t0);
     }
     fn time_base(&self) -> Rational {
-        self.0.time_base()
+        self.inner.time_base()
     }
     fn move_gate(&self) -> MoveGate {
-        self.0.move_gate()
+        self.inner.move_gate()
     }
 }
 
-/// Test 6: closing an encoder whose finish takes 3 s never blocks the
-/// consumer. Bound: every router call around and after the close < 50 ms, and
-/// the close lands on its linger tick.
+/// One gated [`SlowFinish`] close: where it is, and its release.
+struct HeldClose {
+    entered: Arc<AtomicBool>,
+    exited: Arc<AtomicBool>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+/// Opens [`SlowFinish`] encoders, recording each one's [`HeldClose`].
+fn slow_finish_opener(held: &Arc<std::sync::Mutex<Vec<HeldClose>>>) -> OpenFn {
+    let encoded = Arc::new(AtomicUsize::new(0));
+    let opened = Arc::clone(held);
+    Box::new(move |_| {
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let entered = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
+        opened.lock().unwrap().push(HeldClose {
+            entered: Arc::clone(&entered),
+            exited: Arc::clone(&exited),
+            release,
+        });
+        let e: Box<dyn LiveEncoder> = Box::new(SlowFinish {
+            inner: FakeEnc {
+                forced: false,
+                encoded: Arc::clone(&encoded),
+            },
+            entered,
+            exited,
+            release: std::sync::Mutex::new(gate),
+        });
+        Ok(e)
+    })
+}
+
+/// Test 6: closing an encoder whose finish never returns on its own never
+/// blocks the consumer (#501).
+///
+/// Causal part: each close lands on its linger tick, `finish()` is entered,
+/// and the router then runs [`SLOW_FINISH_TICKS`] more ticks (Program cadence
+/// intact) while `finish()` is provably still inside, held by the test. A
+/// router that waits for the close to complete cannot pass this.
+///
+/// Bounded-wait part: a router that waits a bounded time on a close (a timed
+/// join, a sleep, a spin) would still tick on, so for EVERY close the longest
+/// router call from just before the close through its held window must stay
+/// within the router's own cost bound ([`RouterCost::of`]): no
+/// call costs 50 ms of work plus waits (the bound before #501) or runs 20 ms
+/// on a CPU, and host preemption (the whole #501 flake) never counts.
+/// Repeated over
+/// [`SLOW_CLOSES`] closes, every one judged, so a wait on any one of them
+/// (the first, or one conditional on reaper state) fails.
 #[test]
 fn a_slow_close_never_blocks_the_consumer() {
-    let encoded = Arc::new(AtomicUsize::new(0));
-    let enc = Arc::clone(&encoded);
-    let open: OpenFn = Box::new(move |_| {
-        let e: Box<dyn LiveEncoder> = Box::new(SlowFinish(FakeEnc {
-            forced: false,
-            encoded: Arc::clone(&enc),
-        }));
-        Ok(e)
-    });
-    let mut x = harness(2, 6, Some(open));
-    x.tick(0);
-    x.h.try_take(take("a", 1, src())).unwrap();
-    let mut t = 1;
-    while !x.results().contains(&TakeResult::Applied) {
-        x.tick(t);
-        t += 1;
-        assert!(t < 60, "applied");
-    }
-    x.h.try_take(take("b", 1, PictureBus::Program)).unwrap();
-    while !x.results().contains(&TakeResult::Applied) {
-        x.tick(t);
-        t += 1;
-        assert!(t < 120, "back on Program");
-    }
-    // Run to the linger close and well past it; measure from before the close.
-    x.max_router = std::time::Duration::ZERO;
-    let close_by = t + LINGER_TICKS + 2;
-    while x.h.snapshot().dynamic_encoders_live > 0 {
-        x.tick(t);
-        t += 1;
-        assert!(t <= close_by, "closed at its linger tick");
-    }
-    let closed = Instant::now();
-    while closed.elapsed() < std::time::Duration::from_millis(3200) {
-        x.tick(t);
-        t += 1;
-    }
+    /// Ticks the router must run while a close is held: 3 s at 5 fps, the
+    /// span of the old 3 s `finish()`.
+    const SLOW_FINISH_TICKS: u64 = 16;
+    /// Slow closes, every one judged.
+    const SLOW_CLOSES: usize = 5;
+    // Preemption correction is required where CI runs this test, never
+    // silently absent there.
+    #[cfg(target_os = "linux")]
     assert!(
-        x.max_router < std::time::Duration::from_millis(50),
-        "router tick during a 3 s finish: {:?}",
-        x.max_router
+        ThreadTimes::sample().is_some(),
+        "/proc/thread-self/schedstat unreadable: the router bound would measure the host"
     );
+    let held: Arc<std::sync::Mutex<Vec<HeldClose>>> = Arc::default();
+    let mut x = harness(2, 6, Some(slow_finish_opener(&held)));
+    x.tick(0);
+    let mut t = 1;
+    let mut windows = Vec::new();
+    for rep in 0..SLOW_CLOSES {
+        x.h.try_take(take(&format!("a{rep}"), 1, src())).unwrap();
+        let by = t + 60;
+        while !x.results().contains(&TakeResult::Applied) {
+            x.tick(t);
+            t += 1;
+            assert!(t < by, "applied ({rep})");
+        }
+        x.h.try_take(take(&format!("b{rep}"), 1, PictureBus::Program))
+            .unwrap();
+        let by = t + 60;
+        while !x.results().contains(&TakeResult::Applied) {
+            x.tick(t);
+            t += 1;
+            assert!(t < by, "back on Program ({rep})");
+        }
+        // Run to the linger close; measure from before the close.
+        x.router_cost = RouterCost::default();
+        let close_by = t + LINGER_TICKS + 2;
+        while x.h.snapshot().dynamic_encoders_live > 0 {
+            x.tick(t);
+            t += 1;
+            assert!(t <= close_by, "closed at its linger tick ({rep})");
+        }
+        let (entered, exited) = {
+            let held = held.lock().unwrap();
+            assert_eq!(held.len(), rep + 1, "one encoder per take");
+            let h = &held[rep];
+            (Arc::clone(&h.entered), Arc::clone(&h.exited))
+        };
+        // The closing worker reaches `finish()` on its own thread; keep
+        // ticking until it does (a bound on the worker, not on the router).
+        let reached = Instant::now() + SETTLE_BOUND;
+        while !entered.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < reached,
+                "the close reached finish() ({rep})"
+            );
+            x.tick(t);
+            t += 1;
+        }
+        // The router ticks on while the close is held inside `finish()`.
+        for _ in 0..SLOW_FINISH_TICKS {
+            x.tick(t);
+            t += 1;
+        }
+        assert!(
+            !exited.load(Ordering::SeqCst),
+            "the router ran {SLOW_FINISH_TICKS} ticks only after finish() returned: it waited on the close ({rep})"
+        );
+        windows.push(x.router_cost);
+        held.lock().unwrap()[rep].release.send(()).unwrap();
+        let done = Instant::now() + SETTLE_BOUND;
+        while !exited.load(Ordering::SeqCst) {
+            assert!(Instant::now() < done, "the released close finishes ({rep})");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    // Measurement first: a window the harness's own reads made
+    // inconclusive fails as that, never as a router verdict.
+    assert!(
+        windows.iter().all(|w| w.inconclusive == 0),
+        "scheduler accounting inconclusive: a call is over a bound only by the harness's own stalled after-call reads: {windows:?}"
+    );
+    assert!(
+        windows
+            .iter()
+            .all(|w| w.cost < ROUTER_COST_BOUND && w.on_cpu < ROUTER_CPU_BOUND),
+        "a router call during a held close cost >= {ROUTER_COST_BOUND:?} or ran >= {ROUTER_CPU_BOUND:?} on a CPU: {windows:?}"
+    );
+    x.tick(t);
+    t += 1;
     assert_eq!(
         x.windows_of(0).len(),
         usize::try_from(t - 1).unwrap(),
@@ -1113,6 +1386,7 @@ fn a_slow_close_never_blocks_the_consumer() {
         0,
         "handed to the reaper, not dropped"
     );
+    eprintln!("slow-close windows: {windows:?}");
 }
 
 /// A live encoder that counts its live worker threads (the encoder is owned

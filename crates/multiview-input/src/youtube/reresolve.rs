@@ -318,6 +318,33 @@ where
     C: UnixClock,
     S: FnMut(String),
 {
+    run_reresolve_loop_resolved(watch_url, config, resolver, clock, stop, |fresh| {
+        swap(ingest_url(fresh).to_owned());
+    })
+    .await
+}
+
+/// [`run_reresolve_loop`] publishing the whole [`ResolvedHls`], so the caller
+/// also sees the family the resolve ran over and the media family the URL is
+/// signed for (issue #498): a re-resolve that comes back over the other family
+/// switches the media pin with the URL.
+///
+/// # Errors
+///
+/// As [`run_reresolve_loop`].
+pub async fn run_reresolve_loop_resolved<R, C, S>(
+    watch_url: &str,
+    config: ReresolveConfig,
+    resolver: &R,
+    clock: &C,
+    stop: &AtomicBool,
+    mut swap: S,
+) -> Result<ReresolveOutcome, YoutubeError>
+where
+    R: Resolver,
+    C: UnixClock,
+    S: FnMut(&ResolvedHls),
+{
     let mut backoff = Backoff::new(BackoffConfig {
         base: RERESOLVE_BACKOFF_BASE,
         max: RERESOLVE_BACKOFF_MAX,
@@ -341,7 +368,7 @@ where
                 // Make-before-break: the new URL is in hand and validated — hand it
                 // to the ingest path now (the old one, if any, is only retired by
                 // this swap). The tile never blinks; at worst it held last-good.
-                swap(ingest_url(&fresh).to_owned());
+                swap(&fresh);
 
                 let schedule = ReresolveSchedule::new(config, &fresh, clock.now_unix());
                 // Sleep (interruptibly) until the refresh deadline. The schedule's
