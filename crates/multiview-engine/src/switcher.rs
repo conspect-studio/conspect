@@ -3,8 +3,15 @@
 //! The caller drains intents at the tick boundary, passes the *same* output
 //! [`Tick`] used for composition, and applies the returned projection. No time
 //! source, I/O, shared lock or asynchronous work is involved here.
+use std::sync::Arc;
+
 use multiview_core::switcher::{ArmedSet, FrameCount, Progress, SourceRef, TransitionDescriptor};
 use thiserror::Error;
+
+/// Upstream keys per M/E (ADR-0113 §7 hard limit). The machine stores its
+/// key states in a fixed array, so staging it for a rejected frame (a clone
+/// on every tick of a flight) never allocates.
+pub const MAX_KEYS: usize = 4;
 
 use crate::clock::Tick;
 
@@ -69,8 +76,12 @@ enum Flight {
 pub struct SwitcherState {
     program: SourceRef,
     preview: SourceRef,
-    keys_on_air: Vec<bool>,
-    armed: ArmedSet,
+    /// Key on-air states, the first `key_count` entries in use.
+    keys_on_air: [bool; MAX_KEYS],
+    key_count: usize,
+    /// Shared so the per-tick staging clone is a refcount increment (an
+    /// `ArmedSet` holds a `Vec`); replaced only by [`Self::arm`].
+    armed: Arc<ArmedSet>,
     /// The operator's selection (ADR-0112 §4): never changed by an AUTO.
     transition: TransitionDescriptor,
     /// The descriptor an AUTO started with [`Self::auto_with`] renders: the
@@ -88,13 +99,21 @@ pub struct SwitcherState {
 
 impl SwitcherState {
     /// Build one M/E with a background take armed and flip-flop enabled.
+    /// `keys_on_air` gives the number of upstream keys and their starting
+    /// states; at most [`MAX_KEYS`] are kept (the config refuses more).
     #[must_use]
     pub fn new(program: SourceRef, preview: SourceRef, keys_on_air: Vec<bool>) -> Self {
+        let mut keys = [false; MAX_KEYS];
+        let key_count = keys_on_air.len().min(MAX_KEYS);
+        for (slot, on) in keys.iter_mut().zip(keys_on_air) {
+            *slot = on;
+        }
         Self {
             program,
             preview,
-            keys_on_air,
-            armed: ArmedSet::default().with_background(),
+            keys_on_air: keys,
+            key_count,
+            armed: Arc::new(ArmedSet::default().with_background()),
             transition: TransitionDescriptor::Cut,
             flight_transition: None,
             flip_flop: true,
@@ -118,12 +137,22 @@ impl SwitcherState {
     /// Key on-air states in one-based key order.
     #[must_use]
     pub fn keys_on_air(&self) -> &[bool] {
-        &self.keys_on_air
+        self.keys_on_air.get(..self.key_count).unwrap_or(&[])
     }
     /// The selected next-transition elements.
     #[must_use]
     pub fn armed(&self) -> &ArmedSet {
         &self.armed
+    }
+    /// The shared arm set (an `Arc` clone restores it without allocating).
+    #[must_use]
+    pub fn armed_shared(&self) -> &Arc<ArmedSet> {
+        &self.armed
+    }
+    /// Put back an arm set captured by [`Self::armed_shared`] (a rejected
+    /// tick's rollback; no validation: it was valid when captured).
+    pub fn restore_armed(&mut self, armed: Arc<ArmedSet>) {
+        self.armed = armed;
     }
     /// The selected transition descriptor: the operator's selection, which
     /// an AUTO's own rate never replaces (ADR-0112 §4).
@@ -161,6 +190,38 @@ impl SwitcherState {
         self.completion_count
     }
 
+    /// Set the number of upstream keys (at most [`MAX_KEYS`]); new keys start
+    /// off. The keyer runtime owns key state (K3): the driver calls this
+    /// when the defined USKs change, never per tick.
+    ///
+    /// # Errors
+    /// [`SwitcherError::InFlight`] during an active take.
+    pub fn set_key_count(&mut self, count: usize) -> Result<(), SwitcherError> {
+        if self.flight.is_some() {
+            return Err(SwitcherError::InFlight);
+        }
+        let count = count.min(MAX_KEYS);
+        for key in self.keys_on_air.iter_mut().skip(count) {
+            *key = false;
+        }
+        self.key_count = count;
+        Ok(())
+    }
+
+    /// Mirror key `index` (1-based) to `on`, as the keyer runtime decided it
+    /// (a loss policy or a key cut can differ from the machine's toggle).
+    /// No allocation; out of range is ignored.
+    pub fn set_key_on_air(&mut self, index: u32, on: bool) {
+        if let Some(key) = index
+            .checked_sub(1)
+            .and_then(|i| usize::try_from(i).ok())
+            .filter(|&i| i < self.key_count)
+            .and_then(|i| self.keys_on_air.get_mut(i))
+        {
+            *key = on;
+        }
+    }
+
     /// Set per-M/E flip-flop behavior for subsequent completed takes.
     pub fn set_flip_flop(&mut self, enabled: bool) {
         self.flip_flop = enabled;
@@ -185,13 +246,24 @@ impl SwitcherState {
     /// [`SwitcherError::InvalidKey`] for duplicate/out-of-range indices, or
     /// [`SwitcherError::InFlight`] during an active take.
     pub fn arm(&mut self, armed: ArmedSet) -> Result<(), SwitcherError> {
+        self.arm_shared(Arc::new(armed))
+    }
+
+    /// [`Self::arm`] with a set built off the clock (the `arm` verb carries
+    /// it as an `Arc`, so the tick only moves it in). Validation is a fixed
+    /// array scan; nothing is allocated.
+    ///
+    /// # Errors
+    /// As [`Self::arm`].
+    pub fn arm_shared(&mut self, armed: Arc<ArmedSet>) -> Result<(), SwitcherError> {
         if self.flight.is_some() {
             return Err(SwitcherError::InFlight);
         }
         if armed.is_empty() {
             return Err(SwitcherError::NothingArmed);
         }
-        let mut seen = vec![false; self.keys_on_air.len()];
+        let mut seen = [false; MAX_KEYS];
+        let seen = seen.get_mut(..self.key_count).unwrap_or(&mut []);
         for &index in &armed.keys {
             let Some(slot) = index
                 .checked_sub(1)
@@ -489,8 +561,10 @@ impl SwitcherState {
             }
         }
         for &index in &self.armed.keys {
-            if let Some(key) = usize::try_from(index - 1)
-                .ok()
+            if let Some(key) = index
+                .checked_sub(1)
+                .and_then(|i| usize::try_from(i).ok())
+                .filter(|&i| i < self.key_count)
                 .and_then(|i| self.keys_on_air.get_mut(i))
             {
                 *key = !*key;
