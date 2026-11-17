@@ -522,16 +522,32 @@ async fn usk_keyer_set_cut_and_persistence() {
     );
     tick(&mut rig.driver, 1);
     assert!(outcomes.try_recv().unwrap().event.completed);
-    // DSK-only fields on a USK are 422.
+    // DSK-only fields on a USK are 422, chroma (K7) included: a USK has
+    // no `color`, and `type = chroma` is refused by name (`usk-chroma`).
     for extra in [
         json!({ "keyer": "usk2", "family": "usk", "rate": 5 }),
         json!({ "keyer": "usk2", "family": "usk", "on_at_start": true }),
+        json!({ "keyer": "usk2", "family": "usk", "type": "chroma", "color": "#00b140" }),
+        json!({ "keyer": "usk2", "family": "usk", "color": "#00b140" }),
     ] {
         assert_eq!(
             plan(&rig, FULL, &body("keyer_set", extra)).await.status(),
             StatusCode::UNPROCESSABLE_ENTITY
         );
     }
+    let chroma = body_json(
+        plan(
+            &rig,
+            FULL,
+            &body(
+                "keyer_set",
+                json!({ "keyer": "usk2", "family": "usk", "type": "chroma" }),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert!(chroma.to_string().contains("usk-chroma"), "{chroma}");
     let auto = body(
         "keyer_auto",
         json!({ "keyer": "usk2", "family": "usk", "on": true }),

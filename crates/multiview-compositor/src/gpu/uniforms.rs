@@ -302,7 +302,11 @@ impl KeyParams {
         Ok(out.with_group(tile, canvas_wh))
     }
 
-    /// Fold the tile's scene group and merge into the block.
+    /// Fold the tile's scene group and merge into the block. Lane-disjoint
+    /// from the key: the group owns `head[3]` bits 8-9, `merge` and
+    /// `dip_colour` (a WIPE's code, softness, extent, radius, origin and
+    /// expand, K3); a key owns `head[0..3]`, `head[3]` bits 0-5, `table`,
+    /// `mask` and `chroma` (K7). So a chroma key in a WIPE group packs both.
     fn with_group(mut self, tile: &crate::pipeline::Tile<'_>, canvas_wh: (u32, u32)) -> Self {
         use crate::key::{unit, SceneMember, SceneMerge, TileGroup};
         let out = &mut self;
@@ -986,5 +990,125 @@ mod key_params_tests {
         assert_eq!(pack_chroma_codes((1, 2, 3)), 0x0003_0201);
         let want = crate::key::chroma_reference_linear([0, 177, 64], fill.color(), None).unwrap();
         assert_eq!(k.chroma, [want[0], want[1], want[2], 0.0]);
+    }
+
+    /// K3 × K7 merge: the Rust blocks and their WGSL mirrors have the same
+    /// size and member offsets (naga's layouter), so a lane added on one
+    /// side only can never drift silently.
+    #[test]
+    fn rust_and_wgsl_blocks_share_one_layout() {
+        let module = naga::front::wgsl::parse_str(&crate::gpu::shader::composite_wgsl()).unwrap();
+        let mut layouter = naga::proc::Layouter::default();
+        layouter.update(module.to_ctx()).unwrap();
+        let check = |name: &str, size: usize, offsets: &[(&str, usize)]| {
+            let (handle, ty) = module
+                .types
+                .iter()
+                .find(|(_, t)| t.name.as_deref() == Some(name))
+                .unwrap();
+            let naga::TypeInner::Struct { members, span } = &ty.inner else {
+                panic!("{name} is not a struct");
+            };
+            assert_eq!(usize::try_from(*span).unwrap(), size, "{name} size");
+            assert_eq!(
+                usize::try_from(layouter[handle].size).unwrap(),
+                size,
+                "{name} layout size"
+            );
+            let wgsl: Vec<(&str, usize)> = members
+                .iter()
+                .map(|m| {
+                    (
+                        m.name.as_deref().unwrap(),
+                        usize::try_from(m.offset).unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(wgsl, offsets, "{name} members");
+        };
+        check(
+            "KeyParams",
+            core::mem::size_of::<KeyParams>(),
+            &[
+                ("head", core::mem::offset_of!(KeyParams, head)),
+                ("table", core::mem::offset_of!(KeyParams, table)),
+                ("mask", core::mem::offset_of!(KeyParams, mask)),
+                ("merge", core::mem::offset_of!(KeyParams, merge)),
+                ("dip_colour", core::mem::offset_of!(KeyParams, dip_colour)),
+                ("chroma", core::mem::offset_of!(KeyParams, chroma)),
+            ],
+        );
+        assert_eq!(core::mem::size_of::<KeyParams>(), 96);
+        let (_, tile) = module
+            .types
+            .iter()
+            .find(|(_, t)| t.name.as_deref() == Some("TileParams"))
+            .unwrap();
+        let naga::TypeInner::Struct { span, .. } = &tile.inner else {
+            panic!("TileParams is not a struct");
+        };
+        assert_eq!(
+            usize::try_from(*span).unwrap(),
+            core::mem::size_of::<TileParams>()
+        );
+    }
+
+    /// K3 × K7 merge: a chroma key (K7, `table` + `chroma` lanes) in every
+    /// scene group (K3 WIPE in `merge` + `dip_colour`, MIX, DIP) packs both
+    /// halves unchanged: the key lanes equal the ungrouped chroma tile's and
+    /// the group lanes equal the unkeyed grouped tile's.
+    #[test]
+    fn a_chroma_key_packs_beside_every_scene_merge() {
+        use crate::mask::{MaskShape, WipeMask};
+        let fill = img(4, 4, ColorRange::Limited);
+        let key = || TileKey::chroma([0, 177, 64], 0.05, 8.0).inverted(true);
+        let pack = |t: &Tile<'_>| KeyParams::build(t, None, &mut Vec::new(), (8, 8)).unwrap();
+        let alone = pack(&Tile::placed(&fill, 0, 0, 1.0).with_key(key()));
+        let mid = WipeMask::new(MaskShape::Circle, 0.5, 8, 8, [0.25, 0.5], true, 0.1, 0.0);
+        let end = WipeMask::new(MaskShape::Box, 1.0, 8, 8, [0.5, 0.5], false, 0.0, 0.0);
+        let merges = [
+            SceneMerge::Mix { p: 0.3 },
+            SceneMerge::Dip {
+                colour: crate::blend::LinearRgba::opaque(0.1, 0.2, 0.3),
+                d: 0.4,
+                i: 0.6,
+            },
+            SceneMerge::Wipe { mask: mid },
+            SceneMerge::Wipe {
+                mask: mid.complemented(),
+            },
+            SceneMerge::Wipe { mask: end },
+        ];
+        for merge in merges {
+            for member in [SceneMember::Both, SceneMember::Out, SceneMember::In] {
+                let group = TileGroup::Scene { member, merge };
+                let both = pack(
+                    &Tile::placed(&fill, 0, 0, 1.0)
+                        .with_key(key())
+                        .in_group(group),
+                );
+                let unkeyed = pack(&Tile::placed(&fill, 0, 0, 1.0).in_group(group));
+                assert_eq!(both.head[..3], alone.head[..3]);
+                assert_eq!(both.head[3] & 0xff, alone.head[3], "{merge:?}");
+                assert_eq!(
+                    both.head[3] >> KEY_GROUP_SHIFT,
+                    unkeyed.head[3] >> KEY_GROUP_SHIFT
+                );
+                assert_eq!(both.table, alone.table);
+                assert_eq!(both.mask, alone.mask);
+                assert_eq!(both.chroma, alone.chroma);
+                assert_eq!(both.merge, unkeyed.merge, "{merge:?}");
+                assert_eq!(both.dip_colour, unkeyed.dip_colour, "{merge:?}");
+            }
+        }
+        // The WIPE code survives beside the chroma lanes: 2 + circle (5) + 8.
+        let wipe = pack(&Tile::placed(&fill, 0, 0, 1.0).with_key(key()).in_group(
+            TileGroup::Scene {
+                member: SceneMember::In,
+                merge: SceneMerge::Wipe { mask: mid },
+            },
+        ));
+        assert_eq!(wipe.merge[0], 15.0);
+        assert_eq!(wipe.head[3] & KEY_KIND_BITS, KEY_KIND_CHROMA);
     }
 }

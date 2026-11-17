@@ -545,7 +545,8 @@ impl UpstreamKeyerConfig {
             key_type: self.key_type,
             clip: self.clip,
             gain: self.gain,
-            // A USK has no chroma reference (K7 is DSK-only).
+            // A USK has no chroma reference: chroma is a DSK-only type
+            // (K7), refused by `validate_definition` (`usk-chroma`).
             color: None,
             invert: self.invert,
             mask: self.mask,
@@ -618,6 +619,15 @@ impl UpstreamKeyerConfig {
         canvas_w: u32,
         canvas_h: u32,
     ) -> Result<(), ConfigError> {
+        if self.key_type == KeyerType::Chroma {
+            // K7 built chroma for DSKs only; a USK has no `color` field, so
+            // it is refused by name rather than as a missing colour.
+            return Err(ConfigError::Validation(format!(
+                "upstream keyer {:?} type = \"chroma\" is not supported on an upstream \
+                 keyer yet (usk-chroma); use a downstream keyer",
+                self.id
+            )));
+        }
         self.as_definition(program)
             .validate_definition(sources, canvas_w, canvas_h)
             .map_err(|e| match e {
@@ -1530,7 +1540,14 @@ kept = true
         );
         let mut chroma = fly("a", 1);
         chroma.key_type = KeyerType::Chroma;
-        assert!(usks(vec![chroma], None).is_err());
+        let error = usks(vec![chroma], None).unwrap_err().to_string();
+        assert!(
+            error.contains("upstream keyer") && error.contains("usk-chroma"),
+            "{error}"
+        );
+        // A USK has no `color` field (chroma is DSK-only, K7).
+        let doc = "id = \"a\"\nfill = \"bars\"\ntype = \"chroma\"\ncolor = \"#00b140\"\n";
+        assert!(toml::from_str::<UpstreamKeyerConfig>(doc).is_err());
         let mut odd = fly("a", 1);
         odd.fly = Some(KeyerRect {
             x: 1,

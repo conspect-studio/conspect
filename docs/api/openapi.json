@@ -19123,7 +19123,7 @@
               "string",
               "null"
             ],
-            "description": "`keyer_set`: chroma reference colour `#RRGGBB` (`type = chroma`\nonly); `\"\"` clears it."
+            "description": "`keyer_set`: chroma reference colour `#RRGGBB` (`type = chroma`\nonly); `\"\"` clears it. Downstream keyers only (`keyer-usk` on a USK)."
           },
           "family": {
             "oneOf": [
@@ -19263,7 +19263,7 @@
               "string",
               "null"
             ],
-            "description": "`keyer_set`: `linear`, `luma` or `chroma` (K7; needs `color`, refuses\na `key` source)."
+            "description": "`keyer_set`: `linear`, `luma` or `chroma` (K7; needs `color`, refuses\na `key` source; downstream keyers only, a USK refuses it as\n`usk-chroma`)."
           },
           "z": {
             "type": [

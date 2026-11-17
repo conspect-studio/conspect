@@ -556,7 +556,8 @@ keyers.
   `head[0..3]`, `head[3]` bits 0-5, `table`, `mask` and `chroma`; the scene group owns `head[3]`
   bits 8-9, `merge` and `dip_colour` (`KeyParams::with_group`); a tile's own wipe mask and its
   complement live in `TileParams` spare lanes (`prim2.w`), untouched by both. The struct is
-  96 bytes in Rust and WGSL.
+  96 bytes in Rust and WGSL; the `uniforms` unit test `rust_and_wgsl_blocks_share_one_layout`
+  checks every member offset and the size of `KeyParams` and `TileParams` against naga's layout.
 
   `mattes` is binding 7: one 256-entry `f32` table per signal-keyed tile (see §3.3). Both
   buffers are allocated once at `MAX_TILES` entries (tables) and refilled in place, like the
@@ -1356,7 +1357,32 @@ merge (see "K1 GPU key path as built", wipe masks).
     the four bad shapes are 422 with their reasons.
 - **Not done.** Spill suppression (ADR-C007 and ADR-0056 do not ask for it; a chroma key
   leaves green fringes on edges until a spill slice), an automatic reference picker, a
-  separate key-source chroma key, and USK chroma (USKs are K3). A dedicated chroma bench
+  separate key-source chroma key, and USK chroma (see "K3 × K7 merge" below). A dedicated chroma bench
   figure is not recorded (`keyer_composite_bench` has no chroma case); the RTX 4060
   calibration is still owed by the lead as for K1.
 
+### K3 × K7 merge (K3 branch merged with main after PR #507)
+
+- **`KeyParams` (96 bytes).** K3 put the WIPE merge in the existing `merge` / `dip_colour` lanes
+  (kind ≥ 2) and the complemented tile mask in `TileParams::prim2.w`; K7 reused `table` for the
+  chroma reference codes and edge, and added `chroma`. No lane is shared: the textual auto-merge
+  was correct in layout, but it dropped the canvas size from K7's new `KeyParams::with_group`
+  (where K3's WIPE packing now lives) and K7's packing test called the 3-argument `build`;
+  both are fixed. `a_chroma_key_packs_beside_every_scene_merge` checks that a chroma key in
+  every scene group (MIX, DIP, WIPE, a complemented WIPE, a pinned endpoint; each member)
+  keeps its key lanes and the group keeps its merge lanes. `rust_and_wgsl_blocks_share_one_layout`
+  compares the Rust structs with naga's WGSL layout.
+- **GPU.** `keyers_chroma_gpu::a_chroma_key_in_a_wipe_scene_group_matches_the_cpu_oracle_on_the_gpu`
+  (3 frames: a chroma key coming on through a soft circle WIPE; an inverted, masked chroma key
+  going off through a reversed box WIPE beside a PQ/BT.2020 chroma tile; a step-gain chroma
+  key through a complemented mask over a WIPE group). The tile-driven CPU kernel equals the
+  oracle at 1-4 threads with and without LUTs. GPU against CPU on lavapipe (llvmpipe 19,
+  Vulkan): minima SSIM 0.99999 and PSNR 63.6 dB, max |ΔY| 2 (floors SSIM 0.98, PSNR 40 dB).
+- **USK chroma is refused, consistently.** `UpstreamKeyerConfig` has no `color` field
+  (`deny_unknown_fields`, so a TOML `color` on a USK is a parse error), and
+  `UpstreamKeyerConfig::validate_definition` refuses `type = "chroma"` by name (`usk-chroma`)
+  before the shared DSK checks, which would otherwise report a missing colour. `as_definition`
+  sets `color: None`. The boot preflight and the K4 USK `keyer_set` path run the same check;
+  `keyer_set` also refuses `color` on `family = "usk"` as a DSK-only field (`keyer-usk`), so
+  the colour is never silently dropped. Tests: the `multiview-config` USK test and
+  `switcher_keyers_usk::usk_keyer_set_cut_and_persistence`.

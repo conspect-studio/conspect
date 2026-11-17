@@ -112,7 +112,8 @@ pub struct KeyerFields {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     /// `keyer_set`: `linear`, `luma` or `chroma` (K7; needs `color`, refuses
-    /// a `key` source).
+    /// a `key` source; downstream keyers only, a USK refuses it as
+    /// `usk-chroma`).
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(value_type = Option<String>))]
     pub key_type: Option<KeyerType>,
@@ -124,7 +125,7 @@ pub struct KeyerFields {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gain: Option<f32>,
     /// `keyer_set`: chroma reference colour `#RRGGBB` (`type = chroma`
-    /// only); `""` clears it.
+    /// only); `""` clears it. Downstream keyers only (`keyer-usk` on a USK).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
     /// `keyer_set`: invert the matte.
@@ -340,13 +341,15 @@ fn shape(kind: &str, fields: &KeyerFields, other_refs: bool) -> Result<String, B
     if fields.family() == KeyerFamilyWire::Usk
         && (matches!(kind, "keyer_auto" | "keyer_tie")
             || fields.rate.is_some()
-            || fields.on_at_start.is_some())
+            || fields.on_at_start.is_some()
+            || fields.color.is_some())
     {
         return Err(Box::new(typed(
             422,
             "keyer-usk",
             "an upstream keyer changes on air through arm and a CUT or AUTO; keyer_auto, \
-             keyer_tie, rate and on_at_start are downstream keyer fields",
+             keyer_tie, rate, on_at_start and color (chroma is downstream-only) are \
+             downstream keyer fields",
         )));
     }
     let Some(keyer) = fields.keyer.clone().filter(|k| !k.trim().is_empty()) else {

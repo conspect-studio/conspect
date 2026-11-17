@@ -427,3 +427,122 @@ fn an_exact_reference_is_keyed_out_on_the_gpu_at_a_huge_gain() {
         }
     }
 }
+
+/// K3 × K7 (the merge of the WIPE scene merge with the chroma key): a chroma
+/// key (K7: `KeyParams.table` + `.chroma`) on a tile of a WIPE scene group
+/// (K3: `KeyParams.merge` + `.dip_colour`), including the complemented
+/// mask a tied keyer going off draws (`TileParams.prim2.w`). The tile-driven
+/// CPU kernel equals the oracle at 1-4 threads with and without LUTs, and the
+/// GPU matches the oracle at SSIM >= 0.98 / PSNR >= 40 dB on Y and UV.
+#[test]
+fn a_chroma_key_in_a_wipe_scene_group_matches_the_cpu_oracle_on_the_gpu() {
+    use multiview_compositor::mask::{MaskShape, WipeMask};
+    use multiview_compositor::pipeline::{composite_reference, composite_with_threads};
+    let Some(gpu) = try_gpu() else { return };
+    let canvas = CanvasColor::default();
+    let back = ramp(W, H);
+    let fill = screen(W, H, bt709(ColorRange::Limited), 0);
+    let fill_hdr = screen(40, 30, pq2020(), 5);
+    let green = [0x00, 0xb1, 0x40];
+    let group = |member, mask| TileGroup::Scene {
+        member,
+        merge: SceneMerge::Wipe { mask },
+    };
+    let circle = WipeMask::new(MaskShape::Circle, 0.45, W, H, [0.4, 0.5], false, 0.15, 0.0);
+    let box_rev = WipeMask::new(MaskShape::Box, 0.6, W, H, [0.5, 0.5], true, 0.0, 0.0);
+    let cases: Vec<(&str, WipeMask, Vec<Tile<'_>>)> =
+        vec![
+            (
+                "chroma key going on through a soft circle WIPE",
+                circle,
+                vec![
+                    Tile::placed(&back, 0, 0, 1.0).in_group(group(SceneMember::Both, circle)),
+                    Tile::placed(&fill, 0, 0, 1.0)
+                        .with_key(TileKey::chroma(green, 0.02, 6.0))
+                        .in_group(group(SceneMember::In, circle)),
+                ],
+            ),
+            (
+                "inverted, masked chroma key going off through a reversed box WIPE",
+                box_rev,
+                vec![
+                    Tile::placed(&back, 0, 0, 1.0).in_group(group(SceneMember::Both, box_rev)),
+                    Tile::placed(&fill, 0, 0, 0.8)
+                        .with_key(TileKey::chroma(green, 0.05, 4.0).inverted(true).masked(
+                            KeyMask {
+                                x: 4,
+                                y: 2,
+                                w: 52,
+                                h: 40,
+                            },
+                        ))
+                        .in_group(group(SceneMember::Out, box_rev)),
+                    Tile::scaled(&fill_hdr, 8, 6, 32, 24, 1.0)
+                        .with_key(TileKey::chroma([0x50, 0x88, 0x60], 0.01, 40.0))
+                        .in_group(group(SceneMember::In, box_rev)),
+                ],
+            ),
+            (
+                "chroma key on a top tile through a complemented wipe mask, over a WIPE group",
+                circle,
+                vec![
+                    Tile::placed(&back, 0, 0, 1.0).in_group(group(SceneMember::Out, circle)),
+                    Tile::placed(&fill_hdr, 0, 0, 1.0).in_group(group(SceneMember::In, circle)),
+                    Tile::placed(&fill, 0, 0, 1.0)
+                        .with_key(TileKey::chroma(green, 0.02, f32::INFINITY))
+                        .with_mask(circle.complemented()),
+                ],
+            ),
+        ];
+    let (mut min_s, mut min_p, mut max_dy) = (f64::INFINITY, f64::INFINITY, 0_u8);
+    for (name, mask, tiles) in &cases {
+        // Not vacuous: the key changes the picture, and the WIPE differs from
+        // a half MIX of the same scenes.
+        assert_key_visible(name, tiles);
+        let as_mix: Vec<Tile<'_>> = tiles
+            .iter()
+            .map(|t| {
+                let mut t = t.clone();
+                if let TileGroup::Scene { member, .. } = t.group {
+                    t.group = TileGroup::Scene {
+                        member,
+                        merge: SceneMerge::Mix { p: 0.5 },
+                    };
+                }
+                t
+            })
+            .collect();
+        let wiped = cpu_composite(W, H, canvas, bg(), tiles).unwrap();
+        let mixed = cpu_composite(W, H, canvas, bg(), &as_mix).unwrap();
+        assert_ne!(
+            wiped.y_plane(),
+            mixed.y_plane(),
+            "{name}: the WIPE must matter ({mask:?})"
+        );
+        for use_lut in [false, true] {
+            let oracle = composite_reference(W, H, canvas, bg(), tiles, use_lut).unwrap();
+            for threads in 1..=4 {
+                let fast =
+                    composite_with_threads(W, H, canvas, bg(), tiles, use_lut, threads).unwrap();
+                assert_eq!(
+                    fast.y_plane(),
+                    oracle.y_plane(),
+                    "{name} lut={use_lut} t={threads}"
+                );
+                assert_eq!(
+                    fast.uv_plane(),
+                    oracle.uv_plane(),
+                    "{name} lut={use_lut} t={threads}"
+                );
+            }
+        }
+        let (s, p, d) = gate(&gpu, name, tiles);
+        min_s = min_s.min(s);
+        min_p = min_p.min(p);
+        max_dy = max_dy.max(d);
+    }
+    println!(
+        "chroma×WIPE minima over {} frames: SSIM={min_s:.5} PSNR={min_p:.2}dB max|dY|={max_dy}",
+        cases.len()
+    );
+}
