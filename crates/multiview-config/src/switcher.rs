@@ -591,9 +591,9 @@ impl UpstreamKeyerConfig {
         self.as_definition(program)
             .validate_definition(sources, canvas_w, canvas_h)
             .map_err(|e| match e {
-                ConfigError::Validation(msg) => ConfigError::Validation(
-                    msg.replacen("downstream keyer", "upstream keyer", 1),
-                ),
+                ConfigError::Validation(msg) => {
+                    ConfigError::Validation(msg.replacen("downstream keyer", "upstream keyer", 1))
+                }
                 other => other,
             })
     }
@@ -1426,7 +1426,10 @@ kept = true
         let mut input = fly("a", 1);
         input.fill = "in:1".into();
         let error = usks(vec![input], None).unwrap_err().to_string();
-        assert!(error.contains("upstream keyer") && error.contains("mixer input"), "{error}");
+        assert!(
+            error.contains("upstream keyer") && error.contains("mixer input"),
+            "{error}"
+        );
         let mut chroma = fly("a", 1);
         chroma.key_type = KeyerType::Chroma;
         assert!(usks(vec![chroma], None).is_err());
@@ -1460,7 +1463,10 @@ kept = true
         assert!(both.contains("over switcher.keyer_budget"), "{both}");
         let mut keyed = usk("usk1", 1);
         keyed.key = Some("vt1".into());
-        assert!(usks(vec![keyed.clone()], None).is_err(), "fill + key is 4 folds");
+        assert!(
+            usks(vec![keyed.clone()], None).is_err(),
+            "fill + key is 4 folds"
+        );
         usks(vec![keyed], Some(4.0)).unwrap();
     }
 
@@ -1472,7 +1478,12 @@ kept = true
         assert!(text.contains("[[keyers]]"), "{text}");
         let back: MixEffectsConfig = toml::from_str(&text).unwrap();
         assert_eq!(back, me);
-        for field in ["rate = 5", "tie = true", "on_at_start = true", "program = \"main\""] {
+        for field in [
+            "rate = 5",
+            "tie = true",
+            "on_at_start = true",
+            "program = \"main\"",
+        ] {
             let doc = format!("id = \"u\"\nfill = \"bars\"\n{field}\n");
             assert!(
                 toml::from_str::<UpstreamKeyerConfig>(&doc).is_err(),

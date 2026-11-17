@@ -164,10 +164,10 @@ pub use schema::{
 };
 pub use switcher::{
     keyer_cost, DownstreamKeyerConfig, KeyerLossPolicy, KeyerLossTrigger, KeyerRect, KeyerSize,
-    KeyerType, MixEffectsConfig, MixerInput, MixerInputVideo, SwitcherConfig, DEFAULT_KEYER_BUDGET,
-    DEFAULT_KEYER_RATE, DSK_FOLD, INPUT_REF_PREFIX, KEYER_UPLOAD_WEIGHT, MAX_DOWNSTREAM_KEYERS,
-    MAX_KEYER_RATE, MAX_MIXER_INPUTS, MAX_UPSTREAM_KEYERS, MIN_KEYER_FLY, USK_FOLD,
-    UpstreamKeyerConfig,
+    KeyerType, MixEffectsConfig, MixerInput, MixerInputVideo, SwitcherConfig, UpstreamKeyerConfig,
+    DEFAULT_KEYER_BUDGET, DEFAULT_KEYER_RATE, DSK_FOLD, INPUT_REF_PREFIX, KEYER_UPLOAD_WEIGHT,
+    MAX_DOWNSTREAM_KEYERS, MAX_KEYER_RATE, MAX_MIXER_INPUTS, MAX_UPSTREAM_KEYERS, MIN_KEYER_FLY,
+    USK_FOLD,
 };
 pub use sync_group::{SyncGroup, SyncGroupMode, SyncMember};
 pub use tally::{BitColor, IndexCell, TallyProfile};

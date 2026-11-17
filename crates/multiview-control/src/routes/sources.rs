@@ -458,7 +458,10 @@ fn declared_keyers(state: &AppState) -> Vec<(String, multiview_config::Downstrea
         .collect();
     for me in &switcher.mix_effects {
         for usk in &me.keyers {
-            out.push((format!("{}/{}", me.id, usk.id), usk.as_definition(&me.program)));
+            out.push((
+                format!("{}/{}", me.id, usk.id),
+                usk.as_definition(&me.program),
+            ));
         }
     }
     out

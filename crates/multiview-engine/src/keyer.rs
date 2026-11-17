@@ -436,11 +436,11 @@ pub fn admit(
         budget,
         ..KeyerRuntime::default()
     };
-    let (mut next_dsk, mut next_usk) = (KeyerFamily::Dsk.slots(), KeyerFamily::Usk.slots());
+    let (mut dsk_slots, mut usk_slots) = (KeyerFamily::Dsk.slots(), KeyerFamily::Usk.slots());
     for def in defs {
         let index = match def.family {
-            KeyerFamily::Dsk => next_dsk.next(),
-            KeyerFamily::Usk => next_usk.next(),
+            KeyerFamily::Dsk => dsk_slots.next(),
+            KeyerFamily::Usk => usk_slots.next(),
         }
         .unwrap_or(MAX_KEYERS);
         let flags = KeyerFlags {
@@ -572,7 +572,10 @@ impl KeyerDefinitions {
     /// belongs to the M/E scene, so Clean shows it).
     #[must_use]
     pub fn any_dsk(&self) -> bool {
-        self.defs.iter().flatten().any(|d| d.family == KeyerFamily::Dsk)
+        self.defs
+            .iter()
+            .flatten()
+            .any(|d| d.family == KeyerFamily::Dsk)
     }
 }
 
@@ -1179,15 +1182,18 @@ struct DefUndo {
 fn draw_order_of(slots: &[Option<KeyerSlot>; MAX_KEYERS]) -> [usize; MAX_KEYERS] {
     let mut order: [usize; MAX_KEYERS] = std::array::from_fn(|i| i);
     order.sort_by_key(|&i| {
-        slots.get(i).and_then(Option::as_ref).map_or((2_u8, i32::MAX), |s| {
-            (
-                match s.def.family {
-                    KeyerFamily::Usk => 0,
-                    KeyerFamily::Dsk => 1,
-                },
-                s.def.z,
-            )
-        })
+        slots
+            .get(i)
+            .and_then(Option::as_ref)
+            .map_or((2_u8, i32::MAX), |s| {
+                (
+                    match s.def.family {
+                        KeyerFamily::Usk => 0,
+                        KeyerFamily::Dsk => 1,
+                    },
+                    s.def.z,
+                )
+            })
     });
     order
 }
@@ -2134,19 +2140,40 @@ mod tests {
             index: 0,
             pts: multiview_core::time::MediaTime::ZERO,
         };
-        assert!((weight_of(tied, KeyerFamily::Dsk, tick, Some(TieEnvelope::mix(0.25))) - 0.25).abs() < 1e-6);
+        assert!(
+            (weight_of(tied, KeyerFamily::Dsk, tick, Some(TieEnvelope::mix(0.25))) - 0.25).abs()
+                < 1e-6
+        );
         let tied_on = KeyerFlags {
             on_air: true,
             flight: Some(false),
             ..tied
         };
-        assert!((weight_of(tied_on, KeyerFamily::Dsk, tick, Some(TieEnvelope::mix(0.25))) - 0.75).abs() < 1e-6);
+        assert!(
+            (weight_of(
+                tied_on,
+                KeyerFamily::Dsk,
+                tick,
+                Some(TieEnvelope::mix(0.25))
+            ) - 0.75)
+                .abs()
+                < 1e-6
+        );
         assert!((weight_of(tied_on, KeyerFamily::Dsk, tick, None) - 1.0).abs() < 1e-6);
         let cancelled = KeyerFlags {
             flight: None,
             ..tied
         };
-        assert!(weight_of(cancelled, KeyerFamily::Dsk, tick, Some(TieEnvelope::mix(0.25))).abs() < 1e-6);
+        assert!(
+            weight_of(
+                cancelled,
+                KeyerFamily::Dsk,
+                tick,
+                Some(TieEnvelope::mix(0.25))
+            )
+            .abs()
+                < 1e-6
+        );
     }
 
     #[test]

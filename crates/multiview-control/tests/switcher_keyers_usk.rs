@@ -116,7 +116,9 @@ const VIEWER: &str = support::VIEWER_TOKEN;
 
 fn keys() -> ApiKeyStore {
     let mut keys = support::seeded_keys();
-    let all = ["me1", "me1/usk1", "me1/usk2", "me1/usk3", "a", "b", "gfx", "gfx2"];
+    let all = [
+        "me1", "me1/usk1", "me1/usk2", "me1/usk3", "a", "b", "gfx", "gfx2",
+    ];
     let mut add = |id: &str, without: Option<&str>, program: bool, role: Role| {
         keys.register(
             id,
@@ -155,8 +157,15 @@ fn stores() -> HashMap<String, Arc<TileStore<Nv12Image>>> {
         .map(|id| {
             let store = Arc::new(TileStore::new(id, thresholds, NoSignalPolicy::Slate));
             store.publish(
-                Nv12Image::solid(64, 64, 200, 128, 128, ColorInfo::default().resolve_defaults(64, 64))
-                    .unwrap(),
+                Nv12Image::solid(
+                    64,
+                    64,
+                    200,
+                    128,
+                    128,
+                    ColorInfo::default().resolve_defaults(64, 64),
+                )
+                .unwrap(),
                 MediaTime::ZERO,
             );
             (id.to_owned(), store)
@@ -318,7 +327,11 @@ async fn arm_is_authorized_per_object_on_plan_and_command() {
     let mut outcomes = rig.handle.outcomes();
     let arm1 = body("arm", json!({ "background": true, "keys": ["usk1"] }));
     for token in [NO_ME, NO_PROGRAM, NO_USK1, NO_GFX2, SCOPED_VIEWER, VIEWER] {
-        assert_eq!(plan(&rig, token, &arm1).await.status(), StatusCode::FORBIDDEN, "{token}");
+        assert_eq!(
+            plan(&rig, token, &arm1).await.status(),
+            StatusCode::FORBIDDEN,
+            "{token}"
+        );
         assert_eq!(
             command(&rig, token, "arm-bola", &arm1).await.status(),
             StatusCode::FORBIDDEN,
@@ -327,10 +340,16 @@ async fn arm_is_authorized_per_object_on_plan_and_command() {
     }
     // An undefined key the caller may not see: 403, nothing about existence.
     let ghost = body("arm", json!({ "keys": ["usk9"] }));
-    assert_eq!(plan(&rig, FULL, &ghost).await.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        plan(&rig, FULL, &ghost).await.status(),
+        StatusCode::FORBIDDEN
+    );
     // One it may see (me1/usk3 is granted but undefined): 404.
     let unknown = body("arm", json!({ "keys": ["usk3"] }));
-    assert_eq!(plan(&rig, FULL, &unknown).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        plan(&rig, FULL, &unknown).await.status(),
+        StatusCode::NOT_FOUND
+    );
     // A background-only arm needs only the M/E and the program (NO_GFX2
     // may arm neither key: both name gfx2).
     let bg = body("arm", json!({ "background": true }));
@@ -359,11 +378,21 @@ async fn arm_shape_and_in_flight_refusal() {
         json!({ "keys": ["me1/usk1"] }),
     ] {
         let response = plan(&rig, ADMIN, &body("arm", extra.clone())).await;
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{extra}");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{extra}"
+        );
     }
     // keys on another verb are refused.
-    let wrong = body("keyer_cut", json!({ "keyer": "usk1", "family": "usk", "on": true, "keys": [] }));
-    assert_eq!(plan(&rig, ADMIN, &wrong).await.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let wrong = body(
+        "keyer_cut",
+        json!({ "keyer": "usk1", "family": "usk", "on": true, "keys": [] }),
+    );
+    assert_eq!(
+        plan(&rig, ADMIN, &wrong).await.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
     // In flight: an AUTO started on the engine directly.
     rig.handle
         .try_send(multiview_engine::switcher_control::SwitcherCommand {
@@ -416,13 +445,22 @@ async fn arm_then_cut_puts_a_key_on_air_with_an_outcome_and_replays() {
     assert!(outcome.event.completed);
     assert!(outcomes.try_recv().is_err(), "the replay enqueued nothing");
     let get_full = body_json(send(&rig.router, get("/api/v1/switcher/me1", FULL)).await).await;
-    assert_eq!(get_full["armed"], json!({ "background": false, "keys": ["usk2"] }));
+    assert_eq!(
+        get_full["armed"],
+        json!({ "background": false, "keys": ["usk2"] })
+    );
     let rows = get_full["keyers"].as_array().unwrap();
     let usk2 = rows.iter().find(|r| r["id"] == "usk2").unwrap();
-    assert_eq!((usk2["family"].as_str(), usk2["armed"].as_bool()), (Some("usk"), Some(true)));
+    assert_eq!(
+        (usk2["family"].as_str(), usk2["armed"].as_bool()),
+        (Some("usk"), Some(true))
+    );
     // A key-only CUT through the existing cut verb.
     let cut = body("cut", json!({}));
-    assert_eq!(command(&rig, FULL, "cut-1", &cut).await.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        command(&rig, FULL, "cut-1", &cut).await.status(),
+        StatusCode::ACCEPTED
+    );
     tick(&mut rig.driver, 2);
     assert!(on_air(&rig, 2) && !on_air(&rig, 1));
     assert_eq!(rig.handle.snapshot().unwrap().program.as_str(), "a");
@@ -443,16 +481,39 @@ async fn usk_keyer_set_cut_and_persistence() {
                 "type": "luma", "clip": 0.2 }),
     );
     // BOLA: the USK object id is me1/<id>.
-    assert_eq!(plan(&rig, NO_USK1, &body("keyer_set",
-        json!({ "keyer": "usk1", "family": "usk", "clip": 0.1 }))).await.status(),
-        StatusCode::FORBIDDEN);
-    assert_eq!(plan(&rig, NO_GFX2, &body("keyer_set",
-        json!({ "keyer": "usk1", "family": "usk", "key": "gfx2" }))).await.status(),
-        StatusCode::FORBIDDEN);
+    assert_eq!(
+        plan(
+            &rig,
+            NO_USK1,
+            &body(
+                "keyer_set",
+                json!({ "keyer": "usk1", "family": "usk", "clip": 0.1 })
+            )
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        plan(
+            &rig,
+            NO_GFX2,
+            &body(
+                "keyer_set",
+                json!({ "keyer": "usk1", "family": "usk", "key": "gfx2" })
+            )
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
     let planned = body_json(plan(&rig, FULL, &set).await).await;
     assert_eq!(planned["keyer"], "me1/usk2");
     assert_eq!(planned["can_take"], true);
-    assert_eq!(command(&rig, FULL, "set-1", &set).await.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        command(&rig, FULL, "set-1", &set).await.status(),
+        StatusCode::ACCEPTED
+    );
     tick(&mut rig.driver, 1);
     assert!(outcomes.try_recv().unwrap().event.completed);
     // DSK-only fields on a USK are 422.
@@ -465,11 +526,23 @@ async fn usk_keyer_set_cut_and_persistence() {
             StatusCode::UNPROCESSABLE_ENTITY
         );
     }
-    let auto = body("keyer_auto", json!({ "keyer": "usk2", "family": "usk", "on": true }));
-    assert_eq!(plan(&rig, FULL, &auto).await.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let auto = body(
+        "keyer_auto",
+        json!({ "keyer": "usk2", "family": "usk", "on": true }),
+    );
+    assert_eq!(
+        plan(&rig, FULL, &auto).await.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
     // keyer_cut outside a transition.
-    let cut = body("keyer_cut", json!({ "keyer": "usk2", "family": "usk", "on": true }));
-    assert_eq!(command(&rig, FULL, "kc-1", &cut).await.status(), StatusCode::ACCEPTED);
+    let cut = body(
+        "keyer_cut",
+        json!({ "keyer": "usk2", "family": "usk", "on": true }),
+    );
+    assert_eq!(
+        command(&rig, FULL, "kc-1", &cut).await.status(),
+        StatusCode::ACCEPTED
+    );
     tick(&mut rig.driver, 2);
     assert!(on_air(&rig, 2));
     // Persisted to the M/E, not to downstream_keyers.
@@ -479,8 +552,12 @@ async fn usk_keyer_set_cut_and_persistence() {
         )
         .unwrap();
         let me = &config.switcher.as_ref().unwrap().mix_effects[0];
-        if me.keyers.get(1).is_some_and(|k| (k.clip - 0.2).abs() < 1e-6) {
-            assert!(config.switcher.as_ref().unwrap().downstream_keyers.is_empty());
+        if me
+            .keyers
+            .get(1)
+            .is_some_and(|k| (k.clip - 0.2).abs() < 1e-6)
+        {
+            assert_eq!(config.switcher.as_ref().unwrap().downstream_keyers.len(), 0);
             assert_eq!(me.keyers[1].fly.unwrap().x, 32);
             config.validate().unwrap();
             return;
@@ -519,7 +596,13 @@ async fn usk_rows_armed_set_and_events_filter_and_redact_alike() {
     };
     let mut no_usk1 = session(&["me1", "me1/usk2", "a", "b", "gfx", "gfx2"]);
     let mut no_gfx2 = session(&["me1", "me1/usk1", "me1/usk2", "a", "b", "gfx"]);
-    command(&rig, ADMIN, "arm", &body("arm", json!({ "keys": ["usk1", "usk2"] }))).await;
+    command(
+        &rig,
+        ADMIN,
+        "arm",
+        &body("arm", json!({ "keys": ["usk1", "usk2"] })),
+    )
+    .await;
     command(&rig, ADMIN, "cut", &body("cut", json!({}))).await;
     tick(&mut rig.driver, 1);
     assert!(on_air(&rig, 1) && on_air(&rig, 2));
@@ -543,13 +626,39 @@ async fn usk_rows_armed_set_and_events_filter_and_redact_alike() {
     assert_eq!(full["keyers"].as_array().unwrap().len(), 2);
     assert_eq!(full["armed"]["keys"], json!(["usk1", "usk2"]));
     let usk1 = body_json(send(&rig.router, get("/api/v1/switcher/me1", NO_USK1)).await).await;
-    let ids: Vec<_> = usk1["keyers"].as_array().unwrap().iter().map(|r| r["id"].clone()).collect();
+    let ids: Vec<_> = usk1["keyers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].clone())
+        .collect();
     assert_eq!(ids, vec![json!("usk2")], "usk1 row filtered");
-    assert_eq!(usk1["armed"]["keys"], json!(["usk2"]), "armed set filtered alike");
+    assert_eq!(
+        usk1["armed"]["keys"],
+        json!(["usk2"]),
+        "armed set filtered alike"
+    );
     let gfx2 = body_json(send(&rig.router, get("/api/v1/switcher/me1", NO_GFX2)).await).await;
-    let row1 = gfx2["keyers"].as_array().unwrap().iter().find(|r| r["id"] == "usk1").unwrap();
-    assert_eq!((row1["fill"].as_str(), row1["key"].as_str()), (Some("gfx"), Some("redacted")));
-    let row2 = gfx2["keyers"].as_array().unwrap().iter().find(|r| r["id"] == "usk2").unwrap();
-    assert_eq!(row2["fill"].as_str(), Some(redacted.fill.as_str()), "GET equals the event");
+    let row1 = gfx2["keyers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "usk1")
+        .unwrap();
+    assert_eq!(
+        (row1["fill"].as_str(), row1["key"].as_str()),
+        (Some("gfx"), Some("redacted"))
+    );
+    let row2 = gfx2["keyers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "usk2")
+        .unwrap();
+    assert_eq!(
+        row2["fill"].as_str(),
+        Some(redacted.fill.as_str()),
+        "GET equals the event"
+    );
     assert_eq!(row2["on_air"], redacted.on_air);
 }

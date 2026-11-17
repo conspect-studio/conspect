@@ -286,7 +286,12 @@ pub(crate) fn dsk(id: &str, fill: &str, key: Option<&str>, z: i32) -> Downstream
 
 /// A USK config on `fill` with test-friendly defaults (K3); `fly` is
 /// optional canvas pixels.
-pub(crate) fn usk(id: &str, fill: &str, z: i32, fly: Option<(u32, u32, u32, u32)>) -> UpstreamKeyerConfig {
+pub(crate) fn usk(
+    id: &str,
+    fill: &str,
+    z: i32,
+    fly: Option<(u32, u32, u32, u32)>,
+) -> UpstreamKeyerConfig {
     let mut cfg = UpstreamKeyerConfig::from_definition(&dsk(id, fill, None, z));
     cfg.fly = fly.map(|(x, y, w, h)| KeyerRect { x, y, w, h });
     cfg

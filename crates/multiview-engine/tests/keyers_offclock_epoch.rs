@@ -23,7 +23,9 @@ use multiview_compositor::readback::SimulatedGpuControl;
 use multiview_core::color::ColorInfo;
 use multiview_core::layout::{Canvas, Layout};
 use multiview_core::time::Rational;
-use multiview_engine::keyer::{DrawRole, KeyerDraw, KeyerFamily, KeyerFly, KeyerParams, MAX_KEYERS};
+use multiview_engine::keyer::{
+    DrawRole, KeyerDraw, KeyerFamily, KeyerFly, KeyerParams, MAX_KEYERS,
+};
 use multiview_engine::{CompositedFrame, CompositorDrive, OutputClock, Tick};
 
 const SIDE: u32 = 16;

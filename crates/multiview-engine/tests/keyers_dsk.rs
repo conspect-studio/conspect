@@ -323,9 +323,8 @@ fn a_tied_dsk_on_a_wipe_follows_the_mask_and_flips_on_the_terminal_tick() {
     handle
         .try_send(cmd("wipe", SwitcherVerb::Auto(rate)))
         .unwrap();
-    let luma_at = |frame: &multiview_engine::CompositedFrame, x: u32| {
-        frame.canvas.sample(x, 32).unwrap().0
-    };
+    let luma_at =
+        |frame: &multiview_engine::CompositedFrame, x: u32| frame.canvas.sample(x, 32).unwrap().0;
     for k in 0..u64::from(n) {
         keep_fresh(&rig, k);
         let frame = step(&mut hook, &mut drive, k);
@@ -340,8 +339,14 @@ fn a_tied_dsk_on_a_wipe_follows_the_mask_and_flips_on_the_terminal_tick() {
             assert_eq!(draw.unwrap().weight, 1.0);
         }
         if k == u64::from(n / 2) {
-            assert!(luma_at(&frame, 2).abs_diff(LUMA_FILL) < 8, "revealed: keyed");
-            assert!(luma_at(&frame, 61).abs_diff(LUMA_A) < 8, "ahead: outgoing, unkeyed");
+            assert!(
+                luma_at(&frame, 2).abs_diff(LUMA_FILL) < 8,
+                "revealed: keyed"
+            );
+            assert!(
+                luma_at(&frame, 61).abs_diff(LUMA_A) < 8,
+                "ahead: outgoing, unkeyed"
+            );
         }
         assert!(!handle.snapshot().unwrap().keyers[0].unwrap().on_air);
     }
@@ -361,11 +366,16 @@ fn a_tied_dsk_on_a_wipe_follows_the_mask_and_flips_on_the_terminal_tick() {
         keep_fresh(&rig, index);
         let frame = step(&mut hook, &mut drive, index);
         let draw = drive.keyer_draws().iter().flatten().find(|d| d.keyer == 0);
-        let mask = draw.and_then(|d| d.wipe).expect("drawn through the complement");
+        let mask = draw
+            .and_then(|d| d.wipe)
+            .expect("drawn through the complement");
         assert!(mask.complement, "going off uses 1 − m(x, y)");
         if k == u64::from(n / 2) {
             assert!(luma_at(&frame, 2).abs_diff(LUMA_A) < 8, "revealed: off");
-            assert!(luma_at(&frame, 61).abs_diff(LUMA_FILL) < 8, "ahead: still keyed");
+            assert!(
+                luma_at(&frame, 61).abs_diff(LUMA_FILL) < 8,
+                "ahead: still keyed"
+            );
         }
         assert!(handle.snapshot().unwrap().keyers[0].unwrap().on_air);
     }

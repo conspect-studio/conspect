@@ -28,9 +28,7 @@ use multiview_config::{
     DEFAULT_KEYER_BUDGET, INPUT_REF_PREFIX, MAX_KEYER_RATE,
 };
 use multiview_core::switcher::FrameCount;
-use multiview_engine::keyer::{
-    KeyerDefinitions, KeyerFamily, KeyerSnapshot, TallyRole, TallySet,
-};
+use multiview_engine::keyer::{KeyerDefinitions, KeyerFamily, KeyerSnapshot, TallyRole, TallySet};
 use multiview_engine::switcher_control::{SwitcherControl, SwitcherSnapshot, SwitcherVerb};
 use multiview_events::AuthzScope;
 use serde::{Deserialize, Serialize};
@@ -382,14 +380,22 @@ fn arm_shape(fields: &KeyerFields, other_refs: bool) -> Result<(), Box<Response>
         )));
     }
     if keys.iter().any(|k| k.trim().is_empty() || k.contains('/')) {
-        return Err(Box::new(typed(422, "validation", "a key id is non-empty without '/'")));
+        return Err(Box::new(typed(
+            422,
+            "validation",
+            "a key id is non-empty without '/'",
+        )));
     }
     if keys
         .iter()
         .enumerate()
         .any(|(i, k)| keys.iter().skip(i + 1).any(|o| o == k))
     {
-        return Err(Box::new(typed(422, "validation", "arm keys must be distinct")));
+        return Err(Box::new(typed(
+            422,
+            "validation",
+            "arm keys must be distinct",
+        )));
     }
     if !fields.background.unwrap_or(false) && keys.is_empty() {
         return Err(Box::new(typed(
@@ -517,7 +523,7 @@ pub fn check(
         )));
     };
     if kind == "arm" {
-        return check_arm(principal, req, handle.snapshot(), &defs);
+        return check_arm(principal, req, handle.snapshot().as_ref(), &defs);
     }
     let family = fields.family();
     let ctx = Ctx {
@@ -582,7 +588,7 @@ pub fn check(
 fn check_arm(
     principal: &Principal,
     req: &super::switcher::SwitcherRequest,
-    snapshot: Option<Arc<SwitcherSnapshot>>,
+    snapshot: Option<&Arc<SwitcherSnapshot>>,
     defs: &KeyerDefinitions,
 ) -> ControlResult<Result<Checked, Response>> {
     let keys = req.keyer.keys.clone().unwrap_or_default();
@@ -605,7 +611,6 @@ fn check_arm(
         set = set.with_key(index);
     }
     let refused = snapshot
-        .as_ref()
         .is_some_and(|s| s.in_flight)
         .then(|| refusal("in-flight", "the arm set cannot change during a transition"));
     Ok(Ok(Checked {

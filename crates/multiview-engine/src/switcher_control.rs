@@ -19,8 +19,8 @@ use crate::clock::Tick;
 use crate::isolation::{event_stream, EventStream, EventSubscription, LatestState};
 use crate::keyer::{
     KeyerAction, KeyerCounters, KeyerDef, KeyerDefinition, KeyerDefinitions, KeyerDraw, KeyerEvent,
-    KeyerReadback, KeyerRuntime, KeyerSnapshot, KeyerTally, NextTake, OpSink, TieEnvelope, MAX_KEYERS,
-    REFUSE_KEYER_CLEAN, REFUSE_KEYER_GATE_CONTENDED, REFUSE_KEYER_SET_DEADLINE,
+    KeyerReadback, KeyerRuntime, KeyerSnapshot, KeyerTally, NextTake, OpSink, TieEnvelope,
+    MAX_KEYERS, REFUSE_KEYER_CLEAN, REFUSE_KEYER_GATE_CONTENDED, REFUSE_KEYER_SET_DEADLINE,
 };
 use crate::patch_set::{ArmState, SetArm, SetRefusal, SET_ADOPT_DEADLINE_TICKS};
 use crate::switcher::{SwitcherProjection, SwitcherState};
@@ -1398,11 +1398,7 @@ impl SwitcherTickDriver {
             }
             if let SwitcherVerb::Arm(armed) = command.verb {
                 // No scene geometry: the arm set names elements only.
-                let result = if armed
-                    .keys
-                    .iter()
-                    .any(|&k| !self.keyers.usk_defined(k))
-                {
+                let result = if armed.keys.iter().any(|&k| !self.keyers.usk_defined(k)) {
                     Err(REFUSE_ARM_UNKNOWN_KEY.to_owned())
                 } else {
                     self.stage();

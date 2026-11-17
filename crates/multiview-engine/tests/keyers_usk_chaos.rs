@@ -173,7 +173,10 @@ async fn stalling_and_vanishing_armed_key_sources_never_stall_or_skip_a_tick() {
     if lagged == 0 {
         let mut seen = HashSet::new();
         for o in &got {
-            assert!(seen.insert(o.operation_id.clone()), "one outcome per op: {o:?}");
+            assert!(
+                seen.insert(o.operation_id.clone()),
+                "one outcome per op: {o:?}"
+            );
         }
     }
     let _ = busy.load(Ordering::Relaxed);
@@ -202,7 +205,9 @@ fn key_changing_transitions_never_grow_the_pools() {
         let n = k / CYCLE;
         match phase {
             0 => {
-                handle.try_send(cmd(&format!("t-{k}"), transition(n))).unwrap();
+                handle
+                    .try_send(cmd(&format!("t-{k}"), transition(n)))
+                    .unwrap();
                 let background = n % 4 != 3;
                 handle
                     .try_send(cmd(&format!("arm-{k}"), arm(background, &[1, 2, 3])))

@@ -265,13 +265,25 @@ fn the_complement_is_one_minus_the_mask_and_an_invalid_mask_keeps_the_outgoing_s
     }
     let a = solid(W, H, 80, 128, 128);
     let b = solid(W, H, 160, 100, 150);
-    let foreign = WipeMask::new(MaskShape::Horizontal, 1.0, W * 2, H, [0.5, 0.5], false, 0.0, 0.0);
+    let foreign = WipeMask::new(
+        MaskShape::Horizontal,
+        1.0,
+        W * 2,
+        H,
+        [0.5, 0.5],
+        false,
+        0.0,
+        0.0,
+    );
     let merge = SceneMerge::Wipe { mask: foreign };
     let out = comp(&[
         Tile::placed(&a, 0, 0, 1.0).in_group(group(SceneMember::Out, merge)),
         Tile::placed(&b, 0, 0, 1.0).in_group(group(SceneMember::In, merge)),
     ]);
-    assert_eq!(out.y_plane(), comp(&[Tile::placed(&a, 0, 0, 1.0)]).y_plane());
+    assert_eq!(
+        out.y_plane(),
+        comp(&[Tile::placed(&a, 0, 0, 1.0)]).y_plane()
+    );
 }
 
 /// A keyer tile drawn through a complemented mask (a tied DSK going off

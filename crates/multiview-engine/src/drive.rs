@@ -1065,28 +1065,7 @@ impl CompositorDrive<Nv12Image> {
         order.extend(0..cell_count);
         order.sort_by_key(|&i| self.layout.cells.get(i).map_or(i32::MIN, |c| c.z));
 
-        // K3 (design note §3.2): a transition that changes the key set
-        // composes in scene groups. The outgoing background is `Out` when the
-        // background changes with a fresh incoming picture, else `Both` (a
-        // key-only transition, or a missing incoming frame that keeps the
-        // outgoing picture). Without a changing key everything stays `Top`
-        // (the single-accumulator path of lane `transitions`).
-        let scenes = match &self.mix_overlay {
-            Some(mix) if self.key_changing() => {
-                let incoming = self
-                    .transition_background
-                    .then(|| self.fresh_incoming(mix, now))
-                    .flatten();
-                let merge = mix.scene_merge(self.transition_colour, self.transition_background);
-                Some((merge, incoming))
-            }
-            _ => None,
-        };
-        let cell_member = match &scenes {
-            Some((_, Some(_))) => Some(SceneMember::Out),
-            Some((_, None)) => Some(SceneMember::Both),
-            None => None,
-        };
+        let (scenes, cell_member) = self.scene_groups(now);
         for &i in order.iter() {
             let Some(cell) = self.layout.cells.get(i) else {
                 continue;
@@ -1115,45 +1094,7 @@ impl CompositorDrive<Nv12Image> {
         // The AUTO dissolve's incoming picture: one full-canvas tile on top, in
         // this same pass. A missing frame is skipped (the outgoing picture shows
         // through), never a slate blended into Program.
-        match (&self.mix_overlay, &scenes) {
-            // Grouped: the incoming background whole in its own scene (the
-            // merge carries the weight, the DIP colour and the WIPE mask).
-            (Some(mix), Some((merge, Some(incoming)))) => {
-                held.push(Arc::clone(incoming));
-                placements.push(Placement {
-                    image_index: held.len().saturating_sub(1),
-                    dst_x: 0,
-                    dst_y: 0,
-                    dst_w: canvas.width,
-                    dst_h: canvas.height,
-                    opacity: 1.0,
-                    mask: None,
-                    key: None,
-                    group: Some((SceneMember::In, *merge)),
-                });
-                // The WIPE border band over both scenes (`over` is linear in
-                // what lies beneath, so this equals the band over the merge).
-                if let Some((fill, band)) = self.wipe_band(mix, true) {
-                    held.push(fill);
-                    placements.push(Placement {
-                        image_index: held.len().saturating_sub(1),
-                        dst_x: 0,
-                        dst_y: 0,
-                        dst_w: canvas.width,
-                        dst_h: canvas.height,
-                        opacity: 1.0,
-                        mask: Some(band),
-                        key: None,
-                        group: Some((SceneMember::Both, *merge)),
-                    });
-                }
-            }
-            (Some(_), Some((_, None))) => {}
-            (Some(mix), None) if self.transition_background => {
-                self.push_transition_tiles(mix, now, canvas.width, canvas.height, held, placements);
-            }
-            _ => {}
-        }
+        self.push_transition(scenes.as_ref(), now, canvas, held, placements);
         // Keyers above everything, the transition included (ADR-0113 §3,
         // render lists 3 and 4): USKs, then DSKs.
         self.push_keyer_tiles(held, placements, scenes.map(|(merge, _)| merge));
@@ -1185,7 +1126,10 @@ impl CompositorDrive<Nv12Image> {
                 JobMeta(Arc::new(FrameMeta {
                     source_states: source_states.clone(),
                     source_times: source_times.clone(),
-                    mix: self.mix_overlay.clone().filter(|_| self.transition_background),
+                    mix: self
+                        .mix_overlay
+                        .clone()
+                        .filter(|_| self.transition_background),
                 }))
             }),
         });
@@ -1205,7 +1149,10 @@ impl CompositorDrive<Nv12Image> {
         // with it (issue #415 review MC-R2-1), never this tick's.
         // A key-only transition is no background crossfade (Program audio
         // stays on the outgoing source).
-        let mut mix = self.mix_overlay.clone().filter(|_| self.transition_background);
+        let mut mix = self
+            .mix_overlay
+            .clone()
+            .filter(|_| self.transition_background);
         if let Some(adopted) = output.adopted {
             let meta = adopted
                 .as_ref()
@@ -1237,6 +1184,107 @@ impl CompositorDrive<Nv12Image> {
             repeat: false,
             mix,
         })
+    }
+
+    /// The transition tiles of this frame: grouped (K3) when a key changes,
+    /// else lane `transitions`' tiles when the background moves, else none
+    /// (a key-only transition draws no incoming picture).
+    fn push_transition(
+        &self,
+        scenes: Option<&(SceneMerge, Option<Arc<Nv12Image>>)>,
+        now: MediaTime,
+        canvas: &multiview_core::layout::Canvas,
+        held: &mut Vec<Arc<Nv12Image>>,
+        placements: &mut Vec<Placement>,
+    ) {
+        let Some(mix) = &self.mix_overlay else {
+            return;
+        };
+        match scenes {
+            Some((merge, Some(incoming))) => {
+                self.push_grouped_incoming(mix, *merge, incoming, canvas, held, placements);
+            }
+            None if self.transition_background => {
+                self.push_transition_tiles(mix, now, canvas.width, canvas.height, held, placements);
+            }
+            _ => {}
+        }
+    }
+
+    /// A key-changing transition's incoming background (K3): one `In` tile
+    /// at opacity 1 (the merge carries the weight, the DIP colour and the
+    /// WIPE mask), then the WIPE border band over both scenes (`over` is
+    /// linear in what lies beneath, so this equals the band over the merge).
+    fn push_grouped_incoming(
+        &self,
+        mix: &MixOverlay,
+        merge: SceneMerge,
+        incoming: &Arc<Nv12Image>,
+        canvas: &multiview_core::layout::Canvas,
+        held: &mut Vec<Arc<Nv12Image>>,
+        placements: &mut Vec<Placement>,
+    ) {
+        held.push(Arc::clone(incoming));
+        placements.push(Placement {
+            image_index: held.len().saturating_sub(1),
+            dst_x: 0,
+            dst_y: 0,
+            dst_w: canvas.width,
+            dst_h: canvas.height,
+            opacity: 1.0,
+            mask: None,
+            key: None,
+            group: Some((SceneMember::In, merge)),
+        });
+        if let Some((fill, band)) = self.wipe_band(mix, true) {
+            held.push(fill);
+            placements.push(Placement {
+                image_index: held.len().saturating_sub(1),
+                dst_x: 0,
+                dst_y: 0,
+                dst_w: canvas.width,
+                dst_h: canvas.height,
+                opacity: 1.0,
+                mask: Some(band),
+                key: None,
+                group: Some((SceneMember::Both, merge)),
+            });
+        }
+    }
+
+    /// The scene groups of this frame (K3, design note §3.2): a transition
+    /// that changes the key set composes in groups. The merge, the fresh
+    /// incoming picture (when the background changes and reads live), and
+    /// the layout cells' member: `Out` with an incoming picture, else `Both`
+    /// (a key-only transition, or a missing incoming frame that keeps the
+    /// outgoing picture). Without a changing key everything stays `Top`
+    /// (the single-accumulator path of lane `transitions`).
+    #[allow(clippy::type_complexity)]
+    // reason: a private (merge, incoming) pair plus the cells' member.
+    fn scene_groups(
+        &self,
+        now: MediaTime,
+    ) -> (
+        Option<(SceneMerge, Option<Arc<Nv12Image>>)>,
+        Option<SceneMember>,
+    ) {
+        let scenes = match &self.mix_overlay {
+            Some(mix) if self.key_changing() => {
+                let incoming = self
+                    .transition_background
+                    .then(|| self.fresh_incoming(mix, now))
+                    .flatten();
+                let merge = mix.scene_merge(self.transition_colour, self.transition_background);
+                Some((merge, incoming))
+            }
+            _ => None,
+        };
+        let member = match &scenes {
+            Some((_, Some(_))) => Some(SceneMember::Out),
+            Some((_, None)) => Some(SceneMember::Both),
+            None => None,
+        };
+        (scenes, member)
     }
 
     /// The transition's incoming frame when it reads live now (SW2-02: a

@@ -157,7 +157,10 @@ id = "usk1"
 fill = "gfx"
 "#;
     load(full).validate().unwrap();
-    let error = load(&format!("{full}{DSK}")).validate().unwrap_err().to_string();
+    let error = load(&format!("{full}{DSK}"))
+        .validate()
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("keyer_budget"), "{error}");
     // Outside this canvas.
     let error = load(
@@ -171,5 +174,8 @@ fly = { x = 600, y = 0, w = 160, h = 90 }
     .validate()
     .unwrap_err()
     .to_string();
-    assert!(error.contains("upstream keyer") && error.contains("canvas"), "{error}");
+    assert!(
+        error.contains("upstream keyer") && error.contains("canvas"),
+        "{error}"
+    );
 }
