@@ -422,6 +422,20 @@ fn settle_workers(r: &OutputRouter, bound: std::time::Duration) {
     }
 }
 
+/// The calling thread's cumulative time runnable but waiting for a CPU
+/// (preempted), from `/proc/thread-self/schedstat` (Linux; field 2, ns).
+/// `None` elsewhere, so a caller then counts the whole wall time.
+///
+/// A router call's wall time minus this is time it spent on a CPU or
+/// sleeping/blocked: a wait, timed join, sleep or spin is all still counted;
+/// only host preemption (#501: 83 ms on a loaded 2-core run with the router
+/// behaving correctly) is not.
+fn runqueue_wait() -> Option<std::time::Duration> {
+    let stat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
+    let ns = stat.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    Some(std::time::Duration::from_nanos(ns))
+}
+
 fn pts(t: u64) -> MediaTime {
     MediaTime::from_nanos(i64::try_from(t).unwrap() * 200_000_000)
 }
@@ -440,6 +454,9 @@ struct Harness {
     base_force: Arc<AtomicU64>,
     live: bool,
     max_router: std::time::Duration,
+    /// The longest router call, less the time the calling thread spent
+    /// runnable but not running (see [`runqueue_wait`]).
+    max_router_unqueued: std::time::Duration,
     /// The pre-bake canvas handed to `publish_clean` per tick (kept alive so
     /// pointer identity is meaningful).
     clean: Vec<(u64, Arc<Nv12Image>)>,
@@ -540,6 +557,7 @@ fn harness_full(
         base_force,
         live: true,
         max_router: std::time::Duration::ZERO,
+        max_router_unqueued: std::time::Duration::ZERO,
         clean: Vec::new(),
         aux_active,
         aux_sent,
@@ -621,11 +639,19 @@ impl Harness {
         self.clean.push((t, clean));
         // The baked Program picture, for a reformatted output's key (#342 B3).
         self.r.publish_program(t, &canvas());
+        let queued = runqueue_wait();
         let started = Instant::now();
         self.r
             .on_tick(t, pts(t), &mut self.d, &mut self.rec)
             .unwrap();
-        self.max_router = self.max_router.max(started.elapsed());
+        let took = started.elapsed();
+        self.max_router = self.max_router.max(took);
+        let preempted = runqueue_wait()
+            .zip(queued)
+            .map_or(std::time::Duration::ZERO, |(after, before)| {
+                after.saturating_sub(before)
+            });
+        self.max_router_unqueued = self.max_router_unqueued.max(took.saturating_sub(preempted));
         // A live worker encodes within the tick period.
         std::thread::sleep(std::time::Duration::from_millis(2));
         settle_workers(&self.r, self.settle);
@@ -1092,13 +1118,13 @@ struct HeldClose {
 /// router that waits for the close to complete cannot pass this.
 ///
 /// Bounded-wait part: a router that waits a bounded time on a close (a timed
-/// join) would still tick on, so each repetition also records the longest
-/// router call from just before the close through the held window. A real
-/// wait costs that time on EVERY repetition; host preemption (the #501 flake,
-/// 83 ms on a loaded 2-core run) lands on a given window only sometimes. So
-/// the bound applies to the shortest such window over [`SLOW_CLOSES`]
-/// repetitions: one clean window proves the close path itself never waits
-/// 50 ms, without the test measuring the host.
+/// join, a sleep, a spin) would still tick on, so for EVERY close the longest
+/// router call from just before the close through its held window must stay
+/// under 50 ms, as before #501, but counted without the time the router
+/// thread was runnable and preempted ([`runqueue_wait`]). That time is the
+/// host, not the router: it was the whole #501 flake. Repeated over
+/// [`SLOW_CLOSES`] closes so a wait on any one of them (the first, or one
+/// conditional on reaper state) fails.
 #[test]
 fn a_slow_close_never_blocks_the_consumer() {
     /// Ticks the router must run while a close is held: 3 s at 5 fps, the
@@ -1150,7 +1176,7 @@ fn a_slow_close_never_blocks_the_consumer() {
             assert!(t < by, "back on Program ({rep})");
         }
         // Run to the linger close; measure from before the close.
-        x.max_router = std::time::Duration::ZERO;
+        x.max_router_unqueued = std::time::Duration::ZERO;
         let close_by = t + LINGER_TICKS + 2;
         while x.h.snapshot().dynamic_encoders_live > 0 {
             x.tick(t);
@@ -1183,7 +1209,7 @@ fn a_slow_close_never_blocks_the_consumer() {
             !exited.load(Ordering::SeqCst),
             "the router ran {SLOW_FINISH_TICKS} ticks only after finish() returned: it waited on the close ({rep})"
         );
-        windows.push(x.max_router);
+        windows.push(x.max_router_unqueued);
         held.lock().unwrap()[rep].release.send(()).unwrap();
         let done = Instant::now() + SETTLE_BOUND;
         while !exited.load(Ordering::SeqCst) {
@@ -1191,10 +1217,11 @@ fn a_slow_close_never_blocks_the_consumer() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
-    let shortest = windows.iter().min().copied().unwrap();
     assert!(
-        shortest < std::time::Duration::from_millis(50),
-        "the longest router call during a held close, in every one of {SLOW_CLOSES} closes, was >= 50 ms: {windows:?}"
+        windows
+            .iter()
+            .all(|w| *w < std::time::Duration::from_millis(50)),
+        "a router call during a held close took >= 50 ms (preemption excluded): {windows:?}"
     );
     x.tick(t);
     t += 1;
