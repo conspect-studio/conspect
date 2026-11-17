@@ -32,7 +32,7 @@ use crate::error::{Error, Result};
 use crate::gpu::device::GpuContext;
 use crate::gpu::pool::{self, CachedBuffer, Dim2, Dim3, SurfacePool};
 use crate::gpu::shader::{composite_wgsl, encode_wgsl};
-use crate::gpu::uniforms::{CompositeUniforms, EncodeUniforms, TileParams};
+use crate::gpu::uniforms::{CompositeUniforms, EncodeUniforms, KeyParams, TileParams};
 use crate::pipeline::{CanvasColor, Nv12Image, Tile};
 use crate::readback::{PendingReadback, ReadbackGate, ReadbackPoll};
 
@@ -893,77 +893,45 @@ impl GpuCompositor {
                 "{tile_count} tiles exceeds MAX_TILES ({MAX_TILES})"
             )));
         }
-        // Keyer coverage and scene groups (ADR-0113, K1) are built on the CPU
-        // oracle first; the WGSL key path lands after #395 (a deadline on the
-        // GPU readback). Until then a keyed or grouped tile is a typed limit,
-        // so `RunBackend` composes that frame on the CPU reference (counted)
-        // instead of drawing it without its key.
-        if crate::key::needs_cpu_keyer_path(tiles) {
-            return Err(Error::GpuLimit(
-                "keyer tiles are composed on the CPU until the GPU key path lands".to_owned(),
-            ));
+        // Keyer coverage and scene groups (ADR-0113, design note §3.3): every
+        // key source takes its own `y_planes` layer after the fill layers, so
+        // a frame needs `tiles + key sources` layers. Past the array's
+        // MAX_TILES layers the frame is a typed limit, which `RunBackend`
+        // composes on its persistent CPU reference (never drawn unkeyed).
+        let key_sources = tiles
+            .iter()
+            .filter(|t| t.key.as_ref().is_some_and(|k| k.source.is_some()))
+            .count();
+        let layers_needed = tiles.len().saturating_add(key_sources);
+        if layers_needed > usize::try_from(MAX_TILES).unwrap_or(usize::MAX) {
+            return Err(Error::GpuLimit(format!(
+                "{} tiles + {key_sources} key sources exceed the {MAX_TILES}-layer tile array",
+                tiles.len()
+            )));
         }
 
         let device = self.ctx.device();
         let queue = self.ctx.queue();
 
         // Pack the per-tile params + compute the max tile extent BEFORE touching
-        // the pool, so a color/geometry error short-circuits without growing it.
-        let max_w = tiles.iter().map(|t| t.image.width()).max().unwrap_or(2);
-        let max_h = tiles.iter().map(|t| t.image.height()).max().unwrap_or(2);
-        let mut tile_params: Vec<TileParams> = Vec::with_capacity(tiles.len());
-        // Alpha layers are assigned densely to the alpha tiles only, in slice
-        // order; opaque tiles keep `has_alpha = 0` and never sample the array.
-        let mut next_alpha_layer = 0_u32;
+        // the GPU pool, so a color/geometry error short-circuits without
+        // growing it. The fill and key extents both size the Y array.
+        let mut max_w = 2_u32;
+        let mut max_h = 2_u32;
         for tile in tiles {
-            let img = tile.image;
-            require_even_positive(img.width(), img.height(), "tile")?;
-            let params = TileParams::build(
-                tile.dst_x,
-                tile.dst_y,
-                tile.dst_w,
-                tile.dst_h,
-                img.width(),
-                img.height(),
-                tile.opacity,
-                img.color(),
-                canvas,
-            )?;
-            let params = match &tile.mask {
-                Some(mask) => params.with_mask(mask, canvas_w, canvas_h),
-                None => params,
-            };
-            let params = match img.alpha_plane() {
-                Some(alpha) => {
-                    // `AlphaPlanePool::attach` already enforces this; re-check
-                    // so a malformed plane is a typed error, never a wgpu panic.
-                    let expected = usize::try_from(img.width())
-                        .ok()
-                        .zip(usize::try_from(img.height()).ok())
-                        .and_then(|(w, h)| w.checked_mul(h));
-                    if expected != Some(alpha.len()) {
-                        return Err(Error::Geometry(format!(
-                            "alpha plane length {} != {}x{}",
-                            alpha.len(),
-                            img.width(),
-                            img.height()
-                        )));
-                    }
-                    let layer = next_alpha_layer;
-                    next_alpha_layer = next_alpha_layer.saturating_add(1);
-                    params.with_alpha_layer(layer)
-                }
-                None => params,
-            };
-            tile_params.push(params);
+            max_w = max_w.max(tile.image.width());
+            max_h = max_h.max(tile.image.height());
+            if let Some(src) = tile.key.as_ref().and_then(|k| k.source) {
+                max_w = max_w.max(src.width());
+                max_h = max_h.max(src.height());
+            }
         }
-        // The texture array must have at least one layer even with zero tiles;
-        // pad the params buffer so the storage binding is non-empty (the shader
-        // reads only the `tile_count` entries either way).
-        if tile_params.is_empty() {
-            tile_params.push(TileParams::zeroed());
+        let max_dim = device.limits().max_texture_dimension_2d;
+        if max_w > max_dim || max_h > max_dim {
+            return Err(Error::GpuLimit(format!(
+                "a {max_w}x{max_h} tile or key exceeds the device's {max_dim} texture limit"
+            )));
         }
-
         // Destructure the pool once so each surface slot is borrowed disjointly
         // from the shared allocation counter (a `self.counter()` accessor would
         // alias the whole pool and clash with a `&mut slot` borrow).
@@ -975,8 +943,36 @@ impl GpuCompositor {
             canvas_lin,
             comp_uniform,
             tile_buf,
+            key_buf,
+            matte_buf,
+            tile_params,
+            key_params,
+            mattes,
             ..
         } = pool;
+        // The param scratch is pooled (cleared and refilled, grow-only), so a
+        // steady-state tick allocates no Vec here. Packing runs before any GPU
+        // surface is touched, so a color/geometry error grows nothing.
+        pack_params(
+            tiles,
+            canvas,
+            canvas_w,
+            canvas_h,
+            tile_params,
+            key_params,
+            mattes,
+        )?;
+        // The texture array must have at least one layer even with zero tiles;
+        // pad the params buffers so the storage bindings are non-empty (the
+        // shader reads only the `tile_count` entries either way).
+        if tile_params.is_empty() {
+            tile_params.push(TileParams::zeroed());
+            key_params.push(KeyParams::zeroed());
+        }
+        // The matte binding must be non-empty too (no keyed tile reads it).
+        if mattes.is_empty() {
+            mattes.push(0.0);
+        }
 
         // --- size / reuse the pooled tile texture arrays ---------------------
         // Grow-only on the max tile extent; always MAX_TILES layers so the layer
@@ -1067,6 +1063,23 @@ impl GpuCompositor {
                 img.uv_plane(),
             );
         }
+        // Key sources: only their Y plane (the matte reads luma only), into
+        // the layer `KeyParams::build` recorded (after the fill layers).
+        for (kp, tile) in key_params.iter().zip(tiles) {
+            if let (Some(layer), Some(src)) =
+                (kp.key_layer(), tile.key.as_ref().and_then(|k| k.source))
+            {
+                write_tile_plane(
+                    queue,
+                    y_tex,
+                    layer,
+                    src.width(),
+                    src.height(),
+                    1,
+                    src.y_plane(),
+                );
+            }
+        }
 
         // --- size / reuse the pooled linear canvas ---------------------------
         let canvas_lin_view = SurfacePool::exact_texture(
@@ -1102,7 +1115,38 @@ impl GpuCompositor {
                 mapped_at_creation: false,
             })
         });
-        queue.write_buffer(tile_param_buf, 0, bytemuck::cast_slice(&tile_params));
+        queue.write_buffer(
+            tile_param_buf,
+            0,
+            bytemuck::cast_slice(tile_params.as_slice()),
+        );
+        // The key/group block, parallel to the tile params (binding 6). All
+        // zero for an unkeyed top tile, so an ordinary frame draws exactly as
+        // before.
+        let key_param_buf = SurfacePool::fixed_buffer(key_buf, alloc_count, || {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("multiview key params"),
+                size: pool::key_buf_size(),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        queue.write_buffer(
+            key_param_buf,
+            0,
+            bytemuck::cast_slice(key_params.as_slice()),
+        );
+        // The matte tables (binding 7): at most one per tile, so they always
+        // fit the MAX_TILES-sized buffer (tile_count was bounded above).
+        let matte_table_buf = SurfacePool::fixed_buffer(matte_buf, alloc_count, || {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("multiview matte tables"),
+                size: pool::matte_buf_size(),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        queue.write_buffer(matte_table_buf, 0, bytemuck::cast_slice(mattes.as_slice()));
 
         let composite_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("multiview composite bind"),
@@ -1131,6 +1175,14 @@ impl GpuCompositor {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: wgpu::BindingResource::TextureView(&a_array_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: key_param_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: matte_table_buf.as_entire_binding(),
                 },
             ],
         });
@@ -1460,12 +1512,101 @@ impl crate::offclock::GpuComposer for GpuCompositor {
     fn health(&self) -> std::sync::Arc<crate::readback::GpuHealth> {
         std::sync::Arc::clone(self.ctx.health())
     }
+
+    /// The WGSL key path (ADR-0113 §3.3) draws keyed and grouped tiles; a
+    /// frame past the layer limit is a typed `GpuLimit` the run backend
+    /// composes on its CPU fallback.
+    fn draws_keys(&self) -> bool {
+        true
+    }
 }
 
 impl Compositor for GpuCompositor {
     fn kind(&self) -> BackendKind {
         BackendKind::Wgpu
     }
+}
+
+/// Pack the per-tile [`TileParams`] and the parallel [`KeyParams`] of
+/// `tiles` into the pooled scratch (cleared first, so its capacity is reused
+/// and a steady-state tick allocates nothing). Alpha layers are assigned
+/// densely to the alpha tiles only, in slice order; key-source layers follow
+/// the fill layers of `y_planes` (layer `tiles.len() + n` for the n-th key
+/// source), so fill and key never share a layer.
+///
+/// # Errors
+///
+/// [`Error::Geometry`] for an odd/zero tile or key source or a malformed
+/// alpha plane; the colour errors of [`TileParams::build`] /
+/// [`KeyParams::build`].
+fn pack_params(
+    tiles: &[Tile<'_>],
+    canvas: CanvasColor,
+    canvas_w: u32,
+    canvas_h: u32,
+    tile_params: &mut Vec<TileParams>,
+    key_params: &mut Vec<KeyParams>,
+    mattes: &mut Vec<f32>,
+) -> Result<()> {
+    tile_params.clear();
+    key_params.clear();
+    mattes.clear();
+    let mut next_alpha_layer = 0_u32;
+    let mut next_key_layer = u32::try_from(tiles.len())
+        .map_err(|_| Error::GpuLimit("tile layer overflows u32".to_owned()))?;
+    for tile in tiles {
+        let img = tile.image;
+        require_even_positive(img.width(), img.height(), "tile")?;
+        let params = TileParams::build(
+            tile.dst_x,
+            tile.dst_y,
+            tile.dst_w,
+            tile.dst_h,
+            img.width(),
+            img.height(),
+            tile.opacity,
+            img.color(),
+            canvas,
+        )?;
+        let params = match &tile.mask {
+            Some(mask) => params.with_mask(mask, canvas_w, canvas_h),
+            None => params,
+        };
+        let params = match img.alpha_plane() {
+            Some(alpha) => {
+                // `AlphaPlanePool::attach` already enforces this; re-check
+                // so a malformed plane is a typed error, never a wgpu panic.
+                let expected = usize::try_from(img.width())
+                    .ok()
+                    .zip(usize::try_from(img.height()).ok())
+                    .and_then(|(w, h)| w.checked_mul(h));
+                if expected != Some(alpha.len()) {
+                    return Err(Error::Geometry(format!(
+                        "alpha plane length {} != {}x{}",
+                        alpha.len(),
+                        img.width(),
+                        img.height()
+                    )));
+                }
+                let layer = next_alpha_layer;
+                next_alpha_layer = next_alpha_layer.saturating_add(1);
+                params.with_alpha_layer(layer)
+            }
+            None => params,
+        };
+        let key_layer = match tile.key.as_ref().and_then(|k| k.source) {
+            Some(src) => {
+                require_even_positive(src.width(), src.height(), "key source")?;
+                let layer = next_key_layer;
+                next_key_layer = next_key_layer.saturating_add(1);
+                Some(layer)
+            }
+            None => None,
+        };
+        key_params.push(KeyParams::build(tile, key_layer, mattes)?);
+        tile_params.push(params);
+    }
+    Ok(())
 }
 
 /// Upload one NV12 plane into a layer of a texture array.
@@ -1675,6 +1816,30 @@ fn composite_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                     sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     view_dimension: wgpu::TextureViewDimension::D2Array,
                     multisampled: false,
+                },
+                count: None,
+            },
+            // Per-tile key / scene-group params (ADR-0113 §3.3), parallel to
+            // binding 1.
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: min_binding_size::<KeyParams>(),
+                },
+                count: None,
+            },
+            // Per-key matte tables (review MEDIA-1): 256 f32 per signal-keyed
+            // tile, indexed by `KeyParams::table[0]` + the 8-bit Y code.
+            wgpu::BindGroupLayoutEntry {
+                binding: 7,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: min_binding_size::<f32>(),
                 },
                 count: None,
             },
