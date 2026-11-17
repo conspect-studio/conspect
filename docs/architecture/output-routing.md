@@ -306,9 +306,11 @@ axes. It counts actual decoders, including a retained one after a failed downsiz
 decode at native size, not the host tile size; transient replacement sessions are not counted.
 
 M/E layout sources (`layout:<id>`, #307 part 2; #485): the adapter (`me_layouts.rs`) publishes the
-cells of every registered body into its own sizing slot (a sibling of aux sizing) on register,
-body change and unregister — change-only, never per tick — and every decode follows it
-(`DisplayFollow::with_me_layout_sizing`). All registered bodies are sized, on a bus or not, since
+registered bodies' bound sources into its own sizing slot (a sibling of aux sizing) on register,
+body change and unregister — change-only, never per tick; decodes read it with one lock-free
+`SwapCell` load (`DisplayFollow::with_me_layout_sizing`). It holds one synthetic cell per distinct
+bound source with the per-axis max size over that source's cells, so it is bounded by distinct
+sources, not by the (uncapped) cell count. All registered bodies are sized, on a bus or not, since
 each composes on the aux thread. A layout on PGM/PVW names `layout:<id>` in bus sizing; that
 full-canvas cell binds no decoder, so the layout's own cells (drawn at the Program canvas) size
 its sources. Unregistered, the sizes return after the usual settle.
@@ -577,8 +579,12 @@ source (PR 4) and the UI (PR 5).
   picture joins the tick's parallel bakes and the baked frame is published into its store at
   `T.pts` (a failed bake publishes the clean picture; every layer off publishes the clean compose
   at once). Per-cell chrome is inside the picture; Program's own chrome draws over it. Its bound
-  sources join `wanted_sources` (≤ 4 M/E bakes of ≤ 64 cells, total capped as before), and the
-  bake consumer publishes signals while the M/E layout flag ticks the aux thread.
+  sources join `wanted_sources`, together with every registered `layout:<id>` key while anything
+  bakes; the cap is `(8 routed + 4 M/E bakes) × 64 cells + 4 keys`, deduplicated before
+  truncation. The bake consumer publishes signals while the M/E layout flag ticks the aux thread.
+  **Tally:** in every aux bake (routed layouts too) a source is red when Program names it or an
+  M/E layout whose body binds it, and green likewise for the PVW selection. The per-key bound
+  sources are precomputed when the M/E set changes, so the lookup allocates nothing per tick.
 - **Routed Preview of a layout (review M2).** The routing-aux store lookup falls back to the M/E
   layout compose set (`routing_aux::with_me_layouts`: one `SwapCell` load, linear find over ≤ 4,
   only for an unknown `layout:*` id), so a routed Preview feed — and any routed `src:` lookup —
