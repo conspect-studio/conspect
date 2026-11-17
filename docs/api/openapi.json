@@ -19026,11 +19026,15 @@
             "description": "`keyer_set`: fill source id (a source; `in:<n>` is refused)."
           },
           "fly": {
-            "type": [
-              "object",
-              "null"
-            ],
-            "description": "`keyer_set`: destination rectangle in canvas pixels."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyerRectDoc",
+                "description": "`keyer_set`: destination rectangle in canvas pixels. Omitted keeps\nthe current fly; JSON `null` clears it (the full canvas)."
+              }
+            ]
           },
           "gain": {
             "type": [
@@ -19076,18 +19080,26 @@
             "description": "`keyer_set`: `stale`, `reconnecting` or `no_signal`."
           },
           "mask": {
-            "type": [
-              "object",
-              "null"
-            ],
-            "description": "`keyer_set`: mask in fill-source pixels."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyerRectDoc",
+                "description": "`keyer_set`: mask in fill-source pixels. Omitted keeps the current\nmask; JSON `null` clears it (no mask = the whole fill)."
+              }
+            ]
           },
           "max_source": {
-            "type": [
-              "object",
-              "null"
-            ],
-            "description": "`keyer_set`: admitted source envelope `{w, h}`."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyerSizeDoc",
+                "description": "`keyer_set`: admitted source envelope `{w, h}`."
+              }
+            ]
           },
           "on": {
             "type": [
@@ -19205,6 +19217,70 @@
           }
         }
       },
+      "KeyerRampView": {
+        "type": "object",
+        "description": "An in-flight keyer AUTO: the weight at output tick `t` is\n`clamp((t - start_tick) / rate, 0, 1)`, reversed when `to_on` is false.",
+        "required": [
+          "start_tick",
+          "rate",
+          "to_on"
+        ],
+        "properties": {
+          "rate": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Duration in output frames.",
+            "minimum": 0
+          },
+          "start_tick": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Output tick the ramp started on.",
+            "minimum": 0
+          },
+          "to_on": {
+            "type": "boolean",
+            "description": "Ramping on (`true`) or off."
+          }
+        }
+      },
+      "KeyerRectDoc": {
+        "type": "object",
+        "description": "A keyer rectangle in pixels (`fly` in canvas pixels, `mask` in\nfill-source pixels); mirrors `multiview_config::KeyerRect`.",
+        "required": [
+          "x",
+          "y",
+          "w",
+          "h"
+        ],
+        "properties": {
+          "h": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Height.",
+            "minimum": 0
+          },
+          "w": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Width.",
+            "minimum": 0
+          },
+          "x": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Left column.",
+            "minimum": 0
+          },
+          "y": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Top row.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "KeyerRow": {
         "type": "object",
         "description": "One `keyers[]` row of `GET /api/v1/switcher/{me}` (design note §8).",
@@ -19213,14 +19289,23 @@
           "family",
           "fill",
           "type",
+          "clip",
+          "gain",
+          "invert",
           "on_air",
           "tie",
           "rate",
           "loss",
+          "loss_trigger",
           "stale",
           "pending"
         ],
         "properties": {
+          "clip": {
+            "type": "number",
+            "format": "float",
+            "description": "Luma clip, `[0, 1]` (the committed value; meaningful for `luma`)."
+          },
           "family": {
             "type": "string",
             "description": "`dsk` (USKs arrive with K3)."
@@ -19230,15 +19315,28 @@
             "description": "Fill source id, or `\"redacted\"`."
           },
           "fly": {
-            "type": [
-              "object",
-              "null"
-            ],
-            "description": "Destination rectangle, `null` = full canvas."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyerRectDoc",
+                "description": "Destination rectangle, `null` = full canvas."
+              }
+            ]
+          },
+          "gain": {
+            "type": "number",
+            "format": "float",
+            "description": "Luma gain (the committed value; meaningful for `luma`)."
           },
           "id": {
             "type": "string",
             "description": "Keyer id within the program."
+          },
+          "invert": {
+            "type": "boolean",
+            "description": "Matte inverted."
           },
           "key": {
             "type": [
@@ -19251,12 +19349,31 @@
             "type": "string",
             "description": "`drop_to_off_air` or `hold_last_good`."
           },
+          "loss_trigger": {
+            "type": "string",
+            "description": "`stale`, `reconnecting` or `no_signal`."
+          },
           "mask": {
-            "type": [
-              "object",
-              "null"
-            ],
-            "description": "Mask in fill-source pixels."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyerRectDoc",
+                "description": "Mask in fill-source pixels, `null` = no mask."
+              }
+            ]
+          },
+          "max_source": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyerSizeDoc",
+                "description": "Admitted source envelope, `null` = the canvas size."
+              }
+            ]
           },
           "on_air": {
             "type": "boolean",
@@ -19267,11 +19384,15 @@
             "description": "An operator command is held waiting for fresh sources."
           },
           "ramp": {
-            "type": [
-              "object",
-              "null"
-            ],
-            "description": "`{start_tick, rate, to_on}` while ramping; clients compute the weight."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyerRampView",
+                "description": "Present while ramping; clients compute the weight from the tick."
+              }
+            ]
           },
           "rate": {
             "type": "integer",
@@ -19292,6 +19413,29 @@
             "description": "`linear` or `luma`."
           }
         }
+      },
+      "KeyerSizeDoc": {
+        "type": "object",
+        "description": "A picture size in pixels; mirrors `multiview_config::KeyerSize`.",
+        "required": [
+          "w",
+          "h"
+        ],
+        "properties": {
+          "h": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Height.",
+            "minimum": 0
+          },
+          "w": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Width.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
       },
       "LadderStateDoc": {
         "type": "string",
@@ -26361,11 +26505,37 @@
           "program_source",
           "preview_source",
           "in_flight",
+          "canvas_width",
+          "canvas_height",
+          "fps_num",
+          "fps_den",
           "keyers",
           "tally",
           "transition"
         ],
         "properties": {
+          "canvas_height": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Output canvas height in pixels.",
+            "minimum": 0
+          },
+          "canvas_width": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Output canvas width in pixels (the `fly` coordinate space).",
+            "minimum": 0
+          },
+          "fps_den": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Exact output cadence denominator."
+          },
+          "fps_num": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Exact output cadence numerator: `tick` advances `fps_num / fps_den`\ntimes a second (clients extrapolate a keyer ramp from it)."
+          },
           "in_flight": {
             "type": "boolean",
             "description": "Active AUTO status."

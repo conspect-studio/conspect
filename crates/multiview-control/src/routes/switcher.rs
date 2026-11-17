@@ -113,6 +113,15 @@ pub struct SwitcherStateResponse {
     pub preview_source: String,
     /// Active AUTO status.
     pub in_flight: bool,
+    /// Output canvas width in pixels (the `fly` coordinate space).
+    pub canvas_width: u32,
+    /// Output canvas height in pixels.
+    pub canvas_height: u32,
+    /// Exact output cadence numerator: `tick` advances `fps_num / fps_den`
+    /// times a second (clients extrapolate a keyer ramp from it).
+    pub fps_num: i64,
+    /// Exact output cadence denominator.
+    pub fps_den: i64,
     /// Downstream keyer rows the caller may read (keyer object id), with
     /// unreadable source ids `"redacted"`; changes only on state changes.
     pub keyers: Vec<super::switcher_keyers::KeyerRow>,
@@ -453,6 +462,9 @@ pub(crate) async fn get_switcher(
     let snapshot = handle.snapshot().ok_or_else(|| {
         ControlError::Conflict("switcher has not emitted a real output tick".into())
     })?;
+    let provider = handle.provider_status().ok_or_else(|| {
+        ControlError::Conflict("switcher has not published a real output format".into())
+    })?;
     let defs = handle.keyer_definitions();
     Ok((
         StatusCode::OK,
@@ -461,6 +473,10 @@ pub(crate) async fn get_switcher(
             program_source: snapshot.program.as_str().to_owned(),
             preview_source: snapshot.preview.as_str().to_owned(),
             in_flight: snapshot.in_flight,
+            canvas_width: provider.width,
+            canvas_height: provider.height,
+            fps_num: provider.fps_num,
+            fps_den: provider.fps_den,
             keyers: super::switcher_keyers::rows(&principal, defs.as_deref(), &snapshot),
             tally: super::switcher_keyers::tally(&principal, defs.as_deref(), &snapshot),
             transition: snapshot.transition.clone(),

@@ -1055,3 +1055,25 @@ keyers.
 - **Concern.** The GET/events parity test drives the driver without the frame hook, so its
   `tally` is the background roles only. Keyer tally resolution is covered by the lib unit
   test on a constructed snapshot.
+
+### K5 (#390): desk, and the small API additions it needed
+
+- **`keyers[]` carries the committed parameters.** Each row adds `clip`, `gain`, `invert`,
+  `max_source` and `loss_trigger` beside `type`, `fly`, `mask`, `rate` and `loss`, so the
+  panel shows real values and never submits invented defaults. Parameters are not source
+  ids: a row the caller may read carries them as-is; the row filter and the source-id
+  redaction are unchanged (tested for scoped principals). `ramp` is now a typed
+  `KeyerRampView {start_tick, rate, to_on}`.
+- **Canvas and cadence on the GET.** `canvas_width`, `canvas_height`, `fps_num`, `fps_den`
+  come from the provider status (not secret). The desk lays out fly presets on the real
+  canvas and extrapolates a ramp from `tick` at the exact cadence between snapshots.
+- **Clearing `mask` and `fly`.** `keyer_set` distinguishes an omitted `mask`/`fly` (keep)
+  from JSON `null` (clear: no mask, full canvas), like `key: ""` clears the key. `mask`,
+  `fly` and `max_source` are typed in OpenAPI (`KeyerRectDoc`, `KeyerSizeDoc`).
+- **Desk.** One submission gate covers every switcher and keyer control from plan to 202.
+  The panel sends only edited fields, reconciles untouched fields with each new snapshot,
+  separates Review (plan, class and cost shown) from Apply (bound to the reviewed draft),
+  and turns a command-time `on-air-protected` 409 into a fresh plan plus an explicit allow
+  confirmation. `switcher.keyer` events and operation outcomes refresh the snapshot; a
+  stale indicator shows while the realtime stream is not open. The BKGD/KEY arm strip
+  stays deferred to K3 (#388).

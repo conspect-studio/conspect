@@ -95,17 +95,36 @@ pub struct KeyerFields {
     /// `keyer_set`: invert the matte.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invert: Option<bool>,
-    /// `keyer_set`: mask in fill-source pixels.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
-    pub mask: Option<KeyerRect>,
-    /// `keyer_set`: destination rectangle in canvas pixels.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
-    pub fly: Option<KeyerRect>,
+    /// `keyer_set`: mask in fill-source pixels. Omitted keeps the current
+    /// mask; JSON `null` clears it (no mask = the whole fill).
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[cfg_attr(
+        feature = "openapi",
+        schema(value_type = Option<crate::openapi_schemas::KeyerRectDoc>)
+    )]
+    pub mask: Option<Option<KeyerRect>>,
+    /// `keyer_set`: destination rectangle in canvas pixels. Omitted keeps
+    /// the current fly; JSON `null` clears it (the full canvas).
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[cfg_attr(
+        feature = "openapi",
+        schema(value_type = Option<crate::openapi_schemas::KeyerRectDoc>)
+    )]
+    pub fly: Option<Option<KeyerRect>>,
     /// `keyer_set`: admitted source envelope `{w, h}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
+    #[cfg_attr(
+        feature = "openapi",
+        schema(value_type = Option<crate::openapi_schemas::KeyerSizeDoc>)
+    )]
     pub max_source: Option<KeyerSize>,
     /// `keyer_set`: AUTO rate in frames, 1..=300.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -127,6 +146,16 @@ pub struct KeyerFields {
     /// `keyer_set`: the on-air guard for a fill or key change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_air: Option<KeyerOnAir>,
+}
+
+/// Distinguish an omitted field (`None`, keep) from JSON `null`
+/// (`Some(None)`, clear) — the same keep/clear split `key: ""` gives the key.
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 impl KeyerFields {
@@ -657,11 +686,11 @@ fn merge(cfg: &mut DownstreamKeyerConfig, f: &KeyerFields) {
     if let Some(v) = f.invert {
         cfg.invert = v;
     }
-    if f.mask.is_some() {
-        cfg.mask = f.mask;
+    if let Some(mask) = f.mask {
+        cfg.mask = mask;
     }
-    if f.fly.is_some() {
-        cfg.fly = f.fly;
+    if let Some(fly) = f.fly {
+        cfg.fly = fly;
     }
     if f.max_source.is_some() {
         cfg.max_source = f.max_source;
@@ -741,27 +770,59 @@ pub struct KeyerRow {
     /// `linear` or `luma`.
     #[serde(rename = "type")]
     pub key_type: &'static str,
+    /// Luma clip, `[0, 1]` (the committed value; meaningful for `luma`).
+    pub clip: f32,
+    /// Luma gain (the committed value; meaningful for `luma`).
+    pub gain: f32,
+    /// Matte inverted.
+    pub invert: bool,
     /// Destination rectangle, `null` = full canvas.
-    #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
+    #[cfg_attr(
+        feature = "openapi",
+        schema(value_type = Option<crate::openapi_schemas::KeyerRectDoc>)
+    )]
     pub fly: Option<KeyerRect>,
-    /// Mask in fill-source pixels.
-    #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
+    /// Mask in fill-source pixels, `null` = no mask.
+    #[cfg_attr(
+        feature = "openapi",
+        schema(value_type = Option<crate::openapi_schemas::KeyerRectDoc>)
+    )]
     pub mask: Option<KeyerRect>,
+    /// Admitted source envelope, `null` = the canvas size.
+    #[cfg_attr(
+        feature = "openapi",
+        schema(value_type = Option<crate::openapi_schemas::KeyerSizeDoc>)
+    )]
+    pub max_source: Option<KeyerSize>,
     /// On air.
     pub on_air: bool,
     /// Tied to the next background take.
     pub tie: bool,
-    /// `{start_tick, rate, to_on}` while ramping; clients compute the weight.
-    #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
-    pub ramp: Option<serde_json::Value>,
+    /// Present while ramping; clients compute the weight from the tick.
+    pub ramp: Option<KeyerRampView>,
     /// AUTO rate in frames.
     pub rate: u32,
     /// `drop_to_off_air` or `hold_last_good`.
     pub loss: &'static str,
+    /// `stale`, `reconnecting` or `no_signal`.
+    pub loss_trigger: &'static str,
     /// Drawing a frozen pair past its loss trigger.
     pub stale: bool,
     /// An operator command is held waiting for fresh sources.
     pub pending: bool,
+}
+
+/// An in-flight keyer AUTO: the weight at output tick `t` is
+/// `clamp((t - start_tick) / rate, 0, 1)`, reversed when `to_on` is false.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct KeyerRampView {
+    /// Output tick the ramp started on.
+    pub start_tick: u64,
+    /// Duration in output frames.
+    pub rate: u32,
+    /// Ramping on (`true`) or off.
+    pub to_on: bool,
 }
 
 /// The engine tally resolved to source ids (unreadable ids dropped).
@@ -822,21 +883,28 @@ pub fn rows(
                     KeyerType::Luma => "luma",
                     _ => "linear",
                 },
+                clip: cfg.clip,
+                gain: cfg.gain,
+                invert: cfg.invert,
                 fly: cfg.fly,
                 mask: cfg.mask,
+                max_source: cfg.max_source,
                 on_air: state.on_air,
                 tie: state.tie,
-                ramp: state.ramp.map(|r| {
-                    serde_json::json!({
-                        "start_tick": r.start_tick,
-                        "rate": r.rate,
-                        "to_on": r.to_on,
-                    })
+                ramp: state.ramp.map(|r| KeyerRampView {
+                    start_tick: r.start_tick,
+                    rate: r.rate,
+                    to_on: r.to_on,
                 }),
                 rate: cfg.rate,
                 loss: match cfg.loss {
                     KeyerLossPolicy::HoldLastGood => "hold_last_good",
                     _ => "drop_to_off_air",
+                },
+                loss_trigger: match cfg.loss_trigger {
+                    KeyerLossTrigger::Stale => "stale",
+                    KeyerLossTrigger::NoSignal => "no_signal",
+                    _ => "reconnecting",
                 },
                 stale: state.stale,
                 pending: state.pending,
