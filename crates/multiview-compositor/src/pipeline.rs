@@ -1561,7 +1561,7 @@ fn composite_band_reference(
                 }
                 let src = match tile_dst_offset(tile, px, py) {
                     Some((ddx, ddy)) => {
-                        let chroma_ref = tile_chroma_ref(tile)?;
+                        let chroma_ref = tile_chroma_ref(tile, luts)?;
                         tile_pixel(
                             tile,
                             ddx,
@@ -1984,12 +1984,13 @@ fn merge_scenes(
 }
 
 /// A chroma-keyed tile's reference colour in its fill's tile-gamut linear
-/// RGB ([`crate::key::chroma_reference_linear`]); `None` for every other
-/// tile.
-fn tile_chroma_ref(tile: &Tile<'_>) -> Result<Option<[f32; 3]>> {
+/// RGB ([`crate::key::chroma_reference_linear`], through `luts` exactly when
+/// the pixels are); `None` for every other tile.
+fn tile_chroma_ref(tile: &Tile<'_>, luts: Option<&LutSet>) -> Result<Option<[f32; 3]>> {
     match tile.key.as_ref().map(|k| k.kind) {
+        // The same front half as the tile's pixels (review K7 MEDIA-1).
         Some(crate::key::KeyKind::Chroma { reference, .. }) => Ok(Some(
-            crate::key::chroma_reference_linear(reference, tile.image.color().transfer)?,
+            crate::key::chroma_reference_linear(reference, tile.image.color(), luts)?,
         )),
         _ => Ok(None),
     }
@@ -2114,7 +2115,7 @@ fn fold_tile_into_band(
     }
 
     // The chroma reference, converted once for the tile (not per pixel).
-    let chroma_ref = tile_chroma_ref(tile)?;
+    let chroma_ref = tile_chroma_ref(tile, luts)?;
     let mut gy = gy0;
     while gy < gy1 {
         // Accumulator-local row + the destination-rect-local row offset `ddy`.

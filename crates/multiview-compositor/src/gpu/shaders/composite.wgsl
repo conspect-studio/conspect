@@ -63,8 +63,9 @@ struct KeyParams {
     // bits 8-9 the scene group: 0 top, 1 both, 2 out, 3 in).
     head: vec4<u32>,
     // x: base of this tile's 256-entry matte table in `mattes` (valid under
-    // KEY_HAS_TABLE). A chroma key: y edge mode (CHROMA_EDGE_*), z,w the
-    // sanitized finite clip and gain as f32 bits.
+    // KEY_HAS_TABLE). A chroma key: x the reference's fill codes
+    // y | cb << 8 | cr << 16, y edge mode (CHROMA_EDGE_*), z,w the sanitized
+    // finite clip and gain as f32 bits.
     table: vec4<u32>,
     // Mask rectangle in fill-source pixels: x, y, w, h (half-open).
     mask: vec4<u32>,
@@ -130,7 +131,8 @@ fn y_code(v8: f32) -> u32 {
 // function of the signal's 8-bit Y code (the key source's, else the fill's),
 // looked up in the tile's table (`KeyParams::build` / `push_matte_table`).
 fn key_factor(k: KeyParams, sx: u32, sy: u32, ddx: u32, ddy: u32, dst_w: u32, dst_h: u32,
-              fill_y8: f32, lin_tile: vec3<f32>) -> f32 {
+              yuv8: vec3<f32>, lin_tile: vec3<f32>) -> f32 {
+    let fill_y8 = yuv8.x;
     let flags = k.head.w;
     let kind = flags & KEY_KIND_BITS;
     if kind == 0u {
@@ -144,7 +146,7 @@ fn key_factor(k: KeyParams, sx: u32, sy: u32, ddx: u32, ddy: u32, dst_w: u32, ds
         }
     }
     if kind == KEY_KIND_CHROMA {
-        let m = chroma_matte(k, lin_tile);
+        let m = chroma_matte(k, yuv8, lin_tile);
         if (flags & KEY_INVERT) != 0u {
             return 1.0 - m;
         }
@@ -165,10 +167,18 @@ fn key_factor(k: KeyParams, sx: u32, sy: u32, ddx: u32, ddy: u32, dst_w: u32, ds
 
 // The chroma matte before invert. Mirrors `key::chroma_matte` through the
 // CPU-sanitized edge (`uniforms::chroma_edge`): no NaN or infinity reaches
-// the shader, and the distance of finite linear values is finite.
-fn chroma_matte(k: KeyParams, lin_tile: vec3<f32>) -> f32 {
-    let diff = lin_tile - k.chroma.rgb;
-    let d = sqrt(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
+// the shader, and the distance of finite linear values is finite. A pixel
+// whose 8-bit codes equal the reference's is at distance exactly 0, as on
+// the CPU where both run the identical front half (review K7 MEDIA-1), so
+// the shader's EOTF approximation never leaves a residue a huge gain blows
+// up.
+fn chroma_matte(k: KeyParams, yuv8: vec3<f32>, lin_tile: vec3<f32>) -> f32 {
+    let codes = y_code(yuv8.x) | (y_code(yuv8.y) << 8u) | (y_code(yuv8.z) << 16u);
+    var d = 0.0;
+    if codes != k.table.x {
+        let diff = lin_tile - k.chroma.rgb;
+        d = sqrt(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
+    }
     let mode = k.table.y;
     let clip = bitcast<f32>(k.table.z);
     let gain = bitcast<f32>(k.table.w);
@@ -392,7 +402,7 @@ fn composite_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         //    `lin_tile` (step 3's output); it never alters steps 2-4.
         let a = clamp(t.opacity_transfer.x, 0.0, 1.0) * sample_tile_alpha(t, sx, sy)
             * wipe_coverage(t, px, py, cw, ch)
-            * key_factor(k, sx, sy, ddx, ddy, dst_w, dst_h, yuv8.x, lin_tile);
+            * key_factor(k, sx, sy, ddx, ddy, dst_w, dst_h, yuv8, lin_tile);
         let src = vec4<f32>(lin * a, a);
         let inv = 1.0 - src.a;
         switch group {

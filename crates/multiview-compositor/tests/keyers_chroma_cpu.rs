@@ -85,10 +85,17 @@ fn canvas() -> CanvasColor {
     CanvasColor::default()
 }
 
-/// The reference colour in the fill's linear space, written out here:
-/// `code / 255` through the fill's EOTF.
-fn reference_linear(reference: [u8; 3], transfer: TransferCharacteristic) -> [f32; 3] {
-    reference.map(|c| multiview_compositor::transfer::eotf(f32::from(c) / 255.0, transfer).unwrap())
+/// The reference colour in the fill's linear space, written out here from
+/// the public colour functions: the full-range R'G'B' codes through the
+/// fill's matrix and range compress onto its code grid, then the oracle front
+/// half (steps 1-3), exactly like a fill pixel carrying those codes.
+fn reference_linear(reference: [u8; 3], color: ColorInfo) -> [f32; 3] {
+    let g = reference.map(|c| f32::from(c) / 255.0);
+    let yuv = multiview_compositor::matrix::rgb_to_yuv(g[0], g[1], g[2], color.matrix).unwrap();
+    let y8 = multiview_compositor::range::compress_luma(yuv[0], color.range);
+    let cb = multiview_compositor::range::compress_chroma(yuv[1], color.range);
+    let cr = multiview_compositor::range::compress_chroma(yuv[2], color.range);
+    tile_yuv_to_tile_linear(y8, cb, cr, color).unwrap()
 }
 
 /// The independent per-pixel chroma matte (before invert).
@@ -112,7 +119,7 @@ fn expected(
     invert: bool,
 ) -> (Vec<u8>, Vec<u8>) {
     let (w, h) = (fill.width(), fill.height());
-    let r = reference_linear(reference, fill.color().transfer);
+    let r = reference_linear(reference, fill.color());
     let mut y_out = vec![0_u8; (w * h) as usize];
     let mut uv_out = vec![0_u8; (w * h / 2) as usize];
     for py in 0..h {
@@ -222,7 +229,7 @@ fn the_distance_is_measured_in_the_tile_gamut_not_the_canvas_gamut() {
     );
     // At least one block's matte differs between the two domains, so the
     // golden pins the domain choice.
-    let r = reference_linear(reference, TransferCharacteristic::Pq);
+    let r = reference_linear(reference, pq2020());
     let differs = SCREEN.iter().any(|&(y8, cb, cr)| {
         let t = tile_yuv_to_tile_linear(y8, cb, cr, pq2020()).unwrap();
         let c = tile_yuv_to_canvas_linear(y8, cb, cr, pq2020(), canvas()).unwrap();
@@ -250,7 +257,7 @@ fn a_chroma_key_is_premultiplied_once_with_opacity_alpha_and_mask() {
         false,
     )
     .unwrap();
-    let r = reference_linear([0xff, 0x00, 0xff], TransferCharacteristic::Bt709);
+    let r = reference_linear([0xff, 0x00, 0xff], fill.color());
     for (px, py) in [(0_u32, 0_u32), (2, 0), (3, 1), (5, 1), (6, 0), (4, 2)] {
         let (y8, cb, cr) = fill.sample(px, py).unwrap();
         let inside = (2..6).contains(&px) && py < 2;
@@ -392,5 +399,38 @@ proptest! {
         let oracle = composite_reference(32, 16, canvas(), BLACK, &tiles, lut).unwrap();
         let fast = composite_with_threads(32, 16, canvas(), BLACK, &tiles, lut, threads).unwrap();
         prop_assert_eq!(oracle, fast);
+    }
+}
+
+/// Review K7 MEDIA-1: a fill pixel whose codes equal the reference's is at
+/// distance exactly 0 whatever the transfer evaluation (LUT or analytic), so
+/// a huge gain cannot turn LUT interpolation error into a kept fill.
+#[test]
+fn an_exact_reference_is_keyed_out_with_and_without_luts_at_a_huge_gain() {
+    for (color, codes, reference) in [
+        (
+            bt709(ColorRange::Full),
+            (128_u8, 128_u8, 128_u8),
+            [128_u8, 128, 128],
+        ),
+        (bt709(ColorRange::Full), (200, 128, 128), [200, 200, 200]),
+        (bt709(ColorRange::Limited), (126, 128, 128), [128, 128, 128]),
+        (pq2020(), (126, 128, 128), [128, 128, 128]),
+    ] {
+        let fill = Nv12Image::solid(16, 8, codes.0, codes.1, codes.2, color).unwrap();
+        let empty = composite_with(16, 8, canvas(), BLACK, &[], false).unwrap();
+        for gain in [1e9_f32, f32::MAX, f32::INFINITY] {
+            let tiles =
+                [Tile::placed(&fill, 0, 0, 1.0).with_key(TileKey::chroma(reference, 0.0, gain))];
+            for lut in [false, true] {
+                let got = composite_with(16, 8, canvas(), BLACK, &tiles, lut).unwrap();
+                assert!(
+                    got.y_plane() == empty.y_plane() && got.uv_plane() == empty.uv_plane(),
+                    "{codes:?} ref {reference:?} gain {gain} lut {lut}: the reference must key out"
+                );
+                let oracle = composite_reference(16, 8, canvas(), BLACK, &tiles, lut).unwrap();
+                assert_eq!(got, oracle);
+            }
+        }
     }
 }

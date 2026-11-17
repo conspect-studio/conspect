@@ -160,7 +160,9 @@ pub struct KeyParams {
     pub head: [u32; 4],
     /// `[base, 0, 0, 0]`: the first entry of this tile's matte table in the
     /// `mattes` storage buffer (binding 7), valid under [`KEY_HAS_TABLE`].
-    /// A chroma key has no table: `[0, edge_mode, clip_bits, gain_bits]`
+    /// A chroma key has no table: `[ref_codes, edge_mode, clip_bits,
+    /// gain_bits]`, where `ref_codes` packs the reference's fill codes
+    /// `y | cb << 8 | cr << 16` (see [`pack_chroma_codes`])
     /// (`CHROMA_EDGE_*`, then the sanitized finite clip and gain as `f32`
     /// bits; see [`chroma_edge`]).
     pub table: [u32; 4],
@@ -175,6 +177,13 @@ pub struct KeyParams {
     /// tile-gamut linear RGB, converted once per frame here
     /// ([`crate::key::chroma_reference_linear`]); zero otherwise.
     pub chroma: [f32; 4],
+}
+
+/// Pack a chroma reference's fill codes as the shader compares them:
+/// `y | cb << 8 | cr << 16`.
+#[must_use]
+pub fn pack_chroma_codes((y, cb, cr): (u8, u8, u8)) -> u32 {
+    u32::from(y) | (u32::from(cb) << 8) | (u32::from(cr) << 16)
 }
 
 /// Reduce a chroma key's `(clip, gain)` to a NaN- and infinity-free edge the
@@ -244,10 +253,20 @@ impl KeyParams {
                 // Chroma keys the fill itself (ADR-C007 §3): no key source,
                 // no table; the reference is converted once per frame into
                 // the fill's linear space, as the oracle does per tile.
-                let lin =
-                    crate::key::chroma_reference_linear(reference, tile.image.color().transfer)?;
+                // The shader linearizes analytically, so the reference goes
+                // through the analytic front half (no LUT); a pixel with the
+                // reference's codes short-circuits to distance 0 in-shader
+                // (review K7 MEDIA-1).
+                let color = tile.image.color();
+                let codes = crate::key::chroma_reference_codes(reference, color)?;
+                let lin = crate::key::chroma_reference_linear(reference, color, None)?;
                 let (mode, clip, gain) = chroma_edge(clip, gain);
-                out.table = [0, mode, clip.to_bits(), gain.to_bits()];
+                out.table = [
+                    pack_chroma_codes(codes),
+                    mode,
+                    clip.to_bits(),
+                    gain.to_bits(),
+                ];
                 out.chroma = [lin[0], lin[1], lin[2], 0.0];
                 out.head[3] = flags;
                 return Ok(out.with_group(tile));
@@ -866,12 +885,18 @@ mod key_params_tests {
         assert_eq!(k.head[3] & (KEY_HAS_TABLE | KEY_HAS_SOURCE), 0);
         assert_ne!(k.head[3] & KEY_INVERT, 0);
         assert_eq!(k.key_layer(), None);
+        let codes = crate::key::chroma_reference_codes([0, 177, 64], fill.color()).unwrap();
         assert_eq!(
             k.table,
-            [0, CHROMA_EDGE_RAMP, 0.05_f32.to_bits(), 8.0_f32.to_bits()]
+            [
+                pack_chroma_codes(codes),
+                CHROMA_EDGE_RAMP,
+                0.05_f32.to_bits(),
+                8.0_f32.to_bits()
+            ]
         );
-        let want = crate::key::chroma_reference_linear([0, 177, 64], TransferCharacteristic::Bt709)
-            .unwrap();
+        assert_eq!(pack_chroma_codes((1, 2, 3)), 0x0003_0201);
+        let want = crate::key::chroma_reference_linear([0, 177, 64], fill.color(), None).unwrap();
         assert_eq!(k.chroma, [want[0], want[1], want[2], 0.0]);
     }
 }

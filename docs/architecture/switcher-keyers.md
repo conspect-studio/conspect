@@ -101,7 +101,8 @@ matte      = linear, no key source : 1
              chroma (K7)           : invert?(clamp((|rgb_tile − ref_tile| − clip) × gain, 0, 1)),
                                      rgb_tile = the fill's linear RGB in its own gamut (after
                                      step 3, before the step-4 primaries convert, ADR-C007 §3),
-                                     ref_tile = `color` through the fill's EOTF, once per frame
+                                     ref_tile = `color` quantized to the fill's (Y, Cb, Cr)
+                                     codes and decoded like a pixel, once per frame
 ```
 
 Y is post-range-expand code-value Y (step 1 of the pipeline), so steps 2–5 are unchanged and the
@@ -1075,9 +1076,11 @@ keyers.
 - **Matte (ADR-C007 §3).** `KeyKind::Chroma {reference, clip, gain}`:
   `m = clamp((d − clip) × gain, 0, 1)`, then optional invert, where `d` is the Euclidean
   distance in the **fill's own-gamut linear RGB** between the fill pixel and the reference. The
-  reference is the operator's `#RRGGBB`, read as the fill's own R'G'B' codes (`code / 255`)
-  and linearized with the fill's EOTF once per frame per tile (`key::chroma_reference_linear`;
-  CPU: once per tile fold, GPU: in `KeyParams::build`). A pixel at the reference is matte 0
+  reference is the operator's `#RRGGBB`, read as R'G'B' codes (`code / 255`), quantized once
+  per frame per tile onto the fill's own `(Y, Cb, Cr)` code grid (fill matrix and range,
+  `key::chroma_reference_codes`) and decoded through **the same** front half (steps 1-3) as
+  the fill's pixels (`key::chroma_reference_linear`; CPU: once per tile fold, with the LUTs
+  exactly when the pixels use them; GPU: in `KeyParams::build`). A pixel at the reference is matte 0
   (keyed out); far colours are 1; the edge is monotonic in `d`. Clip/gain on the distance is
   the luma key's shape, so operators get one mental model; clip and gain share the config
   fields and bounds (`clip` in [0, 1], `gain` finite and `>= 0`).
@@ -1085,11 +1088,19 @@ keyers.
   LUT twin in `LutSet`) and the step-4 primaries convert, which runs on that same value, so a
   chroma tile's canvas-linear colour is unchanged and the #8 order is untouched; the matte only
   multiplies into alpha at the single premultiply. The shader reads its existing `lin_tile`
-  (step 3) for the distance. With the LUT path the pixel uses the LUT EOTF and the reference
-  the analytic one; the difference is within the LUT tolerance `lut_vs_reference` gates. A
-  fill pixel reaches the reference only through YUV quantization and the matrix, so `d` at
-  "the same colour" is small but rarely exactly 0: a usable key needs `clip > 0` (an exact
-  match with `clip = 0` and a finite gain is matte ≈ 0, not a guaranteed 0).
+  (step 3) for the distance.
+- **Exact reference on every path (review K7 MEDIA-1).** A first cut linearized the reference
+  analytically while LUT composites linearized pixels by table, so a fill carrying exactly
+  the reference (full-range grey 128 vs `#808080`) at `clip = 0, gain = 1e9` was keyed out
+  without LUTs but kept whole with them, and the GPU differed from CPU+LUT by 110 codes.
+  Now the reference is a point on the fill's code grid decoded by the identical CPU path, so
+  equal codes give `d = 0` bit-exactly with and without LUTs. The shader packs the
+  reference codes (`KeyParams.table[0]`, `y | cb << 8 | cr << 16`) and short-circuits a
+  pixel with those codes to `d = 0`, so its transcendental EOTF cannot leave a residue either;
+  other pixels use the analytic reference against the shader's own `lin_tile`. A large gain
+  is therefore a sharp key that removes exactly the reference codes (`clip > 0` widens it to
+  nearby codes); off the reference the matte is still a clamp of `(d − clip) × gain`, whose
+  CPU/GPU agreement at a huge gain is bounded by the SSIM/PSNR gate, not bit-exact.
 - **Degenerate parameters are total.** `key::chroma_matte` flushes a subnormal clip or gain to 0
   (a GPU may flush them) and reads a NaN or negative gain as 0 and a NaN distance as 0. The GPU
   never sees a NaN or infinity: `uniforms::chroma_edge` reduces `(clip, gain)` to a mode and
@@ -1112,21 +1123,27 @@ keyers.
 - **Tests.**
   - `key` unit tests (6): the exact reference is keyed out (and kept when inverted), a far
     colour is 1, the edge is monotonic and bounded, degenerate parameters are total, a key
-    source is ignored and the mask applies, the reference is linearized with the fill's EOTF.
+    source is ignored and the mask applies, the reference is quantized to the fill's codes
+    and decoded exactly like a pixel.
   - `uniforms` unit tests (2): `chroma_edge` equals the oracle for every parameter class; the
     packing (kind, invert, no table, no source, reference, edge).
-  - `tests/keyers_chroma_cpu.rs` (7): goldens against an independent per-pixel computation
+  - `tests/keyers_chroma_cpu.rs` (8): goldens against an independent per-pixel computation
     (green screen with several references, clip/gain and invert; the reference kernel equal);
     the studio green keyed out with subject kept and a soft edge; the distance in the tile
     gamut (a PQ/BT.2020 fill whose canvas-gamut matte would differ); opacity × mask × matte
     premultiplied once; a key source ignored; degenerate parameters never poison the layers
     beneath; a proptest that the tile-driven kernel equals the oracle at 1-4 threads, with
-    LUTs on and off and in a scene group.
-  - `tests/keyers_chroma_gpu.rs` (`wgpu`, 3): GPU vs CPU over 8 frames (soft edge, invert,
+    LUTs on and off and in a scene group; MEDIA-1: a fill carrying exactly the reference
+    (full-range grey, limited grey, a full-range light grey, PQ/BT.2020) keyed out at gain
+    1e9, `f32::MAX` and +∞ with and without LUTs (red before the fix).
+  - `tests/keyers_chroma_gpu.rs` (`wgpu`, 4): GPU vs CPU over 8 frames (soft edge, invert,
     pure distance, upscaled masked full-range fill at weight 0.7, PQ/BT.2020 downscaled fill,
     MIX group, NaN/±∞ parameters, step and `f32::MAX` gain); the exact reference keyed out on
-    the GPU; no CPU fallback and no GPU pool growth over 30 frames. On lavapipe (llvmpipe 19,
-    Vulkan) the minima were SSIM 0.99997 and PSNR 63.4 dB, max |ΔY| 2.
+    the GPU; MEDIA-1: reference-code columns keyed out and neighbouring codes (127, 129)
+    kept at gain 1e9, `f32::MAX` and +∞, within |ΔY| ≤ 2 of the CPU with and without LUTs
+    (red before the fix: |ΔY| 110 against CPU+LUT); no CPU fallback and no GPU pool growth
+    over 30 frames. On lavapipe (llvmpipe 19,
+    Vulkan) the minima were SSIM 0.99997 and PSNR 63.3 dB, max |ΔY| 2.
   - `multiview-config` (3): accept (with mask, invert, `#RGB`, the K4 per-definition check, the
     same cost as a linear self key), the typed refusals and clip/gain bounds, a TOML round
     trip. The K2a "chroma is refused" assertion was removed in its own commit.

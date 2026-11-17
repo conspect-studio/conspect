@@ -369,3 +369,61 @@ fn a_chroma_frame_on_the_gpu_backend_does_not_fall_back_and_allocates_nothing_ne
     }
     assert_eq!(gpu.gpu_allocation_count(), warm, "no GPU pool growth");
 }
+
+/// Review K7 MEDIA-1 on the GPU: pixels whose codes equal the reference's
+/// are keyed out at gain 1e9, `f32::MAX` and +inf, exactly like the CPU with
+/// and without LUTs; neighbouring codes are kept (the step stays sharp).
+#[test]
+fn an_exact_reference_is_keyed_out_on_the_gpu_at_a_huge_gain() {
+    let Some(gpu) = try_gpu() else { return };
+    let canvas = CanvasColor::default();
+    let black = LinearRgba::opaque(0.0, 0.0, 0.0);
+    // Columns of 2x2 blocks: grey 128 (the reference) next to 127 and 129.
+    let full_range = bt709(ColorRange::Full);
+    let (wu, hu) = (W as usize, H as usize);
+    let levels = [128_u8, 127, 128, 129];
+    let y: Vec<u8> = (0..wu * hu)
+        .map(|i| levels[(i % wu) / 2 % levels.len()])
+        .collect();
+    let uv = vec![128_u8; wu * hu / 2];
+    let fill = Nv12Image::new(W, H, y, uv, full_range).unwrap();
+    for gain in [1e9_f32, f32::MAX, f32::INFINITY] {
+        let tiles =
+            [
+                Tile::placed(&fill, 0, 0, 1.0).with_key(TileKey::chroma(
+                    [128, 128, 128],
+                    0.0,
+                    gain,
+                )),
+            ];
+        let gpu_out = gpu.composite(W, H, canvas, black, &tiles).unwrap();
+        for lut in [false, true] {
+            let cpu_out =
+                multiview_compositor::pipeline::composite_with(W, H, canvas, black, &tiles, lut)
+                    .unwrap();
+            let dy = gpu_out
+                .y_plane()
+                .iter()
+                .zip(cpu_out.y_plane())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(dy <= 2, "gain {gain} lut {lut}: GPU vs CPU max |dY| {dy}");
+        }
+        // Reference columns are background (black, Y 16); 127/129 are kept.
+        for (col, level) in levels.iter().enumerate() {
+            let got = gpu_out
+                .sample(u32::try_from(col * 2).unwrap(), 0)
+                .unwrap()
+                .0;
+            if *level == 128 {
+                assert_eq!(got, 16, "gain {gain}: reference column {col} keyed out");
+            } else {
+                assert!(
+                    got > 100,
+                    "gain {gain}: column {col} ({level}) kept, got {got}"
+                );
+            }
+        }
+    }
+}

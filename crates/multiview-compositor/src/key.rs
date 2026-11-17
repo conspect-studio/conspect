@@ -53,10 +53,11 @@ pub enum KeyKind {
     /// Chroma key (slice K7, ADR-C007 §3): `clamp((d − clip) × gain, 0, 1)`
     /// where `d` is the Euclidean distance, in the fill's **own-gamut linear
     /// RGB** (after its EOTF, before the primaries convert), between the
-    /// fill pixel and the reference colour. The reference is the fill's own
-    /// R'G'B' code values (full range, the fill's transfer), linearized once
-    /// per frame with the fill's EOTF ([`chroma_reference_linear`]). A pixel
-    /// at the reference is keyed out (matte 0). Chroma keys the fill itself:
+    /// fill pixel and the reference colour. The reference (full-range R'G'B'
+    /// codes) is quantized once per frame onto the fill's own `(Y, Cb, Cr)`
+    /// code grid and decoded through the same front half as the pixels
+    /// ([`chroma_reference_linear`]), so a pixel carrying those codes is at
+    /// distance exactly 0 and keyed out (matte 0) on every path. Chroma keys the fill itself:
     /// a key source is ignored (config refuses one).
     Chroma {
         /// Reference colour as gamma-encoded full-range R'G'B' codes of the
@@ -333,24 +334,50 @@ pub fn chroma_distance(pixel: [f32; 3], reference: [f32; 3]) -> f32 {
     (dr * dr + dg * dg + db * db).sqrt()
 }
 
-/// The chroma reference colour in the fill's own-gamut linear RGB: each
-/// full-range R'G'B' code divided by 255, through the fill's EOTF. Computed
-/// once per frame per keyed tile (CPU: per tile fold; GPU: in
-/// `KeyParams::build`).
+/// The chroma reference as the fill's own 8-bit `(Y, Cb, Cr)` codes: the
+/// operator's full-range R'G'B' codes (`code / 255`) through the fill's
+/// matrix ([`crate::matrix::rgb_to_yuv`]) and range compress. Quantizing the
+/// reference onto the fill's code grid is what makes "the reference colour"
+/// exact (review K7 MEDIA-1): a fill pixel carrying these codes runs the
+/// identical front half as the reference and is at distance exactly 0.
 ///
 /// # Errors
 ///
-/// [`crate::Error::UnresolvedColor`] / `UnsupportedTransfer` for a fill
-/// transfer the pipeline cannot linearize (exactly the fill's own error).
+/// [`crate::Error::UnresolvedColor`] / `UnsupportedMatrix` for a fill matrix
+/// or range the pipeline cannot decode (exactly the fill's own error).
+pub fn chroma_reference_codes(
+    reference: [u8; 3],
+    color: multiview_core::color::ColorInfo,
+) -> Result<(u8, u8, u8)> {
+    let r = crate::range::require_resolved(color.range)?;
+    let g = reference.map(|c| f32::from(c) / 255.0);
+    let yuv = crate::matrix::rgb_to_yuv(g[0], g[1], g[2], color.matrix)?;
+    Ok((
+        crate::range::compress_luma(yuv[0], r),
+        crate::range::compress_chroma(yuv[1], r),
+        crate::range::compress_chroma(yuv[2], r),
+    ))
+}
+
+/// The chroma reference in the fill's own-gamut linear RGB: its codes
+/// ([`chroma_reference_codes`]) through **the same** front half (steps 1-3)
+/// as the fill's pixels, with `luts` exactly when the pixels use them, so
+/// equal codes give a distance of exactly 0 whatever the transfer
+/// evaluation (review K7 MEDIA-1). Computed once per frame per keyed tile.
+///
+/// # Errors
+///
+/// The fill's own colour errors (unresolved or unsupported axis).
 pub fn chroma_reference_linear(
     reference: [u8; 3],
-    transfer: multiview_core::color::TransferCharacteristic,
+    color: multiview_core::color::ColorInfo,
+    luts: Option<&crate::transfer_lut::LutSet>,
 ) -> Result<[f32; 3]> {
-    if transfer == multiview_core::color::TransferCharacteristic::Unspecified {
-        return Err(crate::Error::UnresolvedColor("transfer"));
+    let (y8, cb8, cr8) = chroma_reference_codes(reference, color)?;
+    match luts {
+        Some(lut) => lut.tile_yuv_to_tile_linear(y8, cb8, cr8, color),
+        None => crate::pipeline::tile_yuv_to_tile_linear(y8, cb8, cr8, color),
     }
-    let lin = |c: u8| crate::transfer::eotf(f32::from(c) / 255.0, transfer);
-    Ok([lin(reference[0])?, lin(reference[1])?, lin(reference[2])?])
 }
 
 /// Post-range-expand luma of `image` at `(x, y)`, or `None` out of bounds.
@@ -477,7 +504,16 @@ mod tests {
 
     // ---- Chroma key (K7, ADR-C007 §3) ----
 
-    use multiview_core::color::TransferCharacteristic;
+    use multiview_core::color::{
+        ColorInfo, ColorPrimaries, ColorRange, MatrixCoefficients, TransferCharacteristic,
+    };
+
+    const BT709_LIMITED: ColorInfo = ColorInfo {
+        primaries: ColorPrimaries::Bt709,
+        transfer: TransferCharacteristic::Bt709,
+        matrix: MatrixCoefficients::Bt709,
+        range: ColorRange::Limited,
+    };
 
     fn chroma_at(key: &TileKey<'_>, px: [f32; 3], reference: [f32; 3]) -> f32 {
         key_factor(key, 0, 0, 0, 0, 1, 1, 0.5, Some((px, reference))).unwrap_or(f32::NAN)
@@ -485,7 +521,7 @@ mod tests {
 
     #[test]
     fn the_exact_reference_colour_is_keyed_out() {
-        let green = chroma_reference_linear([0, 177, 64], TransferCharacteristic::Bt709).unwrap();
+        let green = chroma_reference_linear([0, 177, 64], BT709_LIMITED, None).unwrap();
         for (clip, gain) in [(0.0, 1.0), (0.1, 4.0), (0.0, f32::INFINITY), (0.3, 1e30)] {
             let key = TileKey::chroma([0, 177, 64], clip, gain);
             assert_eq!(
@@ -500,9 +536,8 @@ mod tests {
 
     #[test]
     fn a_far_colour_is_kept() {
-        let green = chroma_reference_linear([0, 177, 64], TransferCharacteristic::Bt709).unwrap();
-        let magenta =
-            chroma_reference_linear([255, 0, 255], TransferCharacteristic::Bt709).unwrap();
+        let green = chroma_reference_linear([0, 177, 64], BT709_LIMITED, None).unwrap();
+        let magenta = chroma_reference_linear([255, 0, 255], BT709_LIMITED, None).unwrap();
         let key = TileKey::chroma([0, 177, 64], 0.1, 4.0);
         assert_eq!(chroma_at(&key, magenta, green), 1.0);
         assert_eq!(chroma_at(&key.inverted(true), magenta, green), 0.0);
@@ -592,11 +627,33 @@ mod tests {
     }
 
     #[test]
-    fn the_reference_is_linearized_with_the_fill_transfer() {
-        let r = chroma_reference_linear([255, 128, 0], TransferCharacteristic::Bt709).unwrap();
-        assert_eq!(r[0], 1.0);
-        assert_eq!(r[2], 0.0);
-        assert!((r[1] - (128.0_f32 / 255.0).powf(2.4)).abs() < 1e-6);
-        assert!(chroma_reference_linear([0; 3], TransferCharacteristic::Unspecified).is_err());
+    fn the_reference_is_quantized_to_the_fill_codes_and_decoded_like_a_pixel() {
+        // White and black land on the limited-range code extremes.
+        assert_eq!(
+            chroma_reference_codes([255, 255, 255], BT709_LIMITED).unwrap(),
+            (235, 128, 128)
+        );
+        assert_eq!(
+            chroma_reference_codes([0; 3], BT709_LIMITED).unwrap(),
+            (16, 128, 128)
+        );
+        let full = ColorInfo {
+            range: ColorRange::Full,
+            ..BT709_LIMITED
+        };
+        assert_eq!(
+            chroma_reference_codes([128; 3], full).unwrap(),
+            (128, 128, 128)
+        );
+        // The linear reference is exactly the front half of those codes.
+        let (y, cb, cr) = chroma_reference_codes([0, 177, 64], BT709_LIMITED).unwrap();
+        let want = crate::pipeline::tile_yuv_to_tile_linear(y, cb, cr, BT709_LIMITED).unwrap();
+        let got = chroma_reference_linear([0, 177, 64], BT709_LIMITED, None).unwrap();
+        assert_eq!(got.map(f32::to_bits), want.map(f32::to_bits));
+        let unresolved = ColorInfo {
+            transfer: TransferCharacteristic::Unspecified,
+            ..BT709_LIMITED
+        };
+        assert!(chroma_reference_linear([0; 3], unresolved, None).is_err());
     }
 }
