@@ -19080,7 +19080,14 @@
               "null"
             ],
             "format": "float",
-            "description": "`keyer_set`: luma clip, `[0, 1]`."
+            "description": "`keyer_set`: luma clip on Y, or chroma clip on the linear-RGB\ndistance, `[0, 1]`."
+          },
+          "color": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`keyer_set`: chroma reference colour `#RRGGBB` (`type = chroma`\nonly); `\"\"` clears it."
           },
           "fill": {
             "type": [
@@ -19102,7 +19109,7 @@
               "null"
             ],
             "format": "float",
-            "description": "`keyer_set`: luma gain, finite and `>= 0`."
+            "description": "`keyer_set`: luma or chroma gain, finite and `>= 0`."
           },
           "invert": {
             "type": [
@@ -19199,7 +19206,7 @@
               "string",
               "null"
             ],
-            "description": "`keyer_set`: `linear` or `luma` (`chroma` is refused until K7)."
+            "description": "`keyer_set`: `linear`, `luma` or `chroma` (K7; needs `color`, refuses\na `key` source)."
           },
           "z": {
             "type": [
@@ -19353,7 +19360,7 @@
           },
           "type": {
             "type": "string",
-            "description": "`linear` or `luma`."
+            "description": "`linear`, `luma` or `chroma`."
           }
         }
       },

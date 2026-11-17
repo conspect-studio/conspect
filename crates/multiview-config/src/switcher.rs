@@ -152,8 +152,7 @@ pub struct KeyerSize {
     pub h: u32,
 }
 
-/// How a DSK derives its matte. `chroma` parses so it can be refused by name
-/// (slice K7); it never reaches the runtime.
+/// How a DSK derives its matte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -163,7 +162,9 @@ pub enum KeyerType {
     Linear,
     /// Luma key with `clip` and `gain`.
     Luma,
-    /// Chroma key: refused at validation until slice K7.
+    /// Chroma key (slice K7, ADR-C007 §3) on the fill's own colour: `color`
+    /// is the reference, `clip`/`gain` shape the edge on the linear-RGB
+    /// distance. A key source is refused.
     Chroma,
 }
 
@@ -225,12 +226,18 @@ pub struct DownstreamKeyerConfig {
     /// Matte derivation.
     #[serde(rename = "type", default)]
     pub key_type: KeyerType,
-    /// Luma clip on normalized Y, `[0, 1]`.
+    /// Luma clip on normalized Y, `[0, 1]`. Chroma: the linear-RGB distance
+    /// below which the fill is keyed out fully, `[0, 1]`.
     #[serde(default)]
     pub clip: f32,
-    /// Luma gain, finite and `>= 0`.
+    /// Luma or chroma gain (soft-edge slope), finite and `>= 0`.
     #[serde(default = "default_gain")]
     pub gain: f32,
+    /// Chroma reference colour, `#RRGGBB` / `#RGB` R'G'B' code values of the
+    /// fill's own transfer (e.g. `#00b140`). Required by `type = "chroma"`,
+    /// refused by every other type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
     /// Invert the matte.
     #[serde(default, skip_serializing_if = "is_false")]
     pub invert: bool,
@@ -367,9 +374,30 @@ impl DownstreamKeyerConfig {
             return err(format!("references undeclared program {:?}", self.program));
         }
         if self.key_type == KeyerType::Chroma {
+            if self.key.is_some() {
+                return err(
+                    "type = \"chroma\" keys the fill's own colour; a separate key source is \
+                     refused (chroma-key-source)"
+                        .into(),
+                );
+            }
+            match self.color.as_deref() {
+                None => {
+                    return err(
+                        "type = \"chroma\" needs color = \"#RRGGBB\" (chroma-color-required)"
+                            .into(),
+                    )
+                }
+                Some(c) if crate::parse_hex_color(c).is_none() => {
+                    return err(format!(
+                        "color {c:?} is not a #RGB / #RRGGBB hex color (chroma-color)"
+                    ));
+                }
+                Some(_) => {}
+            }
+        } else if self.color.is_some() {
             return err(
-                "type = \"chroma\" is not supported yet (chroma keys are slice K7); use linear or luma"
-                    .into(),
+                "color applies only to type = \"chroma\" (chroma-color-without-chroma)".into(),
             );
         }
         if self.premultiplied {
@@ -627,8 +655,8 @@ impl SwitcherConfig {
     /// `keyer_budget` (ADR-0113 §9, reserved at definition).
     ///
     /// # Errors
-    /// A hard limit, a bad reference, a refused-by-name feature (`chroma`,
-    /// `premultiplied`), a geometry out of bounds or a document over budget.
+    /// A hard limit, a bad reference, a refused-by-name feature
+    /// (`premultiplied`, a chroma key with a key source), a geometry out of bounds or a document over budget.
     pub fn validate_keyers(
         &self,
         sources: &[&str],
@@ -976,6 +1004,7 @@ number = 3
             key_type: KeyerType::Linear,
             clip: 0.0,
             gain: 1.0,
+            color: None,
             invert: false,
             mask: None,
             fly: None,
@@ -1054,13 +1083,80 @@ number = 3
     }
 
     #[test]
-    fn chroma_and_premultiplied_are_refused_by_name() {
-        let mut chroma = dsk("dsk1", 1);
-        chroma.key_type = KeyerType::Chroma;
-        keyer_refused(vec![chroma], "chroma");
+    fn premultiplied_is_refused_by_name() {
         let mut shaped = dsk("dsk1", 1);
         shaped.premultiplied = true;
         keyer_refused(vec![shaped], "premultiplied");
+    }
+
+    fn chroma(color: Option<&str>) -> DownstreamKeyerConfig {
+        let mut k = dsk("dsk1", 1);
+        k.key_type = KeyerType::Chroma;
+        k.color = color.map(str::to_owned);
+        k.clip = 0.05;
+        k.gain = 8.0;
+        k
+    }
+
+    #[test]
+    fn a_chroma_key_with_a_reference_colour_is_accepted() {
+        keyers(vec![chroma(Some("#00b140"))], None).unwrap();
+        keyers(vec![chroma(Some("#0f0"))], None).unwrap();
+        let mut masked = chroma(Some("#00FF00"));
+        masked.invert = true;
+        masked.mask = Some(KeyerRect {
+            x: 0,
+            y: 0,
+            w: 960,
+            h: 540,
+        });
+        keyers(vec![masked.clone()], None).unwrap();
+        // The K4 per-definition check is the same rule.
+        masked
+            .validate_definition(SOURCES, CANVAS.0, CANVAS.1)
+            .unwrap();
+        // Same cost as a self linear key (no key source, ADR-0113 §9).
+        assert!(
+            (masked.cost(CANVAS.0, CANVAS.1) - dsk("x", 1).cost(CANVAS.0, CANVAS.1)).abs() < 1e-12
+        );
+    }
+
+    #[test]
+    fn a_chroma_key_is_refused_with_typed_messages() {
+        keyer_refused(vec![chroma(None)], "chroma-color-required");
+        keyer_refused(vec![chroma(Some("green"))], "chroma-color");
+        keyer_refused(vec![chroma(Some("#00b14"))], "chroma-color");
+        let mut sourced = chroma(Some("#00b140"));
+        sourced.key = Some("vt1".into());
+        keyer_refused(vec![sourced], "chroma-key-source");
+        let mut stray = dsk("dsk1", 1);
+        stray.color = Some("#00b140".into());
+        keyer_refused(vec![stray], "chroma-color-without-chroma");
+        for (clip, gain, needle) in [
+            (f32::NAN, 1.0, "clip"),
+            (-0.1, 1.0, "clip"),
+            (1.5, 1.0, "clip"),
+            (0.1, f32::INFINITY, "gain"),
+            (0.1, -1.0, "gain"),
+            (0.1, f32::NAN, "gain"),
+        ] {
+            let mut k = chroma(Some("#00b140"));
+            k.clip = clip;
+            k.gain = gain;
+            keyer_refused(vec![k], needle);
+        }
+    }
+
+    #[test]
+    fn a_chroma_key_round_trips_through_toml() {
+        let doc = "id = \"dsk1\"\nprogram = \"main\"\nfill = \"bars\"\ntype = \"chroma\"\n\
+                   color = \"#00b140\"\nclip = 0.05\ngain = 8.0\n";
+        let k: DownstreamKeyerConfig = toml::from_str(doc).unwrap();
+        assert_eq!(k.key_type, KeyerType::Chroma);
+        assert_eq!(k.color.as_deref(), Some("#00b140"));
+        let back: DownstreamKeyerConfig = toml::from_str(&toml::to_string(&k).unwrap()).unwrap();
+        assert_eq!(back, k);
+        keyers(vec![k], None).unwrap();
     }
 
     #[test]

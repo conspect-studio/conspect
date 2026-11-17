@@ -237,6 +237,7 @@ pub(crate) fn dsk(id: &str, fill: &str, key: Option<&str>, z: i32) -> Downstream
         key_type: KeyerType::Linear,
         clip: 0.0,
         gain: 1.0,
+        color: None,
         invert: false,
         mask: None,
         fly: None,
