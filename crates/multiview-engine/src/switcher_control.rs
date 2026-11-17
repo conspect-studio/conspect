@@ -188,6 +188,14 @@ pub enum SwitcherVerb {
     /// for an empty set, or for a key that is not a defined upstream keyer.
     /// Built off the clock; the tick only moves the `Arc` in.
     Arm(Arc<multiview_core::switcher::ArmedSet>),
+    /// A verb the control plane authorized against a specific committed
+    /// arm set and keyer definitions (review AUTHZ-1/-2): drained, it is
+    /// refused ([`REFUSE_ARM_CHANGED`] / [`crate::keyer::REFUSE_KEYER_DEFINITION_CHANGED`])
+    /// when either version moved since, so a take or keyer cut never
+    /// toggles a keyer the caller was not authorized for. Built (and boxed)
+    /// off the clock; the tick only compares two integers and moves the
+    /// inner verb out.
+    Bound(Box<BoundVerb>),
     /// The mixer half of an atomic multi-crosspoint set (ADR-0110 §12.8,
     /// #308): validated and primed here, then applied only at the adoption
     /// tick the router proposes through `arm`, never on its own. Held in its
@@ -199,6 +207,29 @@ pub enum SwitcherVerb {
         arm: Arc<SetArm>,
     },
 }
+
+/// The payload of [`SwitcherVerb::Bound`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundVerb {
+    /// The verb itself (never another `Bound`).
+    pub verb: SwitcherVerb,
+    /// The arm-set version the caller was authorized against
+    /// ([`SwitcherSnapshot::arm_version`]), or `None` when it does not
+    /// matter (a keyer verb).
+    pub arm_version: Option<u64>,
+    /// The keyer definitions version the caller was authorized against
+    /// ([`KeyerDefinitions::version`]), or `None`.
+    pub defs_version: Option<u64>,
+}
+
+/// Typed refusal: a take authorized against an arm set that changed before
+/// its tick (review AUTHZ-1). Nothing changes; the caller re-plans.
+pub const REFUSE_ARM_CHANGED: &str =
+    "arm-changed: the armed set changed since this take was authorized; re-plan it";
+/// Typed refusal: `arm` while a take is held for a fresh source (review
+/// K3-INV-1: the held take keeps the set it was admitted with).
+pub const REFUSE_ARM_TAKE_HELD: &str =
+    "take-held: a take is held waiting for a fresh frame; arm after it lands or is refused";
 
 /// Ticks past [`SET_ADOPT_DEADLINE_TICKS`] the switcher waits for a ready
 /// set's router half before it refuses the set `deadline` itself: the
@@ -263,6 +294,9 @@ pub struct SwitcherSnapshot {
     pub keyers: [Option<KeyerSnapshot>; MAX_KEYERS],
     /// What the next background transition moves (the `arm` set, K3).
     pub next: NextTake,
+    /// Bumped once per applied `arm` (K3, review AUTHZ-1): a take binds to
+    /// it.
+    pub arm_version: u64,
     /// Engine tally as roles (design note §9, deviation: roles, not store
     /// indices; the control plane resolves them to source ids).
     pub tally: KeyerTally,
@@ -398,6 +432,7 @@ impl SwitcherControl {
             stores: handle.stores.clone(),
             clean_gate: Arc::clone(&handle.clean_gate),
             staged_dsk: None,
+            arm_version: 0,
         };
         let mut driver = driver;
         driver.keyers.set_next(NextTake::of(driver.machine.armed()));
@@ -681,6 +716,8 @@ pub struct SwitcherTickDriver {
     definition_builds: u64,
     stores: LatestState<HashMap<String, Arc<TileStore<Nv12Image>>>>,
     clean_gate: Arc<CleanDskGate>,
+    /// Bumped per applied `arm` (restored by a reject with the machine).
+    arm_version: u64,
     /// The tick backstop's DSK reservation for this tick's applied
     /// definition of a new keyer: held until the commit marks the gate
     /// defined, dropped by a reject.
@@ -697,6 +734,8 @@ struct Staged {
     /// The input table before this tick's first patch, captured lazily (only
     /// on a patch tick, so the steady state never clones the table).
     inputs: Option<(MixerInputs, u64)>,
+    /// The arm version before this tick.
+    arm_version: u64,
 }
 
 impl SwitcherTickDriver {
@@ -992,6 +1031,7 @@ impl SwitcherTickDriver {
                 active_auto: self.active_auto.clone(),
                 active_auto_scenes: self.active_auto_scenes.clone(),
                 inputs: None,
+                arm_version: self.arm_version,
             });
         }
     }
@@ -1063,7 +1103,8 @@ impl SwitcherTickDriver {
             | SwitcherVerb::KeyerAuto { .. }
             | SwitcherVerb::KeyerTie { .. }
             | SwitcherVerb::KeyerSet { .. }
-            | SwitcherVerb::Arm(_) => Err("not a take".into()),
+            | SwitcherVerb::Arm(_)
+            | SwitcherVerb::Bound(_) => Err("not a take".into()),
         }
     }
 
@@ -1319,6 +1360,41 @@ impl SwitcherTickDriver {
             let Ok(command) = self.rx.try_recv() else {
                 break;
             };
+            // Review AUTHZ-1/-2: a bound verb is applied only against the
+            // arm set and keyer definitions it was authorized for.
+            let command = match command.verb {
+                SwitcherVerb::Bound(bound) => {
+                    let BoundVerb {
+                        verb,
+                        arm_version,
+                        defs_version,
+                    } = *bound;
+                    let refusal = if arm_version.is_some_and(|v| v != self.arm_version) {
+                        Some(REFUSE_ARM_CHANGED)
+                    } else if defs_version.is_some_and(|v| v != self.keyers.def_version()) {
+                        Some(crate::keyer::REFUSE_KEYER_DEFINITION_CHANGED)
+                    } else if matches!(verb, SwitcherVerb::Bound(_)) {
+                        Some("invalid: a bound verb cannot be nested")
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = refusal {
+                        self.publish_outcome(
+                            command.operation_id,
+                            tick.index,
+                            false,
+                            Some(reason.into()),
+                        );
+                        continue;
+                    }
+                    SwitcherCommand {
+                        operation_id: command.operation_id,
+                        scene_version: command.scene_version,
+                        verb,
+                    }
+                }
+                _ => command,
+            };
             // Keyer verbs first: they reference no scene geometry, and a held
             // background take never blocks a DSK (ADR-0113 §6).
             if let SwitcherVerb::KeyerSet {
@@ -1398,7 +1474,11 @@ impl SwitcherTickDriver {
             }
             if let SwitcherVerb::Arm(armed) = command.verb {
                 // No scene geometry: the arm set names elements only.
-                let result = if armed.keys.iter().any(|&k| !self.keyers.usk_defined(k)) {
+                let result = if self.pending_take.is_some() {
+                    // Review K3-INV-1: a held take keeps the set it was
+                    // admitted with; a re-arm would retarget it.
+                    Err(REFUSE_ARM_TAKE_HELD.to_owned())
+                } else if armed.keys.iter().any(|&k| !self.keyers.usk_defined(k)) {
                     Err(REFUSE_ARM_UNKNOWN_KEY.to_owned())
                 } else {
                     self.stage();
@@ -1407,6 +1487,7 @@ impl SwitcherTickDriver {
                 match result {
                     Ok(()) => {
                         self.keyers.set_next(NextTake::of(self.machine.armed()));
+                        self.arm_version = self.arm_version.wrapping_add(1);
                         self.staged_success.push(command.operation_id);
                     }
                     Err(error) => {
@@ -1827,6 +1908,7 @@ impl SwitcherTickDriver {
                 || previous.transition != *self.machine.transition()
                 || previous.keyers != keyers
                 || previous.next != next
+                || previous.arm_version != self.arm_version
                 || previous.tally != tally
         });
         if changed {
@@ -1842,6 +1924,7 @@ impl SwitcherTickDriver {
                 transition: self.machine.transition().clone(),
                 keyers,
                 next,
+                arm_version: self.arm_version,
                 tally,
             });
         }
@@ -1908,6 +1991,7 @@ impl SwitcherTickDriver {
             self.machine = previous.machine;
             self.active_auto = previous.active_auto;
             self.active_auto_scenes = previous.active_auto_scenes;
+            self.arm_version = previous.arm_version;
             if let Some((table, version)) = previous.inputs {
                 self.inputs = Some(table);
                 self.inputs_version = version;

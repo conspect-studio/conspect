@@ -112,6 +112,10 @@ pub const REFUSE_KEYER_REPEAT_DEADLINE: &str =
 /// changes state through `arm` and a background CUT or AUTO, K3).
 pub const REFUSE_KEYER_USK_VERB: &str =
     "keyer-usk: an upstream keyer changes through arm and a CUT or AUTO; keyer_auto and keyer_tie are for downstream keyers";
+/// Typed refusal: a keyer verb authorized against keyer definitions that
+/// changed before its tick (review AUTHZ-2). Nothing changes; re-plan.
+pub const REFUSE_KEYER_DEFINITION_CHANGED: &str =
+    "keyer-definitions-changed: the keyer definitions changed since this command was authorized; re-plan it";
 /// Typed refusal: `keyer_cut` on an upstream keyer during a background
 /// transition (design note §8: a USK outside a transition only).
 pub const REFUSE_KEYER_IN_TRANSITION: &str =

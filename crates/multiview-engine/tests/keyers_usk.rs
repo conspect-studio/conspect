@@ -739,3 +739,42 @@ fn usks_draw_below_dsks() {
     assert!(luma(&frame, 8, 8).abs_diff(LUMA_K2) < 4, "the DSK on top");
     assert!(handle.snapshot().unwrap().keyers[0].unwrap().on_air && on_air(&handle, 1));
 }
+
+/// Review K3-INV-1: an `arm` while a take is held by the fresh gate is
+/// refused (`take-held`), so the held CUT lands with the set it was
+/// admitted with: usk1 (cold) only, never usk2.
+#[test]
+fn arm_is_refused_while_a_take_is_held_and_the_held_take_keeps_its_set() {
+    use multiview_engine::switcher_control::REFUSE_ARM_TAKE_HELD;
+    let rig = rig();
+    let (handle, mut hook, mut drive) = build(
+        &rig,
+        &[
+            usk("usk1", "cold", 1, Some(FLY)),
+            usk("usk2", "gfx2", 2, None),
+        ],
+    );
+    let mut outcomes = handle.outcomes();
+    handle.try_send(cmd("arm", arm(false, &[1]))).unwrap();
+    fresh(&rig, 0);
+    step(&mut hook, &mut drive, 0);
+    handle.try_send(cmd("cut", SwitcherVerb::Cut)).unwrap();
+    fresh(&rig, 1);
+    step(&mut hook, &mut drive, 1);
+    assert!(!on_air(&handle, 1), "held: usk1's fill is cold");
+    handle.try_send(cmd("rearm", arm(false, &[2]))).unwrap();
+    fresh(&rig, 2);
+    step(&mut hook, &mut drive, 2);
+    let got = drain(&mut outcomes).0;
+    let rearm = got.iter().find(|o| o.operation_id == "rearm").unwrap();
+    assert_eq!(rearm.error.as_deref(), Some(REFUSE_ARM_TAKE_HELD));
+    assert!(handle.snapshot().unwrap().next.keys[0] && !handle.snapshot().unwrap().next.keys[1]);
+    // The fill comes up: the held CUT lands with its original set.
+    fresh(&rig, 3);
+    rig.publish("cold", LUMA_FILL, 3);
+    step(&mut hook, &mut drive, 3);
+    let got = drain(&mut outcomes).0;
+    assert!(got.iter().any(|o| o.operation_id == "cut" && o.completed));
+    assert!(on_air(&handle, 1), "usk1 went on");
+    assert!(!on_air(&handle, 2), "usk2 never toggled");
+}
