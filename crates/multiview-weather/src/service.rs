@@ -513,6 +513,13 @@ mod tests {
         assert!(svc.product_freshness("IDN11060").unwrap().error.is_some());
     }
 
+    /// Whether the published Sydney view carries a forecast error.
+    fn published_error(svc: &WeatherService) -> bool {
+        svc.store()
+            .get("sydney")
+            .is_some_and(|p| p.data.forecast_freshness.error.is_some())
+    }
+
     /// #483, deterministic interleave: the `set_locations` placeholder view is
     /// built (empty freshness) while the poller's first pass records the
     /// error and republishes. The later of the two stores must not erase the
@@ -542,12 +549,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 let grace = std::time::Instant::now() + Duration::from_millis(500);
-                while std::time::Instant::now() < grace
-                    && !observer
-                        .store()
-                        .get("sydney")
-                        .is_some_and(|p| p.data.forecast_freshness.error.is_some())
-                {
+                while std::time::Instant::now() < grace && !published_error(&observer) {
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }),
@@ -556,11 +558,7 @@ mod tests {
         assert_eq!(fake.calls.load(Ordering::SeqCst), 2, "one failed pass");
         // The poller's republish (blocked behind the placeholder) lands next.
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while !svc
-            .store()
-            .get("sydney")
-            .is_some_and(|p| p.data.forecast_freshness.error.is_some())
-        {
+        while !published_error(&svc) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the recorded error was erased by the placeholder view"
