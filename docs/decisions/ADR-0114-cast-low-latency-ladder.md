@@ -1134,7 +1134,7 @@ rung only after it.
 
 Slice 2 was split. This part (the ladder endpoint, the probe, the clock and latency measurement) is built and
 merged; the per-component identity, the attachment fences and the decision 5.4 test table are the next part of
-the same slice and are not built here. Where this part differs from the text above, this section is what runs.
+the same slice, built in section 11. Where this part differs from the text above, this section is what runs.
 
 **One admission function.** `cast_streams::reauth::admit(state, token)` is the token check of every
 `/cast/<token>/…` route: it finds the token in constant time, runs the re-authorization barrier (`on_media`) on
@@ -1218,6 +1218,112 @@ slice 2 (they matter only to push rungs). Review note R2-N2 (the app's behaviour
 the ladder rate) moves to slice 6: the rate here is per token, burst 4, and a refused call answers `429` with
 `Retry-After: 1`.
 
+### 11. Slice 2 identity part and slice 4 engine (design note, as built)
+
+This part builds the per-component identity, the attachment fences and the decision 5.4 test table (the rest of
+slice 2), and the engine half of slice 4 (the MoQ rung). The receiver's MoQ player (`moq.js`) and the WebRTC rung
+(slice 5) are later pull requests. Where this part differs from the text above, this section is what runs.
+
+**Components.** `video`, `audio` (the program-audio slot: the mix, a source, a track, silence) and one
+`track:<name>` per discrete audio track the output carries. Subtitles are on no push rung (decision 5.4).
+
+**Identity.** `cast_streams::identity::identity(component, content)`: the first 63 bits of SHA-256 over a fixed
+prefix, the component and a canonical *content* string. The content is what the closure depends on: the bus name
+(`program`, `preview`, `clean`, `src:<id>`); for a layout, its id, the sorted set of the sources its cells bind and
+its `audio` attribute (so geometry edits do not change it and a new source does); for the audio slot, the engine's
+audio-source label (`program`, `preview`, `none`, `src:<id>`) or `track:<name>><input>`; for a track, its route
+input. The control plane and the engine compute it with the same functions, so "the control plane mints the
+identity of a change it requests" needs no token passed through the engine's take mailbox: the control plane
+computes it and registers it with the output's labels (`OutputLabels::expect`, bounded at 16) inside
+`reauth::before_change`, before the take is sent. The engine labels a change with that identity only when it is
+registered; any other change gets the same digest with bit 63 set (`ENGINE_MINTED`), a range the control plane
+never computes. A track re-pointed through the audio-routing route is always engine-minted.
+
+**Where the change list attaches.** Not to packets. Packets carry their timestamp, and the timestamp is a function
+of the tick (video PTS is the tick in a `1/fps` base; an audio block's samples lie inside one tick). Each cast output
+has one `OutputLabels` per run (in its `CastOutputEntry`, read by the control plane through `CastEngine::labels`):
+per component a change list of at most 16 `(first tick, identity)` entries, published through a `SwapCell`, and a
+monotonic `labelled_through` tick. The gate maps each packet of a window to `(component, tick)` with exact integer
+arithmetic and resolves it there.
+
+**Who writes it, and when.** `cast_output::CastLabeller`, on the bake consumer, once per iteration, after the router
+tick. Per cast output it compares two fingerprints of what the router says the output carries (picture: the bus and,
+for a layout, the identity of the resolved body; audio slot: the audio router's target) and the live input of each
+track; only on a change does it compute an identity and publish an entry. It labels a change from the previous
+`labelled_through`, that is, from the first window not yet judged, and then sets `labelled_through` to the
+dispatcher's next window index. Two facts make that sound. A requested take is processed by the router at a tick no
+later than the first tick that carries it, so its entry is never late; an engine fallback becomes visible in the
+same consumer iteration in which the dispatcher reports it, before `labelled_through` passes the window that carries
+it. So a window is never judged against a list that could still change for it, and a label is at worst a few
+windows early, never late. Early is safe: a requested change's identity was cleared, for every token that passed
+the check for it, before the engine heard of it, and an engine-minted identity is refused whatever it labels. Why a
+change is unrequested is decided by the router itself: each video fallback, stale move and audio-stage fallback
+increments a per-output counter, and a labelling pass that sees it moved mints in the engine range.
+
+**Clearance.** `Clearance`: per component at most 9 identities, immutable, replaced whole through a `SwapCell`.
+A new attachment is cleared for the identities current right after the shared check (`reauth::clearance_now`, read
+from the engine's labels after `admit` re-authorized the token against the present state). `CastStreams::commit`
+(the critical section of `before_change`) adds the identities of a requested change to every attachment of every
+token still armed at the new generation, so only tokens that passed the check for it are cleared.
+
+**The gate.** `CastAttachment::admit_window`: fenced, refuse; any tick of the window at or past `labelled_through`,
+hold the window (it is the oldest, nothing later is offered before it); otherwise every packet must resolve to an
+identity in the clearance for its component. One miss, or a component without an identity, and the window is
+refused, the attachment fenced, and its closer run. On the MoQ rung the gate is in the off-clock conversion worker
+(`moq_outputs::factory::publish_gated`), after the lease checks and before the window is converted or offered to
+the transport's fence. A refusal is terminal: the worker drops a held window, fences, revokes its subscription
+(the registry closes the peer queue) and revokes the transport fence (the session closes, not drained).
+
+**Fences.** Each stream holds its push attachments (at most 2 per rung, 4 in all; a renewal registers the new one
+before the oldest of that rung is fenced). Revoke, remove, release and expiry fence them under the registry lock:
+one atomic store each and the transport's closer, which only flips the MoQ fence (no I/O). A MoQ lease's own
+fence (DELETE, expiry, registry drop) fences the attachment too.
+
+**The MoQ rung.** The ladder answer walks the offer in order and admits the first rung that admits now: MoQ needs
+a ready MoQ provider and labels for the output, and is admitted with `MoqRegistry::open_cast` under the owner's
+current principal (decision 5.6), the same bounded registry, TTL (30 s) and expiry as a desk lease. Any refusal
+(no subscription left, a codec the lease refuses, no labels) leaves MoQ out of this answer and the next rung is
+offered: review note R2-N4. The attachment is registered with the token only if the token is still armed at the
+admitted generation; otherwise the lease is fenced and HLS is offered. A call reporting `failed` for a rung leaves
+it out of that answer. Lease renewal is a new ladder call: it admits a new lease (make-before-break), and the
+receiver drops the old one; the old attachment is fenced at the second renewal at the latest. A fenced cast lease
+frees its registry slot at the next cast admission. `[cast] ladder` accepts `moq` now; `webrtc` and `srt` stay
+refused.
+
+**The open question of decision 6, settled.** A `kind = "cast"` output's binding enters the effective-output
+registry like any configured output, and its video carries the production encoder's `NoReorder` proof
+(`i_the_cast_binding_enters_the_registry_with_the_no_reorder_proof`, real pipeline, real libx264).
+
+**Activation.** A MoQ attachment does not activate the cast output's HLS packager: the registry mirror is fed
+whether or not the output is active, so the push rung needs no packaging and starts at the next verified keyframe.
+The token's lifetime follows decision 5.5: with a live attachment, a ladder call or a report keeps it live.
+
+**Invariants #1 and #10.** The clock thread does nothing new. The bake consumer does two integer compares per cast
+output per iteration, and an allocation and one `SwapCell` publish only when what an output carries changed. The
+gate runs on the per-subscription conversion thread and takes no lock: two `SwapCell` loads and at most 512 integer
+lookups per window. A fence is an atomic store plus the transport fence's own bounded revoke. Every queue is an
+existing one: the registry's two-window hand-off and bounded batch queue per subscription, and the MoQ fence's
+4-window channel with its 8 MiB per subscription and 64 MiB global charge. The chaos test
+`m_stalled_cast_moq_viewers_cost_the_clock_zero_ticks_and_the_hls_output_zero_packets` fills all 16 subscriptions of
+a real run with cast MoQ viewers that never read, asserts that the 17th is refused, that the retained bytes stay
+under the global ceiling, and the isolation assertions of the ADR-0111 chaos tests against a control run (every
+tick emitted, the HLS binding's video PTS contiguous, its audio count equal to the control run's, tick progress at
+the clock's cadence); the negative controls `n_…` prove those assertions see a stall of the shared path.
+
+**Tests.** The decision 5.4 table runs against the real MoQ rung (`moq_outputs::factory::tests::cast_gate`: real
+registry, worker, converter and transport fence), each case failing with the gate removed (checked: 6 of the 8
+rows fail on that revert; rows 6 and 7 hold by the fence and by clearance, and their own reverts are the fence
+and clearance unit tests). The engine's labelling is tested on the real pipeline (test `j_`), the requested and the
+unrequested take on a real cast MoQ attachment (test `k_`), the registry's fences and clearance under the lock
+(`cast_streams::tests::attachments`), and the ladder's MoQ offer, R2-N4, `failed`, revoke and take paths through the
+real control plane (`tests/cast_streams_routes.rs`, `moq_rung`).
+
+**Not built here, stated.** The receiver's MoQ player; the WebRTC rung, its Opus encoder and the egress feed's byte
+and age ceilings (slice 5); the 60 s stop-reading test with a resident-memory bound, which needs the real
+transport session that only the receiver opens: the engine-side bound it would show is the MoQ fence's 8 MiB per
+subscription and 64 MiB in total, asserted by the chaos test above. The `clock` the ladder answers is unchanged;
+the lease's own `clock_wall_micros` stays `null`, as decision 2 allows (the receiver uses the ladder's `clock`).
+
 ## Rationale
 
 - **Why a ladder decided by the receiver's report, not by the sender.** The sender cannot see what the device's
@@ -1283,8 +1389,8 @@ the ladder rate) moves to slice 6: the rate here is per token, burst 4, and a re
 | Whether CAF gives senders a correct media session for a picture it did not load | Closed in the harness by slice 3: yes, by the two methods of decision 3; no, by an interceptor that returns `null` |
 | Whether a device's CAF plays a `blob:` `contentUrl` in the page's own media element, and whether the WebRTC element hook takes there | first device step of slices 4 and 5 |
 | Whether the receiver page's policy admits a cross-origin WebTransport session | Closed in the harness by slice 3: yes. On a device: slice 4 |
-| Whether a `cast` output is admitted to the effective-output registry and has the no-reorder proof | slice 2 |
-| Where the dispatcher attaches the per-component identity change list to video and audio packets, and whether every unrequested change can mint an identity (decision 5.4) | slice 2 design note; the contract and its tests are fixed |
+| Whether a `cast` output is admitted to the effective-output registry and has the no-reorder proof | Closed by section 11: yes, tested on the real pipeline |
+| Where the dispatcher attaches the per-component identity change list to video and audio packets, and whether every unrequested change can mint an identity (decision 5.4) | Closed by section 11: per output and component, keyed by tick, written on the bake consumer; every unrequested change the router makes is counted and minted in the engine range |
 | What the Cast platform does when `androidReceiverCompatible` is set and the app is not installed | slice 6, first device step |
 | Whether `supportedAppTypes` in the engine-side LAUNCH selects the Android TV app | slice 6 device test |
 | Whether UDP 443 and UDP 9010 pass from the network the Cast devices are on | slices 4 and 6 device tests |
@@ -1298,7 +1404,7 @@ the ladder rate) moves to slice 6: the rate here is per token, burst 4, and a re
 | Existing `webrtc` output: RTP time becomes 0 for every frame after 2^32 (video after 13 h 15 min, audio after 24 h 51 min; read in code, not reproduced) | issue #492, ship lane `rtpwrap`; outside this ADR |
 | What the app does when ladder calls for a fresh SRT selector run into the rate limit during rapid reconnects: step down, or retry (review note R2-N2) | slice 2 design note. Not decided here |
 | Which RTCP wall clock the WebRTC rung uses when the run has no validated epoch (review note R2-N3) | slice 5, as a test requirement. Not decided here |
-| That the ladder answers with the next rung, and not with an error, when no registry subscription is left for MoQ (review note R2-N4; decision 6 already says the receiver gets the next rung) | slice 4 test |
+| That the ladder answers with the next rung, and not with an error, when no registry subscription is left for MoQ (review note R2-N4; decision 6 already says the receiver gets the next rung) | Closed by section 11 (route test `no_subscription_left_offers_the_next_rung`) |
 
 ## Appendix: slice 3 spike (2026-11-15)
 
