@@ -681,3 +681,84 @@ fn a_keyer_auto_rate_override_is_bounded() {
         "in flight, no outcome yet"
     );
 }
+
+/// Keyers K6 (#391, ADR-0058 §5): a DSK with a linear self key over a fill
+/// that carries an NV12+A alpha plane (as the media player now publishes for
+/// an alpha asset) is shaped by that alpha, end to end through the real hook
+/// and CPU drive. The expectation is computed per pixel here, independently
+/// of the kernel: fill and background through the public front half, the
+/// fill premultiplied once by its alpha, `over`, then the back half.
+#[test]
+fn a_linear_self_key_over_an_alpha_fill_is_shaped_by_the_fill_alpha() {
+    use multiview_compositor::blend::{over, LinearRgba};
+    use multiview_compositor::pipeline::{
+        canvas_linear_to_output_yuv, tile_yuv_to_canvas_linear, AlphaPlanePool, CanvasColor,
+    };
+    use std::sync::Arc;
+
+    const BANDS: [u8; 4] = [0, 85, 170, 255];
+    let side = usize::try_from(rig::SIDE).unwrap();
+    let alpha: Vec<u8> = (0..side * side)
+        .map(|i| BANDS[(i % side) / (side / BANDS.len())])
+        .collect();
+    let pool = Arc::new(AlphaPlanePool::default());
+    let rig = rig();
+    let (handle, mut hook, mut drive) = rig.build(&[dsk("dsk1", "gfx", None, 1)], 3.0, "a", "b");
+    let publish_fill = |index: u64| {
+        let fill = pool
+            .attach(Rig::solid(LUMA_FILL, rig::SIDE, rig::SIDE), &alpha)
+            .unwrap();
+        rig.store("gfx")
+            .publish_arc(Arc::new(fill), rig::pts(index));
+    };
+    rig.publish_background(0);
+    publish_fill(0);
+    step(&mut hook, &mut drive, 0);
+    handle
+        .try_send(cmd("on", SwitcherVerb::KeyerCut { keyer: 0, on: true }))
+        .unwrap();
+    rig.publish_background(1);
+    publish_fill(1);
+    let frame = step(&mut hook, &mut drive, 1);
+    assert_eq!(weight_of(&drive, 0), Some(1.0), "the keyer is fully on air");
+
+    let canvas = CanvasColor::default();
+    let lin = |y: u8| {
+        let color = rig.color;
+        tile_yuv_to_canvas_linear(y, 128, 128, color, canvas).unwrap()
+    };
+    let (fill, bg) = (lin(LUMA_FILL), lin(LUMA_A));
+    let straight = |rgb: [f32; 3], a: f32| LinearRgba {
+        r: rgb[0],
+        g: rgb[1],
+        b: rgb[2],
+        a,
+    };
+    let mut shaped = Vec::new();
+    for (band, &a8) in BANDS.iter().enumerate() {
+        let a = f32::from(a8) / 255.0;
+        let out = over(
+            straight(fill, a).premultiplied(),
+            straight(bg, 1.0).premultiplied(),
+        )
+        .unpremultiplied();
+        let want = canvas_linear_to_output_yuv([out.r, out.g, out.b], canvas).unwrap();
+        let x = u32::try_from(band * (side / BANDS.len()) + 3).unwrap();
+        for y in [1_u32, 30, 62] {
+            let (got, cb, cr) = frame.canvas.sample(x, y).unwrap();
+            assert!(
+                got.abs_diff(want[0]) <= 1
+                    && cb.abs_diff(want[1]) <= 1
+                    && cr.abs_diff(want[2]) <= 1,
+                "band {band} (alpha {a8}) at ({x},{y}): {:?} vs oracle {want:?}",
+                (got, cb, cr)
+            );
+        }
+        shaped.push(want[0]);
+    }
+    // The alpha really shapes the key: transparent shows Program, opaque the
+    // fill, and the partial bands sit strictly between, in order.
+    assert!(shaped[0].abs_diff(LUMA_A) <= 1, "{shaped:?}");
+    assert!(shaped[3].abs_diff(LUMA_FILL) <= 1, "{shaped:?}");
+    assert!(shaped.windows(2).all(|w| w[0] < w[1]), "{shaped:?}");
+}
