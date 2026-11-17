@@ -1102,7 +1102,10 @@ merge (see "K1 GPU key path as built", wipe masks).
   its toggle).
 - **`arm`.** `SwitcherVerb::Arm(Arc<ArmedSet>)` (built off the clock) goes through
   `SwitcherState::arm_shared` (empty, duplicate, out-of-range and in-flight refused, fixed-array
-  scan). A key that is not a defined USK is refused `unknown-keyer`. The runtime caches the set
+  scan). A key that is not a defined USK is refused `unknown-keyer`. While a take is held by the
+  fresh gate, `arm` is refused `take-held` (`REFUSE_ARM_TAKE_HELD`, review K3-INV-1), so a held
+  CUT lands with the set it was admitted with. Each applied `arm` bumps `arm_version`
+  (snapshot field; restored by a reject). The runtime caches the set
   as a `Copy` `NextTake`; a rejected frame restores it with the machine.
 - **Transitions.** Armed USKs reuse the tied-DSK flight bookkeeping (`flight: Some(direction)`,
   fixed at the AUTO start, `complete_tied` on the terminal tick or CUT, `cancel_tied` on an
@@ -1142,6 +1145,20 @@ merge (see "K1 GPU key path as built", wipe masks).
     armed key's fill and key, all before any existence answer (an unseen key is 403, a visible
     undefined one 404). 422 for an empty, duplicate or over-long set; 409 `in-flight` during a
     transition.
+  - **CUT and AUTO toggle the armed keys (review AUTHZ-1).** Plan and command authorize
+    `Control` on every currently armed USK object and `Read` on its fill and key
+    (`switcher_keyers::authorize_armed`). The command carries the committed `arm_version` and
+    definitions version it was authorized against (`SwitcherVerb::Bound`, boxed off the clock);
+    the tick refuses it `arm-changed` / `keyer-definitions-changed` if either moved, so a take
+    never toggles a key its caller was not authorized for. Consequence: an `arm` and a CUT sent
+    in the same tick refuse the CUT; arm, see it applied, then take.
+  - **Key-only takes with identical buses (review MEDIA-1).** `same-source` (PGM == PVW) is
+    refused only when the armed set moves the background.
+  - **USK `keyer_cut` (review AUTHZ-2)** also needs `Read` on the keyer's resolved fill and key
+    and is bound to the definitions version (refused `keyer-definitions-changed` if a
+    `keyer_set` re-pointed it meanwhile). DSK `keyer_cut`/`keyer_auto`/`keyer_tie` keep K4's
+    rule (sources are checked when named; the K4 design does not require Read on a DSK's
+    current fill to drive it, tested in `switcher_keyers`).
   - `keyer_set` / `keyer_cut` take `family = "usk"` (object id `<me>/<keyer>`). A USK
     `keyer_set` merges onto the definition, validates with the USK rules, admits its cost
     against the shared budget, never reserves the Clean gate, refuses `rate`/`on_at_start`
@@ -1174,12 +1191,22 @@ merge (see "K1 GPU key path as built", wipe masks).
     MIX) and WIPE; an unarmed USK below (`both`) and above (`top`) an armed one; an AUTO aborted
     on a stale incoming source restores key state; the fresh gate (+50, 0 lost ticks, going off
     never gated); USK verb refusals; USKs below DSKs. `tests/keyers_dsk.rs`: the WIPE tie test.
-  - `tests/keyers_usk_chaos.rs` (2, invariants #1/#10): 1 500 ticks with armed-key sources
-    stalling and one vanishing during AUTOs under an `arm`/AUTO/CUT flood: contiguous ticks,
-    PTS from the tick counter, 0 repeats, one outcome per op, keys dropped at the trigger;
-    6 000 ticks of key-changing MIX, DIP, WIPE-with-border and key-only AUTOs: the drive's
-    scratch, slate and DIP-fill odometers and the definition builds never move after warm-up.
-  - `multiview-control` `tests/switcher_keyers_usk.rs` (5): the `arm` BOLA matrix on plan and
+  - `tests/keyers_usk_chaos.rs` (4, invariants #1/#10; restructured after review K3-INV-2):
+    a clock-driven run (manual time source, sources published by tick index) where each
+    cycle's armed keys stall and vanish DURING a 40-tick key-changing AUTO, the losses counted
+    against the committed snapshot's `in_flight` (≥ 6 in flight over 8 cycles), with
+    contiguous ticks, PTS from the counter and 0 repeats; a bounded `arm`/AUTO/CUT flood from 8
+    tasks whose accepted ids equal the terminal outcomes exactly (sends = accepted + busy,
+    zero lag with a per-tick reader); a stalled reader that sees exactly the 256-entry ring
+    plus a counted lag; and 6 000 ticks of key-changing MIX, DIP, WIPE-with-border and key-only
+    AUTOs where the drive's scratch, slate and DIP-fill odometers and the definition builds
+    never move after warm-up.
+  - `multiview-engine` `tests/keyers_usk.rs` also: `arm` refused while a take is held, the
+    held CUT keeping its set (review K3-INV-1).
+  - `multiview-control` `tests/switcher_keyers_usk.rs` (9; round 1 added: key-only CUT/AUTO
+    with identical buses and the retained background refusal; CUT/AUTO BOLA on the armed keys
+    and their sources; a take bound to a stale arm set refused `arm-changed`; USK `keyer_cut`
+    BOLA on its sources and bound to its definition): the `arm` BOLA matrix on plan and
     command (M/E, program, keyer object, sources, viewer; 403 before 404; no key burned); shape
     and `in-flight`; 202 + outcome + replay and the armed set in GET; USK `keyer_set` /
     `keyer_cut` and persistence to the M/E; GET/events parity and redaction for scoped
