@@ -244,6 +244,9 @@ struct PrivateBus {
     fed: u64,
     /// One past the last faded sample (the bus start before any fade).
     settled_from: u64,
+    /// Test observation of the encode thread's progress (#461).
+    #[cfg(test)]
+    progress: Arc<crate::rendition_workers::WorkerProgress>,
 }
 
 impl PrivateBus {
@@ -428,6 +431,16 @@ pub(crate) struct RoutedAudio {
 }
 
 impl RoutedAudio {
+    /// Test observation: the progress of every private bus encode thread.
+    #[cfg(test)]
+    pub(crate) fn worker_progress(&self) -> Vec<Arc<crate::rendition_workers::WorkerProgress>> {
+        self.outputs
+            .iter()
+            .flat_map(|o| o.bus.iter().chain(o.staged.iter().map(|s| &s.bus)))
+            .map(|b| Arc::clone(&b.progress))
+            .collect()
+    }
+
     pub(crate) fn new(
         outputs: usize,
         config: AudioEncodeConfig,
@@ -694,6 +707,8 @@ impl RoutedAudio {
         };
         let failed = Arc::new(AtomicBool::new(false));
         let (config_tx, config_rx) = mpsc::sync_channel(1);
+        #[cfg(test)]
+        let progress = Arc::new(crate::rendition_workers::WorkerProgress::default());
         let spawned = spawn_bus_worker(
             BusWorker {
                 config: self.config.clone(),
@@ -704,6 +719,8 @@ impl RoutedAudio {
                 dropped: Arc::clone(&self.dropped),
                 #[cfg(test)]
                 hook: self.worker_hook.clone(),
+                #[cfg(test)]
+                progress: Arc::clone(&progress),
             },
             Arc::clone(&failed),
         );
@@ -728,6 +745,8 @@ impl RoutedAudio {
             reserved: false,
             fed: start,
             settled_from: start,
+            #[cfg(test)]
+            progress,
         })
     }
 
@@ -1446,7 +1465,11 @@ impl RoutedAudio {
             .jobs
             .as_ref()
             .is_some_and(|jobs| match jobs.try_send(tail) {
-                Ok(()) => true,
+                Ok(()) => {
+                    #[cfg(test)]
+                    bus.progress.offered.fetch_add(1, Ordering::Release);
+                    true
+                }
                 Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
             });
         if sent {
@@ -1706,6 +1729,8 @@ struct BusWorker {
     dropped: Arc<AtomicU64>,
     #[cfg(test)]
     hook: Option<WorkerHook>,
+    #[cfg(test)]
+    progress: Arc<crate::rendition_workers::WorkerProgress>,
 }
 
 /// The private bus's encode thread: open the AAC encoder on the global grid,
@@ -1727,6 +1752,17 @@ fn spawn_bus_worker(
             }
         })?;
     Ok(jobs_tx)
+}
+
+/// Counts one processed job on drop (test observation, #461).
+#[cfg(test)]
+struct JobDone<'a>(&'a crate::rendition_workers::WorkerProgress);
+
+#[cfg(test)]
+impl Drop for JobDone<'_> {
+    fn drop(&mut self) {
+        self.0.done.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// Returns `false` on an encoder failure or a lost event.
@@ -1751,6 +1787,10 @@ fn bus_worker(w: &BusWorker, jobs: &Receiver<Vec<f32>>) -> bool {
             }
             job_index += 1;
         }
+        // Counted when this job's iteration ends (event sent, skipped or
+        // failed), so a harness never waits on a job already handled.
+        #[cfg(test)]
+        let _done = JobDone(&w.progress);
         let Ok(mut packets) = encoder.encode_interleaved(&pcm, pcm.len() / channels) else {
             return false;
         };
