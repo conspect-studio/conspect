@@ -309,3 +309,241 @@ async fn live_source_switcher_on_bus_refusal_redacts_unreadable_keyers() {
     assert!(!detail.contains("dsk1"), "{detail}");
     assert_eq!(upserts(&mut rig, "scoped-layout"), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Windy VT (ship-1111): PVW select of a live-added `media_player` source.
+// ---------------------------------------------------------------------------
+
+/// A demand provider modelled on the binary's: an id is leasable only once it
+/// is catalogued, and an alias of a player with no channel has a reason.
+struct AliasDemand {
+    catalogued: Vec<&'static str>,
+    no_channel: Option<(&'static str, &'static str)>,
+}
+
+struct NoopLease;
+impl SourceDemandLease for NoopLease {}
+
+impl SourceDemandProvider for AliasDemand {
+    fn status(&self, id: &str) -> SourceDemandView {
+        SourceDemandView::idle(id)
+    }
+    fn active(&self) -> Vec<SourceDemandView> {
+        Vec::new()
+    }
+    fn preview_lease(&self, id: &str, _label: &str) -> Option<Box<dyn SourceDemandLease>> {
+        if self.catalogued.contains(&id) {
+            let lease: Box<dyn SourceDemandLease> = Box::new(NoopLease);
+            Some(lease)
+        } else {
+            None
+        }
+    }
+    fn touch_preview(&self, _id: &str) -> Option<SourceDemandPhase> {
+        None
+    }
+    fn select_refusal(&self, id: &str) -> Option<String> {
+        self.no_channel
+            .filter(|(alias, _)| *alias == id)
+            .map(|(_, player)| format!("media player {player:?} has no channel in this run"))
+    }
+}
+
+fn primed(
+    id: &str,
+) -> Arc<multiview_framestore::TileStore<multiview_compositor::pipeline::Nv12Image>> {
+    let store = Arc::new(multiview_framestore::TileStore::with_defaults(
+        id.to_owned(),
+    ));
+    store.publish(
+        multiview_compositor::pipeline::Nv12Image::solid(
+            64,
+            64,
+            90,
+            128,
+            128,
+            multiview_core::color::ColorInfo::default().resolve_defaults(64, 64),
+        )
+        .unwrap(),
+        MediaTime::ZERO,
+    );
+    store
+}
+
+fn vt_harness(
+    demand: AliasDemand,
+) -> (
+    support::Harness,
+    SwitcherControl,
+    multiview_engine::switcher_control::SwitcherTickDriver,
+) {
+    let (handle, mut driver) = SwitcherControl::new(SwitcherState::new(
+        SourceRef::new("cam-a"),
+        SourceRef::new("cam-b"),
+        vec![],
+    ));
+    let scene = |name: &str, source: &str| {
+        Arc::new(multiview_core::layout::Layout {
+            name: name.into(),
+            canvas: multiview_core::layout::Canvas {
+                width: 64,
+                height: 64,
+                fps_num: 25,
+                fps_den: 1,
+            },
+            cells: vec![multiview_core::layout::Cell {
+                x: 0.0,
+                y: 0.0,
+                w: 1.0,
+                h: 1.0,
+                source: Some(source.to_owned()),
+                ..multiview_core::layout::Cell::default()
+            }],
+        })
+    };
+    handle
+        .set_scenes(multiview_engine::switcher_control::ScenePair {
+            version: 1,
+            program: scene("program", "cam-a"),
+            preview: scene("preview", "cam-b"),
+        })
+        .unwrap();
+    let player = primed("vt-1");
+    driver.set_prime_stores(
+        [
+            ("cam-a".to_owned(), primed("cam-a")),
+            ("cam-b".to_owned(), primed("cam-b")),
+            ("vt-1".to_owned(), Arc::clone(&player)),
+            ("vt-1-src".to_owned(), player),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let tick = Tick {
+        index: 0,
+        pts: MediaTime::ZERO,
+    };
+    driver.drain_at_tick(tick);
+    driver.commit_composed_tick(tick);
+    driver.publish_provider_status(multiview_engine::switcher_control::ProviderStatus {
+        scene_version: 1,
+        last_tick: 0,
+        width: 64,
+        height: 64,
+        fps_num: 25,
+        fps_den: 1,
+    });
+    let store = multiview_control::InMemorySourceStore::new();
+    for (id, body) in [
+        ("cam-a", json!({"id": "cam-a", "kind": "solid"})),
+        ("cam-b", json!({"id": "cam-b", "kind": "solid"})),
+        (
+            "vt-1-src",
+            json!({"id": "vt-1-src", "kind": "media_player", "player": "vt-1"}),
+        ),
+        (
+            "vt-ghost",
+            json!({"id": "vt-ghost", "kind": "media_player", "player": "vt-9"}),
+        ),
+    ] {
+        multiview_control::ResourceRepository::create(
+            &store,
+            id,
+            multiview_control::ResourceInput {
+                name: id.to_owned(),
+                body,
+            },
+        )
+        .unwrap();
+    }
+    let sources: Arc<dyn multiview_control::ResourceRepository> = Arc::new(store);
+    let control = handle.clone();
+    let h = harness_with(move |state| {
+        state
+            .with_sources_store(sources)
+            .with_switcher(control)
+            .with_source_demand(Arc::new(demand))
+    });
+    (h, handle, driver)
+}
+
+fn select(source: &str, key: &str) -> axum::http::Request<axum::body::Body> {
+    let mut request = post_json(
+        "/api/v1/switcher/commands/select_preview",
+        OPERATOR_TOKEN,
+        &json!({"me": "me1", "program": "main", "action": "select_preview", "source": source}),
+    );
+    request
+        .headers_mut()
+        .insert("Idempotency-Key", key.parse().unwrap());
+    request
+}
+
+/// A live-added `media_player` source bound to a playing player is accepted
+/// on PVW (202) and the engine applies it; nothing answers a bare Conflict.
+#[tokio::test]
+async fn vt_select_preview_of_a_media_player_source_is_accepted_and_applied() {
+    let (h, handle, mut driver) = vt_harness(AliasDemand {
+        catalogued: vec!["cam-a", "cam-b", "vt-1-src"],
+        no_channel: None,
+    });
+    let resp = send(&h.router, select("vt-1-src", "pvw-vt")).await;
+    let status = resp.status();
+    assert_eq!(status, StatusCode::ACCEPTED, "{:?}", body_json(resp).await);
+    let audit = body_json(send(&h.router, get("/api/v1/audit", support::ADMIN_TOKEN)).await).await;
+    assert!(
+        audit.to_string().contains("\"object_kind\":\"switcher\"")
+            && audit.to_string().contains("\"source\":\"vt-1-src\""),
+        "the accepted select is audited: {audit}"
+    );
+    let tick = Tick {
+        index: 1,
+        pts: MediaTime::from_nanos(40_000_000),
+    };
+    driver.drain_at_tick(tick);
+    driver.commit_composed_tick(tick);
+    assert_eq!(
+        handle.snapshot().unwrap().preview.as_str(),
+        "vt-1-src",
+        "Preview is the VT"
+    );
+}
+
+/// A select that cannot work says why: a `media_player` source whose player
+/// has no channel is a typed 409 naming the player, a not-yet-registered
+/// source a typed 409 that says to retry — never a bare "Conflict".
+#[tokio::test]
+async fn vt_select_preview_that_cannot_work_is_a_typed_problem_with_its_reason() {
+    let (h, _handle, _driver) = vt_harness(AliasDemand {
+        catalogued: vec!["cam-a", "cam-b"],
+        no_channel: Some(("vt-ghost", "vt-9")),
+    });
+    let resp = send(&h.router, select("vt-ghost", "pvw-ghost")).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    assert_eq!(body["type"], "/problems/source-unavailable", "{body}");
+    assert!(body["detail"].as_str().unwrap().contains("vt-9"), "{body}");
+
+    let resp = send(&h.router, select("vt-1-src", "pvw-late")).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    assert_eq!(body["type"], "/problems/source-unavailable", "{body}");
+    assert!(
+        body["detail"].as_str().unwrap().contains("vt-1-src"),
+        "{body}"
+    );
+
+    // BOLA: a scoped key not granted the source is refused before any reason.
+    let mut request = post_json(
+        "/api/v1/switcher/commands/select_preview",
+        SCOPED_TOKEN,
+        &json!({"me": "me1", "program": "main", "action": "select_preview", "source": "vt-ghost"}),
+    );
+    request
+        .headers_mut()
+        .insert("Idempotency-Key", "scoped".parse().unwrap());
+    let resp = send(&h.router, request).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = body_json(resp).await;
+    assert!(!body.to_string().contains("vt-9"), "{body}");
+}

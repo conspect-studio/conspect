@@ -2413,6 +2413,10 @@ pub struct Pipeline {
     /// ([`crate::control::command_drain_with_seams`]) can address every declared
     /// channel. Empty when no media players are configured.
     player_mailboxes: std::collections::HashMap<String, Arc<crate::player::TransportMailbox>>,
+    /// The media-player channels this run actually booted (a real store fed
+    /// by a player loop). A declared player that failed boot is absent: an
+    /// alias of it can never show a picture (review ship-1111 #4).
+    booted_players: Arc<std::collections::BTreeSet<String>>,
     /// The shared WHIP publisher rendezvous (ADR-T014): the control plane's
     /// `WhipProvider` writes a negotiated publisher into it and each webrtc
     /// source's `drive_webrtc` loop reads. Exposed to the run wiring via
@@ -3405,6 +3409,13 @@ impl Pipeline {
             player_state,
         );
         let player_mailboxes = media_player_boot.mailboxes;
+        // Players with a channel (a store) in this run: an alias of any other
+        // player can never show a picture, and its status says so.
+        let booted_players: std::collections::BTreeSet<String> = media_player_boot
+            .stores
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
         for (id, store) in media_player_boot.stores {
             stores.insert(id, store);
         }
@@ -3721,8 +3732,10 @@ impl Pipeline {
 
         // Every configured source is catalogued, demanded or not; the stores of
         // booted sources are shared so a later lease reuses them.
-        // A `media_player` source is an alias of a player channel the player
-        // boot owns: demand never starts or stops it (no catalogue entry).
+        // A `media_player` source is catalogued as an alias of its player's
+        // store (ADR-M012): demand reports and leases it like any source (its
+        // standing pin is its consumer), but never starts, stops or clears a
+        // producer — the player boot owns the channel.
         let catalogue = crate::source_rails::catalogue(
             config.sources.iter().filter(|source| {
                 !matches!(
@@ -3732,6 +3745,21 @@ impl Pipeline {
             }),
             &stores,
         );
+        for source in &config.sources {
+            if let SourceKind::MediaPlayer { player } = &source.kind {
+                let store = stores
+                    .get(&source.id)
+                    .map_or_else(|| crate::source_rails::empty_store(&source.id), Arc::clone);
+                let unavailable = (!booted_players.contains(player))
+                    .then(|| crate::source_rails::no_channel_reason(player));
+                crate::source_rails::catalogue_alias(
+                    &catalogue,
+                    source,
+                    &store,
+                    unavailable.as_deref(),
+                );
+            }
+        }
         let demand_config = crate::source_demand::demand_config(config);
         let boot_pins: Vec<(String, Vec<crate::source_demand::StandingPin>)> = config
             .sources
@@ -3780,6 +3808,7 @@ impl Pipeline {
             live_island: Arc::new(multiview_framestore::SwapCell::empty()),
             ingest_plans,
             player_mailboxes,
+            booted_players: Arc::new(booted_players),
             #[cfg(feature = "webrtc-native")]
             webrtc_registry,
             #[cfg(feature = "webrtc-native")]
@@ -4032,6 +4061,14 @@ impl Pipeline {
         &self,
     ) -> std::collections::HashMap<String, Arc<crate::player::TransportMailbox>> {
         self.player_mailboxes.clone()
+    }
+
+    /// The media-player channels this run booted, for the command drain's
+    /// `media_player` source binding (ADR-M012): an alias of any other player
+    /// reads no-signal and its switcher select is refused with the reason.
+    #[must_use]
+    pub fn booted_players(&self) -> Arc<std::collections::BTreeSet<String>> {
+        Arc::clone(&self.booted_players)
     }
 
     /// The shared per-source producer stop registry (ADR-W018): hand this to
@@ -4576,6 +4613,7 @@ impl Pipeline {
                 .consumer_set(multiview_engine::ConsumerClass::SubtitleRoute, Rails::VIDEO),
             manager,
             catalogue: Arc::clone(&self.catalogue),
+            booted_players: Arc::clone(&self.booted_players),
         })
     }
 
@@ -4682,8 +4720,9 @@ impl Pipeline {
                 if self.audio_stores.contains_key(id) {
                     continue;
                 }
+                // An alias's audio is its player's channel (routed by alias).
                 let entry = self.catalogue.load().get(id).cloned();
-                let Some(entry) = entry else {
+                let Some(entry) = entry.filter(|entry| !entry.is_alias()) else {
                     continue;
                 };
                 let lifecycle = if self.ingest_plans.iter().any(|plan| plan.id == *id) {
@@ -12077,6 +12116,37 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
         true
     }
 
+    fn catalogue_alias(
+        &self,
+        source: &Source,
+        store: &Arc<TileStore<Nv12Image>>,
+        unavailable: Option<String>,
+    ) -> bool {
+        let Some((catalogue, manager)) = &self.demand else {
+            return false;
+        };
+        crate::source_rails::catalogue_alias(catalogue, source, store, unavailable.as_deref());
+        manager.set_pins(&source.id, crate::source_demand::standing_pins(source));
+        // A repoint re-baselines readiness on the new player's store.
+        manager.restart(&source.id);
+        true
+    }
+
+    fn alias_removed(&self, id: &str, store: &Arc<TileStore<Nv12Image>>) {
+        if let Some((catalogue, manager)) = &self.demand {
+            // Only the alias that was bound to `store`: a stale (retried)
+            // unbind never removes a later definition under the same id.
+            if catalogue
+                .load()
+                .get(id)
+                .is_some_and(|entry| entry.is_alias() && Arc::ptr_eq(entry.store(), store))
+            {
+                crate::source_rails::catalogue_remove(catalogue, id);
+                manager.remove_source(id);
+            }
+        }
+    }
+
     fn invalidate_live_edit(&self, id: &str) -> bool {
         if !self.clear_on_remove {
             return false;
@@ -12089,6 +12159,13 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
         let Some(entry) = catalogue.load().get(id).cloned() else {
             return false;
         };
+        if entry.is_alias() {
+            // Leaving a `media_player` alias: its store is the player
+            // channel's and is never cleared; the new definition gets its own
+            // store from the drain and is catalogued right after this.
+            crate::source_rails::catalogue_remove(catalogue, id);
+            return false;
+        }
         // A media edit (the control plane refused it already if the source
         // was on a bus). The hub's teardown has stopped and awaited the old
         // producer; fence any detached writer with a fresh lifecycle, then
@@ -12186,9 +12263,11 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
         #[cfg(feature = "youtube")]
         crate::youtube_status::forget(id);
         let retired_store = self.demand.as_ref().and_then(|(catalogue, manager)| {
+            // An alias's store is its player channel's: never cleared here.
             let store = catalogue
                 .load()
                 .get(id)
+                .filter(|entry| !entry.is_alias())
                 .map(|entry| Arc::clone(entry.store()));
             crate::source_rails::catalogue_remove(catalogue, id);
             // Every pin it owns (standing and an operator Start) and every
@@ -27510,6 +27589,36 @@ segment_ms = 1000
         config
     }
 
+    /// Ship-1111 review #4: a player that fails boot (its journal is owned
+    /// by another runtime) leaves no channel. Its identity alias still gets a
+    /// placeholder store under the player id, but it is not a booted player:
+    /// the catalogue marks the alias unavailable and the drain's booted set
+    /// excludes it, so a re-apply cannot clear the refusal.
+    #[cfg(feature = "ffmpeg")]
+    #[test]
+    fn an_identity_alias_of_a_player_that_failed_boot_is_unavailable() {
+        let _budget = crate::player::budget_test_guard();
+        let state = tempfile::tempdir().unwrap();
+        let holder = crate::player::BindingJournal::new(state.path(), "vt-1");
+        let _owned = holder.claim_runtime().expect("hold the journal");
+        let pipeline = Pipeline::build_with_player_state(&config("vt-1"), Some(state.path()))
+            .expect("a failed player never fails the build");
+        assert!(
+            pipeline.stores.contains_key("vt-1"),
+            "a placeholder store sits under the player id"
+        );
+        assert!(!pipeline.booted_players().contains("vt-1"));
+        let entry = pipeline.catalogue.load().get("vt-1").cloned().unwrap();
+        assert!(entry.is_alias());
+        assert!(
+            entry.unavailable().is_some_and(|r| r.contains("vt-1")),
+            "{:?}",
+            entry.unavailable()
+        );
+        let demand = pipeline.drain_demand();
+        assert!(demand.is_none(), "no demand before Pipeline::demand");
+    }
+
     #[test]
     fn a_media_player_source_builds_and_its_cell_samples_the_player_store() {
         let _budget = crate::player::budget_test_guard();
@@ -27529,10 +27638,13 @@ segment_ms = 1000
             .ingest_plans
             .iter()
             .any(|plan| plan.id == "vt-1" && plan.player.is_some()));
-        assert!(
-            !pipeline.catalogue.load().contains_key("vt-a"),
-            "demand never manages the alias"
-        );
+        // Catalogued as an alias of the player's store (ship-1111): demand
+        // reports and leases it, but never starts or stops a producer.
+        let entry = pipeline.catalogue.load().get("vt-a").cloned();
+        let entry = entry.expect("the alias is catalogued for demand");
+        assert!(entry.is_alias());
+        assert!(Arc::ptr_eq(entry.store(), player));
+        assert!(entry.unavailable().is_none(), "its player booted");
         // The solved layout's cell binds the source id, which the drive's
         // store map resolves to the player's store.
         let bound = pipeline
