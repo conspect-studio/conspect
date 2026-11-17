@@ -97,6 +97,8 @@ pub struct MasterPlaylist {
     /// compiling and rendering unchanged).
     audio_channels: Vec<Option<String>>,
     audio_group_id: Option<String>,
+    /// Every audio rendition is `AUTOSELECT=YES` (not only the default).
+    audio_autoselect_all: bool,
     subtitles: Vec<SubtitleMedia>,
 }
 
@@ -160,6 +162,13 @@ impl MasterPlaylist {
         self.audio_group_id = Some(group_id.into());
     }
 
+    /// Render `AUTOSELECT=YES` on every audio rendition, not only on the
+    /// `DEFAULT` one (a player may then pick any by language). Off by
+    /// default, so existing masters render unchanged.
+    pub fn set_audio_autoselect_all(&mut self, all: bool) {
+        self.audio_autoselect_all = all;
+    }
+
     /// Add a subtitle (`WebVTT`) media playlist to the `"subs"` group.
     pub fn push_subtitle(&mut self, rendition: SubtitleMedia) {
         self.subtitles.push(rendition);
@@ -202,7 +211,11 @@ impl MasterPlaylist {
                 group,
                 escape_attribute(&audio.name),
                 if audio.default { "YES" } else { "NO" },
-                if audio.default { "YES" } else { "NO" },
+                if audio.default || self.audio_autoselect_all {
+                    "YES"
+                } else {
+                    "NO"
+                },
                 channels,
                 escape_attribute(&audio.uri),
                 language

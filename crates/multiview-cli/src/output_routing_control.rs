@@ -14,9 +14,9 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use multiview_control::output_routing::{
     AudioPlanCost, LayoutBody, OutputLive, OutputOutcome, OutputReformatRequest, OutputRouting,
-    OutputTakeRequest, OutputTakeSet, PlanCost, PlanPath, PlanRefusal, PrincipalSessions,
-    ReformatSubmitError, RoutedAudio, RoutedFeed, RoutingLive, SlotPlan, SubtitleTakeError,
-    SubtitleTakeRequest, TakeSubmitError,
+    OutputTakeRequest, OutputTakeSet, PassthroughLive, PlanCost, PlanPath, PlanRefusal,
+    PrincipalSessions, ReformatSubmitError, RoutedAudio, RoutedFeed, RoutingLive, SlotPlan,
+    SubtitleTakeError, SubtitleTakeRequest, TakeSubmitError,
 };
 
 use crate::output_routing::{
@@ -210,6 +210,40 @@ fn carried_by_live_key(
         .live_keys
         .iter()
         .any(|(b, settings)| *b == wanted && *settings == run_output.settings)
+}
+
+/// The one passthrough predicate of the plan (#344 D2b), the engine's own:
+/// `None` for a feed that is not a source; else the router's static
+/// verdict ([`OutputRoutingHandle::passthrough_static`], eligibility plus
+/// `evaluate_traits`) and, for the output's live candidate on the same
+/// source, its key's measured verdict (`evaluate` on its meter). A source
+/// with no candidate yet has no 10 s history: `not-enough-history`. The
+/// strings are rule names, never a source id.
+fn passthrough_verdict(
+    handle: &OutputRoutingHandle,
+    index: usize,
+    feed: &RoutedFeed,
+) -> Option<Result<(), String>> {
+    let RoutedFeed::Source(source) = feed else {
+        return None;
+    };
+    if let Err(miss) = handle.passthrough_static(index, source) {
+        return Some(Err(miss.to_owned()));
+    }
+    let snapshot = handle.snapshot();
+    let view = snapshot.outputs.get(index)?;
+    let candidate_on_source = view.bus == format!("src:{source}");
+    let measured = view.passthrough.as_ref().filter(|_| candidate_on_source);
+    Some(match measured {
+        // The key's meter passed (or the output is on it): P0.
+        Some(p) if matches!(p.state.as_str(), "moving" | "passthrough" | "returning") => Ok(()),
+        Some(p) if p.state == "metering" && p.reason.is_none() => Ok(()),
+        Some(p) => Err(p
+            .reason
+            .clone()
+            .unwrap_or_else(|| "not-enough-history".to_owned())),
+        None => Err("not-enough-history".to_owned()),
+    })
 }
 
 /// Outcomes buffered between the engine and the control relay.
@@ -418,15 +452,39 @@ impl OutputRouting for OutputRoutingAdapter {
     fn plan_slot(&self, output: &str, feed: &RoutedFeed) -> Result<SlotPlan, PlanRefusal> {
         let cost = self.plan(output, feed)?;
         let handle = self.handle().ok_or(PlanRefusal::OutputKindUnroutable)?;
-        let run_output = handle
+        let index = handle
             .index_of(output)
-            .and_then(|index| handle.outputs().get(index).cloned())
             .ok_or(PlanRefusal::OutputKindUnroutable)?;
+        let run_output = handle
+            .outputs()
+            .get(index)
+            .cloned()
+            .ok_or(PlanRefusal::OutputKindUnroutable)?;
+        // #344 D2b: a source onto a P0-eligible output whose tap matches now
+        // (the engine's own static predicate plus a live candidate's meter
+        // verdict) is P0: no encoder, no convert.
+        let passthrough = match passthrough_verdict(&handle, index, feed) {
+            Some(Ok(())) => {
+                return Ok(SlotPlan {
+                    path: PlanPath::P0,
+                    cost: PlanCost {
+                        needs_encoder: false,
+                        needs_aux_canvas: false,
+                        ..cost
+                    },
+                    converts: 0,
+                    passthrough: None,
+                });
+            }
+            Some(Err(miss)) => Some(miss),
+            None => None,
+        };
         if !cost.needs_encoder {
             return Ok(SlotPlan {
                 path: PlanPath::P1,
                 cost,
                 converts: 0,
+                passthrough,
             });
         }
         let identity = is_identity(&handle, &run_output, feed);
@@ -435,6 +493,7 @@ impl OutputRouting for OutputRoutingAdapter {
                 path: PlanPath::P2,
                 cost,
                 converts: 0,
+                passthrough,
             });
         }
         let feed_live = matches!(feed, RoutedFeed::Source(_) | RoutedFeed::Preview) && {
@@ -447,6 +506,7 @@ impl OutputRouting for OutputRoutingAdapter {
             path: PlanPath::P3,
             cost,
             converts: u8::from(!feed_live),
+            passthrough,
         })
     }
 
@@ -455,7 +515,11 @@ impl OutputRouting for OutputRoutingAdapter {
         let index = handle.index_of(output)?;
         let run_output = handle.outputs().get(index)?.clone();
         let snapshot = handle.snapshot();
-        let feed = RoutedFeed::from_bus_name(&snapshot.outputs.get(index)?.bus)?;
+        let view = snapshot.outputs.get(index)?;
+        if view.path.as_deref() == Some("P0") {
+            return Some(PlanPath::P0);
+        }
+        let feed = RoutedFeed::from_bus_name(&view.bus)?;
         // P1 exactly when the plan would say +0 for this feed (#342 review
         // M5): Program (its base key) or a live key of its own (feed name,
         // settings) carries the output's current bus.
@@ -470,6 +534,17 @@ impl OutputRouting for OutputRoutingAdapter {
                 PlanPath::P3
             },
         )
+    }
+
+    fn current_passthrough(&self, output: &str) -> Option<PassthroughLive> {
+        let handle = self.handle()?;
+        let index = handle.index_of(output)?;
+        let snapshot = handle.snapshot();
+        let view = snapshot.outputs.get(index)?.passthrough.as_ref()?;
+        Some(PassthroughLive {
+            state: view.state.clone(),
+            reason: view.reason.clone(),
+        })
     }
 
     fn plan_audio(
@@ -716,6 +791,19 @@ impl OutputRouting for OutputRoutingAdapter {
                 .saturating_add(snapshot.opens_in_flight),
             sessions_max: self.max_encoders,
             dropped_ticks: snapshot.dropped_aux_ticks,
+            passthrough: {
+                let p = snapshot.passthrough;
+                multiview_control::output_routing::PassthroughTotals {
+                    keys: p.keys_live,
+                    aus: p.aus,
+                    repeats: p.repeats,
+                    drift_drops: p.drift_drops,
+                    stalls: p.stalls,
+                    slate_ticks: p.slate_ticks,
+                    bridges: p.bridges,
+                    bridges_refused: p.bridges_refused,
+                }
+            },
         })
     }
 
@@ -909,6 +997,8 @@ mod tests {
             audio: audio.to_owned(),
             audio_choice: choice.to_owned(),
             private_audio: private,
+            path: None,
+            passthrough: None,
             reset: None,
         }
     }

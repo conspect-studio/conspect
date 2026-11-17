@@ -194,6 +194,7 @@ fn router(
             max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
             boot_retry: BootRetryPolicy::default(),
             live_reset: Vec::new(),
+            passthrough: Vec::new(),
         },
         aux,
         open,
@@ -327,6 +328,10 @@ fn unroutable_and_unfresh_takes_are_refused_and_the_mailbox_bounds_floods() {
 struct Rec {
     windows: Vec<(usize, Vec<(i64, bool)>)>,
     audio: Vec<(usize, EncodedPacket)>,
+    /// Per delivered window: (output, its video packets' DTS) (#344 D2b).
+    dts: Vec<(usize, Vec<i64>)>,
+    /// Losses / discontinuities signalled, per output (#344 D2b).
+    losses: Vec<usize>,
 }
 impl WindowDelivery for Rec {
     fn offer_window(
@@ -348,11 +353,21 @@ impl WindowDelivery for Rec {
         {
             self.audio.push((o, a.clone_shared_ref().unwrap()));
         }
+        let d = p
+            .iter()
+            .filter(|p| p.kind() == multiview_ffmpeg::StreamKind::Video)
+            .map(|p| p.dts().unwrap_or(i64::MIN))
+            .collect();
+        self.dts.push((o, d));
         self.windows.push((o, v));
         Ok(())
     }
-    fn report_loss(&mut self, _o: usize, _r: multiview_output::batch::OfferError) {}
-    fn mark_discontinuity(&mut self, _o: usize, _r: multiview_output::batch::OfferError) {}
+    fn report_loss(&mut self, o: usize, _r: multiview_output::batch::OfferError) {
+        self.losses.push(o);
+    }
+    fn mark_discontinuity(&mut self, o: usize, _r: multiview_output::batch::OfferError) {
+        self.losses.push(o);
+    }
     fn take_discontinuity(&mut self, _o: usize) -> Option<multiview_output::batch::Discontinuity> {
         None
     }
@@ -440,6 +455,20 @@ fn harness(outputs: usize, max: usize, open: Option<OpenFn>) -> Harness {
 }
 
 fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: bool) -> Harness {
+    harness_full(outputs, max, open, has_preview, None, Vec::new(), None)
+}
+
+/// [`harness_with`] plus the passthrough wiring (#344 D2b).
+fn harness_full(
+    outputs: usize,
+    max: usize,
+    open: Option<OpenFn>,
+    has_preview: bool,
+    pass: Option<PassHooks>,
+    eligibility: Vec<PassEligibility>,
+    reformat: Option<ReformatOpenFn>,
+) -> Harness {
+    let live_reset = vec![reformat.is_some(); outputs];
     let store = Arc::new(TileStore::<Nv12Image>::with_defaults("cam"));
     let store2 = Arc::new(TileStore::<Nv12Image>::with_defaults("cam2"));
     let lookup = Arc::clone(&store);
@@ -459,7 +488,8 @@ fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: b
             Ok(enc)
         })
     });
-    let (r, h) = OutputRouter::new(
+    let mut open = open;
+    let (r, h) = OutputRouter::new_with_passthrough(
         RouterConfig {
             cadence: CADENCE,
             gop: 5,
@@ -471,7 +501,8 @@ fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: b
             formats: Vec::new(),
             max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
             boot_retry: BootRetryPolicy::default(),
-            live_reset: Vec::new(),
+            live_reset,
+            passthrough: eligibility,
         },
         AuxWiring {
             feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
@@ -489,7 +520,9 @@ fn harness_with(outputs: usize, max: usize, open: Option<OpenFn>, has_preview: b
             sizing: None,
             source_sizing: None,
         },
-        open,
+        Box::new(move |settings, _bus| open(settings)),
+        reformat,
+        pass,
     )
     .unwrap();
     let outcomes = h.outcomes().unwrap();
@@ -2016,6 +2049,28 @@ fn an_aux_failure_never_moves_an_output_off_clean() {
     assert_eq!(x.h.snapshot().outputs[1].bus, "clean");
 }
 
+/// ADR-0113 K4: the router shares the switcher's Clean / DSK gate. A Clean
+/// take already queued when a run-time `keyer_set` reserves a DSK is
+/// refused at the drain, and the handle's plan sees the same gate.
+#[test]
+fn a_clean_take_is_refused_at_the_drain_once_the_shared_dsk_cell_is_set() {
+    let (mut x, _seen) = ptr_harness(2);
+    x.tick(0);
+    let gate = multiview_engine::clean_gate::CleanDskGate::new();
+    x.r.set_clean_gate(Arc::clone(&gate));
+    let h = x.h.clone().with_clean_gate(Arc::clone(&gate));
+    assert!(!h.dsk_defined());
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    let _dsk = gate.try_reserve_dsk().unwrap();
+    assert!(h.dsk_defined(), "the handle reads the shared gate");
+    x.tick(1);
+    assert_eq!(
+        x.results(),
+        vec![TakeResult::Refused(RefuseReason::Unroutable)]
+    );
+    assert_ne!(x.h.snapshot().outputs[1].bus, "clean");
+}
+
 /// Clean without an M/E is unroutable (like Preview).
 #[test]
 fn clean_without_a_switcher_is_refused() {
@@ -2176,6 +2231,7 @@ fn audio_harness(outputs: usize, cadence: Rational, open: OpenFn) -> AudioHarnes
             max_aux_canvases: DEFAULT_MAX_AUX_CANVASES,
             boot_retry: BootRetryPolicy::default(),
             live_reset: Vec::new(),
+            passthrough: Vec::new(),
         },
         AuxWiring {
             feeds: Arc::new(SwapCell::from_pointee(Vec::new())),
@@ -4562,6 +4618,7 @@ fn reformat_harness(outputs: usize, max: usize, mode: OpenMode) -> ReformatHarne
             formats: Vec::new(),
             boot_retry: BootRetryPolicy::default(),
             live_reset: vec![true; outputs],
+            passthrough: Vec::new(),
             max_aux_canvases: crate::output_routing::DEFAULT_MAX_AUX_CANVASES,
         },
         AuxWiring {
@@ -8211,6 +8268,72 @@ fn a_rejected_set_never_switches_a_staying_members_private_bus_audio() {
     }
 }
 
+/// Review H3(a), router first: a `keyer_set` handler running inside the
+/// router's drain (after the Clean take was admitted, before the routing
+/// snapshot shows it pending) cannot reserve its first DSK, because the
+/// router took the Clean reservation at the admission point. Never both.
+#[test]
+fn a_dsk_reserved_inside_the_drain_loses_to_the_admitted_clean_take() {
+    let (mut x, _seen) = ptr_harness(2);
+    x.tick(0);
+    let gate = multiview_engine::clean_gate::CleanDskGate::new();
+    x.r.set_clean_gate(Arc::clone(&gate));
+    let h = x.h.clone().with_clean_gate(Arc::clone(&gate));
+    let won = Arc::new(Mutex::new(None));
+    let (g, w, h2) = (Arc::clone(&gate), Arc::clone(&won), h.clone());
+    x.r.drain_hook = Some(Box::new(move || {
+        // The snapshot the old check read: no Clean pending yet.
+        let stale = h2.snapshot().outputs.iter().all(|o| o.pending.is_none());
+        *w.lock().unwrap() = Some((stale, g.try_reserve_dsk()));
+    }));
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    x.tick(1);
+    x.r.drain_hook = None;
+    let (stale, dsk) = won.lock().unwrap().take().unwrap();
+    assert!(stale, "the handler ran before the snapshot showed the take");
+    assert!(
+        dsk.is_none(),
+        "the first DSK reserved under an admitted Clean take"
+    );
+    assert!(x.r.outputs[1].pending.is_some(), "the Clean take proceeds");
+    assert!(!h.dsk_defined());
+}
+
+/// Review H3(a), DSK first: a DSK reserved before the drain refuses the
+/// Clean take there; once that reservation drops (its `keyer_set` refused),
+/// the router's tick reconcile has left nothing held, and a new Clean take is
+/// admitted. A Clean take's reservation is released when it is refused or
+/// superseded, never leaked.
+#[test]
+fn a_reserved_dsk_refuses_clean_at_the_drain_and_releases_cleanly() {
+    let (mut x, _seen) = ptr_harness(2);
+    x.tick(0);
+    let gate = multiview_engine::clean_gate::CleanDskGate::new();
+    x.r.set_clean_gate(Arc::clone(&gate));
+    let dsk = gate.try_reserve_dsk().unwrap();
+    x.h.try_take(take("c", 1, PictureBus::Clean)).unwrap();
+    x.tick(1);
+    assert_eq!(
+        x.results(),
+        vec![TakeResult::Refused(RefuseReason::Unroutable)]
+    );
+    assert_eq!(gate.clean_reservations(), 0);
+    drop(dsk);
+    x.h.try_take(take("c2", 1, PictureBus::Clean)).unwrap();
+    x.tick(2);
+    assert_eq!(
+        gate.clean_reservations(),
+        1,
+        "the pending Clean take holds one"
+    );
+    assert!(gate.try_reserve_dsk().is_none());
+    // Superseded by a Program take: the reservation goes at the reconcile.
+    x.h.try_take(take("p", 1, PictureBus::Program)).unwrap();
+    x.tick(3);
+    assert_eq!(gate.clean_reservations(), 0);
+    assert!(gate.try_reserve_dsk().is_some());
+}
+
 /// #469 (a): a source routed to an output as a bare feed is published for
 /// the decoders (at the canvas: no output format) from the take until its
 /// feed closes after the linger, and the Program-only router publishes none.
@@ -8378,3 +8501,6 @@ fn the_encoder_identity_includes_the_output_settings_and_format() {
     assert_ne!(id("a"), id("d"), "other feed format: another encoder");
     assert_eq!(adapter.encoder_identity("nope", &cam), None);
 }
+
+#[path = "output_routing_passthrough_tests.rs"]
+mod passthrough;

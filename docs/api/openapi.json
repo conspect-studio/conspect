@@ -8536,7 +8536,7 @@
         "operationId": "get_patch",
         "responses": {
           "200": {
-            "description": "`{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, live, source: {source}|{bus}|{layout}|{redacted:true}|null, path: P1|P2|P3|null, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ], subtitle: [ { slot, format, language, name, live, source: {source}|{redacted:true}|null } ] } ] }`. Subtitle slots come from the engine's live route table when the running engine samples that slot (`live: true`), else (no run, the run ended, the output not in this run, or a slot beyond the run's table) from the accepted config (`live: false`), per slot. Video slot 0 comes from the engine's live readback (`live: true`); `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. With no readback (no running engine, routing unavailable, or the output not in this run) `live` is false and `source` and `path` are null: the live state is unknown, never reported as Program. Audio slot 0's `source` is the output's accepted audio feed (`\"follow\"` by default, else `\"program\"`, `\"none\"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{\"redacted\": true}`.",
+            "description": "`{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, live, source: {source}|{bus}|{layout}|{redacted:true}|null, path: P0|P1|P2|P3|null, passthrough: {state, reason}|null, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ], subtitle: [ { slot, format, language, name, live, source: {source}|{redacted:true}|null } ] } ] }`. Subtitle slots come from the engine's live route table when the running engine samples that slot (`live: true`), else (no run, the run ended, the output not in this run, or a slot beyond the run's table) from the accepted config (`live: false`), per slot. Video slot 0 comes from the engine's live readback (`live: true`); `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. `path` is P0 while the output passes its source's compressed video through (#344: 0 decode, 0 encode); `passthrough` is that output's passthrough state (`metering`, `moving`, `passthrough`, `slate`, `bridging`, `returning`, `unavailable`, …) and its reason (a match-rule miss, a bridge reason, or `bridging on slate: no encoder session`), null when the output has no passthrough candidate; a reason never names a source. With no readback (no running engine, routing unavailable, or the output not in this run) `live` is false and `source` and `path` are null: the live state is unknown, never reported as Program. Audio slot 0's `source` is the output's accepted audio feed (`\"follow\"` by default, else `\"program\"`, `\"none\"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{\"redacted\": true}`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8583,7 +8583,7 @@
         "tags": [
           "patch"
         ],
-        "summary": "Plan 1..64 crosspoints: mixer inputs (path, on-air flag, refusals), the\nslots of one output (§12.4 path P1/P2/P3 and cost), or an atomic set\nover many destinations (#308: every member planned, `can_take` only when\nall can and the set's new encoders fit the caller's caps); no change.",
+        "summary": "Plan 1..64 crosspoints: mixer inputs (path, on-air flag, refusals), the\nslots of one output (§12.4 path P0/P1/P2/P3, cost and the first\npassthrough miss), or an atomic set over many destinations (#308: every\nmember planned, `can_take` only when all can and the set's new encoders\nfit the caller's caps); no change.",
         "operationId": "plan_patch",
         "requestBody": {
           "content": {
@@ -12564,6 +12564,16 @@
           {
             "name": "kind",
             "in": "path",
+            "description": "The verb; must equal `action`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Required; a replay answers the first 202.",
             "required": true,
             "schema": {
               "type": "string"
@@ -12582,7 +12592,7 @@
         },
         "responses": {
           "202": {
-            "description": "",
+            "description": "Queued; the outcome arrives as `switcher.operation` at the engine tick. Keyer verbs also emit `switcher.keyer` on a committed state change.",
             "content": {
               "application/json": {
                 "schema": {
@@ -12592,7 +12602,17 @@
             }
           },
           "403": {
-            "description": "",
+            "description": "Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source; the key is not burned.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`unknown-keyer`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -12602,7 +12622,7 @@
             }
           },
           "409": {
-            "description": "",
+            "description": "`capacity` (keyer budget; generic for scoped callers), `on-air-protected` (a fill/key change of a keyer on air without `on_air = \"allow\"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyers-unavailable`; nothing is enqueued and every lease taken is released.",
             "content": {
               "application/json": {
                 "schema": {
@@ -12622,7 +12642,7 @@
             }
           },
           "503": {
-            "description": "",
+            "description": "`engine-busy` (the 64-slot mailbox is full; key and leases released) or `idempotency-capacity`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -12653,17 +12673,27 @@
         },
         "responses": {
           "200": {
-            "description": "",
+            "description": "`SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`).",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SwitcherPlan"
+                  "$ref": "#/components/schemas/SwitcherPlanResponseDoc"
                 }
               }
             }
           },
           "403": {
-            "description": "",
+            "description": "Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source (checked before any existence answer); a keyer verb also needs the command role (Operator), so a Viewer or ReadOnly key cannot plan one.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`unknown-keyer` (a keyer the caller may read is not defined).",
             "content": {
               "application/json": {
                 "schema": {
@@ -12683,7 +12713,7 @@
             }
           },
           "422": {
-            "description": "",
+            "description": "Invalid verb fields; `keyer-source-not-a-source` (a fill or key naming a mixer input `in:<n>`); `keyer-rate`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -12714,7 +12744,7 @@
         ],
         "responses": {
           "200": {
-            "description": "",
+            "description": "Engine-owned state. `keyers[]` lists only the downstream keyer rows whose object id (`<program>/<keyer>`) the caller may read, with unreadable fill/key source ids replaced by `\"redacted\"`; `tally` drops unreadable ids (ADR-0113 §8).",
             "content": {
               "application/json": {
                 "schema": {
@@ -19268,6 +19298,338 @@
           }
         }
       },
+      "KeyerCost": {
+        "type": "object",
+        "description": "Admission cost (ADR-0113 §9). Scoped callers see only their own delta;\nthe totals go to unscoped readers only (ADR-0108 decision 8).",
+        "required": [
+          "delta",
+          "fits"
+        ],
+        "properties": {
+          "budget": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "The keyer budget (unscoped readers only)."
+          },
+          "delta": {
+            "type": "number",
+            "format": "double",
+            "description": "The change's cost delta in canvas folds (new cost − old cost)."
+          },
+          "fits": {
+            "type": "boolean",
+            "description": "Whether it fits the remaining budget."
+          },
+          "holders": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Every keyer holding a reservation, by object id (unscoped readers\nonly)."
+          },
+          "reserved": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Reserved total after the change (unscoped readers only)."
+          }
+        }
+      },
+      "KeyerFields": {
+        "type": "object",
+        "description": "The keyer fields of a switcher request (flattened into it). Every field\nis optional; which ones a verb takes is checked by shape.",
+        "properties": {
+          "clip": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "`keyer_set`: luma clip, `[0, 1]`."
+          },
+          "fill": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`keyer_set`: fill source id (a source; `in:<n>` is refused)."
+          },
+          "fly": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "`keyer_set`: destination rectangle in canvas pixels."
+          },
+          "gain": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "`keyer_set`: luma gain, finite and `>= 0`."
+          },
+          "invert": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`keyer_set`: invert the matte."
+          },
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`keyer_set`: key source id; JSON `null` keeps it, `\"\"` clears it (a\nself key)."
+          },
+          "keyer": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Keyer id within the program (`dsk1`); the object id is\n`<program>/<keyer>`. Required by every keyer verb."
+          },
+          "loss": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`keyer_set`: `drop_to_off_air` or `hold_last_good`."
+          },
+          "loss_trigger": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`keyer_set`: `stale`, `reconnecting` or `no_signal`."
+          },
+          "mask": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "`keyer_set`: mask in fill-source pixels."
+          },
+          "max_source": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "`keyer_set`: admitted source envelope `{w, h}`."
+          },
+          "on": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`keyer_cut` / `keyer_auto`: the target state."
+          },
+          "on_air": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyerOnAir",
+                "description": "`keyer_set`: the on-air guard for a fill or key change."
+              }
+            ]
+          },
+          "on_at_start": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`keyer_set`: go on at boot through the fresh gate."
+          },
+          "rate": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "`keyer_set`: AUTO rate in frames, 1..=300.",
+            "minimum": 0
+          },
+          "tie": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`keyer_tie`: tied to the next background take."
+          },
+          "type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`keyer_set`: `linear` or `luma` (`chroma` is refused until K7)."
+          },
+          "z": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "`keyer_set` defining a new keyer: its z among DSKs."
+          }
+        }
+      },
+      "KeyerOnAir": {
+        "type": "string",
+        "description": "`on_air` guard of `keyer_set`.",
+        "enum": [
+          "protect",
+          "allow"
+        ]
+      },
+      "KeyerPlan": {
+        "type": "object",
+        "description": "The plan answer of a keyer verb.",
+        "required": [
+          "class",
+          "keyer",
+          "on_air",
+          "can_take"
+        ],
+        "properties": {
+          "can_take": {
+            "type": "boolean",
+            "description": "Whether the command can be taken now."
+          },
+          "class": {
+            "type": "string",
+            "description": "`class1`: every keyer verb lands at one tick."
+          },
+          "cost": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyerCost",
+                "description": "`keyer_set`: the admission cost."
+              }
+            ]
+          },
+          "keyer": {
+            "type": "string",
+            "description": "The keyer object id."
+          },
+          "on_air": {
+            "type": "boolean",
+            "description": "Whether the keyer is on air now."
+          },
+          "refusal": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PatchRefusal",
+                "description": "The refusal the command would answer, if any."
+              }
+            ]
+          }
+        }
+      },
+      "KeyerRow": {
+        "type": "object",
+        "description": "One `keyers[]` row of `GET /api/v1/switcher/{me}` (design note §8).",
+        "required": [
+          "id",
+          "family",
+          "fill",
+          "type",
+          "on_air",
+          "tie",
+          "rate",
+          "loss",
+          "stale",
+          "pending"
+        ],
+        "properties": {
+          "family": {
+            "type": "string",
+            "description": "`dsk` (USKs arrive with K3)."
+          },
+          "fill": {
+            "type": "string",
+            "description": "Fill source id, or `\"redacted\"`."
+          },
+          "fly": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Destination rectangle, `null` = full canvas."
+          },
+          "id": {
+            "type": "string",
+            "description": "Keyer id within the program."
+          },
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Key source id, `\"redacted\"`, or `null` (self key)."
+          },
+          "loss": {
+            "type": "string",
+            "description": "`drop_to_off_air` or `hold_last_good`."
+          },
+          "mask": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Mask in fill-source pixels."
+          },
+          "on_air": {
+            "type": "boolean",
+            "description": "On air."
+          },
+          "pending": {
+            "type": "boolean",
+            "description": "An operator command is held waiting for fresh sources."
+          },
+          "ramp": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "`{start_tick, rate, to_on}` while ramping; clients compute the weight."
+          },
+          "rate": {
+            "type": "integer",
+            "format": "int32",
+            "description": "AUTO rate in frames.",
+            "minimum": 0
+          },
+          "stale": {
+            "type": "boolean",
+            "description": "Drawing a frozen pair past its loss trigger."
+          },
+          "tie": {
+            "type": "boolean",
+            "description": "Tied to the next background take."
+          },
+          "type": {
+            "type": "string",
+            "description": "`linear` or `luma`."
+          }
+        }
+      },
       "LadderStateDoc": {
         "type": "string",
         "description": "`OpenAPI` mirror of [`multiview_licence::LadderState`] (the seven conditions).\n\nSerde-equivalent: a unit enum rendered `snake_case`.",
@@ -21951,6 +22313,69 @@
           }
         }
       },
+      "PassthroughTotals": {
+        "type": "object",
+        "description": "Passthrough (P0) counters of the run (#344 D2b): keys open (no encoder\nsession each) and cumulative AU / repeat / drift-drop / stall / slate /\nbridge counts.",
+        "required": [
+          "keys",
+          "aus",
+          "repeats",
+          "drift_drops",
+          "stalls",
+          "slate_ticks",
+          "bridges",
+          "bridges_refused"
+        ],
+        "properties": {
+          "aus": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Source access units passed through.",
+            "minimum": 0
+          },
+          "bridges": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Moves onto an on-demand picture bridge.",
+            "minimum": 0
+          },
+          "bridges_refused": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bridges that found no encoder session (stayed on the slate).",
+            "minimum": 0
+          },
+          "drift_drops": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Access units dropped by drift corrections.",
+            "minimum": 0
+          },
+          "keys": {
+            "type": "integer",
+            "description": "Passthrough keys open.",
+            "minimum": 0
+          },
+          "repeats": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Repeat (skip) access units emitted by drift corrections.",
+            "minimum": 0
+          },
+          "slate_ticks": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ticks emitted from a format slate.",
+            "minimum": 0
+          },
+          "stalls": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Runs ended by a stall.",
+            "minimum": 0
+          }
+        }
+      },
       "PatchAccepted": {
         "type": "object",
         "description": "`POST /patch/take` 202 answer. The outcome arrives as `switcher.operation`\n(mixer inputs), `route.output` (one output) or, for a set of two or more\ndestinations, `patch.take` (#308).",
@@ -22347,9 +22772,16 @@
             "type": "boolean",
             "description": "Whether the destination input is on Program now (mixer inputs)."
           },
+          "passthrough": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For an output video slot fed by a source that is not P0: the first\npassthrough miss (#344 D2b), e.g. `passthrough-not-supported-on-medium`\nor `not-enough-history`. Never names a source."
+          },
           "path": {
             "type": "string",
-            "description": "The path this crosspoint takes: `mixer-input`, `P1`, `P2`, `P3`\n(§12.4), `follow` (an audio slot riding the video take) or\n`subtitle` (a subtitle slot's route-table re-point)."
+            "description": "The path this crosspoint takes: `mixer-input`, `P0`, `P1`, `P2`, `P3`\n(§12.4), `follow` (an audio slot riding the video take) or\n`subtitle` (a subtitle slot's route-table re-point)."
           },
           "refusal": {
             "oneOf": [
@@ -23781,6 +24213,17 @@
             "type": "integer",
             "description": "Video encoders running.",
             "minimum": 0
+          },
+          "passthrough": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PassthroughTotals",
+                "description": "Passthrough (P0) counters (#344 D2b) — whole-system principals only."
+              }
+            ]
           }
         }
       },
@@ -26184,78 +26627,97 @@
           }
         }
       },
-      "SwitcherRequest": {
-        "type": "object",
-        "description": "One source-select, take or output-binding request. References are checked\nindependently; absent references never authorize implicitly.",
-        "required": [
-          "me",
-          "program",
-          "action"
-        ],
-        "properties": {
-          "action": {
-            "type": "string",
-            "description": "Action to classify on `/plan`, one of `select_program`, `select_preview`,\n`cut`, `auto`, `set_transition`; the action is part of the same\nvalidated request."
+      "SwitcherPlanResponseDoc": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/SwitcherPlan"
           },
-          "duration_frames": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
-            "description": "AUTO duration at the output's exact cadence; no floating milliseconds.",
-            "minimum": 0
-          },
-          "input": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
-            "description": "Numbered mixer input for `select_program`/`select_preview` (ADR-0110\n§12.8); exactly one of `source`/`input`. Requires declared inputs.",
-            "minimum": 0
-          },
-          "layout": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Referenced stored layout, when selecting an authored scene."
-          },
-          "me": {
-            "type": "string",
-            "description": "M/E identity (`me1` for the first slice)."
-          },
-          "output": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Referenced output to bind; all output reads/writes require output BOLA."
-          },
-          "program": {
-            "type": "string",
-            "description": "Program identity (`main` for the first slice)."
-          },
-          "source": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Referenced source for `select_program`/`select_preview`."
-          },
-          "transition": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/TransitionDescriptorDoc",
-                "description": "The transition `set_transition` selects for the next AUTO (ADR-0112\n§4), required by it and refused on every other action. Tagged on\n`kind`: `{\"kind\":\"cut\"}`; `{\"kind\":\"mix\",\"rate\":N}`;\n`{\"kind\":\"dip\",\"rate\":N,\"color\":\"#rrggbb\",\"switch_point\":{\"num\":1,\"den\":2}}`\n(rate >= 2, switch point strictly inside (0, 1)); `{\"kind\":\"wipe\",\n\"pattern\":\"linear_edge\"|\"vertical\"|\"diagonal\"|\"box\"|\"circle\",\"rate\":N,\n\"reverse\":bool,\"softness\":0..1,\"border_width\":0..1,\"border_color\":\"#rrggbb\",\n\"position_xy\":[0..1,0..1]}`. `rate` is 1..=1000 frames; AUTO replaces it\nwith its own `duration_frames`. Refused with `unsupported-transition`:\n`stinger`, DVE kinds, a dip through a source, `flip_flop` and\n`border_fill_source`; with `invalid-transition`: anything that does not\nparse or is out of range.\n\nParsed from raw JSON so a malformed descriptor is a typed 422; the\ndocumented shape is [`crate::openapi_schemas::TransitionDescriptorDoc`]."
-              }
-            ]
+          {
+            "$ref": "#/components/schemas/KeyerPlan"
           }
-        }
+        ],
+        "description": "A `SwitcherPlan` for a background verb, or a `KeyerPlan` for `keyer_cut`, `keyer_auto`, `keyer_tie` and `keyer_set`."
+      },
+      "SwitcherRequest": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/KeyerFields",
+            "description": "Downstream keyer fields (ADR-0113 §8, K4): `keyer` names the keyer\n(object id `<program>/<keyer>`); `on`, `tie` and the `keyer_set`\ndefinition fields. Fill and key name sources only (`in:<n>` is 422)."
+          },
+          {
+            "type": "object",
+            "required": [
+              "me",
+              "program",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "description": "Action to classify on `/plan`, one of `select_program`, `select_preview`,\n`cut`, `auto`, `set_transition`, `keyer_cut`, `keyer_auto`, `keyer_tie`,\n`keyer_set`; the action is part of the same validated request."
+              },
+              "duration_frames": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int32",
+                "description": "AUTO duration at the output's exact cadence; no floating milliseconds.\nFor `keyer_auto`, an optional rate override in 1..=300 frames.",
+                "minimum": 0
+              },
+              "input": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int32",
+                "description": "Numbered mixer input for `select_program`/`select_preview` (ADR-0110\n§12.8); exactly one of `source`/`input`. Requires declared inputs.",
+                "minimum": 0
+              },
+              "layout": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Referenced stored layout, when selecting an authored scene."
+              },
+              "me": {
+                "type": "string",
+                "description": "M/E identity (`me1` for the first slice)."
+              },
+              "output": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Referenced output to bind; all output reads/writes require output BOLA."
+              },
+              "program": {
+                "type": "string",
+                "description": "Program identity (`main` for the first slice)."
+              },
+              "source": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Referenced source for `select_program`/`select_preview`."
+              },
+              "transition": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/TransitionDescriptorDoc",
+                    "description": "The transition `set_transition` selects for the next AUTO (ADR-0112\n§4), required by it and refused on every other action. Tagged on\n`kind`: `{\"kind\":\"cut\"}`; `{\"kind\":\"mix\",\"rate\":N}`;\n`{\"kind\":\"dip\",\"rate\":N,\"color\":\"#rrggbb\",\"switch_point\":{\"num\":1,\"den\":2}}`\n(rate >= 2, switch point strictly inside (0, 1)); `{\"kind\":\"wipe\",\n\"pattern\":\"linear_edge\"|\"vertical\"|\"diagonal\"|\"box\"|\"circle\",\"rate\":N,\n\"reverse\":bool,\"softness\":0..1,\"border_width\":0..1,\"border_color\":\"#rrggbb\",\n\"position_xy\":[0..1,0..1]}`. `rate` is 1..=1000 frames; AUTO replaces it\nwith its own `duration_frames`. Refused with `unsupported-transition`:\n`stinger`, DVE kinds, a dip through a source, `flip_flop` and\n`border_fill_source`; with `invalid-transition`: anything that does not\nparse or is out of range.\n\nParsed from raw JSON so a malformed descriptor is a typed 422; the\ndocumented shape is [`crate::openapi_schemas::TransitionDescriptorDoc`]."
+                  }
+                ]
+              }
+            }
+          }
+        ],
+        "description": "One source-select, take or output-binding request. References are checked\nindependently; absent references never authorize implicitly."
       },
       "SwitcherStateResponse": {
         "type": "object",
@@ -26265,12 +26727,21 @@
           "program_source",
           "preview_source",
           "in_flight",
+          "keyers",
+          "tally",
           "transition"
         ],
         "properties": {
           "in_flight": {
             "type": "boolean",
             "description": "Active AUTO status."
+          },
+          "keyers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KeyerRow"
+            },
+            "description": "Downstream keyer rows the caller may read (keyer object id), with\nunreadable source ids `\"redacted\"`; changes only on state changes."
           },
           "preview_source": {
             "type": "string",
@@ -26279,6 +26750,10 @@
           "program_source": {
             "type": "string",
             "description": "Actual PGM source id."
+          },
+          "tally": {
+            "$ref": "#/components/schemas/TallyView",
+            "description": "Engine tally resolved to source ids; unreadable ids are dropped."
           },
           "tick": {
             "type": "integer",
@@ -26596,6 +27071,30 @@
           }
         ],
         "description": "`OpenAPI` mirror of [`multiview_events::TallyTarget`].\n\nSerde-equivalent: internally tagged on `kind`, `snake_case` variant tags."
+      },
+      "TallyView": {
+        "type": "object",
+        "description": "The engine tally resolved to source ids (unreadable ids dropped).",
+        "required": [
+          "program",
+          "preview"
+        ],
+        "properties": {
+          "preview": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Sources on Preview and keys going on next."
+          },
+          "program": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Sources contributing to Program."
+          }
+        }
       },
       "TcSourceKindDoc": {
         "type": "string",

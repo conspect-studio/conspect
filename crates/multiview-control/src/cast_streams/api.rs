@@ -2,7 +2,9 @@
 //! never across an `.await`.
 
 use super::reauth::Need;
-use super::registry::{Claim, ClaimError, Ended, Entry, Registry, ReportError, Slot, StreamView};
+use super::registry::{
+    Claim, ClaimError, Ended, Entry, Registry, ReportError, SinkMark, Slot, StreamView,
+};
 use super::{
     bounded_user_agent, token, CastFetches, CastStreams, ReceiverFetch, ReceiverReport,
     CREATE_BURST, CREATE_REFILL, MAX_LIFETIME, MAX_LIMITED_PRINCIPALS, MAX_STREAMS,
@@ -103,10 +105,24 @@ pub struct SlotView {
 }
 
 impl CastStreams {
-    /// Expire streams and end lingers: the outputs to deactivate.
+    /// Expire streams and end lingers: the outputs to deactivate. Without
+    /// the engine's sink status no superseded grant is forgotten
+    /// ([`Self::sweep_with`]).
     pub fn sweep(&self) -> Vec<Ended> {
         let now = self.now_ms();
-        self.lock().sweep(now)
+        self.lock().sweep(now, None)
+    }
+
+    /// [`Self::sweep`] with `sinks`, the engine status of every cast
+    /// output (`None`: unavailable): a superseded grant set is forgotten
+    /// only once its output's sink provably replaced its media (#418 review
+    /// ABUSE-HISTORY-R4).
+    pub(crate) fn sweep_with(
+        &self,
+        sinks: Option<&std::collections::HashMap<String, SinkMark>>,
+    ) -> Vec<Ended> {
+        let now = self.now_ms();
+        self.lock().sweep(now, sinks)
     }
 
     /// Admit one stream creation by `principal` (burst [`CREATE_BURST`],
@@ -179,7 +195,7 @@ impl CastStreams {
     ) -> Result<Claim, ClaimError> {
         let now = self.now_ms();
         let mut inner = self.lock();
-        inner.sweep(now);
+        inner.sweep(now, None);
         if inner.entries.len() >= MAX_STREAMS {
             return Err(ClaimError::Capacity);
         }
@@ -262,8 +278,10 @@ impl CastStreams {
     }
 
     /// The gate of output `config_id` for arming a token (created at a
-    /// fresh generation on first use).
-    pub(crate) fn arm_snapshot(&self, config_id: &str) -> Arm {
+    /// fresh generation on first use); `sink`: the output's engine status
+    /// now (`None`: unavailable, no superseded grant is forgotten).
+    pub(crate) fn arm_snapshot(&self, config_id: &str, sink: Option<SinkMark>) -> Arm {
+        let now = self.now_ms();
         let mut inner = self.lock();
         // No gate (over [`super::MAX_GATES`]): nothing is cleared and
         // arming finds no gate either, so the creation is refused.
@@ -272,9 +290,12 @@ impl CastStreams {
                 generation: 0,
                 needs: None,
             },
-            |gate| Arm {
-                generation: gate.generation,
-                needs: gate.cleared_needs(),
+            |gate| {
+                gate.prune(now, sink.as_ref());
+                Arm {
+                    generation: gate.generation,
+                    needs: gate.cleared_needs(),
+                }
             },
         )
     }
@@ -368,11 +389,13 @@ impl CastStreams {
     /// section: a new generation, the change carried (what the output may
     /// now carry, until an outcome settles it), every armed token
     /// re-authorized for it and moved to the new generation or revoked.
-    /// Nothing to do on an output without streams. Returns the revoked.
+    /// Nothing to do on an output without streams. `sink`: the output's
+    /// engine status now (`None`: unavailable). Returns the revoked.
     pub(crate) fn commit(
         &self,
         config_id: &str,
         change: Change,
+        sink: Option<SinkMark>,
         check: Check<'_>,
     ) -> Vec<(OwnedStream, &'static str)> {
         let now = self.now_ms();
@@ -388,8 +411,13 @@ impl CastStreams {
             Self::recheck(&mut inner, config_id, None, false, check, &mut revoked, now);
             return revoked;
         };
+        gate.prune(now, sink.as_ref());
         while gate.carry.len() >= super::MAX_CARRY {
-            gate.carry.pop_front();
+            // Forgotten, not settled: its media may still be on air or
+            // retained, so its grants stay required (ABUSE-HISTORY-R4).
+            if let Some(old) = gate.carry.pop_front() {
+                gate.retire(old.needs, now, sink.as_ref());
+            }
         }
         gate.carry.push_back(super::registry::Carry {
             op: change.op,
@@ -397,7 +425,8 @@ impl CastStreams {
             needs: change.needs,
         });
         // Every token at the new generation is authorized for EVERYTHING
-        // the output may carry now (the invariant of [`super::registry::Gate`]).
+        // the output may carry now or still serves (the invariant of
+        // [`super::registry::Gate`]).
         let needs = gate.cleared_needs();
         Self::recheck(
             &mut inner,
@@ -415,7 +444,9 @@ impl CastStreams {
     /// [`ChangeMode`]). When the armed tokens were not already authorized
     /// for all of it (or on [`ChangeMode::Recheck`]), every one is
     /// re-authorized in the same critical section — at a new generation
-    /// when the needs are new. Returns the revoked.
+    /// when the needs are new. `sink`: the output's engine status now
+    /// (`None`: unavailable). Returns the revoked.
+    #[allow(clippy::too_many_arguments)] // One critical section's inputs.
     pub(crate) fn observe(
         &self,
         config_id: &str,
@@ -423,6 +454,7 @@ impl CastStreams {
         bus: &str,
         needs: Option<Vec<Need>>,
         mode: ChangeMode,
+        sink: Option<SinkMark>,
         check: Check<'_>,
     ) -> Vec<(OwnedStream, &'static str)> {
         let now = self.now_ms();
@@ -438,16 +470,21 @@ impl CastStreams {
             Self::recheck(&mut inner, config_id, None, false, check, &mut revoked, now);
             return revoked;
         };
+        gate.prune(now, sink.as_ref());
         let covered = match (&needs, gate.cleared_needs()) {
             (Some(needs), Some(cleared)) => needs.iter().all(|n| cleared.contains(n)),
             _ => false,
         };
+        // What is settled or carried here moves to the history, not away:
+        // its media may stay servable until the sink replaced it
+        // (ABUSE-HISTORY-R4). Only narrowing on the history's own expiry.
         if mode == ChangeMode::Outcome {
-            gate.settle(op);
+            gate.settle(op, now, sink.as_ref());
         }
-        gate.settled = Some((bus.to_owned(), needs));
+        gate.replace_settled((bus.to_owned(), needs), now, sink.as_ref());
         if !covered || mode == ChangeMode::Recheck {
-            // What the output may carry now, under the current grants.
+            // What the output may carry now or still serves, under the
+            // current grants.
             let all = gate.cleared_needs();
             Self::recheck(
                 &mut inner,
@@ -460,6 +497,17 @@ impl CastStreams {
             );
         }
         revoked
+    }
+
+    /// Whether every armed token on `config_id` is authorized for all of
+    /// `needs` (the media path's check of the subtitle readback, #418).
+    #[must_use]
+    pub(crate) fn covers(&self, config_id: &str, needs: &[Need]) -> bool {
+        self.lock()
+            .gates
+            .get(config_id)
+            .and_then(super::registry::Gate::cleared_needs)
+            .is_some_and(|cleared| needs.iter().all(|n| cleared.contains(n)))
     }
 
     /// Whether every armed token on `config_id` is authorized for the
@@ -494,6 +542,17 @@ impl CastStreams {
             .iter()
             .filter(|e| e.config_id == config_id && !e.expired(now) && inner.servable(e))
             .count()
+    }
+
+    /// TEST SEAM: the superseded grant sets output `config_id` still
+    /// requires (#418 review ABUSE-HISTORY-R4).
+    #[cfg(any(test, feature = "_test-seams"))]
+    #[must_use]
+    pub fn history_len(&self, config_id: &str) -> usize {
+        self.lock()
+            .gates
+            .get(config_id)
+            .map_or(0, |g| g.history.len())
     }
 
     /// The generation of output `config_id` (`None`: no gate; tests).

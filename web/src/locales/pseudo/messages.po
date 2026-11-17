@@ -298,11 +298,22 @@ msgstr ""
 msgid "{option} (custom — preserved)"
 msgstr ""
 
+#. placeholder {0}: feed.layout
+#. placeholder {0}: feed.source
+#: src/cast/castLabels.ts:51
+#: src/cast/castLabels.ts:52
+msgid "{outputId} ({0})"
+msgstr ""
+
+#: src/cast/castLabels.ts:49
+msgid "{outputId} ({bus})"
+msgstr ""
+
 #: src/devices/lastSeen.tsx:53
 msgid "{seconds} s ago"
 msgstr ""
 
-#: src/cast/castLabels.ts:38
+#: src/cast/castLabels.ts:39
 msgid "{seconds} s behind live"
 msgstr ""
 
@@ -1599,6 +1610,7 @@ msgid "Attached automatically"
 msgstr ""
 
 #: src/app/navigation.tsx:58
+#: src/cast/ActiveCastCard.tsx:182
 #: src/components/broadcast/BroadcastShell.tsx:34
 #: src/components/broadcast/library/Chips.tsx:139
 #: src/pages/approved/PatchMatrix.tsx:895
@@ -2058,7 +2070,7 @@ msgstr ""
 msgid "Buffering on {0}"
 msgstr ""
 
-#: src/cast/castLabels.ts:18
+#: src/cast/castLabels.ts:19
 msgid "Buffering…"
 msgstr ""
 
@@ -2338,7 +2350,7 @@ msgstr ""
 msgid "Cast devices never join a synchronized canvas (their latency is multiple seconds and uncontrolled). Use a display node or a vendor decoder for synchronized walls."
 msgstr ""
 
-#: src/cast/castLabels.ts:24
+#: src/cast/castLabels.ts:25
 msgid "Cast failed"
 msgstr ""
 
@@ -2367,7 +2379,7 @@ msgstr ""
 msgid "Cast receivers seen on the network (untrusted hints)."
 msgstr ""
 
-#: src/cast/castLoad.ts:125
+#: src/cast/castLoad.ts:134
 msgid "Cast session error."
 msgstr ""
 
@@ -2377,6 +2389,11 @@ msgstr ""
 
 #: src/pages/CastPage.tsx:250
 msgid "Cast session stopped"
+msgstr ""
+
+#: src/cast/DeskCastButton.tsx:54
+#: src/cast/DeskCastButton.tsx:55
+msgid "Cast settings"
 msgstr ""
 
 #: src/pages/docs/SyncHelpPage.tsx:58
@@ -2391,7 +2408,7 @@ msgstr ""
 msgid "Cast to this"
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:48
+#: src/cast/ActiveCastCard.tsx:89
 msgid "Casting from this browser"
 msgstr ""
 
@@ -2609,7 +2626,7 @@ msgstr ""
 msgid "Choose light, dark, or follow the system."
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:52
+#: src/cast/ActiveCastCard.tsx:93
 msgid "Choosing a device…"
 msgstr ""
 
@@ -2705,6 +2722,7 @@ msgstr ""
 msgid "Clauses"
 msgstr ""
 
+#: src/cast/castLabels.ts:48
 #: src/pages/approved/PatchMatrix.tsx:520
 #: src/pages/LayoutsPage.tsx:120
 msgid "Clean"
@@ -3095,7 +3113,7 @@ msgstr ""
 msgid "Connecting"
 msgstr ""
 
-#: src/cast/castLabels.ts:14
+#: src/cast/castLabels.ts:15
 msgid "Connecting to the TV…"
 msgstr ""
 
@@ -3327,8 +3345,8 @@ msgstr ""
 msgid "Could not cancel the action"
 msgstr ""
 
-#: src/cast/castLoad.ts:135
-#: src/cast/castLoad.ts:138
+#: src/cast/castLoad.ts:144
+#: src/cast/castLoad.ts:147
 msgid "Could not cast to this device."
 msgstr ""
 
@@ -4246,7 +4264,7 @@ msgstr ""
 msgid "Detected: {0}"
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:51
+#: src/cast/ActiveCastCard.tsx:92
 #: src/devices/FromDevice.tsx:85
 #: src/pages/CapabilitiesPage.tsx:140
 msgid "Device"
@@ -6938,7 +6956,7 @@ msgstr ""
 msgid "loading new clip"
 msgstr ""
 
-#: src/cast/castLabels.ts:16
+#: src/cast/castLabels.ts:17
 msgid "Loading on the TV…"
 msgstr ""
 
@@ -7601,8 +7619,8 @@ msgstr ""
 msgid "Mute {label}"
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:80
-#: src/cast/ActiveCastCard.tsx:81
+#: src/cast/ActiveCastCard.tsx:121
+#: src/cast/ActiveCastCard.tsx:122
 msgid "Mute the TV"
 msgstr ""
 
@@ -7895,7 +7913,7 @@ msgstr ""
 msgid "No cast output is configured. Browser casting plays from a cast output: add one to the engine configuration and restart the engine."
 msgstr ""
 
-#: src/cast/castLoad.ts:129
+#: src/cast/castLoad.ts:138
 msgid "No Cast receiver is available on this network."
 msgstr ""
 
@@ -8356,7 +8374,7 @@ msgstr ""
 msgid "Not available on this server yet — tracked as issue #423. There is no server endpoint to import a URL into the media library."
 msgstr ""
 
-#: src/cast/castLabels.ts:10
+#: src/cast/castLabels.ts:11
 msgid "Not casting"
 msgstr ""
 
@@ -8555,6 +8573,7 @@ msgstr ""
 msgid "Observing: HLS cue/DATERANGE, SCTE-35 and timed ID3 are watched for this source."
 msgstr ""
 
+#: src/cast/ActiveCastCard.tsx:215
 #: src/components/TallyLampBadge.tsx:48
 #: src/pages/DataPage.tsx:207
 #: src/pages/MeshPage.tsx:144
@@ -9289,7 +9308,7 @@ msgstr ""
 msgid "Players"
 msgstr ""
 
-#: src/cast/castLabels.ts:20
+#: src/cast/castLabels.ts:21
 #: src/pages/MediaPlayersPage.tsx:659
 msgid "Playing"
 msgstr ""
@@ -9346,7 +9365,7 @@ msgstr ""
 msgid "Premium Windy capture is not configured on this server; the public (unauthenticated) view is used."
 msgstr ""
 
-#: src/cast/castLabels.ts:12
+#: src/cast/castLabels.ts:13
 msgid "Preparing the stream…"
 msgstr ""
 
@@ -9363,7 +9382,8 @@ msgid "preview"
 msgstr ""
 
 #: src/cast/CastFeedPicker.tsx:36
-#: src/cast/DeskCastButton.tsx:12
+#: src/cast/castLabels.ts:48
+#: src/cast/DeskCastButton.tsx:25
 #: src/layout/components/GridLayoutEditor.tsx:552
 #: src/pages/approved/PatchMatrix.tsx:519
 #: src/pages/OutputFeedRow.tsx:178
@@ -9526,7 +9546,8 @@ msgid "PROG"
 msgstr ""
 
 #: src/cast/CastFeedPicker.tsx:34
-#: src/cast/DeskCastButton.tsx:12
+#: src/cast/castLabels.ts:48
+#: src/cast/DeskCastButton.tsx:25
 #: src/pages/approved/PatchMatrix.test.tsx:760
 #: src/pages/approved/PatchMatrix.tsx:518
 #: src/pages/MonitoringPage.tsx:210
@@ -11081,7 +11102,7 @@ msgstr ""
 msgid "Show selected channel"
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:120
+#: src/cast/ActiveCastCard.tsx:231
 msgid "Show something else"
 msgstr ""
 
@@ -11105,7 +11126,7 @@ msgstr ""
 msgid "Shown past the target. Blank uses the default “+”."
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:53
+#: src/cast/ActiveCastCard.tsx:94
 msgid "Shows"
 msgstr ""
 
@@ -11448,7 +11469,7 @@ msgstr ""
 msgid "Starting: {startingPhase}"
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:55
+#: src/cast/ActiveCastCard.tsx:96
 #: src/pages/AlarmsPage.tsx:183
 #: src/pages/CastPage.tsx:392
 #: src/pages/DevicesPage.tsx:552
@@ -11538,7 +11559,7 @@ msgstr ""
 msgid "Stop {name}"
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:112
+#: src/cast/ActiveCastCard.tsx:153
 #: src/cast/CastButton.tsx:60
 #: src/cast/CastButton.tsx:61
 msgid "Stop casting"
@@ -11569,7 +11590,7 @@ msgstr ""
 msgid "Stopped"
 msgstr ""
 
-#: src/cast/castLabels.ts:22
+#: src/cast/castLabels.ts:23
 msgid "Stopping…"
 msgstr ""
 
@@ -11714,6 +11735,10 @@ msgstr ""
 
 #: src/pages/SourcesPage.tsx:729
 msgid "Subtitle track (id / language)"
+msgstr ""
+
+#: src/cast/ActiveCastCard.tsx:204
+msgid "Subtitles"
 msgstr ""
 
 #: src/pages/WindyFillDialog.tsx:617
@@ -12188,23 +12213,23 @@ msgstr ""
 msgid "The building blocks of a Conspect deployment, and what each one does."
 msgstr ""
 
-#: src/cast/castLoad.ts:131
+#: src/cast/castLoad.ts:140
 msgid "The Cast receiver could not load the media."
 msgstr ""
 
-#: src/cast/castLoad.ts:133
+#: src/cast/castLoad.ts:142
 msgid "The Cast receiver could not play this stream. Check that the address uses HTTPS with a valid certificate."
 msgstr ""
 
-#: src/cast/castLoad.ts:127
+#: src/cast/castLoad.ts:136
 msgid "The Cast request timed out."
 msgstr ""
 
-#: src/cast/castController.ts:229
+#: src/cast/castController.ts:309
 msgid "The cast settings are still loading. Try again in a moment."
 msgstr ""
 
-#: src/cast/castController.ts:379
+#: src/cast/castController.ts:543
 msgid "The cast stream ended on the server (expired or stopped elsewhere)."
 msgstr ""
 
@@ -12325,7 +12350,7 @@ msgstr ""
 msgid "The engine dials the TV itself, so this only works when the engine and the TV share a network. A session can be saved as a permanent device. The session list refreshes on its own."
 msgstr ""
 
-#: src/cast/castLoad.ts:119
+#: src/cast/castLoad.ts:128
 msgid "The engine did not have the cast stream ready within 15 seconds. Try again; if it keeps failing, check the cast output on the Outputs page."
 msgstr ""
 
@@ -12713,7 +12738,7 @@ msgstr ""
 msgid "The TV could not play the stream."
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:69
+#: src/cast/ActiveCastCard.tsx:110
 msgid "The TV has not reached this server. Check that the TV can open https://{host} (certificate, DNS, firewall)."
 msgstr ""
 
@@ -13154,6 +13179,11 @@ msgstr ""
 msgid "Top (%)"
 msgstr ""
 
+#. placeholder {0}: track.trackId
+#: src/cast/castTracks.ts:39
+msgid "Track {0}"
+msgstr ""
+
 #: src/pages/SourcesPage.tsx:805
 msgid "Track id or language tag"
 msgstr ""
@@ -13298,7 +13328,7 @@ msgstr ""
 msgid "Turning it on"
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:89
+#: src/cast/ActiveCastCard.tsx:130
 msgid "TV volume"
 msgstr ""
 
@@ -13412,7 +13442,7 @@ msgstr ""
 msgid "Unknown error"
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:29
+#: src/cast/ActiveCastCard.tsx:53
 msgid "Unknown feed"
 msgstr ""
 
@@ -13485,8 +13515,8 @@ msgstr ""
 msgid "Unmute {label}"
 msgstr ""
 
-#: src/cast/ActiveCastCard.tsx:80
-#: src/cast/ActiveCastCard.tsx:81
+#: src/cast/ActiveCastCard.tsx:121
+#: src/cast/ActiveCastCard.tsx:122
 msgid "Unmute the TV"
 msgstr ""
 
@@ -13677,6 +13707,7 @@ msgstr ""
 msgid "Very low (~1 frame)"
 msgstr ""
 
+#: src/cast/ActiveCastCard.tsx:160
 #: src/components/broadcast/library/Chips.tsx:139
 #: src/pages/approved/PatchMatrix.tsx:894
 #: src/pages/OutputFeedRow.tsx:333
