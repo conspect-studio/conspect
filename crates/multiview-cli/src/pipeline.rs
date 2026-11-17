@@ -4465,11 +4465,17 @@ impl Pipeline {
         }
         // ADR-0113 §4: a defined keyer keeps its fill and key warm, leased to
         // the keyer object id (listed in `GET /api/v1/sources/status`).
-        if !self.switcher_keyers.is_empty() {
+        // K3: the M/E's upstream keyers keep theirs warm the same way.
+        let usk_items = self
+            .switcher_me
+            .as_ref()
+            .map(crate::switcher_runtime::usk_demand_items)
+            .unwrap_or_default();
+        if !self.switcher_keyers.is_empty() || !usk_items.is_empty() {
             let keyers = manager.consumer_set(multiview_engine::ConsumerClass::Keyer, Rails::VIDEO);
-            keyers.seed(crate::switcher_runtime::keyer_demand_items(
-                &self.switcher_keyers,
-            ));
+            let mut items = crate::switcher_runtime::keyer_demand_items(&self.switcher_keyers);
+            items.extend(usk_items);
+            keyers.seed(items);
             self.keyer_demand = Some(keyers);
         }
         // K4: a run with an M/E can define its first DSK at run time

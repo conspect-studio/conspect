@@ -19,7 +19,7 @@ use crate::clock::Tick;
 use crate::isolation::{event_stream, EventStream, EventSubscription, LatestState};
 use crate::keyer::{
     KeyerAction, KeyerCounters, KeyerDef, KeyerDefinition, KeyerDefinitions, KeyerDraw, KeyerEvent,
-    KeyerReadback, KeyerRuntime, KeyerSnapshot, KeyerTally, OpSink, TieEnvelope, MAX_DSK,
+    KeyerReadback, KeyerRuntime, KeyerSnapshot, KeyerTally, NextTake, OpSink, TieEnvelope, MAX_KEYERS,
     REFUSE_KEYER_CLEAN, REFUSE_KEYER_GATE_CONTENDED, REFUSE_KEYER_SET_DEADLINE,
 };
 use crate::patch_set::{ArmState, SetArm, SetRefusal, SET_ADOPT_DEADLINE_TICKS};
@@ -101,6 +101,11 @@ pub fn is_rendered_transition(descriptor: &TransitionDescriptor) -> bool {
     descriptor.is_rendered()
 }
 
+/// Typed refusal: an `arm` names a key that is not a defined upstream
+/// keyer of this M/E (K3).
+pub const REFUSE_ARM_UNKNOWN_KEY: &str =
+    "unknown-keyer: an armed key is not a defined upstream keyer of this M/E";
+
 /// Typed refusal: a select names an undeclared or unpatched input.
 pub const REFUSE_UNKNOWN_INPUT: &str = "unknown-slot: the input is not declared or not patched";
 
@@ -178,6 +183,11 @@ pub enum SwitcherVerb {
         /// ([`REFUSE_KEYER_SET_DEADLINE`]) and never applies (review H4).
         deadline: u64,
     },
+    /// Select the elements the next background transition moves (ADR-0113
+    /// §4, slice K3): `{background} ∪ {USK keys}`. Refused during a take,
+    /// for an empty set, or for a key that is not a defined upstream keyer.
+    /// Built off the clock; the tick only moves the `Arc` in.
+    Arm(Arc<multiview_core::switcher::ArmedSet>),
     /// The mixer half of an atomic multi-crosspoint set (ADR-0110 §12.8,
     /// #308): validated and primed here, then applied only at the adoption
     /// tick the router proposes through `arm`, never on its own. Held in its
@@ -248,9 +258,11 @@ pub struct SwitcherSnapshot {
     /// this tick (ADR-0112 §4). An AUTO never changes it: the flight renders
     /// its own descriptor (the selection at the AUTO's rate).
     pub transition: TransitionDescriptor,
-    /// Downstream keyer rows, in config order (ADR-0113 §8). Ramps are
-    /// descriptors (start, rate, direction), never per-tick weights.
-    pub keyers: [Option<KeyerSnapshot>; MAX_DSK],
+    /// Keyer rows by runtime slot: DSKs, then USKs (ADR-0113 §8). Ramps
+    /// are descriptors (start, rate, direction), never per-tick weights.
+    pub keyers: [Option<KeyerSnapshot>; MAX_KEYERS],
+    /// What the next background transition moves (the `arm` set, K3).
+    pub next: NextTake,
     /// Engine tally as roles (design note §9, deviation: roles, not store
     /// indices; the control plane resolves them to source ids).
     pub tally: KeyerTally,
@@ -387,6 +399,8 @@ impl SwitcherControl {
             clean_gate: Arc::clone(&handle.clean_gate),
             staged_dsk: None,
         };
+        let mut driver = driver;
+        driver.keyers.set_next(NextTake::of(driver.machine.armed()));
         (handle, driver)
     }
 
@@ -667,12 +681,16 @@ impl SwitcherTickDriver {
     pub fn set_keyers(&mut self, mut keyers: KeyerRuntime) {
         keyers.set_counters(Arc::clone(&self.keyer_counters));
         *self.keyers = keyers;
+        // K3: the machine holds one key per USK slot; the keyer runtime
+        // owns their on-air state and the machine mirrors it.
+        let _ = self.machine.set_key_count(crate::keyer::MAX_USK);
+        self.keyers.set_next(NextTake::of(self.machine.armed()));
         // The attach-time definitions (K4 readback); later only on a
         // committed `keyer_set` tick.
         self.keyer_defs.publish(self.keyers.definitions());
         self.definition_builds += 1;
         self.published_def_version = self.keyers.def_version();
-        if !self.keyers.is_empty() {
+        if self.keyers.any_dsk() {
             self.clean_gate.set_defined();
         }
     }
@@ -683,6 +701,12 @@ impl SwitcherTickDriver {
     #[must_use]
     pub fn definition_builds(&self) -> u64 {
         self.definition_builds
+    }
+
+    /// What the next background take moves (the machine's arm set).
+    #[must_use]
+    pub fn next_take(&self) -> NextTake {
+        NextTake::of(self.machine.armed())
     }
 
     /// The keyer runtime (read-only: flags, last-good pair, tally).
@@ -704,7 +728,7 @@ impl SwitcherTickDriver {
         tick: Tick,
         auto_p: Option<TieEnvelope>,
         incoming_drawn: bool,
-        out: &mut [Option<KeyerDraw>; MAX_DSK],
+        out: &mut [Option<KeyerDraw>; MAX_KEYERS],
     ) {
         self.keyers
             .resolve(tick, auto_p, incoming_drawn, out, &self.outcomes);
@@ -714,7 +738,7 @@ impl SwitcherTickDriver {
     /// draws as the committed resting state (an on-air keyer draws its
     /// restored last-good pair at weight 1, even where the committed tick
     /// drew it at weight 0; review round 2 G1).
-    pub fn settle_keyer_draws(&self, draws: &mut [Option<KeyerDraw>; MAX_DSK]) {
+    pub fn settle_keyer_draws(&self, draws: &mut [Option<KeyerDraw>; MAX_KEYERS]) {
         self.keyers.settle_draws(draws);
     }
 
@@ -1014,7 +1038,8 @@ impl SwitcherTickDriver {
             | SwitcherVerb::KeyerCut { .. }
             | SwitcherVerb::KeyerAuto { .. }
             | SwitcherVerb::KeyerTie { .. }
-            | SwitcherVerb::KeyerSet { .. } => Err("not a take".into()),
+            | SwitcherVerb::KeyerSet { .. }
+            | SwitcherVerb::Arm(_) => Err("not a take".into()),
         }
     }
 
@@ -1195,7 +1220,9 @@ impl SwitcherTickDriver {
         if let Some((start, rate)) = self.machine.auto_window() {
             let terminal = i128::from(tick.index) - start >= i128::from(rate.get());
             let (_, preview) = self.resolved_selections();
-            if terminal && self.fresh_at(preview.as_str(), tick) == Some(false) {
+            // A key-only transition (K3) puts no incoming picture on air.
+            let background = self.machine.armed().background;
+            if terminal && background && self.fresh_at(preview.as_str(), tick) == Some(false) {
                 self.machine.abort();
                 // Aborted: tied keyers keep their state.
                 self.keyers.cancel_tied();
@@ -1294,7 +1321,10 @@ impl SwitcherTickDriver {
                 // whatever the caller did. At most `MAX_TICK_ATTEMPTS` CAS
                 // attempts, then refused as contention (review J2: never
                 // spins on the clock); no allocation.
-                let new_keyer = self.keyers.def(usize::from(keyer)).is_none();
+                // Clean is pre-DSK Program: only a new DSK excludes it (a
+                // USK belongs to the M/E scene, K3).
+                let new_keyer = self.keyers.def(usize::from(keyer)).is_none()
+                    && def.0.family == crate::keyer::KeyerFamily::Dsk;
                 let reservation = if new_keyer {
                     match self.clean_gate.tick_reserve_dsk() {
                         Ok(reservation) => Some(reservation),
@@ -1342,7 +1372,31 @@ impl SwitcherTickDriver {
                 }
                 continue;
             }
+            if let SwitcherVerb::Arm(armed) = command.verb {
+                // No scene geometry: the arm set names elements only.
+                let result = if armed
+                    .keys
+                    .iter()
+                    .any(|&k| !self.keyers.usk_defined(k))
+                {
+                    Err(REFUSE_ARM_UNKNOWN_KEY.to_owned())
+                } else {
+                    self.stage();
+                    self.machine.arm_shared(armed).map_err(|e| e.to_string())
+                };
+                match result {
+                    Ok(()) => {
+                        self.keyers.set_next(NextTake::of(self.machine.armed()));
+                        self.staged_success.push(command.operation_id);
+                    }
+                    Err(error) => {
+                        self.publish_outcome(command.operation_id, tick.index, false, Some(error));
+                    }
+                }
+                continue;
+            }
             if let Some((keyer, action)) = KeyerAction::of(&command.verb) {
+                self.keyers.set_in_transition(self.machine.is_in_flight());
                 self.keyers.command(
                     keyer,
                     action,
@@ -1431,7 +1485,9 @@ impl SwitcherTickDriver {
                 } else {
                     Err("program source is absent from the active scene".into())
                 }
-            } else if self.resolved_selections().0 == self.resolved_selections().1 {
+            } else if self.machine.armed().background
+                && self.resolved_selections().0 == self.resolved_selections().1
+            {
                 Err(REFUSE_SAME_SOURCE.into())
             } else {
                 self.gate_take(&command, scenes.as_ref(), tick)
@@ -1677,6 +1733,11 @@ impl SwitcherTickDriver {
     /// (ADR-0113 §6). `None` when no store map is installed.
     fn take_fresh(&self, verb: &SwitcherVerb, tick: Tick) -> Option<bool> {
         let incoming = self.fresh_at(self.incoming(verb), tick)?;
+        // A key-only CUT or AUTO (K3) puts no background on air: only its
+        // keys going on are gated.
+        let incoming = incoming
+            || (matches!(verb, SwitcherVerb::Cut | SwitcherVerb::Auto(_))
+                && !self.machine.armed().background);
         // A CUT during the background AUTO completes that flight: it puts on
         // only the flight's surviving going-on participants (review round 2
         // G2), the same set `stage_take` lands.
@@ -1709,6 +1770,15 @@ impl SwitcherTickDriver {
                 self.staged_success.push(armed.operation_id);
             }
         }
+        // The machine mirrors the runtime's USK states (a loss or a key cut
+        // can differ from its toggle). Fixed array, no allocation.
+        for slot in crate::keyer::KeyerFamily::Usk.slots() {
+            if let (Some(key), Some(flags)) =
+                (crate::keyer::usk_key_index(slot), self.keyers.flags(slot))
+            {
+                self.machine.set_key_on_air(key, flags.on_air);
+            }
+        }
         self.applied_tick
             .store(tick.index, std::sync::atomic::Ordering::Release);
         let (program, preview) = self.resolved_selections();
@@ -1723,6 +1793,7 @@ impl SwitcherTickDriver {
         // Copy rows: no allocation unless the snapshot actually changed.
         let keyers = self.keyers.snapshot();
         let tally = self.keyers.tally();
+        let next = NextTake::of(self.machine.armed());
         let changed = self.snapshots.latest().is_none_or(|previous| {
             previous.program != *program
                 || previous.preview != *preview
@@ -1735,6 +1806,7 @@ impl SwitcherTickDriver {
                 // below, on a tick whose published state actually changed.
                 || previous.transition != *self.machine.transition()
                 || previous.keyers != keyers
+                || previous.next != next
                 || previous.tally != tally
         });
         if changed {
@@ -1749,6 +1821,7 @@ impl SwitcherTickDriver {
                 completion_count: self.machine.completion_count(),
                 transition: self.machine.transition().clone(),
                 keyers,
+                next,
                 tally,
             });
         }
@@ -1768,7 +1841,7 @@ impl SwitcherTickDriver {
             self.published_def_version = self.keyers.def_version();
             // Before this tick's outcomes: once a caller sees `applied`, the
             // gate already refuses Clean for good.
-            if !self.keyers.is_empty() {
+            if self.keyers.any_dsk() {
                 self.clean_gate.set_defined();
             }
         }
@@ -1828,6 +1901,8 @@ impl SwitcherTickDriver {
         // ... and with it any tied keyer participation: they keep their
         // committed state.
         self.keyers.cancel_tied();
+        // The restored machine's arm set (an `arm` this tick is undone).
+        self.keyers.set_next(NextTake::of(self.machine.armed()));
         let restored_auto = self.active_auto.take();
         self.active_auto_scenes = None;
         self.spare_success.clear();

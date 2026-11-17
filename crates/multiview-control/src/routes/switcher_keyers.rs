@@ -28,7 +28,9 @@ use multiview_config::{
     DEFAULT_KEYER_BUDGET, INPUT_REF_PREFIX, MAX_KEYER_RATE,
 };
 use multiview_core::switcher::FrameCount;
-use multiview_engine::keyer::{KeyerDefinitions, KeyerSnapshot, TallyRole, TallySet};
+use multiview_engine::keyer::{
+    KeyerDefinitions, KeyerFamily, KeyerSnapshot, TallyRole, TallySet,
+};
 use multiview_engine::switcher_control::{SwitcherControl, SwitcherSnapshot, SwitcherVerb};
 use multiview_events::AuthzScope;
 use serde::{Deserialize, Serialize};
@@ -1336,8 +1338,20 @@ async fn persist_keyers_locked(
         .defs
         .iter()
         .flatten()
+        .filter(|d| d.family == KeyerFamily::Dsk)
         .map(|d| (*d.config).clone())
         .collect();
+    // K3: upstream keyers go back to their M/E, in key-index order.
+    for me in &mut switcher.mix_effects {
+        let prefix = format!("{}/", me.id);
+        me.keyers = defs
+            .defs
+            .iter()
+            .flatten()
+            .filter(|d| d.family == KeyerFamily::Usk && d.object_id.starts_with(&prefix))
+            .map(|d| multiview_config::UpstreamKeyerConfig::from_definition(&d.config))
+            .collect();
+    }
     config
         .validate()
         .map_err(|e| ControlError::Validation(e.to_string()))?;
@@ -1350,7 +1364,7 @@ async fn persist_keyers_locked(
 mod tests {
     use super::*;
     use multiview_core::switcher::SourceRef;
-    use multiview_engine::keyer::{KeyerTally, MAX_DSK};
+    use multiview_engine::keyer::{KeyerTally, MAX_KEYERS};
 
     fn principal(objects: &[&str]) -> Principal {
         Principal {
@@ -1374,8 +1388,8 @@ mod tests {
         .into_iter()
         .collect();
         let def = multiview_engine::keyer::KeyerDef::from_config(&cfg, &stores, 64, 64).unwrap();
-        let mut list: [Option<Arc<multiview_engine::keyer::KeyerDef>>; MAX_DSK] =
-            [const { None }; MAX_DSK];
+        let mut list: [Option<Arc<multiview_engine::keyer::KeyerDef>>; MAX_KEYERS] =
+            [const { None }; MAX_KEYERS];
         list[0] = Some(Arc::new(def));
         KeyerDefinitions {
             version: 0,
@@ -1396,7 +1410,8 @@ mod tests {
             in_flight: false,
             completion_count: 0,
             transition: multiview_core::switcher::TransitionDescriptor::Cut,
-            keyers: [None; MAX_DSK],
+            keyers: [None; MAX_KEYERS],
+            next: multiview_engine::keyer::NextTake::default(),
             tally: KeyerTally {
                 program: TallySet::from_roles([
                     TallyRole::Program,

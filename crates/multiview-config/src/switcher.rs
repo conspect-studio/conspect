@@ -531,6 +531,28 @@ impl UpstreamKeyerConfig {
         }
     }
 
+    /// The USK of a per-definition view (the inverse of
+    /// [`Self::as_definition`]; the DSK-only fields are dropped).
+    #[must_use]
+    pub fn from_definition(def: &DownstreamKeyerConfig) -> Self {
+        Self {
+            id: def.id.clone(),
+            fill: def.fill.clone(),
+            key: def.key.clone(),
+            key_type: def.key_type,
+            clip: def.clip,
+            gain: def.gain,
+            invert: def.invert,
+            mask: def.mask,
+            fly: def.fly,
+            max_source: def.max_source,
+            z: def.z,
+            loss: def.loss,
+            loss_trigger: def.loss_trigger,
+            premultiplied: def.premultiplied,
+        }
+    }
+
     /// This keyer's admission cost (`fold` = [`USK_FOLD`], ADR-0113 §7).
     #[must_use]
     pub fn cost(&self, canvas_w: u32, canvas_h: u32) -> f64 {

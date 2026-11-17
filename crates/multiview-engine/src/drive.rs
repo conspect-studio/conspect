@@ -42,6 +42,7 @@ use std::sync::Arc;
 
 use multiview_compositor::backend::{RunBackend, RunBackendKind};
 use multiview_compositor::blend::LinearRgba;
+use multiview_compositor::key::{SceneMember, SceneMerge, TileGroup};
 use multiview_compositor::mask::{MaskShape, WipeMask};
 use multiview_compositor::offclock::{FrameJob, JobMeta, SharedKey, SharedTile};
 
@@ -62,12 +63,13 @@ use multiview_framestore::TileStore;
 
 use crate::clock::Tick;
 use crate::error::{Error, Result};
-use crate::keyer::{KeyerDraw, KeyerFly, KeyerParams, TieEnvelope, MAX_DSK};
+use crate::keyer::{DrawRole, KeyerDraw, KeyerFly, KeyerParams, TieEnvelope, MAX_KEYERS};
 use crate::slate::{failover_slate_image, FailoverSlate};
 
 /// Scratch slots reserved for keyer tiles on every compose (fill and key per
-/// downstream keyer), so `scratch_reservations` never depends on keyer state.
-const KEYER_TILES: usize = 2 * MAX_DSK;
+/// keyer, DSKs and USKs), so `scratch_reservations` never depends on keyer
+/// state.
+const KEYER_TILES: usize = 2 * MAX_KEYERS;
 
 /// A frame composited for one output tick: the tagged canvas image, its
 /// presentation timestamp, and the per-source states sampled this tick.
@@ -155,9 +157,64 @@ pub struct MixOverlay {
     pub start: i128,
     /// How the step is drawn (dissolve, dip, ...).
     pub style: TransitionStyle,
+    /// The canvas `(width, height)` the step is drawn on (a WIPE mask is
+    /// evaluated in canvas coordinates).
+    pub canvas: (u32, u32),
 }
 
 impl MixOverlay {
+    /// The incoming picture's WIPE mask at this step (no border band), or
+    /// `None` for another style. The canvas size is the mask's own.
+    #[must_use]
+    pub fn wipe_mask(&self) -> Option<WipeMask> {
+        match self.style {
+            TransitionStyle::Wipe {
+                shape,
+                origin,
+                reverse,
+                softness,
+                border_width,
+                border_color,
+            } => Some(WipeMask::new(
+                shape,
+                self.opacity(),
+                self.canvas.0,
+                self.canvas.1,
+                origin,
+                reverse,
+                softness,
+                if border_color.is_some() {
+                    border_width
+                } else {
+                    0.0
+                },
+            )),
+            _ => None,
+        }
+    }
+
+    /// The scene merge of a key-changing transition at this step (design
+    /// note §3.2, K3): MIX `p`, DIP `dip_weights` in `colour`, WIPE the mask.
+    /// A key-only transition (`background` false) draws a DIP as a MIX.
+    #[must_use]
+    pub fn scene_merge(&self, colour: LinearRgba, background: bool) -> SceneMerge {
+        match self.style {
+            TransitionStyle::Dip { switch_point, .. } if background => {
+                let (d, i) = multiview_core::switcher::kernel::dip_weights(
+                    self.elapsed,
+                    self.duration,
+                    switch_point,
+                );
+                SceneMerge::Dip { colour, d, i }
+            }
+            TransitionStyle::Wipe { .. } => match self.wipe_mask() {
+                Some(mask) => SceneMerge::Wipe { mask },
+                None => SceneMerge::Mix { p: self.opacity() },
+            },
+            _ => SceneMerge::Mix { p: self.opacity() },
+        }
+    }
+
     /// The incoming tile's opacity for this frame.
     #[must_use]
     pub fn opacity(&self) -> f32 {
@@ -194,8 +251,8 @@ impl MixOverlay {
     /// MIX `p` going on and `1 − p` going off, with `p` the same opacity the
     /// incoming tile uses; DIP the incoming contribution `i` going on and
     /// `1 − d` going off, with the same `dip_weights` the transition tiles use;
-    /// WIPE (until K3) `0` going on and `1` going off, a CUT at the terminal
-    /// tick.
+    /// WIPE the transition's mask `m(x, y)` going on and its complement going
+    /// off (K3).
     #[must_use]
     pub fn tie_envelope(&self) -> TieEnvelope {
         match self.style {
@@ -209,17 +266,15 @@ impl MixOverlay {
                 TieEnvelope {
                     going_on: incoming,
                     going_off: 1.0 - dip,
+                    wipe: None,
                 }
             }
-            // K2a deviation (design note §14, K3): the per-pixel WIPE
-            // envelope (`m(x, y)` on, `1 − m(x, y)` off) needs a complement
-            // mask the compositor does not have yet. Until K3 a tied keyer
-            // on a WIPE behaves like a CUT at the transition end: it keeps
-            // its current state through the flight and flips on the
-            // terminal tick.
-            TransitionStyle::Wipe { .. } => TieEnvelope {
-                going_on: 0.0,
-                going_off: 1.0,
+            // K3 (design note §3.2): the per-pixel envelope, `m(x, y)` going
+            // on and `1 − m(x, y)` going off, in canvas coordinates, from the
+            // same mask the incoming tile is drawn through (no border band).
+            TransitionStyle::Wipe { .. } => match self.wipe_mask() {
+                Some(mask) => TieEnvelope::wipe(self.opacity(), mask),
+                None => TieEnvelope::mix(self.opacity()),
             },
         }
     }
@@ -326,7 +381,14 @@ pub struct CompositorDrive<T> {
     /// switcher frame hook. Drawn above the layout and the transition tiles
     /// in the same pass. All `None` without keyers (the steady state).
     /// Boxed once at construction (never per tick) to keep the drive small.
-    keyers: Box<[Option<KeyerDraw>; MAX_DSK]>,
+    keyers: Box<[Option<KeyerDraw>; MAX_KEYERS]>,
+    /// Whether the background takes part in the transition in flight
+    /// (K3): `false` for a key-only transition, which draws no incoming
+    /// picture or DIP colour and keeps Program audio on the outgoing source.
+    transition_background: bool,
+    /// The DIP colour in linear canvas light (for a key-changing DIP merge),
+    /// derived once per colour from `transition_fill`.
+    transition_colour: LinearRgba,
     /// Bumped by every change to what a composite draws other than the
     /// source frames' contents (layout, bindings, stores, slates, transition
     /// step and style, downstream keyer draws). A GPU backend's CPU fallback hands a late result to a
@@ -375,7 +437,9 @@ impl<T> CompositorDrive<T> {
             transition_style: TransitionStyle::Mix,
             transition_fill: None,
             transition_fill_builds: 0,
-            keyers: Box::new([const { None }; MAX_DSK]),
+            keyers: Box::new([const { None }; MAX_KEYERS]),
+            transition_background: true,
+            transition_colour: LinearRgba::opaque(0.0, 0.0, 0.0),
             scene_epoch: 0,
             stores_generation: 0,
         })
@@ -404,12 +468,14 @@ impl<T> CompositorDrive<T> {
         }
         let duration = duration.max(1);
         let style = self.transition_style;
+        let canvas = (self.layout.canvas.width, self.layout.canvas.height);
         match &mut self.mix_overlay {
             Some(mix) if mix.source == source => {
                 mix.elapsed = elapsed;
                 mix.duration = duration;
                 mix.start = start;
                 mix.style = style;
+                mix.canvas = canvas;
             }
             slot => {
                 *slot = Some(MixOverlay {
@@ -418,6 +484,7 @@ impl<T> CompositorDrive<T> {
                     duration,
                     start,
                     style,
+                    canvas,
                 });
             }
         }
@@ -437,6 +504,32 @@ impl<T> CompositorDrive<T> {
         self.transition_style
     }
 
+    /// Whether the background takes part in the transition in flight (K3:
+    /// `false` draws a key-only transition). Pure state, set by the frame
+    /// hook from the machine's armed set; a change bumps the scene epoch.
+    pub fn set_transition_background(&mut self, background: bool) {
+        if self.transition_background != background {
+            self.transition_background = background;
+            self.scene_epoch = self.scene_epoch.wrapping_add(1);
+        }
+    }
+
+    /// Whether the background takes part in the transition in flight.
+    #[must_use]
+    pub const fn transition_background(&self) -> bool {
+        self.transition_background
+    }
+
+    /// Whether any keyer draw is in a changing scene (an armed USK going on
+    /// or off): the frame then composes with scene groups (design note
+    /// §3.2). A fixed-array scan.
+    fn key_changing(&self) -> bool {
+        self.keyers
+            .iter()
+            .flatten()
+            .any(|d| matches!(d.role, DrawRole::In | DrawRole::Out))
+    }
+
     /// The active mix overlay, if any.
     #[must_use]
     pub fn mix_overlay(&self) -> Option<&MixOverlay> {
@@ -453,7 +546,7 @@ impl<T> CompositorDrive<T> {
     /// other keyer draws is never adopted. A new fill/key frame alone is
     /// source content and keeps the epoch, as a cell's new frame does.
     /// Allocation-free.
-    pub fn set_keyer_draws(&mut self, draws: &mut [Option<KeyerDraw>; MAX_DSK]) {
+    pub fn set_keyer_draws(&mut self, draws: &mut [Option<KeyerDraw>; MAX_KEYERS]) {
         std::mem::swap(&mut *self.keyers, draws);
         let changed = self
             .keyers
@@ -467,7 +560,7 @@ impl<T> CompositorDrive<T> {
 
     /// The installed keyer draws.
     #[must_use]
-    pub fn keyer_draws(&self) -> &[Option<KeyerDraw>; MAX_DSK] {
+    pub fn keyer_draws(&self) -> &[Option<KeyerDraw>; MAX_KEYERS] {
         &self.keyers
     }
 
@@ -481,9 +574,9 @@ impl<T> CompositorDrive<T> {
     /// CPU-fallback job can still be adopted (#443 review INV-MC-1).
     pub fn settle_keyer_draws_with(
         &mut self,
-        settle: impl FnOnce(&mut [Option<KeyerDraw>; MAX_DSK]),
+        settle: impl FnOnce(&mut [Option<KeyerDraw>; MAX_KEYERS]),
     ) {
-        let before: [Option<KeyerSceneKey>; MAX_DSK] = self
+        let before: [Option<KeyerSceneKey>; MAX_KEYERS] = self
             .keyers
             .each_ref()
             .map(|d| d.as_ref().map(KeyerSceneKey::of));
@@ -506,6 +599,10 @@ impl<T> CompositorDrive<T> {
         let Some(mix) = self.mix_overlay.as_ref() else {
             return false;
         };
+        if !self.transition_background {
+            // A key-only transition draws no incoming picture.
+            return false;
+        }
         let weight = mix.incoming_weight();
         if weight.is_nan() || weight <= 0.0 {
             return false;
@@ -822,6 +919,23 @@ impl CompositorDrive<Nv12Image> {
             if self.transition_fill.as_ref().map(|(c, _)| *c) != Some(color) {
                 let fill = Nv12Image::solid_rgb(2, 2, color.r, color.g, color.b, self.canvas_color)
                     .map_err(|e| Error::Canvas(e.to_string()))?;
+                // The linear colour a key-changing DIP merges through,
+                // decoded once from the fill through the fixed front half.
+                self.transition_colour = fill
+                    .sample(0, 0)
+                    .and_then(|(y, cb, cr)| {
+                        multiview_compositor::pipeline::tile_yuv_to_canvas_linear(
+                            y,
+                            cb,
+                            cr,
+                            fill.color(),
+                            self.canvas_color,
+                        )
+                        .ok()
+                    })
+                    .map_or(LinearRgba::opaque(0.0, 0.0, 0.0), |c| {
+                        LinearRgba::opaque(c[0], c[1], c[2])
+                    });
                 self.transition_fill = Some((color, Arc::new(fill)));
                 self.transition_fill_builds = self.transition_fill_builds.saturating_add(1);
             }
@@ -940,6 +1054,28 @@ impl CompositorDrive<Nv12Image> {
         order.extend(0..cell_count);
         order.sort_by_key(|&i| self.layout.cells.get(i).map_or(i32::MIN, |c| c.z));
 
+        // K3 (design note §3.2): a transition that changes the key set
+        // composes in scene groups. The outgoing background is `Out` when the
+        // background changes with a fresh incoming picture, else `Both` (a
+        // key-only transition, or a missing incoming frame that keeps the
+        // outgoing picture). Without a changing key everything stays `Top`
+        // (the single-accumulator path of lane `transitions`).
+        let scenes = match &self.mix_overlay {
+            Some(mix) if self.key_changing() => {
+                let incoming = self
+                    .transition_background
+                    .then(|| self.fresh_incoming(mix, now))
+                    .flatten();
+                let merge = mix.scene_merge(self.transition_colour, self.transition_background);
+                Some((merge, incoming))
+            }
+            _ => None,
+        };
+        let cell_member = match &scenes {
+            Some((_, Some(_))) => Some(SceneMember::Out),
+            Some((_, None)) => Some(SceneMember::Both),
+            None => None,
+        };
         for &i in order.iter() {
             let Some(cell) = self.layout.cells.get(i) else {
                 continue;
@@ -962,17 +1098,54 @@ impl CompositorDrive<Nv12Image> {
                 opacity: cell.opacity,
                 mask: None,
                 key: None,
+                group: group_of(cell_member, scenes.as_ref()),
             });
         }
         // The AUTO dissolve's incoming picture: one full-canvas tile on top, in
         // this same pass. A missing frame is skipped (the outgoing picture shows
         // through), never a slate blended into Program.
-        if let Some(mix) = &self.mix_overlay {
-            self.push_transition_tiles(mix, now, canvas.width, canvas.height, held, placements);
+        match (&self.mix_overlay, &scenes) {
+            // Grouped: the incoming background whole in its own scene (the
+            // merge carries the weight, the DIP colour and the WIPE mask).
+            (Some(mix), Some((merge, Some(incoming)))) => {
+                held.push(Arc::clone(incoming));
+                placements.push(Placement {
+                    image_index: held.len().saturating_sub(1),
+                    dst_x: 0,
+                    dst_y: 0,
+                    dst_w: canvas.width,
+                    dst_h: canvas.height,
+                    opacity: 1.0,
+                    mask: None,
+                    key: None,
+                    group: Some((SceneMember::In, *merge)),
+                });
+                // The WIPE border band over both scenes (`over` is linear in
+                // what lies beneath, so this equals the band over the merge).
+                if let Some((fill, band)) = self.wipe_band(mix, true) {
+                    held.push(fill);
+                    placements.push(Placement {
+                        image_index: held.len().saturating_sub(1),
+                        dst_x: 0,
+                        dst_y: 0,
+                        dst_w: canvas.width,
+                        dst_h: canvas.height,
+                        opacity: 1.0,
+                        mask: Some(band),
+                        key: None,
+                        group: Some((SceneMember::Both, *merge)),
+                    });
+                }
+            }
+            (Some(_), Some((_, None))) => {}
+            (Some(mix), None) if self.transition_background => {
+                self.push_transition_tiles(mix, now, canvas.width, canvas.height, held, placements);
+            }
+            _ => {}
         }
-        // Downstream keyers above everything, the transition included
-        // (ADR-0113 §3, render list 4).
-        self.push_keyer_tiles(held, placements);
+        // Keyers above everything, the transition included (ADR-0113 §3,
+        // render lists 3 and 4): USKs, then DSKs.
+        self.push_keyer_tiles(held, placements, scenes.map(|(merge, _)| merge));
 
         // Hand the compositor the held images as owned `Arc`s plus each cell's
         // DESTINATION rect (no pixel copy): a GPU backend composites the frame
@@ -1001,7 +1174,7 @@ impl CompositorDrive<Nv12Image> {
                 JobMeta(Arc::new(FrameMeta {
                     source_states: source_states.clone(),
                     source_times: source_times.clone(),
-                    mix: self.mix_overlay.clone(),
+                    mix: self.mix_overlay.clone().filter(|_| self.transition_background),
                 }))
             }),
         });
@@ -1019,7 +1192,9 @@ impl CompositorDrive<Nv12Image> {
         // An adopted late result is the picture of an EARLIER job of the same
         // scene: report that job's source states, times and transition step
         // with it (issue #415 review MC-R2-1), never this tick's.
-        let mut mix = self.mix_overlay.clone();
+        // A key-only transition is no background crossfade (Program audio
+        // stays on the outgoing source).
+        let mut mix = self.mix_overlay.clone().filter(|_| self.transition_background);
         if let Some(adopted) = output.adopted {
             let meta = adopted
                 .as_ref()
@@ -1053,6 +1228,39 @@ impl CompositorDrive<Nv12Image> {
         })
     }
 
+    /// The transition's incoming frame when it reads live now (SW2-02: a
+    /// held stale frame or a slate never enters Program). One wait-free read.
+    fn fresh_incoming(&self, mix: &MixOverlay, now: MediaTime) -> Option<Arc<Nv12Image>> {
+        self.stores.get(&mix.source).and_then(|store| {
+            let read = store.read_at(now);
+            match (read.state().is_live(), read.frame()) {
+                (true, Some(frame)) => Some(Arc::clone(frame)),
+                _ => None,
+            }
+        })
+    }
+
+    /// The WIPE border band's fill and mask at this step, if the style draws
+    /// one and the incoming picture is fresh (review MED-03).
+    fn wipe_band(&self, mix: &MixOverlay, fresh: bool) -> Option<(Arc<Nv12Image>, WipeMask)> {
+        let TransitionStyle::Wipe {
+            border_width,
+            border_color: Some(color),
+            ..
+        } = mix.style
+        else {
+            return None;
+        };
+        if !(fresh && border_width > 0.0) {
+            return None;
+        }
+        let edge = mix.wipe_mask()?;
+        self.transition_fill
+            .as_ref()
+            .filter(|(c, _)| *c == color)
+            .map(|(_, fill)| (Arc::clone(fill), edge.expanded(border_width)))
+    }
+
     /// Push the AUTO transition's full-canvas tiles above the layout cells, in
     /// this same composite pass (ADR-0104 §3, ADR-0112): the DIP colour at its
     /// weight, then the incoming picture at its weight. A missing incoming
@@ -1077,6 +1285,7 @@ impl CompositorDrive<Nv12Image> {
                 opacity,
                 mask,
                 key: None,
+                group: None,
             });
         };
         // Only a fresh incoming frame is blended (SW2-02): a held stale frame
@@ -1168,7 +1377,12 @@ impl CompositorDrive<Nv12Image> {
     /// the ascending-z order the hook resolved. Refcount increments only; the
     /// capacity was reserved by `begin` (`KEYER_TILES`), so this never grows
     /// the pool. A zero or NaN weight contributes nothing.
-    fn push_keyer_tiles(&self, held: &mut Vec<Arc<Nv12Image>>, placements: &mut Vec<Placement>) {
+    fn push_keyer_tiles(
+        &self,
+        held: &mut Vec<Arc<Nv12Image>>,
+        placements: &mut Vec<Placement>,
+        merge: Option<SceneMerge>,
+    ) {
         for draw in self.keyers.iter().flatten() {
             if draw.weight.is_nan() || draw.weight <= 0.0 {
                 continue;
@@ -1186,10 +1400,21 @@ impl CompositorDrive<Nv12Image> {
                 dst_w: draw.rect.w,
                 dst_h: draw.rect.h,
                 opacity: draw.weight,
-                mask: None,
+                // A tied DSK's WIPE envelope (K3): the mask going on, its
+                // complement going off, in canvas coordinates.
+                mask: draw.wipe,
                 key: Some(PlacedKey {
                     params: draw.params,
                     key_image,
+                }),
+                group: merge.and_then(|merge| {
+                    let member = match draw.role {
+                        DrawRole::Top => return None,
+                        DrawRole::Both => SceneMember::Both,
+                        DrawRole::Out => SceneMember::Out,
+                        DrawRole::In => SceneMember::In,
+                    };
+                    Some((member, merge))
                 }),
             });
         }
@@ -1296,6 +1521,15 @@ struct PlacedKey {
     key_image: Option<usize>,
 }
 
+/// The scene group of a layout cell this tick (K3): `member` while a
+/// key-changing transition runs, else none.
+fn group_of(
+    member: Option<SceneMember>,
+    scenes: Option<&(SceneMerge, Option<Arc<Nv12Image>>)>,
+) -> Option<(SceneMember, SceneMerge)> {
+    Some((member?, scenes?.0))
+}
+
 /// Internal: a resolved tile placement referencing an entry in the `held` vec.
 #[derive(Clone, Copy)]
 struct Placement {
@@ -1313,6 +1547,8 @@ struct Placement {
     mask: Option<WipeMask>,
     /// A keyer's key block (ADR-0113 §3); `None` for an ordinary tile.
     key: Option<PlacedKey>,
+    /// The scene group of a key-changing transition (K3); `None` is `Top`.
+    group: Option<(SceneMember, SceneMerge)>,
 }
 
 /// Whether two keyer draws draw the same scene (issue #415): the same keyer,
@@ -1337,6 +1573,10 @@ struct KeyerSceneKey {
     invert: bool,
     mask: Option<multiview_compositor::key::KeyMask>,
     has_key: bool,
+    /// The scene role (K3) and whether a WIPE envelope (and which side) is
+    /// drawn; the mask itself follows the transition step in `scene_key`.
+    role: DrawRole,
+    wipe: Option<bool>,
 }
 
 impl KeyerSceneKey {
@@ -1355,6 +1595,8 @@ impl KeyerSceneKey {
             invert: d.params.invert,
             mask: d.params.mask,
             has_key: d.key.is_some(),
+            role: d.role,
+            wipe: d.wipe.map(|m| m.complement),
         }
     }
 }
@@ -1373,7 +1615,10 @@ fn shared_tile(p: &Placement, held: &[Arc<Nv12Image>]) -> Option<SharedTile> {
         opacity: p.opacity,
         mask: p.mask,
         key: p.key.map(|placed| shared_key(placed, held)),
-        group: multiview_compositor::key::TileGroup::Top,
+        group: match p.group {
+            Some((member, merge)) => TileGroup::Scene { member, merge },
+            None => TileGroup::Top,
+        },
     })
 }
 
