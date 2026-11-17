@@ -190,6 +190,7 @@ impl Rig {
                 operation_id: op.into(),
                 scene_version: 1,
                 verb,
+                expect: None,
             })
             .unwrap();
     }
@@ -480,6 +481,7 @@ async fn a_suspended_roll_receiver_never_stalls_the_tick() {
             operation_id: "set".into(),
             scene_version: 1,
             verb: SwitcherVerb::SetTransition(stinger(1, 8, 2, 3)),
+            expect: None,
         })
         .unwrap();
     let clock = Arc::new(ManualTimeSource::new());
@@ -511,6 +513,7 @@ async fn a_suspended_roll_receiver_never_stalls_the_tick() {
                         operation_id: format!("auto-{}", frame.tick.index),
                         scene_version: 1,
                         verb: SwitcherVerb::Auto(FrameCount::try_from(5).unwrap()),
+                        expect: None,
                     });
                     autos += u64::from(sent.is_ok());
                 }
@@ -729,6 +732,7 @@ async fn a_stinger_command_flood_never_moves_the_output_clock() {
                 operation_id: op.into(),
                 scene_version: 1,
                 verb,
+                expect: None,
             })
             .unwrap();
     }
@@ -758,6 +762,7 @@ async fn a_stinger_command_flood_never_moves_the_output_clock() {
                     operation_id: op.clone(),
                     scene_version: 1,
                     verb,
+                    expect: None,
                 };
                 if handle.try_send(command).is_ok() {
                     accepted.lock().unwrap().push(op);

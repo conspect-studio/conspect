@@ -89,6 +89,7 @@ async fn owned_hook_cut_changes_actual_composited_program_without_false_202() {
             operation_id: "one".into(),
             scene_version: 1,
             verb: SwitcherVerb::Cut,
+            expect: None,
         })
         .unwrap();
     let pace = Arc::clone(&clock);
@@ -169,6 +170,7 @@ fn failed_rebind_rolls_back_selection_and_never_airs_later() {
             operation_id: "failed-cut".into(),
             scene_version: 1,
             verb: SwitcherVerb::Cut,
+            expect: None,
         })
         .unwrap();
     hook.before_compose(
@@ -274,6 +276,7 @@ fn repatching_the_program_input_rebinds_the_program_cell_on_the_same_tick() {
                         members: vec![(1, Some(SourceRef::new("b")))],
                         allow_on_air: true,
                     }),
+                    expect: None,
                 })
                 .unwrap();
         }
@@ -402,6 +405,7 @@ fn the_hook_publishes_bus_sizing_only_when_a_selection_changes() {
             operation_id: "cut".into(),
             scene_version: 1,
             verb: SwitcherVerb::Cut,
+            expect: None,
         })
         .unwrap();
     hook.before_compose(&mut drive, tick(2));
@@ -411,6 +415,16 @@ fn the_hook_publishes_bus_sizing_only_when_a_selection_changes() {
         "the new PGM source is published before its first frame composes"
     );
     assert_eq!(read(&preview).as_deref(), Some("a"));
+}
+
+/// A CUT with no selection guard (#307), scene version 1.
+fn unguarded_cut(operation_id: String) -> SwitcherCommand {
+    SwitcherCommand {
+        operation_id,
+        scene_version: 1,
+        verb: SwitcherVerb::Cut,
+        expect: None,
+    }
 }
 
 /// #469 chaos (inv #1/#10): a CUT on every tick while a decode-side reader
@@ -483,11 +497,7 @@ async fn a_cut_flood_with_a_hammering_sizing_reader_keeps_every_tick() {
                 observed.push(watch.load());
                 // One CUT per tick from the control side; a full mailbox
                 // drops, it never waits.
-                let _ = flood.try_send(SwitcherCommand {
-                    operation_id: format!("cut{}", frame.tick.index),
-                    scene_version: 1,
-                    verb: SwitcherVerb::Cut,
-                });
+                let _ = flood.try_send(unguarded_cut(format!("cut{}", frame.tick.index)));
                 pace.advance(std::time::Duration::from_nanos(TICK_NS));
                 let next = i64::try_from((frame.tick.index + 1) * TICK_NS).unwrap();
                 for store in &sources {
@@ -553,6 +563,7 @@ fn a_failed_compose_republishes_the_rolled_back_bus_sizing() {
             operation_id: "cut".into(),
             scene_version: 1,
             verb: SwitcherVerb::Cut,
+            expect: None,
         })
         .unwrap();
     hook.before_compose(&mut drive, tick(1));

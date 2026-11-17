@@ -96,6 +96,8 @@ import {
 import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
 import { WindyFillDialog } from './WindyFillDialog';
+import { FillRefreshStatusBadge } from './FillRefreshStatus';
+import { windyFillId } from '../api/web-capture';
 import {
   classifySubmissionError,
   configuredDefaultAsset,
@@ -466,6 +468,9 @@ function MediaPlayerCard({
               <CloudSun aria-hidden="true" />
               <Trans>Fill from web…</Trans>
             </TouchAction>
+          </div>
+          <div className="mt-2">
+            <FillRefreshStatusBadge fillId={windyFillId(player.id)} />
           </div>
           {unresolved.filter((entry) => entry !== op).length > 0 ? (
             <div role="status" className="mt-2 rounded-md border border-amber-500/50 p-2 text-xs break-words">

@@ -262,6 +262,7 @@ async fn twenty_live_adds_under_load_on_a_switcher_run_never_move_the_clock() {
                         operation_id: format!("me-{n}"),
                         scene_version: 1,
                         verb,
+                        expect: None,
                     })
                     .is_err()
                 {
