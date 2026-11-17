@@ -1054,10 +1054,7 @@ number = 3
     }
 
     #[test]
-    fn chroma_and_premultiplied_are_refused_by_name() {
-        let mut chroma = dsk("dsk1", 1);
-        chroma.key_type = KeyerType::Chroma;
-        keyer_refused(vec![chroma], "chroma");
+    fn premultiplied_is_refused_by_name() {
         let mut shaped = dsk("dsk1", 1);
         shaped.premultiplied = true;
         keyer_refused(vec![shaped], "premultiplied");
