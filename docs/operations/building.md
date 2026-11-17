@@ -118,6 +118,16 @@ ffmpeg -protocols | grep -E 'srt|rtsp|rtmp|hls'   # SRT 404s silently if libsrt 
 ffmpeg -hwaccels                                  # vaapi / cuda depending on build
 ```
 
+> [!IMPORTANT]
+> **libsrt 1.5.7 or newer is required for SRT listeners.** `multiview-srt-sys` refuses to open
+> any SRT listener (input or output) on an older libsrt, reporting the loaded and required
+> versions: 1.5.7 fixes a pre-authentication heap overflow in the listener handshake
+> (GHSA-m96h-3rc9-xx6h). Debian trixie's `libsrt1.5-*` 1.5.4 packages do not carry that fix. The
+> images and release archives ship the pinned upstream 1.5.7 that `deploy/libsrt-build.sh` builds
+> into the FFmpeg prefix (`bash deploy/libsrt-build.sh build /opt/multiview-ffmpeg`, which needs
+> cmake and `libssl-dev`); for a host build, build it the same way and put its `lib/` on the
+> loader path.
+
 `pkg-config` must find the `libav*.pc` files (and `srt.pc` for SRT). If you build a custom FFmpeg,
 export its location:
 

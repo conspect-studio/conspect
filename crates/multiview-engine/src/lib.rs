@@ -89,6 +89,7 @@
 #![warn(missing_docs)]
 
 pub mod alarm;
+pub mod clean_gate;
 pub mod clock;
 pub mod clock_thread;
 pub mod cycle;

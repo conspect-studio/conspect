@@ -144,10 +144,20 @@ buffer `key_params` (binding 6, one entry per tile, parallel to `tiles`, pooled 
 the tile buffer) carries:
 
 ```text
-KeyParams { key_layer, key_w, key_h, kind|invert|group (u32 bits),
-            key_luma_scale, key_luma_off, clip, gain,
-            mask: vec4<u32>, merge: vec4<f32> /* kind, p | d, i */ }
+KeyParams { key_layer, key_w, key_h, kind|invert|has_table|group (u32 bits),
+            table_base: u32,
+            mask: vec4<u32>, merge: vec4<f32> /* kind, p | d, i */, dip_colour }
 ```
+
+A matte from a signal (luma, or linear with a key source) is a pure function of the signal's
+8-bit Y code, its resolved range, clip, gain and invert. So the CPU builds it per keyed tile as
+a 256-entry `f32` table with the oracle's own functions (`range::expand_luma`, then
+`key::luma_matte` or `key::unit`, then invert), using the key source's range, or the fill's for
+a luma self key. The tables live in a second storage buffer `mattes` (binding 7, pooled and
+refilled in place like `key_params`); the shader rounds the texel to its integer code and looks
+it up at `table_base + code`. This is exact by construction: a huge or infinite gain makes the
+matte a step at the clip, and a shader evaluation of `(y − clip) × gain` could flip whole
+pixels on float fuzz (review MEDIA-1).
 
 Nothing is borrowed from the fill's `TileParams`, so fill and key can differ in size and range.
 Layer count: at most 1 Program cell + 3 transition tiles + 6 keyers × 2 (fill, key) = 16 ≤ 64.
@@ -481,20 +491,20 @@ keyers.
   tile or the end of the list. While any tile is grouped the band's accumulator spans the whole
   band, because a DIP merge colours pixels no tile covers. Frames with no grouped tile keep the
   covered-span path unchanged.
-- **Deviation: WIPE merge and the GPU key path are not in K1.** `SceneMerge::Wipe` lands with K3 on
-  top of lane `transitions`' mask. The WGSL key path (`key_params`, binding 6) is not merged before
-  #395. Until it is, `GpuCompositor` refuses a frame with a keyed or grouped tile with a typed
-  `GpuLimit`, and `RunBackend` routes a keyed or grouped frame (an allocation-free scan, before
-  any GPU work) to a **persistent** CPU reference owned by the GPU compositor, whose LUT cache and
-  band/scene scratch survive across ticks (counted in `gpu_cpu_fallback_frames`; its pool is what
-  `scratch_alloc_count` reports on a GPU backend). It is never drawn without its key. A genuine
-  GPU failure falls back through the same persistent backend. The LUT cache checks a frame's transfer set
-  in place (no per-frame list is built unless the set changed). The parallel CPU path still spawns
-  its scoped band threads each frame, as it did before K1: a fixed, bounded cost, tracked in #416
-  (persistent band workers). #395 (the bounded GPU readback, PR #424) merged after K1 was written; the
-  persistent fallback is now main's `cpu_fallback_backend`, and the WGSL key path is the next GPU
-  step (owed, tracked on #386). ADR-0113 §9 already bounds this:
-  the default budget is 1 full-canvas DSK until the mda001 run passes.
+- **Deviation: WIPE merge is not in K1.** `SceneMerge::Wipe` lands with K3 on top of lane
+  `transitions`' mask. The GPU key path was first held back until #395 (the bounded GPU
+  readback, PR #424). Until it landed, `GpuCompositor` refused a keyed or grouped frame with a
+  typed `GpuLimit`, and `RunBackend` composed it on the persistent CPU fallback. That
+  deviation is closed; see "K1 GPU key path as built" below. A genuine GPU failure, and a
+  keyed frame the GPU cannot hold, still fall back through the same **persistent** CPU
+  reference owned by the GPU backend (`cpu_fallback_backend`). Its LUT cache and band/scene
+  scratch survive across ticks, its frames are counted in `gpu_cpu_fallback_frames`, its pool
+  is what `scratch_alloc_count` reports on a GPU backend, and it never draws a keyer without
+  its key. The LUT cache checks a frame's transfer set in place, so no per-frame list is
+  built unless the set changed. The parallel CPU path still spawns its scoped band threads
+  each frame, as it did before K1. That is a fixed, bounded cost, tracked in #416
+  (persistent band workers). ADR-0113 §9 bounds this: the default budget is 1 full-canvas
+  DSK until the mda001 run passes.
 - Tests: `tests/keyers_cpu.rs` (20: goldens for linear self key with alpha used once, linear key
   source, luma clip/gain/invert, luma on a key source, mask with a flying key, unequal fill/key
   sizes up and down, mixed ranges, premultiply-once after primaries, weight; a monotonic and
@@ -503,12 +513,79 @@ keyers.
   reads as 0; the tile-driven kernel equal to the oracle with keys and groups at 1-4 threads, on a
   small canvas (proptest) and on a 320x256 canvas above the parallel threshold with tiles across
   band edges; no scratch growth over 50 grouped composites) and `tests/keyers_gpu_fallback.rs`
-  (`wgpu`: the refusal, the oracle-equal fallback, and no scratch growth or LUT rebuild over 20
-  repeated keyed and grouped fallback frames).
+  (`wgpu`: the layer-limit refusal, the oracle-equal fallback, and no scratch growth or LUT
+  rebuild over 20 repeated keyed and grouped fallback frames).
 - Bench: `examples/keyer_composite_bench.rs`. CPU figures from a shared 56-core devcontainer (not
   the target host; median ms at 1080p): 0 keyers 30.0, 1 full-canvas alpha DSK 41.1, 2 full-canvas
   keyers 54.5, 2 flying 576x324 31.2, 1080p source in a 128x72 fly 27.6, key-changing MIX + DSK
-  58.9. The calibration of `u` and `fold` on the RTX 4060 is owed with the GPU key path.
+  58.9. The calibration of `u` and `fold` on the RTX 4060 is owed (lead), on the GPU key path below.
+
+### K1 GPU key path as built (#386 part 2)
+
+- **Where.** `composite.wgsl` draws keyed tiles and scene groups itself. `GpuComposer::draws_keys`
+  is `true` for the wgpu compositor, so `OffClockGpu` no longer routes a keyed frame to the CPU
+  before GPU work. The simulated chaos GPU keeps the CPU route, so the engine's slow-fallback
+  epoch tests are unchanged.
+- **Parameters (§3.3).** `KeyParams` (80 bytes) is binding 6, one entry per tile, parallel to
+  `tiles`. It holds:
+  - `head`: key layer, key w and h, and the flags (kind, invert, has-source, has-mask,
+    has-table, and the 2-bit group).
+  - `table`: the base of the tile's matte table in `mattes`.
+  - `mask`: a `vec4<u32>` in fill-source pixels.
+  - `merge`: kind, p or d, and i, plus the DIP colour.
+
+  `mattes` is binding 7: one 256-entry `f32` table per signal-keyed tile (see §3.3). Both
+  buffers are allocated once at `MAX_TILES` entries (tables) and refilled in place, like the
+  tile buffer. The CPU-side `TileParams`/`KeyParams`/matte scratch lives in `SurfacePool` and is
+  cleared and refilled, so a steady-state tick allocates no `Vec`.
+- **Key sources.** Each key source uploads only its Y plane, into its own `y_planes` layer
+  after the fill layers. It is sampled with its own nearest map, `kx = floor(ddx × key_w / dst_w)`,
+  and its matte table is built with its own range. The matte reads the Y code only (the input
+  of range expand), never the colour math. `mask × matte`
+  multiplies into alpha before the single premultiply, so the #8 order is unchanged and nothing
+  is materialised as RGBA (#5).
+- **Matte math is the oracle's.**
+  - A linear self key is 1 and ignores invert.
+  - The mask test is half-open and compares offsets, so it cannot overflow.
+  - Every signal matte is the oracle's own value for the Y code: the shader computes
+    `round(texel × 255)` clamped to [0, 255] and reads the CPU-built table, so degenerate
+    parameters (NaN, negative, zero or infinite gain; NaN, infinite or subnormal clip) and the
+    step of a huge gain cannot diverge from the CPU, and the shader never clamps a NaN.
+  - A NaN tile opacity reads as 0, as on the CPU.
+- **Scene groups.** Two extra `vec4` registers (outgoing and incoming) hold the open segment.
+  It merges (MIX, DIP) at the next `Top` tile or the end of the list, and the last grouped
+  tile's merge wins. A grouped tile that covers nothing still opens its segment and sets its
+  merge, matching the CPU oracle.
+- **Still refused (typed `GpuLimit`, then the CPU fallback).**
+  - Tiles plus key sources past the 64-layer tile array. §3.3's worst case is 16 layers.
+  - A fill or key larger than the device's `max_texture_dimension_2d`.
+- **Tests.**
+  - `tests/keyers_gpu.rs` (`wgpu`, 5 tests) compares GPU and CPU oracle output (SSIM ≥ 0.98,
+    PSNR ≥ 40 dB on Y and UV) across 18 frames, plus the MEDIA-1 frames below. The cases cover:
+    - a luma self key, and a luma key with a key source of another size and range (up- and
+      downscaled tile);
+    - a linear key with a key source, and a linear self key with fill alpha;
+    - luma and linear invert, and a mask on a flying key;
+    - two keyers at non-unit scale, and degenerate parameters;
+    - MIX at p 0, 0.3, 0.5 and 1, and DIP at three (d, i);
+    - two segments with an off-canvas grouped tile whose merge wins;
+    - review MEDIA-1: a full-range black key source, clip −1e-40, gain +∞ (matte 1, and
+      inverted 0) under a white fill, and a limited-range key whose codes sit one below, on and
+      one above the clip with gain 1e30 and +∞. These also bound every pixel to |ΔY| ≤ 2, so a
+      flipped step pixel fails.
+
+    The suite also checks that a keyed or grouped frame on the GPU backend leaves
+    `gpu_cpu_fallback_frames` at 0, that there is no GPU pool growth over 30 keyed and grouped
+    composites, and that the layer-limit refusal falls back to the oracle.
+  - On lavapipe (llvmpipe, Vulkan) the minima were SSIM 0.99998 and PSNR 60.9 dB, with a
+    maximum |ΔY| of 2 codes.
+  - GPU-free `KeyParams` packing unit tests run in `cargo test` without an adapter, including
+    a check that the matte table equals `key::luma_matte` for all 256 codes over NaN, negative
+    and infinite gains and NaN, ±∞ and subnormal clips, in both ranges.
+- **Bench.** `keyer_composite_bench` times the GPU key path. It prints the adapter and a
+  per-case fallback delta, which must be 0. RTX 4060 figures and the calibration of `u` and
+  `fold` are still owed by the lead; no numbers are recorded here. lavapipe timings measure
+  the shader on the CPU and are not a calibration.
 
 ### K2a (#387): DSK runtime in the Program drive
 
@@ -720,3 +797,261 @@ keyers.
     `EventStream` cost), never per tick.
   - **Upload weight.** `u` is uncalibrated.
   - **Extra reads.** Each keyer on air adds 1–2 lock-free `read_at` per tick.
+
+### K4 (#389): keyer control API
+
+- **Routes.** No new route. `keyer_cut`, `keyer_auto`, `keyer_tie` and `keyer_set` are actions on
+  `POST /api/v1/switcher/plan` and `POST /api/v1/switcher/commands/{kind}`. `SwitcherRequest`
+  flattens `KeyerFields`: `keyer`, `on`, `tie`, and the `keyer_set` fields `fill`, `key`, `type`,
+  `clip`, `gain`, `invert`, `mask`, `fly`, `max_source`, `rate`, `loss`, `loss_trigger`, `z`,
+  `on_at_start` and `on_air`. `keyer_auto` takes its optional rate override in the existing
+  `duration_frames` (1..=300). The handlers dispatch keyer verbs to `routes::switcher_keyers`
+  right after BOLA. The background verbs are unchanged and refuse keyer fields. The plan's
+  `200` is documented as `oneOf [SwitcherPlan, KeyerPlan]` (`SwitcherPlanResponseDoc`; review
+  round 1 H5), since keyer plans answer a `KeyerPlan`, which has no `scene_version`.
+  - Commands use the same `Idempotency-Key` store (a replay answers the first 202), resolved
+    right after authorization and the stateless request shape and **before** any
+    state-dependent admission (review round 1 H2): a retry of a `keyer_auto` whose ramp has
+    started, or of a `keyer_set` that already applied, replays its 202 instead of answering
+    409. A fresh request that then fails admission reserves nothing. They also use the same
+    202 `SwitcherAccepted {operation_id, kind}` and the same 64-slot `try_send` (503
+    `engine-busy`, key and leases released). Outcomes ride `switcher.operation` unchanged.
+  - The engine verbs are K2a's `KeyerCut`/`KeyerAuto`/`KeyerTie`. The control plane maps
+    `keyer` ids to indices through the committed definitions. K4 adds
+    `SwitcherVerb::KeyerSet {keyer, def, allow_on_air}`.
+- **BOLA (plan and command, before any existence answer or key).** The checks run in
+  `authorize_refs` after the role gate. A keyer verb needs `Write` (Operator) on plan as well as
+  on command: a keyer plan rehearses the command (cost, on-air state, the refusal it would
+  answer), so a Viewer or ReadOnly key is 403 on `/plan` too (review round 1 H1; background
+  verbs keep `Read` for plan). Then:
+  `authorize_object(me)`, `Program(program)`, `authorize_object("<program>/<keyer>")` and
+  `authorize_object` on every named `fill`/`key`. The control plane has one object axis, so
+  `Control` and `Read` on an id are both that grant, and the role separates them (as for
+  every other switcher verb). An unknown keyer that the caller may not see is a 403, never a
+  404. A readable unknown keyer is 404 `unknown-keyer`. A denied request burns no key.
+- **Shape.** `in:<n>` as fill or key is 422 `keyer-source-not-a-source`. Each verb accepts only
+  its own fields. `duration_frames` outside 1..=300 is 422 `keyer-rate`.
+- **`keyer_set` (class 1, one tick).**
+  - **Merge.** The request is merged onto the committed definition. A free slot defines a new
+    DSK: `fill` is required, z defaults to max + 1, and the other fields take the config
+    defaults.
+  - **Validation.** The merged entry is checked with the config's own per-definition rules
+    (`DownstreamKeyerConfig::validate_definition`, the same checks boot validation runs: source
+    exists, `chroma`/`premultiplied` refused by name, geometry, `max_source`, mask). The
+    cross-keyer rules are then checked against the live set: unique z, at most 2 DSKs (409
+    `capacity`), and the budget.
+  - **Resolve.** The definition is resolved off the clock (`SwitcherControl::resolve_keyer`,
+    against the stores and canvas published once at attach) into an `Arc<KeyerDef>`. The tick
+    only moves that `Arc` in.
+  - **At the tick.** `KeyerRuntime::define` rechecks the summed cost (`REFUSE_KEYER_CAPACITY`),
+    a unique id and z, and that a slot keeps its id for life (`keyer-definition`). It also
+    rechecks the on-air guard (`REFUSE_KEYER_ON_AIR_PROTECTED`). A fill or key change of a keyer
+    on air or ramping (`allow`) needs the new sources fresh now, else it is refused and never
+    held. The tick bumps `def_version` and releases a last-good pair that belonged to the old
+    sources. It queues a `switcher.keyer` event with `reason = "definition"` and never changes
+    on-air state.
+  - **Rejected frames.** A rejected frame restores the previous definitions, the reserved cost,
+    the draw order and the version (`DefUndo`, `Arc` refcounts only).
+  - **Publication.** Definitions are published in a `LatestState<KeyerDefinitions>` at attach
+    and then only on a committed `keyer_set` tick, before that tick's keyer events. The clock
+    allocates nothing for it (review round 1 H6). The control plane builds the readback off
+    the clock with the request (`SwitcherControl::keyer_set_verb`,
+    `KeyerDefinitions::with_definition`: the admitted base, the slot replaced, version + 1)
+    and the verb carries it as `KeyerReadback`. At the tick `define` checks that readback by
+    pointer identity against the result (O(MAX_DSK) compares). The commit then publishes that
+    `Arc` (`publish_arc`). A readback whose base changed meanwhile (two sets admitted on the
+    same definitions) is refused `keyer-definitions-changed` and nothing changes. Odometer:
+    `SwitcherTickDriver::definition_builds` stays at the attach build.
+- **Admission (§7).** The plan reports `KeyerCost {delta, fits}` for every caller.
+  `reserved`, `budget` and `holders` (keyer object ids) go to unscoped principals only
+  (`Principal::is_global`, ADR-0108 decision 8). A scoped caller's 409 `capacity` detail is
+  generic. A refused command takes no lease and keeps no key. Raising `max_source` is
+  admitted like any other cost increase (tested).
+- **On-air guard.** Changing `fill` or `key` of a keyer that is on air, ramping or holding a
+  command needs `on_air = "allow"`, else 409 `on-air-protected` (plan refusal and command).
+  Parameter changes that keep the sources are not protected. They take effect on the applying
+  tick.
+- **Make-before-break.** A `keyer_set` takes leases on its fill and key (label
+  `keyer:<program>/<keyer>`) before the enqueue. A settle task subscribed before the enqueue
+  waits for a terminal engine answer and then decides from the committed definitions, not the
+  event, so a lagged ring cannot mislead it.
+  - **Engine deadline (review round 1 H4).** The verb carries `deadline` = the clock's last
+    composed tick at admission + `KEYER_SET_DEADLINE_TICKS` (= `TAKE_PRIME_DEADLINE_TICKS`,
+    50). A `keyer_set` drained at or after that tick is refused `keyer-set-deadline` and never
+    applies. Settlement has no wall-clock deadline any more. It ends only on the outcome,
+    once `applied_tick >= deadline` (from then on the command cannot apply), or when the
+    mailbox is closed (the run ended). Until then it re-reads the composed tick every 500 ms
+    (`KEYER_SET_RECHECK`). It therefore never releases leases or the DSK reservation while
+    the command could still apply. The old 10 s timeout released both and left an applied
+    definition unpersisted, with its demand unpublished and Clean reopened.
+  - **Applied.** It republishes the run's `keyer` demand set (`ConsumerSet::publish`, which
+    leases the new set before it releases the old one), persists the definitions, and only
+    then drops the request's leases.
+  - **Serialized reconciliation (review round 2 J1).** Republish and persist run together
+    under the config-mutation lock, and the definitions are read *inside* the lock
+    (`reconcile_keyers`), never captured before it. Committed definitions only move
+    forward, so the settlement that runs last writes the newest version. Before, a
+    settlement captured version N, was descheduled while N+1 applied, published and
+    persisted, and then republished N's demand (releasing sources the engine still keys) and
+    persisted N last, so a restart came back with stale keyers.
+  - **Refused or busy.** The leases drop at once.
+- **Clean rule (review round 1 H3: one counted admission point).** One `CleanDskGate`
+  (`multiview_engine::clean_gate`) is shared by the switcher (`SwitcherControl::clean_gate`),
+  the routing handle (plan answers) and the router (drain admission). It replaces the old
+  "DSK defined" `AtomicBool`, which raced: the router read `false` while the handler set it
+  and read a routing snapshot that did not yet show the pending Clean take, so both could
+  proceed. A failing request could also clear the bool under a queued sibling.
+  - **One word.** The gate is one `AtomicU64` holding a committed "defined" bit, a count of
+    DSK reservations and a count of Clean reservations. Every reservation is one CAS that
+    checks the other side in the same step. A DSK reservation is refused while any Clean
+    reservation is held. A Clean reservation is refused while a DSK is defined or any DSK
+    reservation is held. Reservations are RAII guards that release exactly their own count,
+    so a request that fails can never release another's. The operations are lock-free and
+    allocation-free.
+  - **Bounded on the clock (review round 2 J2).** A lock-free CAS loop is not wait-free:
+    concurrent control-plane reservations could keep invalidating the clock's CAS. The clock
+    therefore admits only through `tick_reserve_dsk` / `tick_reserve_clean`, which make at
+    most `MAX_TICK_ATTEMPTS` (4) CAS attempts and then refuse as `TickRefusal::Contended`,
+    counted on the gate (`contended()`). The switcher answers that refusal
+    `clean-gate-contended` (`REFUSE_KEYER_GATE_CONTENDED`; nothing changes, the caller
+    re-issues); the router refuses the Clean take `Unroutable`, as when excluded. Off-clock
+    callers keep the retrying CAS. Every release is one non-retrying `fetch_sub` on its own
+    count field (the field holds at least the guard's own count, so it never borrows into the
+    neighbour), and `set_defined` is one `fetch_or`.
+  - **Control plane.** A `keyer_set` that defines a new keyer (not only the first one) takes
+    a DSK reservation before its leases and enqueue. A refusal is 409
+    `clean-unavailable-with-dsk`. It holds the reservation in its settle task until a
+    terminal engine answer (H4). A refused, lease-less or busy request drops only its own.
+    The plan answers from the same gate (`clean_reservations() > 0`).
+  - **Router.** A take to Clean is admitted at the drain only by taking a Clean reservation
+    for its output (`hold_clean`). A take set with any Clean member that cannot reserve is
+    refused whole, and a re-issued Clean boot take reserves again. The tick's
+    `reconcile_clean` releases the reservation of every output that neither carries Clean
+    nor has a take to it pending (O(outputs); the slots are sized at construction).
+  - **Engine backstop.** At the tick, a `keyer_set` for a free slot takes its own DSK
+    reservation (bounded, J2). If Clean is held it is refused `clean-unavailable-with-dsk`
+    (`REFUSE_KEYER_CLEAN`), if contended `clean-gate-contended`, and nothing changes. The reservation is held across the compose.
+    The commit sets the "defined" bit before the tick's outcomes, then drops it. A rejected
+    frame drops it without setting the bit. Attach sets the bit for declared DSKs. Nothing
+    clears it (no keyer removal verb).
+  - **Every interleaving.** Each side admits only through its own CAS against the other side's
+    count, so at most one wins. Whoever wins keeps the other excluded until its reservation
+    settles (DSK) or its output leaves Clean (Clean). After a DSK commits, the bit keeps
+    Clean out.
+- **GET.** `GET /api/v1/switcher/{me}` adds:
+  - `keyers[]` (design note §8 shape: `id`, `family = "dsk"`, `fill`, `key`, `type`, `fly`,
+    `mask`, `on_air`, `tie`, `ramp {start_tick, rate, to_on}`, `rate`, `loss`, `stale`,
+    `pending`), filtered by the keyer object id, with an unreadable fill or key replaced by
+    `"redacted"`;
+  - `tally {program, preview}`: the engine roles resolved to source ids off the clock. An
+    unreadable id is dropped, and so is a keyer role whose keyer row is unreadable.
+
+  The snapshot carries ramp descriptors, so it changes only on state changes.
+- **`switcher.keyer` event.** A new `Event::SwitcherKeyer {me, program, keyer, tick, on_air,
+  stale, reason, fill, key}` on topic `switcher`, with envelope `id` = the keyer object id.
+  - **Scope.** It has its own `AuthzScope::Keyer {me, program, keyer}`: the M/E object, the
+    `program:` grant and the keyer object, the same rule GET filters rows by. This is a new
+    variant of the exhaustive enum, and `scope_permits` handles it.
+  - **Redaction.** The per-client projection (`redact_embedded_objects`) replaces an
+    unreadable fill or key with `"redacted"`, as GET does.
+  - **Relay.** `switcher_keyers::forward_keyer_events` turns committed `KeyerEvent`s into this
+    event off the clock. The CLI spawns it next to the outcome relay.
+  - **AsyncAPI.** The message and schema are added.
+- **Persistence.** After `applied`, the committed definitions are written as
+  `switcher.downstream_keyers` of the accepted state, under the config-mutation lock, after a
+  full `validate()`. Nothing is written before the engine applied the change (tested).
+  On-air, tie, ramp and pending state are never written. A restart therefore comes up with
+  every keyer off, except `on_at_start` DSKs, which return as the op-less boot intent. The
+  test round-trips the persisted document through TOML, `validate()` and `keyer::admit`.
+- **CLI wiring.**
+  - `attach_first_slice` now always installs a keyer runtime when an M/E exists (an empty
+    runtime is a no-op per tick), so the first DSK can be defined at run time.
+  - The pipeline creates the `keyer` consumer set for every M/E run (seeded only with declared
+    DSKs) and hands it to the switcher (`set_keyer_demand`).
+  - The routing handle and the router get the switcher's `CleanDskGate`.
+- **Deviations and choices.**
+  - **`arm` is not built.** It needs USKs (K3, #388). USK `keyer_set` fields arrive with K3.
+  - **z is fixed after definition.** The design is silent on re-ordering. Changing z would
+    re-order draws mid-flight, so a `keyer_set` with a different z on an existing keyer is 422.
+  - **No delete.** The design defines no verb that removes a keyer. A DSK is removed by
+    editing the config.
+  - **Fill/key change on an engaged keyer.** With `allow`, the new sources must be fresh at the
+    applying tick, else the change is refused (`keyer source has no fresh frame…`), never
+    held. The design is silent here. Refusing keeps the slot's one pending entry for operator
+    CUT/AUTO.
+  - **New-source leases.** These are video-only preview leases
+    (`SourceDemandProvider::preview_lease`), held until settle. The durable lease is the
+    `keyer` consumer set, as at boot.
+  - **The +1 decode charge** for a fill or key that is not running (ADR-0110 §10) is not
+    computed separately. The lease is refused if the demand manager cannot take it (409
+    `capacity`).
+  - **Every new keyer reserves, not only the first (H3).** The brief refuses "the first DSK"
+    while Clean is routed. The gate makes any `keyer_set` that defines a new keyer reserve.
+    While a DSK is already committed Clean cannot be held, so the result is the same. This
+    also closes two first-DSK requests racing on an empty set.
+  - **No per-principal fairness** on the switcher routes and the shared idempotency store. It
+    is still tracked in #394.
+- **Tests.**
+  - `multiview-engine` `tests/keyers_set.rs`: define at one tick and publish on change,
+    refusal over budget, on-air guard with protect and allow, a rejected frame restoring the
+    definition, and id/z clashes; a definition-changing tick builds no readback on the clock,
+    and a set admitted on a stale base is refused while the published readback is the
+    prepared `Arc` (H6); a set drained at its deadline tick is refused and one drained the
+    tick before applies (H4).
+  - `multiview-control` `tests/switcher_keyers.rs` (15):
+    - the BOLA matrix for each verb on plan and command, for the M/E, program, keyer and
+      source grants and a viewer, with no key burned;
+    - a Viewer and a ReadOnly key holding every grant are 403 on `/plan` for all four verbs
+      (H1);
+    - 202 plus outcome, replay and ramp refusal;
+    - a `keyer_auto` retry during its own ramp replays the first 202, enqueuing nothing, while
+      a new key is 409 `keyer-ramping` (H2);
+    - 503 on a full mailbox, releasing the key and the leases;
+    - `in:<n>` refused with 422;
+    - `capacity` generic for scoped callers, totals for unscoped, a repeated refusal leaving
+      nothing behind, and `max_source` raise admission;
+    - `on-air-protected` and make-before-break leases;
+    - a `keyer_set` held past any wall-clock deadline keeps its leases and Clean exclusion,
+      is refused `keyer-set-deadline` when drained past its deadline tick, and leaves no
+      definition, lease, reservation or persisted keyer (H4, paused tokio time);
+    - the Clean rule;
+    - a settlement paused after its outcome while a newer `keyer_set` applies and settles
+      leaves both the durable document and the demand set at the newer version (J1,
+      deterministic through the `_test-seams` `settle_seam`);
+    - GET/events parity and redaction for scoped principals;
+    - persistence and a restart.
+  - Lib unit tests: tally resolution, row filtering and redaction, and the `Keyer` scope.
+  - `multiview-events` `authz_scope` (switcher.keyer).
+  - `multiview-control` `tests/openapi.rs`: the plan `200` is `SwitcherPlan | KeyerPlan` (H5).
+  - `multiview-cli` `output_routing`: a queued Clean take refused at the drain once a DSK is
+    reserved on the shared gate; a DSK reserved from inside the drain (after the Clean take's
+    admission, before the snapshot shows it) loses; a reserved DSK refuses Clean at the
+    drain, and a Clean take's reservation is released on refusal and on supersession (H3,
+    `drain_hook` seam, no sleeps).
+  - H3 control tests (`switcher_keyers`): A queued, sibling B refused 503, and a Clean
+    reservation stays refused while A is queued and after A applies; both orders at the one
+    admission point. Engine (`keyers_set`): the tick refuses a new keyer while Clean is held
+    and a rejected definition releases the tick's reservation. Lib `clean_gate`: counting,
+    and 2 000 barrier-synchronised races of both orders, never both winning.
+  - J2 lib `clean_gate`: a concurrent reservation landing between every load and CAS of a
+    clock admission (attempt seam, deterministic) is refused `Contended` within
+    `MAX_TICK_ATTEMPTS` and counted (it spun 1 001 attempts before the fix); the bounded
+    entry points keep the exclusion, and releases leave the other field and the defined bit
+    intact.
+- **Concern: tick refusals allocate once per command (review round 2 J3, investigated, not
+  redesigned).** A tick-side `keyer_set` refusal (`keyer-set-deadline`,
+  `clean-unavailable-with-dsk`, `clean-gate-contended`) builds its `String` reason and
+  `EventStream::publish` wraps the outcome in an `Arc`. Every existing tick-side switcher
+  refusal on main does the same through the same paths: `publish_outcome`
+  (`switcher_control.rs` on main: 1539) for `REFUSE_LOST_DURING_AUTO.into()` (1003) and
+  `REFUSE_NO_FRESH_FRAME.into()` (1024, 1048, and `refuse_armed` 1216 from 1246/1300), and the
+  K2a keyer `refuse` (`keyer.rs` on main: 653 `reason.to_owned()`) for `keyer-rate` (945) and the
+  repeat deadline (1144); `EventStream::publish` (`isolation.rs` 223, `Arc::new`). The K4
+  refusals sit in the same mailbox drain and consume their command, so it is the existing
+  per-command outcome pattern: bounded by the 64-slot mailbox and `MAX_COMMANDS_PER_TICK`,
+  one event per refused command, never steady-state (no K4 verb is held across ticks).
+  `keyers_set` asserts one outcome per refused command and nothing on later steady ticks.
+  Making outcome publication allocation-free is a cross-switcher change, out of K4.
+- **Concern.** The GET/events parity test drives the driver without the frame hook, so its
+  `tally` is the background roles only. Keyer tally resolution is covered by the lib unit
+  test on a constructed snapshot.

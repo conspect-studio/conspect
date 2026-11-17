@@ -14,11 +14,13 @@ use multiview_framestore::TileStore;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
+use crate::clean_gate::{CleanDskGate, DskReservation, TickRefusal};
 use crate::clock::Tick;
 use crate::isolation::{event_stream, EventStream, EventSubscription, LatestState};
 use crate::keyer::{
-    KeyerAction, KeyerCounters, KeyerDraw, KeyerEvent, KeyerRuntime, KeyerSnapshot, KeyerTally,
-    OpSink, TieEnvelope, MAX_DSK,
+    KeyerAction, KeyerCounters, KeyerDef, KeyerDefinition, KeyerDefinitions, KeyerDraw, KeyerEvent,
+    KeyerReadback, KeyerRuntime, KeyerSnapshot, KeyerTally, OpSink, TieEnvelope, MAX_DSK,
+    REFUSE_KEYER_CLEAN, REFUSE_KEYER_GATE_CONTENDED, REFUSE_KEYER_SET_DEADLINE,
 };
 use crate::patch_set::{ArmState, SetArm, SetRefusal, SET_ADOPT_DEADLINE_TICKS};
 use crate::switcher::{SwitcherProjection, SwitcherState};
@@ -61,6 +63,13 @@ pub const COMMAND_CAPACITY: usize = 64;
 /// Output ticks a take may wait for its incoming source's first fresh frame
 /// before it is refused (ADR-0104). The clock never waits; the take does.
 pub const TAKE_PRIME_DEADLINE_TICKS: u64 = 50;
+/// Ticks after admission (the clock's last composed tick when the control
+/// plane built the verb) within which a queued `keyer_set` must be drained;
+/// drained at or after its deadline tick it is refused and never applies
+/// (review H4, mirroring [`TAKE_PRIME_DEADLINE_TICKS`]). Once the clock has
+/// composed the deadline tick, the command can no longer apply, so the
+/// control plane's settlement always reaches a terminal answer.
+pub const KEYER_SET_DEADLINE_TICKS: u64 = TAKE_PRIME_DEADLINE_TICKS;
 
 /// Typed refusal: the incoming source had no fresh frame before the deadline.
 pub const REFUSE_NO_FRESH_FRAME: &str =
@@ -175,6 +184,25 @@ pub enum SwitcherVerb {
         /// Tied.
         tie: bool,
     },
+    /// Define or change downstream keyer `keyer` at one tick (ADR-0113 §10,
+    /// K4): a class-1 change whose definition and stores the control plane
+    /// resolved and admitted off the clock. A free index defines a new keyer.
+    KeyerSet {
+        /// Keyer index (a free slot defines a new keyer).
+        keyer: u8,
+        /// The resolved definition (moved in; never cloned per tick).
+        def: KeyerDefinition,
+        /// The committed definitions after this change, built off the clock
+        /// ([`SwitcherControl::keyer_set_verb`]); the tick checks it by
+        /// pointer identity and publishes it, allocating nothing (review
+        /// H6). A stale one (the base changed) refuses the verb.
+        readback: KeyerReadback,
+        /// `on_air = "allow"`: the fill or key of a keyer on air may change.
+        allow_on_air: bool,
+        /// Drained at or after this tick, the verb is refused
+        /// ([`REFUSE_KEYER_SET_DEADLINE`]) and never applies (review H4).
+        deadline: u64,
+    },
     /// The mixer half of an atomic multi-crosspoint set (ADR-0110 §12.8,
     /// #308): validated and primed here, then applied only at the adoption
     /// tick the router proposes through `arm`, never on its own. Held in its
@@ -280,6 +308,17 @@ pub struct SwitcherControl {
     inputs: LatestState<InputsReadback>,
     keyer_events: EventStream<KeyerEvent>,
     keyer_counters: Arc<KeyerCounters>,
+    keyer_defs: LatestState<KeyerDefinitions>,
+    /// The run's frame stores, published once at attach so `keyer_set` can
+    /// resolve a definition off the clock (K4).
+    stores: LatestState<HashMap<String, Arc<TileStore<Nv12Image>>>>,
+    /// The Clean / DSK admission point (review H3): counted DSK and Clean
+    /// reservations plus the committed "defined" bit, shared with the
+    /// routing handle and the router (K2a deviation until K2b).
+    clean_gate: Arc<CleanDskGate>,
+    /// The `keyer` demand consumer set (ADR-0113 §4), installed at attach so
+    /// a committed `keyer_set` republishes the fill/key leases off the clock.
+    keyer_demand: Arc<std::sync::OnceLock<crate::ConsumerSet<Nv12Image>>>,
 }
 
 /// Actual paired-bus frame capability, published after the rendering provider
@@ -333,6 +372,10 @@ impl SwitcherControl {
             inputs: LatestState::new(),
             keyer_events,
             keyer_counters: Arc::new(KeyerCounters::default()),
+            keyer_defs: LatestState::new(),
+            stores: LatestState::new(),
+            clean_gate: CleanDskGate::new(),
+            keyer_demand: Arc::new(std::sync::OnceLock::new()),
         };
         let driver = SwitcherTickDriver {
             rx,
@@ -362,6 +405,13 @@ impl SwitcherControl {
             keyers: Box::default(),
             keyer_events: handle.keyer_events.clone(),
             keyer_counters: Arc::clone(&handle.keyer_counters),
+            keyer_defs: handle.keyer_defs.clone(),
+            published_def_version: 0,
+            staged_readback: None,
+            definition_builds: 0,
+            stores: handle.stores.clone(),
+            clean_gate: Arc::clone(&handle.clean_gate),
+            staged_dsk: None,
         };
         (handle, driver)
     }
@@ -375,6 +425,13 @@ impl SwitcherControl {
         self.tx
             .try_send(command)
             .map_err(tokio::sync::mpsc::error::TrySendError::into_inner)
+    }
+
+    /// Whether the engine side of the mailbox is gone (the run ended): no
+    /// queued command can apply any more.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
     }
 
     /// Publish an immutable pair after validating its layout geometry. This is
@@ -486,6 +543,81 @@ impl SwitcherControl {
     pub fn keyer_counters(&self) -> Arc<KeyerCounters> {
         Arc::clone(&self.keyer_counters)
     }
+
+    /// The committed downstream keyer definitions (K4): published at attach
+    /// and then only on a committed `keyer_set` tick. `None` when no keyer
+    /// runtime was installed (no M/E keyers on this run).
+    #[must_use]
+    pub fn keyer_definitions(&self) -> Option<Arc<KeyerDefinitions>> {
+        self.keyer_defs.latest()
+    }
+
+    /// Resolve an accepted keyer definition against this run's frame stores
+    /// and canvas, off the clock (K4 `keyer_set`). The result is moved into
+    /// [`SwitcherVerb::KeyerSet`].
+    ///
+    /// # Errors
+    /// No keyer runtime on this run, or a fill or key without a frame store.
+    pub fn resolve_keyer(
+        &self,
+        config: &multiview_config::DownstreamKeyerConfig,
+    ) -> Result<KeyerDefinition, String> {
+        let defs = self
+            .keyer_defs
+            .latest()
+            .ok_or_else(|| "this run has no downstream keyer runtime".to_owned())?;
+        let stores = self
+            .stores
+            .latest()
+            .ok_or_else(|| "this run has no frame stores attached".to_owned())?;
+        let (w, h) = defs.canvas;
+        KeyerDef::from_config(config, &stores, w, h).map(|def| KeyerDefinition(Arc::new(def)))
+    }
+
+    /// Build the [`SwitcherVerb::KeyerSet`] for `def` at `keyer`, admitted
+    /// against the committed definitions `base`: prepares the readback the
+    /// committing tick publishes (off the clock, review H6) and stamps the
+    /// deadline tick (the last composed tick + [`KEYER_SET_DEADLINE_TICKS`],
+    /// review H4).
+    #[must_use]
+    pub fn keyer_set_verb(
+        &self,
+        base: &KeyerDefinitions,
+        keyer: u8,
+        def: KeyerDefinition,
+        allow_on_air: bool,
+    ) -> SwitcherVerb {
+        let readback = KeyerReadback(Arc::new(base.with_definition(keyer, &def.0)));
+        SwitcherVerb::KeyerSet {
+            keyer,
+            def,
+            readback,
+            allow_on_air,
+            deadline: self.applied_tick().saturating_add(KEYER_SET_DEADLINE_TICKS),
+        }
+    }
+
+    /// The shared Clean / DSK admission point (review H3). Its "defined"
+    /// bit is set at attach (declared DSKs) and by the commit of a tick that
+    /// defined a keyer. The control plane holds a DSK reservation from
+    /// before it enqueues a `keyer_set` defining a new keyer until that
+    /// command settles. The router holds one Clean reservation per output on
+    /// or taking Clean.
+    #[must_use]
+    pub fn clean_gate(&self) -> Arc<CleanDskGate> {
+        Arc::clone(&self.clean_gate)
+    }
+
+    /// Install the run's `keyer` demand set (once, at attach).
+    pub fn set_keyer_demand(&self, set: crate::ConsumerSet<Nv12Image>) {
+        let _ = self.keyer_demand.set(set);
+    }
+
+    /// The run's `keyer` demand set, if installed.
+    #[must_use]
+    pub fn keyer_demand(&self) -> Option<&crate::ConsumerSet<Nv12Image>> {
+        self.keyer_demand.get()
+    }
 }
 
 /// Sole output-clock owner of the M/E state; do not share with REST handlers.
@@ -529,6 +661,20 @@ pub struct SwitcherTickDriver {
     keyers: Box<KeyerRuntime>,
     keyer_events: EventStream<KeyerEvent>,
     keyer_counters: Arc<KeyerCounters>,
+    keyer_defs: LatestState<KeyerDefinitions>,
+    published_def_version: u64,
+    /// The readback of this tick's applied `keyer_set` (published at the
+    /// commit, dropped by a reject).
+    staged_readback: Option<Arc<KeyerDefinitions>>,
+    /// Odometer: `KeyerDefinitions` readbacks the clock built itself (an
+    /// allocation on the clock); review H6 pins it at the attach build.
+    definition_builds: u64,
+    stores: LatestState<HashMap<String, Arc<TileStore<Nv12Image>>>>,
+    clean_gate: Arc<CleanDskGate>,
+    /// The tick backstop's DSK reservation for this tick's applied
+    /// definition of a new keyer: held until the commit marks the gate
+    /// defined, dropped by a reject.
+    staged_dsk: Option<DskReservation>,
 }
 
 /// Everything a rejected tick must restore (review SW2-03): the machine and
@@ -549,6 +695,22 @@ impl SwitcherTickDriver {
     pub fn set_keyers(&mut self, mut keyers: KeyerRuntime) {
         keyers.set_counters(Arc::clone(&self.keyer_counters));
         *self.keyers = keyers;
+        // The attach-time definitions (K4 readback); later only on a
+        // committed `keyer_set` tick.
+        self.keyer_defs.publish(self.keyers.definitions());
+        self.definition_builds += 1;
+        self.published_def_version = self.keyers.def_version();
+        if !self.keyers.is_empty() {
+            self.clean_gate.set_defined();
+        }
+    }
+
+    /// Odometer: committed-definition readbacks built on the clock (one at
+    /// attach; a committed `keyer_set` publishes the readback the control
+    /// plane prepared off the clock, so it never moves).
+    #[must_use]
+    pub fn definition_builds(&self) -> u64 {
+        self.definition_builds
     }
 
     /// The keyer runtime (read-only: flags, last-good pair, tally).
@@ -743,6 +905,8 @@ impl SwitcherTickDriver {
     /// Install the shared, already allocated source stores before the clock
     /// starts. Only `is_primed` is sampled on a tick; ingest remains off-clock.
     pub fn set_prime_stores(&mut self, stores: HashMap<String, Arc<TileStore<Nv12Image>>>) {
+        // Shared with the control plane once, at attach (K4 `keyer_set`).
+        self.stores.publish(stores.clone());
         self.primed_stores = Some(stores);
     }
 
@@ -760,6 +924,20 @@ impl SwitcherTickDriver {
     /// Bounded by the drive's store count (the drain bounds that).
     pub fn sync_live_stores(&mut self, stores: &HashMap<String, Arc<TileStore<Nv12Image>>>) {
         self.live_stores.clone_from(stores);
+        // K4 `keyer_set` resolves fills and keys off the clock from the
+        // shared cell: republish the same view `store_for` uses (the drive's
+        // current set first, then the boot map), so a live-added source can
+        // be keyed and a re-added id resolves its new store. Operator-paced
+        // like the resync itself; the publish never waits on a reader.
+        if let Some(boot) = self.primed_stores.as_ref() {
+            let mut view = boot.clone();
+            view.extend(
+                self.live_stores
+                    .iter()
+                    .map(|(id, store)| (id.clone(), Arc::clone(store))),
+            );
+            self.stores.publish(view);
+        }
     }
 
     /// The drive's current store for `source`, if any (the PVW monitor reads
@@ -887,7 +1065,8 @@ impl SwitcherTickDriver {
             | SwitcherVerb::SetTransition(_)
             | SwitcherVerb::KeyerCut { .. }
             | SwitcherVerb::KeyerAuto { .. }
-            | SwitcherVerb::KeyerTie { .. } => Err("not a take".into()),
+            | SwitcherVerb::KeyerTie { .. }
+            | SwitcherVerb::KeyerSet { .. } => Err("not a take".into()),
         }
     }
 
@@ -1158,6 +1337,78 @@ impl SwitcherTickDriver {
             };
             // Keyer verbs first: they reference no scene geometry, and a held
             // background take never blocks a DSK (ADR-0113 §6).
+            if let SwitcherVerb::KeyerSet {
+                keyer,
+                def,
+                readback,
+                allow_on_air,
+                deadline,
+            } = command.verb
+            {
+                if tick.index >= deadline {
+                    // Expired in the mailbox: never applied (review H4).
+                    self.publish_outcome(
+                        command.operation_id,
+                        tick.index,
+                        false,
+                        Some(REFUSE_KEYER_SET_DEADLINE.into()),
+                    );
+                    continue;
+                }
+                // Backstop (review H3): a new keyer is defined only under a
+                // DSK reservation taken here, at the tick, so it cannot land
+                // while an output carries Clean or has a take to it pending,
+                // whatever the caller did. At most `MAX_TICK_ATTEMPTS` CAS
+                // attempts, then refused as contention (review J2: never
+                // spins on the clock); no allocation.
+                let new_keyer = self.keyers.def(usize::from(keyer)).is_none();
+                let reservation = if new_keyer {
+                    match self.clean_gate.tick_reserve_dsk() {
+                        Ok(reservation) => Some(reservation),
+                        Err(refusal) => {
+                            let reason = match refusal {
+                                TickRefusal::Excluded => REFUSE_KEYER_CLEAN,
+                                TickRefusal::Contended => REFUSE_KEYER_GATE_CONTENDED,
+                            };
+                            self.publish_outcome(
+                                command.operation_id,
+                                tick.index,
+                                false,
+                                Some(reason.into()),
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let before = self.keyers.def_version();
+                self.keyers.define(
+                    keyer,
+                    def.0,
+                    &readback.0,
+                    allow_on_air,
+                    command.operation_id,
+                    tick,
+                    &mut OpSink {
+                        success: &mut self.staged_success,
+                        outcomes: &self.outcomes,
+                        tick: tick.index,
+                    },
+                );
+                if self.keyers.def_version() != before {
+                    // Applied: its prepared readback is what the commit
+                    // publishes (a move; a later set this tick replaces it).
+                    self.staged_readback = Some(readback.0);
+                    // One held reservation excludes Clean until the commit
+                    // marks the gate defined; a second new keyer this tick
+                    // keeps the first one (never a gap between them).
+                    if self.staged_dsk.is_none() {
+                        self.staged_dsk = reservation;
+                    }
+                }
+                continue;
+            }
             if let Some((keyer, action)) = KeyerAction::of(&command.verb) {
                 self.keyers.command(
                     keyer,
@@ -1569,6 +1820,28 @@ impl SwitcherTickDriver {
                 tally,
             });
         }
+        // Definitions only on a committed `keyer_set` tick, before the
+        // tick's keyer events, so an event relay always resolves a keyer
+        // index against its definition. The readback was built off the clock
+        // with the request (review H6): publishing it moves an `Arc`.
+        if self.keyers.def_version() != self.published_def_version {
+            if let Some(readback) = self.staged_readback.take() {
+                self.keyer_defs.publish_arc(readback);
+            } else {
+                // Unreachable (every applied set carries its readback);
+                // fail-safe: build it here and count the build.
+                self.keyer_defs.publish(self.keyers.definitions());
+                self.definition_builds += 1;
+            }
+            self.published_def_version = self.keyers.def_version();
+            // Before this tick's outcomes: once a caller sees `applied`, the
+            // gate already refuses Clean for good.
+            if !self.keyers.is_empty() {
+                self.clean_gate.set_defined();
+            }
+        }
+        self.staged_readback = None;
+        self.staged_dsk = None;
         self.keyers.commit(&self.keyer_events);
         // Readback only on a committed patch tick (allocates; never steady state).
         if self.inputs_version != self.published_inputs_version {
@@ -1596,6 +1869,9 @@ impl SwitcherTickDriver {
         // that moved this tick, drop queued events. Applied keyer ops sit in
         // `staged_success` and are refused below with everything else.
         self.keyers.reject(tick.index, reason, &self.outcomes);
+        self.staged_readback = None;
+        // The restored definitions have no new keyer: its reservation goes.
+        self.staged_dsk = None;
         // The armed patch applied on this tick is restored with the table
         // below and goes back to the router (never committed).
         if let Some(armed) = self.armed.as_mut() {

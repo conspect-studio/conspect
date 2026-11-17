@@ -216,18 +216,18 @@ pub fn attach_first_slice(
         // boot lease and the scene pair below name the resolved sources.
         driver.set_inputs(inputs);
     }
-    if !pipeline.switcher_keyers().is_empty() {
-        // ADR-0113 / K2a: keyers are admitted before the clock starts; a
-        // missing store or an over-budget document fails the boot.
-        let runtime = admit_keyers(
-            pipeline.switcher_keyers(),
-            &pipeline.preview_stores(),
-            pipeline.canvas_size(),
-            pipeline.keyer_budget(),
-        )
-        .map_err(PipelineError::Engine)?;
-        driver.set_keyers(runtime);
-    }
+    // ADR-0113 / K2a: keyers are admitted before the clock starts; a missing
+    // store or an over-budget document fails the boot. K4: the runtime is
+    // installed even with no DSK declared, so `keyer_set` can define the
+    // first one at run time (an empty runtime is a no-op per tick).
+    let runtime = admit_keyers(
+        pipeline.switcher_keyers(),
+        &pipeline.preview_stores(),
+        pipeline.canvas_size(),
+        pipeline.keyer_budget(),
+    )
+    .map_err(PipelineError::Engine)?;
+    driver.set_keyers(runtime);
     control
         .set_scenes(ScenePair {
             version: FIRST_SLICE_SCENE_VERSION,
@@ -254,6 +254,12 @@ pub fn attach_first_slice(
         None => None,
     };
     pipeline.attach_switcher(control.clone(), driver, Arc::clone(&preview_slot))?;
+    // K4: the demand manager may already exist (it is built before the
+    // attach on the run path); hand its `keyer` set to the switcher so a
+    // committed `keyer_set` republishes the fill/key leases.
+    if let Some(set) = pipeline.keyer_demand() {
+        control.set_keyer_demand(set.clone());
+    }
     Ok(Some(FirstSliceSwitcher {
         control,
         leases,
