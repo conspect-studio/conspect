@@ -667,7 +667,15 @@ fn check_arm(
         .is_some_and(|s| s.in_flight)
         .then(|| refusal("in-flight", "the arm set cannot change during a transition"));
     Ok(Ok(Checked {
-        verb: SwitcherVerb::Arm(Arc::new(set)),
+        // Bound to the definitions the sources were authorized against
+        // (review AUTHZ-R3-1): a `keyer_set` that re-points an armed key
+        // before this drains makes the engine refuse the arm, never arm the
+        // new source on this caller's authority.
+        verb: SwitcherVerb::Bound(Box::new(multiview_engine::switcher_control::BoundVerb {
+            verb: SwitcherVerb::Arm(Arc::new(set)),
+            arm_version: None,
+            defs_version: Some(defs.version),
+        })),
         plan: KeyerPlan {
             class: "class1",
             keyer: req.me.clone(),

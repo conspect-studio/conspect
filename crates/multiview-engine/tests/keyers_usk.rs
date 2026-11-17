@@ -969,3 +969,47 @@ fn a_held_usk_keyer_cut_never_lands_during_a_background_auto() {
     );
     assert_eq!(kcut.tick, 2);
 }
+
+/// Review round 3 (AUTHZ-R3-1): an `arm` is bound to the keyer definitions
+/// its sources were authorized against. A `keyer_set` re-pointing the key
+/// that drains before it makes the arm refuse `keyer-definitions-changed`,
+/// leaving the armed set unchanged (never arming the new source on the
+/// arming caller's authority).
+#[test]
+fn an_arm_bound_to_older_definitions_is_refused_and_arms_nothing() {
+    use multiview_engine::keyer::REFUSE_KEYER_DEFINITION_CHANGED;
+    let rig = rig();
+    let (handle, mut hook, mut drive) = build(&rig, &[usk("usk1", "cold", 1, Some(FLY))]);
+    let mut outcomes = handle.outcomes();
+    fresh(&rig, 0);
+    step(&mut hook, &mut drive, 0);
+    // The arm is authorized against the current definitions ...
+    let armed = SwitcherVerb::Bound(Box::new(multiview_engine::switcher_control::BoundVerb {
+        verb: arm(false, &[1]),
+        arm_version: None,
+        defs_version: Some(handle.keyer_definitions().unwrap().version),
+    }));
+    // ... but a re-point is queued ahead of it.
+    handle
+        .try_send(cmd("repoint", repoint_usk1(&handle, "gfx", false)))
+        .unwrap();
+    handle.try_send(cmd("arm", armed)).unwrap();
+    fresh(&rig, 1);
+    step(&mut hook, &mut drive, 1);
+    let got = drain(&mut outcomes).0;
+    assert!(
+        got.iter()
+            .any(|o| o.operation_id == "repoint" && o.completed),
+        "{got:?}"
+    );
+    let arm_outcome = got.iter().find(|o| o.operation_id == "arm").unwrap();
+    assert_eq!(
+        arm_outcome.error.as_deref(),
+        Some(REFUSE_KEYER_DEFINITION_CHANGED),
+        "{got:?}"
+    );
+    assert!(
+        !handle.snapshot().unwrap().next.keys[0],
+        "nothing was armed"
+    );
+}

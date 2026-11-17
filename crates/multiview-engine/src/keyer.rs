@@ -1364,12 +1364,13 @@ impl KeyerRuntime {
             let Some(pending) = slot.flags.pending else {
                 continue;
             };
+            // Freshness is sampled ONCE per slot per tick (review K3-R3-1): a
+            // producer publishing between two reads must not let a pending
+            // USK cut skip the in-transition refusal and land mid-AUTO.
+            let live = live_now(&slot.def, tick);
             let refusal = if pending.defs_version.is_some_and(|v| v != self.def_version) {
                 Some(REFUSE_KEYER_DEFINITION_CHANGED)
-            } else if slot.def.family == KeyerFamily::Usk
-                && self.in_transition
-                && live_now(&slot.def, tick)
-            {
+            } else if slot.def.family == KeyerFamily::Usk && self.in_transition && live {
                 Some(REFUSE_KEYER_IN_TRANSITION)
             } else {
                 None
@@ -1379,7 +1380,7 @@ impl KeyerRuntime {
                 if let Some(op) = slot.pending_op.take() {
                     sink.refused(op, reason);
                 }
-            } else if live_now(&slot.def, tick) {
+            } else if live {
                 slot.flags.pending = None;
                 // A held command that lands takes the keyer out of a tied
                 // transition: the operator's verb wins.
