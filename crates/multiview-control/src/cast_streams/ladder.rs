@@ -808,7 +808,10 @@ mod tests {
     fn the_offer_of_this_build_is_moq_then_hls() {
         let all: Vec<String> = ["srt", "moq", "webrtc", "hls"].map(String::from).to_vec();
         let probe = probe_with(Some(FrameCounter::Rvfc), &[]);
-        assert_eq!(offer(&all, SERVED_RUNGS, Some(&probe)), ("moq", vec!["hls"]));
+        assert_eq!(
+            offer(&all, SERVED_RUNGS, Some(&probe)),
+            ("moq", vec!["hls"])
+        );
         let no_frames = probe_with(None, &[]);
         assert_eq!(offer(&all, SERVED_RUNGS, Some(&no_frames)), ("hls", vec![]));
         assert_eq!(

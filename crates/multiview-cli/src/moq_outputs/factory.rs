@@ -61,6 +61,7 @@ use crate::output_window_registry::{
     SubscribeError, Subscription, SubscriptionFactory, SubscriptionRevokeHandle,
     SubscriptionWindow, VideoDescriptor,
 };
+use multiview_control::cast_streams::identity::{CastAttachment, Component, GateRefusal};
 use multiview_control::{
     auth::Principal,
     moq::MoqReject,
@@ -69,7 +70,6 @@ use multiview_control::{
 };
 use multiview_core::time::Rational;
 use multiview_ffmpeg::{is_idr, CodecId, CodecKind, EncodedPacket, NalFraming, StreamKind};
-use multiview_control::cast_streams::identity::{CastAttachment, Component, GateRefusal};
 use multiview_moq::provider::{Fence, Revocation};
 use multiview_output::batch::RecoveryGate;
 use std::{
@@ -870,9 +870,8 @@ impl RegistryFeedFactory {
             None
         };
         let metadata = program_metadata.as_ref().unwrap_or(prepared);
-        let gate = gate.map(|attachment| {
-            CastWindowGate::new(attachment, &binding, binding.video.time_base)
-        });
+        let gate = gate
+            .map(|attachment| CastWindowGate::new(attachment, &binding, binding.video.time_base));
         let worker = OffClockWorker::spawn(
             &runtime,
             revocation,
@@ -1346,13 +1345,13 @@ impl CastWindowGate {
         for packet in packets {
             let (component, base) = match packet.kind() {
                 StreamKind::Video => (0, self.video),
-                kind => match self.audio.iter().position(|(k, _, _)| *k == kind) {
-                    Some(at) => (at + 1, self.audio.get(at).map_or(self.video, |a| a.2)),
-                    None => {
+                kind => {
+                    let Some(at) = self.audio.iter().position(|(k, _, _)| *k == kind) else {
                         self.attachment.fence();
                         return GateVerdict::Refuse;
-                    }
-                },
+                    };
+                    (at + 1, self.audio.get(at).map_or(self.video, |a| a.2))
+                }
             };
             let Some(tick) = packet.pts().and_then(|pts| self.tick_of(pts, base)) else {
                 self.attachment.fence();
@@ -3096,7 +3095,7 @@ mod tests {
             for tick in 2..6 {
                 c.offer(tick);
             }
-            assert!(c.delivered(Duration::from_millis(300)).is_empty());
+            assert_eq!(c.delivered(Duration::from_millis(300)), Vec::<u64>::new());
             assert!(c.attachment.is_fenced());
             assert!(c.sink.revocation().is_revoked(), "the transport is closed");
             assert!(wait_until(
@@ -3114,7 +3113,7 @@ mod tests {
             c.labels
                 .record(&Component::Audio, 1, engine_minted(audio_id("src:secret")));
             c.offer(1);
-            assert!(c.delivered(Duration::from_millis(300)).is_empty());
+            assert_eq!(c.delivered(Duration::from_millis(300)), Vec::<u64>::new());
             assert!(c.attachment.is_fenced());
             assert_eq!(c.attachment.counters(), (0, 1));
         }
@@ -3125,7 +3124,11 @@ mod tests {
         async fn a_layout_edit_on_the_same_bus_is_refused_from_its_tick() {
             use multiview_control::cast_streams::identity::layout_content;
             let mut c = cast(100);
-            let before = layout_content("wall", &["cam1".into()], &multiview_config::LayoutAudio::Program);
+            let before = layout_content(
+                "wall",
+                &["cam1".into()],
+                &multiview_config::LayoutAudio::Program,
+            );
             let after = layout_content(
                 "wall",
                 &["cam1".into(), "secret".into()],
@@ -3160,7 +3163,7 @@ mod tests {
             assert_eq!(c.delivered(Duration::from_millis(500)), [4]);
             c.offer(5);
             c.offer(6);
-            assert!(c.delivered(Duration::from_millis(200)).is_empty());
+            assert_eq!(c.delivered(Duration::from_millis(200)), Vec::<u64>::new());
             assert!(!c.attachment.is_fenced());
             c.labels
                 .record(&Component::Video, 6, engine_minted(video_id("src:secret")));
@@ -3183,7 +3186,7 @@ mod tests {
                     .record(&Component::Video, 100 + i, video_id("program") ^ (i + 1));
             }
             c.offer(1);
-            assert!(c.delivered(Duration::from_millis(300)).is_empty());
+            assert_eq!(c.delivered(Duration::from_millis(300)), Vec::<u64>::new());
             assert!(c.attachment.is_fenced());
         }
 
@@ -3239,7 +3242,7 @@ mod tests {
             c.labels
                 .record(&Component::Video, 2, engine_minted(video_id("src:cam2")));
             c.offer(2);
-            assert!(c.delivered(Duration::from_millis(300)).is_empty());
+            assert_eq!(c.delivered(Duration::from_millis(300)), Vec::<u64>::new());
             assert!(c.attachment.is_fenced());
             let present = Clearance::of(&c.labels.current());
             assert!(present.clears(&Component::Video, engine_minted(video_id("src:cam2"))));
@@ -3305,5 +3308,4 @@ mod tests {
             }
         }
     }
-
 }

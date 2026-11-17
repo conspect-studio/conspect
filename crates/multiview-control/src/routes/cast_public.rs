@@ -356,7 +356,12 @@ async fn take_ladder(state: &AppState, token: &str, body: Body) -> Response {
         .and_then(|engine| engine.clock(&again.config_id, t1.saturating_mul(1000)));
     let offered = if request.full {
         let failed = request.failed.as_ref().map(|f| f.rung.clone());
-        Some(attach_best(state, &again, request.probe.as_ref(), failed.as_deref()))
+        Some(attach_best(
+            state,
+            &again,
+            request.probe.as_ref(),
+            failed.as_deref(),
+        ))
     } else {
         None
     };
@@ -409,7 +414,7 @@ struct Offered {
 }
 
 /// The rungs the running engine can serve now (decision 3, first rule):
-/// HLS always; MoQ while a MoQ provider is ready and the run labels the
+/// HLS always; `MoQ` while a `MoQ` provider is ready and the run labels the
 /// output (no labels: no gate, so no push rung).
 fn served_now(state: &AppState, config_id: &str) -> Vec<&'static str> {
     let mut served = vec!["hls"];
@@ -455,17 +460,24 @@ fn attach_best(
                 };
             }
         }
-        candidate = if rest.is_empty() { "hls" } else { rest.remove(0) };
+        candidate = if rest.is_empty() {
+            "hls"
+        } else {
+            rest.remove(0)
+        };
     }
 }
 
-/// Admit a MoQ cast lease for `admitted` (ADR-0114 slice 4): the attachment
+/// Admit a `MoQ` cast lease for `admitted` (ADR-0114 slice 4): the attachment
 /// is cleared for the identities current right after the shared check, the
 /// lease runs with the token owner's CURRENT principal (decision 5.6), and
 /// it is registered with the token in one critical section that requires
 /// the token still armed at the same generation; on any failure the lease
 /// is fenced and nothing is offered.
-fn attach_moq(state: &AppState, admitted: &crate::cast_streams::Admitted) -> Option<serde_json::Value> {
+fn attach_moq(
+    state: &AppState,
+    admitted: &crate::cast_streams::Admitted,
+) -> Option<serde_json::Value> {
     let owner = crate::cast_streams::reauth::owner_of(state, &admitted.stream_id)?;
     let (labels, clearance) =
         crate::cast_streams::reauth::clearance_now(state, &admitted.config_id)?;
@@ -478,10 +490,7 @@ fn attach_moq(state: &AppState, admitted: &crate::cast_streams::Admitted) -> Opt
     ));
     let scope = crate::preview::WhepScope::Output(admitted.config_id.clone());
     let lease = state.moq.open_cast(&owner, &scope, &attachment).ok()?;
-    if !state
-        .cast_streams
-        .attach(std::sync::Arc::clone(&attachment), admitted.generation)
-    {
+    if !state.cast_streams.attach(&attachment, admitted.generation) {
         attachment.fence();
         return None;
     }

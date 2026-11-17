@@ -437,7 +437,11 @@ mod attachments {
             .unwrap();
         let arm = streams.arm_snapshot("c1", None);
         streams
-            .arm(&claim.id, arm.generation, Some(("program".into(), Some(vec![Need::Bus]))))
+            .arm(
+                &claim.id,
+                arm.generation,
+                Some(("program".into(), Some(vec![Need::Bus]))),
+            )
             .unwrap();
         (claim, arm.generation)
     }
@@ -457,9 +461,9 @@ mod attachments {
         let (_, streams) = clocked();
         let (claim, generation) = armed(&streams, "op");
         let stale = attachment(&claim.id, "moq");
-        assert!(!streams.attach(Arc::clone(&stale), generation + 1));
+        assert!(!streams.attach(&stale, generation + 1));
         let ok = attachment(&claim.id, "moq");
-        assert!(streams.attach(Arc::clone(&ok), generation));
+        assert!(streams.attach(&ok, generation));
         assert_eq!(streams.attachments(&claim.id).len(), 1);
         // Another output's attachment never registers on this stream.
         let foreign = Arc::new(CastAttachment::new(
@@ -469,7 +473,7 @@ mod attachments {
             Arc::new(OutputLabels::new()),
             Clearance::default(),
         ));
-        assert!(!streams.attach(foreign, generation));
+        assert!(!streams.attach(&foreign, generation));
     }
 
     #[test]
@@ -478,11 +482,15 @@ mod attachments {
         let (a, ga) = armed(&streams, "op");
         let (b, gb) = armed(&streams, "op2");
         let (c, gc) = armed(&streams, "op3");
-        let (xa, xb, xc) = (attachment(&a.id, "moq"), attachment(&b.id, "moq"), attachment(&c.id, "moq"));
-        assert!(streams.attach(Arc::clone(&xa), streams.generation("c1").unwrap()));
+        let (xa, xb, xc) = (
+            attachment(&a.id, "moq"),
+            attachment(&b.id, "moq"),
+            attachment(&c.id, "moq"),
+        );
+        assert!(streams.attach(&xa, streams.generation("c1").unwrap()));
         let _ = (ga, gb, gc);
-        assert!(streams.attach(Arc::clone(&xb), streams.generation("c1").unwrap()));
-        assert!(streams.attach(Arc::clone(&xc), streams.generation("c1").unwrap()));
+        assert!(streams.attach(&xb, streams.generation("c1").unwrap()));
+        assert!(streams.attach(&xc, streams.generation("c1").unwrap()));
         streams.revoke(&a.id, "test").unwrap();
         assert!(xa.is_fenced());
         streams.remove(&b.id).unwrap();
@@ -503,8 +511,8 @@ mod attachments {
         let generation = streams.generation("c1").unwrap();
         let xk = attachment(&keep.id, "moq");
         let xl = attachment(&lose.id, "moq");
-        assert!(streams.attach(Arc::clone(&xk), generation));
-        assert!(streams.attach(Arc::clone(&xl), generation));
+        assert!(streams.attach(&xk, generation));
+        assert!(streams.attach(&xl, generation));
         let lose_id = lose.id.clone();
         let check = move |s: &OwnedStream, _: Option<&[Need]>| {
             if s.id == lose_id {
@@ -526,8 +534,14 @@ mod attachments {
         );
         assert_eq!(revoked.len(), 1);
         assert!(xk.clearance().clears(&Component::Video, 42));
-        assert!(xk.clearance().clears(&Component::Video, 1), "the current one stays");
-        assert!(xl.is_fenced(), "revoked before the request goes to the engine");
+        assert!(
+            xk.clearance().clears(&Component::Video, 1),
+            "the current one stays"
+        );
+        assert!(
+            xl.is_fenced(),
+            "revoked before the request goes to the engine"
+        );
         assert!(!xl.clearance().clears(&Component::Video, 42));
     }
 
@@ -538,10 +552,10 @@ mod attachments {
         let first = attachment(&claim.id, "moq");
         let second = attachment(&claim.id, "moq");
         let third = attachment(&claim.id, "moq");
-        assert!(streams.attach(Arc::clone(&first), generation));
-        assert!(streams.attach(Arc::clone(&second), generation));
+        assert!(streams.attach(&first, generation));
+        assert!(streams.attach(&second, generation));
         assert!(!first.is_fenced() && !second.is_fenced());
-        assert!(streams.attach(Arc::clone(&third), generation));
+        assert!(streams.attach(&third, generation));
         assert!(first.is_fenced(), "the oldest of the rung goes");
         assert!(!second.is_fenced() && !third.is_fenced());
         assert_eq!(streams.attachments(&claim.id).len(), MAX_PER_RUNG);
@@ -551,11 +565,15 @@ mod attachments {
     fn a_live_attachment_keeps_its_token_live_through_ladder_calls() {
         let (now, streams) = clocked();
         let (claim, generation) = armed(&streams, "op");
-        assert!(streams.attach(attachment(&claim.id, "moq"), generation));
+        assert!(streams.attach(&attachment(&claim.id, "moq"), generation));
         for _ in 0..5 {
             advance(&now, IDLE_TTL - Duration::from_secs(1));
-            let request = crate::cast_streams::ladder::parse_request(br#"{"v":1}"#, streams.now_ms()).unwrap();
-            streams.record_ladder(&claim.id, request, Some("moq")).unwrap();
+            let request =
+                crate::cast_streams::ladder::parse_request(br#"{"v":1}"#, streams.now_ms())
+                    .unwrap();
+            streams
+                .record_ladder(&claim.id, request, Some("moq"))
+                .unwrap();
         }
         assert!(streams.lookup(&claim.token).is_some());
     }

@@ -2081,7 +2081,13 @@ impl OutputRouter {
         match self.outputs.get(index).map(|o| &o.bus) {
             None => 0_u8.hash(&mut h),
             Some(PictureBus::Layout(layout)) => {
-                (1_u8, &layout.id, layout.body.revision, Arc::as_ptr(&layout.body)).hash(&mut h);
+                (
+                    1_u8,
+                    &layout.id,
+                    layout.body.revision,
+                    Arc::as_ptr(&layout.body),
+                )
+                    .hash(&mut h);
             }
             Some(bus) => (2_u8, bus).hash(&mut h),
         }
@@ -2112,9 +2118,10 @@ impl OutputRouter {
 
     /// See [`Self::cast_audio_fingerprint`].
     pub(crate) fn cast_audio_content(&self, index: usize) -> String {
-        self.audio
-            .as_ref()
-            .map_or_else(|| "program".to_owned(), |audio| audio.carried_content(index))
+        self.audio.as_ref().map_or_else(
+            || "program".to_owned(),
+            |audio| audio.carried_content(index),
+        )
     }
 
     /// One Program tick: drain dynamic events, takes, opens and dispatcher

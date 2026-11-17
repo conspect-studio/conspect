@@ -285,7 +285,10 @@ impl WebTransportProvider {
             return Err(MoqReject::Unavailable);
         }
         let (fence, windows) = Fence::channel(4);
-        let feed = match self.factory.attach_cast(principal, scope, fence.clone(), gate) {
+        let feed = match self
+            .factory
+            .attach_cast(principal, scope, fence.clone(), gate)
+        {
             Ok(feed) => feed,
             Err(error) => {
                 fence.revoke();

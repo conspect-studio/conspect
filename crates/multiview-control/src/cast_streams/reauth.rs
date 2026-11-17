@@ -181,11 +181,18 @@ fn requested_ids(
     let stored = |id: &str| {
         crate::routes::routing::layout_sources(state)
             .ok()
-            .and_then(|library| library.get(id).map(|l| (l.sources.clone(), l.audio.clone())))
+            .and_then(|library| {
+                library
+                    .get(id)
+                    .map(|l| (l.sources.clone(), l.audio.clone()))
+            })
     };
     let mut layout_audio = None;
     if let Some(feed) = &feed {
-        let content = match (feed, layout.filter(|l| matches!(feed, RoutedFeed::Layout(id) if *id == l.id))) {
+        let content = match (
+            feed,
+            layout.filter(|l| matches!(feed, RoutedFeed::Layout(id) if *id == l.id)),
+        ) {
             (RoutedFeed::Layout(_), Some(body)) => {
                 layout_audio = Some(body.audio.clone());
                 Some(video_content(&feed.bus_name(), Some(body)))
@@ -201,7 +208,9 @@ fn requested_ids(
             ids.push((Component::Video, identity(&Component::Video, &content)));
         }
     }
-    let choice = audio.cloned().or_else(|| configured_audio(state, config_id));
+    let choice = audio
+        .cloned()
+        .or_else(|| configured_audio(state, config_id));
     if let (Some(choice), Some(feed)) = (choice, feed.as_ref()) {
         let content = audio_slot_content(&choice, feed, layout_audio.as_ref());
         ids.push((Component::Audio, identity(&Component::Audio, &content)));
@@ -239,7 +248,10 @@ fn configured_audio(state: &AppState, config_id: &str) -> Option<RoutedAudio> {
 pub(crate) fn clearance_now(
     state: &AppState,
     config_id: &str,
-) -> Option<(std::sync::Arc<super::identity::OutputLabels>, super::identity::Clearance)> {
+) -> Option<(
+    std::sync::Arc<super::identity::OutputLabels>,
+    super::identity::Clearance,
+)> {
     let labels = labels(state, config_id)?;
     let current = labels.current();
     // No picture label (the output is not routed by this run): no gate can

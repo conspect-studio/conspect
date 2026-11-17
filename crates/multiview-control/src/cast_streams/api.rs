@@ -451,11 +451,9 @@ impl CastStreams {
         // new generation), in this critical section, before the request goes
         // to the engine. Replaced whole; read without a lock by the gate.
         let generation = inner.gates.get(config_id).map(|g| g.generation);
-        for entry in inner
-            .entries
-            .iter_mut()
-            .filter(|e| e.config_id == config_id && e.generation.is_some() && e.generation == generation)
-        {
+        for entry in inner.entries.iter_mut().filter(|e| {
+            e.config_id == config_id && e.generation.is_some() && e.generation == generation
+        }) {
             for attachment in &entry.attachments {
                 let mut clearance = attachment.clearance().as_ref().clone();
                 for (component, id) in &ids {
@@ -786,7 +784,7 @@ impl CastStreams {
     /// `false`: refused (the caller fences it).
     pub fn attach(
         &self,
-        attachment: std::sync::Arc<super::identity::CastAttachment>,
+        attachment: &std::sync::Arc<super::identity::CastAttachment>,
         generation: u64,
     ) -> bool {
         let now = self.now_ms();
@@ -809,7 +807,7 @@ impl CastStreams {
             return false;
         }
         entry.live_attachments();
-        entry.attachments.push(attachment.clone());
+        entry.attachments.push(std::sync::Arc::clone(attachment));
         let rung = attachment.rung;
         while entry.attachments.iter().filter(|a| a.rung == rung).count() > super::MAX_PER_RUNG {
             if let Some(oldest) = entry.attachments.iter().position(|a| a.rung == rung) {

@@ -680,14 +680,17 @@ impl CastLabeller {
         if self.outputs.is_empty() {
             return;
         }
-        let next = next_window.and_then(|w| u64::try_from(w).ok()).unwrap_or(tick);
+        let next = next_window
+            .and_then(|w| u64::try_from(w).ok())
+            .unwrap_or(tick);
         for out in &mut self.outputs {
             let from = out.labels.labelled_through();
             let unrequested = router.cast_unrequested(out.index);
             let forced = out.unrequested.is_some_and(|seen| seen != unrequested);
             let first = out.unrequested.is_none();
             out.unrequested = Some(unrequested);
-            let label = |labels: &multiview_control::cast_streams::identity::OutputLabels, id: u64| {
+            let label = |labels: &multiview_control::cast_streams::identity::OutputLabels,
+                         id: u64| {
                 if first {
                     id
                 } else if forced {
@@ -701,14 +704,22 @@ impl CastLabeller {
                 out.video = Some(video);
                 if let Some(content) = router.cast_video_content(out.index) {
                     let id = identity(&Component::Video, &content);
-                    out.labels.record(&Component::Video, if first { 0 } else { from }, label(&out.labels, id));
+                    out.labels.record(
+                        &Component::Video,
+                        if first { 0 } else { from },
+                        label(&out.labels, id),
+                    );
                 }
             }
             let audio = router.cast_audio_fingerprint(out.index);
             if out.audio != Some(audio) || forced {
                 out.audio = Some(audio);
                 let id = identity(&Component::Audio, &router.cast_audio_content(out.index));
-                out.labels.record(&Component::Audio, if first { 0 } else { from }, label(&out.labels, id));
+                out.labels.record(
+                    &Component::Audio,
+                    if first { 0 } else { from },
+                    label(&out.labels, id),
+                );
             }
             if out.track_inputs.len() != out.tracks.len() {
                 out.track_inputs = vec![None; out.tracks.len()];
@@ -722,7 +733,8 @@ impl CastLabeller {
                     // A re-pointed track is a change nobody requested through
                     // the routing seam: engine range.
                     let labelled = if first_seen { id } else { engine_minted(id) };
-                    out.labels.record(&component, if first_seen { 0 } else { from }, labelled);
+                    out.labels
+                        .record(&component, if first_seen { 0 } else { from }, labelled);
                     *seen = Some(input);
                 }
             }

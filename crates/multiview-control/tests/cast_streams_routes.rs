@@ -425,7 +425,9 @@ fn rig_mode(doc: &str, mode: Mode, adjust: impl FnOnce(AppState) -> AppState) ->
         labels: ["cast-1", "cast-2"]
             .iter()
             .map(|id| {
-                use multiview_control::cast_streams::identity::{identity, Component, OutputLabels};
+                use multiview_control::cast_streams::identity::{
+                    identity, Component, OutputLabels,
+                };
                 let labels = Arc::new(OutputLabels::new());
                 labels.record(&Component::Video, 0, identity(&Component::Video, "program"));
                 labels.record(&Component::Audio, 0, identity(&Component::Audio, "program"));
@@ -3873,7 +3875,6 @@ async fn the_preflight_runs_the_shared_token_check() {
     );
 }
 
-
 // ---------------------------------------------------------------- ADR-0114 slice 4: the MoQ rung
 
 mod moq_rung {
@@ -3881,7 +3882,7 @@ mod moq_rung {
     use multiview_control::auth::Principal;
     use multiview_control::cast_streams::identity::{identity, CastAttachment, Component};
     use multiview_control::moq::{
-        MoqFence, MoqLease, MoqProvider, MoqReject, MoqRegistry, MoqVideo,
+        MoqFence, MoqLease, MoqProvider, MoqRegistry, MoqReject, MoqVideo,
     };
     use multiview_control::WhepScope;
     use std::time::Duration;
@@ -3954,7 +3955,11 @@ mod moq_rung {
         let provider: Arc<dyn MoqProvider> = fake.clone();
         let rig = rig_with(move |state| {
             state
-                .with_moq(Arc::new(MoqRegistry::new(provider, Duration::from_secs(30), capacity)))
+                .with_moq(Arc::new(MoqRegistry::new(
+                    provider,
+                    Duration::from_secs(30),
+                    capacity,
+                )))
                 .with_cast_ladder(vec!["moq".into(), "hls".into()])
         });
         (rig, fake)
@@ -3991,7 +3996,10 @@ mod moq_rung {
         assert!(body["attach"]["expires_in_ms"].as_u64().unwrap() <= 30_000);
         assert_eq!(body["then"], serde_json::json!(["hls"]));
         let admitted = fake.admitted.lock().unwrap().clone();
-        assert_eq!(admitted, [("cs-scoped".to_owned(), "output:cast-1".to_owned())]);
+        assert_eq!(
+            admitted,
+            [("cs-scoped".to_owned(), "output:cast-1".to_owned())]
+        );
         let attachment = fake.attachments.lock().unwrap()[0].clone();
         assert!(attachment
             .clearance()
@@ -4027,10 +4035,17 @@ mod moq_rung {
         let (_, body, _) = ladder(&rig, &token, &probe_body()).await;
         assert_eq!(body["attach"]["rung"], "moq");
         let attachment = fake.attachments.lock().unwrap()[0].clone();
-        let r = send(&rig.router, delete(&format!("/api/v1/cast/streams/{id}"), SCOPED)).await;
+        let r = send(
+            &rig.router,
+            delete(&format!("/api/v1/cast/streams/{id}"), SCOPED),
+        )
+        .await;
         assert!(r.status().is_success(), "{}", r.status());
         assert!(attachment.is_fenced());
-        assert!(fake.revoked.load(Ordering::SeqCst) >= 1, "the lease's transport fence ran");
+        assert!(
+            fake.revoked.load(Ordering::SeqCst) >= 1,
+            "the lease's transport fence ran"
+        );
         let (status, _, _) = ladder(&rig, &token, &probe_body()).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
@@ -4048,7 +4063,12 @@ mod moq_rung {
         let attachment = fake.attachments.lock().unwrap()[0].clone();
         let readable = send(
             &rig.router,
-            route_take(OPERATOR_TOKEN, "moq-take-a", "output-0", serde_json::json!({"bus": "program"})),
+            route_take(
+                OPERATOR_TOKEN,
+                "moq-take-a",
+                "output-0",
+                serde_json::json!({"bus": "program"}),
+            ),
         )
         .await;
         assert_eq!(readable.status(), StatusCode::ACCEPTED);
@@ -4071,9 +4091,10 @@ mod moq_rung {
         assert_eq!(unreadable.status(), StatusCode::ACCEPTED);
         assert!(attachment.is_fenced(), "revoked and fenced");
         assert_eq!(rig.routing.takes().len(), takes_before + 1);
-        assert!(!attachment
-            .clearance()
-            .clears(&Component::Video, identity(&Component::Video, "src:secret-cam")));
+        assert!(!attachment.clearance().clears(
+            &Component::Video,
+            identity(&Component::Video, "src:secret-cam")
+        ));
     }
 
     /// Decision 3: a call reporting `failed` for MoQ answers with the next

@@ -123,7 +123,7 @@ struct Ctl {
     /// The engine side of the cast output's subtitle feed (with
     /// [`Setup::tracks`]).
     subtitle_feed: Option<multiview_output::hls::SubtitleFeed>,
-    /// The run's effective-output registry slot (the MoQ factory's source).
+    /// The run's effective-output registry slot (the `MoQ` factory's source).
     #[allow(dead_code)] // Read by the `moq-output` tests only.
     windows: crate::output_window_registry::WindowSubscriptionSlot,
 }
@@ -2081,7 +2081,7 @@ fn take_to(
     ctl: &Ctl,
     outcomes: &std::sync::mpsc::Receiver<crate::output_routing::TakeOutcome>,
     op: &str,
-    bus: crate::routing_aux::PictureBus,
+    bus: &crate::routing_aux::PictureBus,
 ) {
     use crate::output_routing::{OutputTake, RefuseReason, TakeResult};
     let index = ctl.routing.index_of("cast-1").unwrap();
@@ -2119,7 +2119,9 @@ fn take_to(
 fn i_the_cast_binding_enters_the_registry_with_the_no_reorder_proof() {
     drive("cast_i", Until::Stop, |ctl| {
         ctl.wait_tick(2 * FPS);
-        let factory = wait_for("the registry", Duration::from_secs(10), || ctl.windows.load());
+        let factory = wait_for("the registry", Duration::from_secs(10), || {
+            ctl.windows.load()
+        });
         let binding = factory
             .resolve(&multiview_control::WhepScope::Output("cast-1".into()))
             .expect("the cast output resolves in the effective-output registry");
@@ -2129,7 +2131,10 @@ fn i_the_cast_binding_enters_the_registry_with_the_no_reorder_proof() {
             crate::rendition_workers::ReorderBound::NoReorder,
             "the production encoder's no-reorder proof"
         );
-        assert!(binding.audio.iter().any(|a| a.kind == multiview_ffmpeg::StreamKind::Audio));
+        assert!(binding
+            .audio
+            .iter()
+            .any(|a| a.kind == multiview_ffmpeg::StreamKind::Audio));
         ctl.stop.stop();
     });
 }
@@ -2158,23 +2163,37 @@ fn j_the_engine_labels_requested_and_unrequested_changes() {
         // Requested: the control plane registers the identity first.
         let source = identity(&Component::Video, "src:cast_j_b");
         labels.expect(&[source]);
-        take_to(ctl, &outcomes, "to-b", PictureBus::Source("cast_j_b".to_owned()));
+        take_to(
+            ctl,
+            &outcomes,
+            "to-b",
+            &PictureBus::Source("cast_j_b".to_owned()),
+        );
         wait_for("the take labelled", Duration::from_secs(10), || {
             (labels.lists().get(&Component::Video)?.current()? == source).then_some(())
         });
         let list = labels.lists().get(&Component::Video).cloned().unwrap();
         let (at, _) = *list.entries().last().unwrap();
-        let since = ctl.routing.snapshot().outputs[ctl.routing.index_of("cast-1").unwrap()].since_tick;
-        assert!(at <= since, "labelled from {at}, the feed started at {since}");
+        let since =
+            ctl.routing.snapshot().outputs[ctl.routing.index_of("cast-1").unwrap()].since_tick;
+        assert!(
+            at <= since,
+            "labelled from {at}, the feed started at {since}"
+        );
         // Unrequested (the identity of Program was not registered for it
         // now): the take back to Program is labelled in the engine range,
         // so no attachment is cleared for it by a control-plane identity.
-        take_to(ctl, &outcomes, "back", PictureBus::Program);
+        take_to(ctl, &outcomes, "back", &PictureBus::Program);
         wait_for("the move back labelled", Duration::from_secs(10), || {
             let id = labels.lists().get(&Component::Video)?.current()?;
             (id & !ENGINE_MINTED == program).then_some(())
         });
-        let id = labels.lists().get(&Component::Video).unwrap().current().unwrap();
+        let id = labels
+            .lists()
+            .get(&Component::Video)
+            .unwrap()
+            .current()
+            .unwrap();
         assert_eq!(id, program | ENGINE_MINTED, "not requested: engine range");
         ctl.stop.stop();
     });
@@ -2199,7 +2218,7 @@ mod moq_rung {
         }
     }
 
-    /// A real cast MoQ attachment on the running pipeline, cleared for what
+    /// A real cast `MoQ` attachment on the running pipeline, cleared for what
     /// the output carries now (as the ladder admits it).
     fn attach(
         ctl: &Ctl,
@@ -2209,7 +2228,9 @@ mod moq_rung {
         tokio::sync::mpsc::Receiver<multiview_moq::av::AvWindow>,
         multiview_control::moq_provider::AuthorizedFeed,
     ) {
-        let factory = wait_for("the registry", Duration::from_secs(10), || ctl.windows.load());
+        let factory = wait_for("the registry", Duration::from_secs(10), || {
+            ctl.windows.load()
+        });
         let feed_factory = RegistryFeedFactory::from_subscriptions((*factory).clone()).unwrap();
         let labels = Arc::clone(&ctl.cast.labels);
         let attachment = Arc::new(CastAttachment::new(
@@ -2232,14 +2253,6 @@ mod moq_rung {
             )
             .expect("a cast MoQ attachment on the real binding");
         (attachment, windows, feed)
-    }
-
-    fn drain(windows: &mut tokio::sync::mpsc::Receiver<multiview_moq::av::AvWindow>) -> usize {
-        let mut n = 0;
-        while windows.try_recv().is_ok() {
-            n += 1;
-        }
-        n
     }
 
     /// Decision 5.4 rows 1 and 7 on the real rung, real pipeline: a
@@ -2288,20 +2301,34 @@ mod moq_rung {
                     .with(&Component::Audio, audio),
             );
             ctl.cast.labels.expect(&[source, audio]);
-            take_to(ctl, &outcomes, "to-b", PictureBus::Source("cast_k_b".to_owned()));
+            take_to(
+                ctl,
+                &outcomes,
+                "to-b",
+                &PictureBus::Source("cast_k_b".to_owned()),
+            );
             let before = received.load(Ordering::Acquire);
             ctl.run_seconds(2);
             assert!(!attachment.is_fenced(), "{:?}", attachment.counters());
-            assert!(received.load(Ordering::Acquire) > before, "the cleared feed keeps playing");
+            assert!(
+                received.load(Ordering::Acquire) > before,
+                "the cleared feed keeps playing"
+            );
             // Unrequested: back to Program without registering the identity.
-            take_to(ctl, &outcomes, "back", PictureBus::Program);
-            wait_for("the fence", Duration::from_secs(10), || attachment.is_fenced().then_some(()));
+            take_to(ctl, &outcomes, "back", &PictureBus::Program);
+            wait_for("the fence", Duration::from_secs(10), || {
+                attachment.is_fenced().then_some(())
+            });
             let (passed, refused) = attachment.counters();
             assert_eq!(refused, 1, "one refused window, then nothing is offered");
             ctl.run_seconds(1);
             let after = received.load(Ordering::Acquire);
             ctl.run_seconds(1);
-            assert_eq!(received.load(Ordering::Acquire), after, "nothing after the fence");
+            assert_eq!(
+                received.load(Ordering::Acquire),
+                after,
+                "nothing after the fence"
+            );
             assert_eq!(attachment.counters().0, passed);
             reading.store(false, Ordering::Release);
             reader.join().unwrap();
@@ -2310,7 +2337,7 @@ mod moq_rung {
     }
 
     /// R3 chaos, invariants #1 and #10 (ADR-0114 decision 6, "Long-run and
-    /// stalled-consumer proof", engine rows): cast MoQ attachments that never
+    /// stalled-consumer proof", engine rows): cast `MoQ` attachments that never
     /// read (stalled), and one whose transport is wedged, on the real
     /// pipeline, cost the clock zero ticks and the HLS binding zero packets
     /// against the control run; the registry's subscription cap holds and
@@ -2373,7 +2400,11 @@ mod moq_rung {
                     };
                     let progress = ctl.sample_progress(CHAOS_TICKS - 20);
                     let mut caps = cap_record.lock().unwrap();
-                    *caps = (stalled.len(), refused, multiview_moq::provider::retained_payload_bytes());
+                    *caps = (
+                        stalled.len(),
+                        refused,
+                        multiview_moq::provider::retained_payload_bytes(),
+                    );
                     drop(caps);
                     record.lock().unwrap().progress = progress;
                     drop(stalled);

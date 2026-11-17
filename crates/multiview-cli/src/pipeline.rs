@@ -9595,9 +9595,12 @@ fn consumer_main<D: WindowDelivery>(
         // after this tick's takes and every move outcome of the windows
         // offered so far (two fingerprint compares per cast output; no
         // allocation unless something changed).
-        cast_labels.label(&router, item.tick_index, dispatcher.next_window_index(), &|name| {
-            routed_track_input(track_inputs, &declared_track_names, name)
-        });
+        cast_labels.label(
+            &router,
+            item.tick_index,
+            dispatcher.next_window_index(),
+            &|name| routed_track_input(track_inputs, &declared_track_names, name),
+        );
         // Every output tick hands any admitted-but-undelivered tail to its
         // transport, so a quiet encoder cannot strand an admitted window behind a
         // subscriber's bounded handoff. Off-clock, never waits on a peer.

@@ -132,11 +132,19 @@ pub fn video_content(bus: &str, layout: Option<&RoutedLayout>) -> String {
 /// The same content from a layout's id, cell sources and audio attribute
 /// (the control plane's stored library view).
 #[must_use]
-pub fn layout_content(id: &str, sources: &[String], audio: &multiview_config::LayoutAudio) -> String {
+pub fn layout_content(
+    id: &str,
+    sources: &[String],
+    audio: &multiview_config::LayoutAudio,
+) -> String {
     let mut sources: Vec<&str> = sources.iter().map(String::as_str).collect();
     sources.sort_unstable();
     sources.dedup();
-    format!("aux:{id}|{}|audio={}", sources.join(","), layout_audio_label(audio))
+    format!(
+        "aux:{id}|{}|audio={}",
+        sources.join(","),
+        layout_audio_label(audio)
+    )
 }
 
 fn layout_audio_label(audio: &multiview_config::LayoutAudio) -> String {
@@ -414,7 +422,7 @@ pub enum GateRefusal {
 /// which closes the connection abruptly).
 pub type Closer = Box<dyn FnOnce() + Send>;
 
-/// One push attachment (a MoQ lease, a WebRTC session) of one cast stream.
+/// One push attachment (a `MoQ` lease, a `WebRTC` session) of one cast stream.
 pub struct CastAttachment {
     /// The stream it belongs to.
     pub stream_id: String,
@@ -617,12 +625,28 @@ mod tests {
 
     #[test]
     fn a_layout_identity_follows_its_closure_not_its_geometry() {
-        let a = layout_content("l", &["b".into(), "a".into()], &multiview_config::LayoutAudio::Program);
-        let b = layout_content("l", &["a".into(), "b".into(), "a".into()], &multiview_config::LayoutAudio::Program);
+        let a = layout_content(
+            "l",
+            &["b".into(), "a".into()],
+            &multiview_config::LayoutAudio::Program,
+        );
+        let b = layout_content(
+            "l",
+            &["a".into(), "b".into(), "a".into()],
+            &multiview_config::LayoutAudio::Program,
+        );
         assert_eq!(a, b);
-        let c = layout_content("l", &["a".into(), "b".into(), "secret".into()], &multiview_config::LayoutAudio::Program);
+        let c = layout_content(
+            "l",
+            &["a".into(), "b".into(), "secret".into()],
+            &multiview_config::LayoutAudio::Program,
+        );
         assert_ne!(a, c);
-        let d = layout_content("l", &["a".into(), "b".into()], &multiview_config::LayoutAudio::Source("a".into()));
+        let d = layout_content(
+            "l",
+            &["a".into(), "b".into()],
+            &multiview_config::LayoutAudio::Source("a".into()),
+        );
         assert_ne!(a, d);
     }
 
@@ -646,8 +670,17 @@ mod tests {
     fn the_gate_passes_cleared_windows_and_fences_on_one_miss() {
         let v = Component::Video;
         let a = Component::Audio;
-        let l = labels(&[(v.clone(), 0, 1), (a.clone(), 0, 7), (v.clone(), 50, 2)], 100);
-        let att = CastAttachment::new("s", "o", "moq", l, Clearance::of(&[(v.clone(), 1), (a.clone(), 7)]));
+        let l = labels(
+            &[(v.clone(), 0, 1), (a.clone(), 0, 7), (v.clone(), 50, 2)],
+            100,
+        );
+        let att = CastAttachment::new(
+            "s",
+            "o",
+            "moq",
+            l,
+            Clearance::of(&[(v.clone(), 1), (a.clone(), 7)]),
+        );
         let closed = Arc::new(AtomicU64::new(0));
         let seen = closed.clone();
         att.set_closer(Box::new(move || {
@@ -659,7 +692,10 @@ mod tests {
         assert!(!att.is_fenced());
         // Video of the new feed (identity 2, not cleared): the whole window,
         // its cleared audio with it, is refused and the attachment fenced.
-        assert_eq!(att.admit_window([(&a, 60), (&v, 60)]), Err(GateRefusal::Fenced));
+        assert_eq!(
+            att.admit_window([(&a, 60), (&v, 60)]),
+            Err(GateRefusal::Fenced)
+        );
         assert!(att.is_fenced());
         assert_eq!(closed.load(Ordering::Acquire), 1);
         // Nothing later is offered, even a cleared window.
@@ -675,7 +711,10 @@ mod tests {
         let t = Component::Track("commentary".into());
         let l = labels(&[(v.clone(), 0, 1)], 10);
         let att = CastAttachment::new("s", "o", "moq", l, Clearance::of(&[(v.clone(), 1)]));
-        assert_eq!(att.admit_window([(&v, 1), (&t, 1)]), Err(GateRefusal::Fenced));
+        assert_eq!(
+            att.admit_window([(&v, 1), (&t, 1)]),
+            Err(GateRefusal::Fenced)
+        );
     }
 
     #[test]
@@ -693,16 +732,39 @@ mod tests {
     fn audio_slot_content_mirrors_the_engine_resolution() {
         use multiview_config::LayoutAudio;
         let follow = RoutedAudio::Follow;
-        assert_eq!(audio_slot_content(&follow, &RoutedFeed::Program, None), "program");
-        assert_eq!(audio_slot_content(&follow, &RoutedFeed::Clean, None), "program");
-        assert_eq!(audio_slot_content(&follow, &RoutedFeed::Preview, None), "preview");
-        assert_eq!(audio_slot_content(&follow, &RoutedFeed::Source("c".into()), None), "src:c");
         assert_eq!(
-            audio_slot_content(&follow, &RoutedFeed::Layout("l".into()), Some(&LayoutAudio::Source("x".into()))),
+            audio_slot_content(&follow, &RoutedFeed::Program, None),
+            "program"
+        );
+        assert_eq!(
+            audio_slot_content(&follow, &RoutedFeed::Clean, None),
+            "program"
+        );
+        assert_eq!(
+            audio_slot_content(&follow, &RoutedFeed::Preview, None),
+            "preview"
+        );
+        assert_eq!(
+            audio_slot_content(&follow, &RoutedFeed::Source("c".into()), None),
+            "src:c"
+        );
+        assert_eq!(
+            audio_slot_content(
+                &follow,
+                &RoutedFeed::Layout("l".into()),
+                Some(&LayoutAudio::Source("x".into()))
+            ),
             "src:x"
         );
         assert_eq!(
-            audio_slot_content(&RoutedAudio::Track { name: "n".into(), input: "i".into() }, &RoutedFeed::Program, None),
+            audio_slot_content(
+                &RoutedAudio::Track {
+                    name: "n".into(),
+                    input: "i".into()
+                },
+                &RoutedFeed::Program,
+                None
+            ),
             audio_content("track:n", Some(("n", "i")))
         );
     }

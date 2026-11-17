@@ -224,10 +224,13 @@ impl crate::moq::MoqProvider for DeferredProvider {
         ttl: std::time::Duration,
         gate: Arc<crate::cast_streams::identity::CastAttachment>,
     ) -> Result<(crate::moq::MoqLease, Arc<dyn crate::moq::MoqFence>), MoqReject> {
-        self.inner
-            .get()
-            .ok_or(MoqReject::Unavailable)?
-            .admit_cast(principal, scope, subscription_id, ttl, gate)
+        self.inner.get().ok_or(MoqReject::Unavailable)?.admit_cast(
+            principal,
+            scope,
+            subscription_id,
+            ttl,
+            gate,
+        )
     }
 }
 
