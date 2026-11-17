@@ -22,4 +22,4 @@ pub mod uniforms;
 pub use compositor::{GpuCompositor, MAX_TILES};
 pub use device::GpuContext;
 pub use shader::{validate_module, validate_shaders};
-pub use uniforms::{CompositeUniforms, EncodeUniforms, TileParams, TransferId};
+pub use uniforms::{CompositeUniforms, EncodeUniforms, KeyParams, TileParams, TransferId};

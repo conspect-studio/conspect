@@ -155,6 +155,14 @@ impl OutputRouter {
         self.sets.clock = Some(applied_tick);
     }
 
+    /// Share the switcher's Clean / DSK gate (K4 review H3): a take or set
+    /// member to Clean is admitted at the drain only by taking a Clean
+    /// reservation on it, so it and a `keyer_set` defining a DSK can never
+    /// both win, in either order.
+    pub(crate) fn set_clean_gate(&mut self, gate: Arc<multiview_engine::clean_gate::CleanDskGate>) {
+        self.clean_gate = gate;
+    }
+
     /// The set output `index`'s pending take belongs to.
     pub(super) fn group_of(&self, index: usize) -> Option<u64> {
         self.outputs
@@ -415,6 +423,18 @@ impl OutputRouter {
                 && !stale
                 && !set.members.iter().take(i).any(|o| o.output_index == index);
         }
+        // Every Clean member takes its Clean reservation (review H3; one
+        // refused member refuses the set whole, and the reservations taken
+        // are released by the tick's reconcile).
+        routable = routable
+            && set
+                .members
+                .iter()
+                .filter(|m| m.bus == Some(PictureBus::Clean))
+                .map(|m| m.output_index)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .all(|index| self.hold_clean(index));
         if !routable {
             self.refuse_unadmitted(&set, RefuseReason::Unroutable, tick);
             return;

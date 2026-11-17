@@ -4248,6 +4248,9 @@ impl Pipeline {
         // composed tick: a wait-free atomic load, never a lock on the clock.
         if let Some(control) = self.switcher_control.as_ref() {
             router.set_switcher_clock(control.applied_tick_cell());
+            // K4 (review H3): one Clean / DSK gate shared by the switcher,
+            // the routing handle (plan) and the router (drain admission).
+            router.set_clean_gate(control.clean_gate());
         }
         let run_outputs = self.run_outputs(binding_ids, audio_tracks);
         // Slice F part F2: the run's subtitle route tables, keyed by output
@@ -4270,6 +4273,12 @@ impl Pipeline {
                 .with_dsk_defined(!self.switcher_keyers.is_empty())
                 .with_subtitles(subtitle_tables, Arc::clone(&subtitle_tick)),
         );
+        // K4: the switcher's gate, so a run-time `keyer_set` defining a DSK
+        // and a Clean take are admitted against the same counted word.
+        let handle = match self.switcher_control.as_ref() {
+            Some(control) => Arc::new((*handle).clone().with_clean_gate(control.clean_gate())),
+            None => handle,
+        };
         enqueue_boot_takes(&handle, &self.boot_output_feeds, &self.boot_audio_takes);
         // Review INV-1: the run's subtitle routing ends with the run (every
         // exit path drops this guard), so a take can no longer re-point an
@@ -4496,6 +4505,15 @@ impl Pipeline {
                 &self.switcher_keyers,
             ));
             self.keyer_demand = Some(keyers);
+        }
+        // K4: a run with an M/E can define its first DSK at run time
+        // (`keyer_set`), so the switcher always gets a `keyer` demand set.
+        if self.keyer_demand.is_none() && self.switcher_me.is_some() {
+            self.keyer_demand =
+                Some(manager.consumer_set(multiview_engine::ConsumerClass::Keyer, Rails::VIDEO));
+        }
+        if let (Some(control), Some(set)) = (&self.switcher_control, &self.keyer_demand) {
+            control.set_keyer_demand(set.clone());
         }
         self.demand_sets = Some((layout, audio));
         self.demand = Some(manager.clone());
@@ -18833,7 +18851,13 @@ fn ingest_loop(plan: &IngestPlan, stop: &AtomicBool) {
     // for one (ADR-0039 decision 10, amended) — so this is unreachable there.
     #[cfg(feature = "srt-libsrt")]
     let _srt_listener = match &plan.location {
-        SourceLocation::Url(url) if multiview_output::sink::is_srt_listener_url(url) => {
+        // Below the libsrt security floor no bridge is started at all (its
+        // thread could only retry a refusal that never clears); the open below
+        // reports the reason instead.
+        SourceLocation::Url(url)
+            if multiview_output::sink::is_srt_listener_url(url)
+                && multiview_srt_sys::listener_floor_check().is_ok() =>
+        {
             crate::srt_ingest::acquire(url).ok()
         }
         _ => None,
@@ -20004,6 +20028,11 @@ fn open_and_stream(
             // is unreachable in that build and compiled out.
             #[cfg(feature = "srt-libsrt")]
             let open_url = if multiview_output::sink::is_srt_listener_url(&open_url) {
+                // Security floor (GHSA-m96h-3rc9-xx6h, ADR-0114 decision 4): on
+                // a libsrt below 1.5.7 fail this open with the
+                // `srt-libsrt-too-old` reason (both versions), which the
+                // reconnect bracket logs against the source and backs off.
+                multiview_srt_sys::listener_floor_check().map_err(|e| e.to_string())?;
                 let reader = crate::srt_ingest::acquire(&open_url)?.open_reader()?;
                 let url = reader.url().to_owned();
                 _srt_reader = Some(reader);
