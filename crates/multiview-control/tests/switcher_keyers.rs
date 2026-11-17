@@ -1440,3 +1440,86 @@ async fn keyer_set_repointing_a_fill_moves_the_media_edit_guard_to_the_new_fill(
         body_json(resp).await
     );
 }
+
+/// K7 (#392): `keyer_set` accepts `type = "chroma"` with its reference
+/// `color`, applies it at the tick as a chroma key, persists it, and GET
+/// reports it; a chroma key without a colour, with a key source, or a stray
+/// colour on a luma key are 422 `validation` with typed reasons.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chroma_keyer_set_applies_persists_and_refuses_bad_shapes() {
+    let (_dir, path) = temp_boot(DOC);
+    let mut rig = rig(&path);
+    let mut outcomes = rig.handle.outcomes();
+    for (extra, needle) in [
+        (
+            json!({"keyer":"dsk1","type":"chroma"}),
+            "chroma-color-required",
+        ),
+        (
+            json!({"keyer":"dsk1","type":"chroma","color":"#00b140","key":"gfx2"}),
+            "chroma-key-source",
+        ),
+        (
+            json!({"keyer":"dsk1","type":"chroma","color":"nope"}),
+            "chroma-color",
+        ),
+        (
+            json!({"keyer":"dsk1","type":"luma","color":"#00b140"}),
+            "chroma-color-without-chroma",
+        ),
+    ] {
+        let verb = body("keyer_set", extra.clone());
+        let response = command(&rig, FULL, &format!("bad-{needle}"), &verb).await;
+        let status = response.status();
+        let problem = body_json(response).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{extra}: {problem}"
+        );
+        assert!(
+            problem.to_string().contains(needle),
+            "{extra}: {problem} lacks {needle}"
+        );
+    }
+    let set = body(
+        "keyer_set",
+        json!({"keyer":"dsk1","type":"chroma","color":"#00b140","clip":0.05,"gain":8.0,
+               "invert":true}),
+    );
+    let planned = body_json(plan(&rig, FULL, &set).await).await;
+    assert_eq!(planned["can_take"], true, "{planned}");
+    assert_eq!(
+        command(&rig, FULL, "chroma", &set).await.status(),
+        StatusCode::ACCEPTED
+    );
+    tick(&mut rig.driver, 1);
+    assert!(outcomes.try_recv().unwrap().event.completed);
+    let defs = rig.handle.keyer_definitions().unwrap();
+    let def = defs.defs[0].as_ref().unwrap();
+    assert_eq!(
+        def.params.kind,
+        multiview_compositor::key::KeyKind::Chroma {
+            reference: [0x00, 0xb1, 0x40],
+            clip: 0.05,
+            gain: 8.0,
+        }
+    );
+    assert!(def.params.invert);
+    wait_for(|| {
+        persisted(&rig.state).switcher.unwrap().downstream_keyers[0]
+            .color
+            .as_deref()
+            == Some("#00b140")
+    })
+    .await;
+    let config = persisted(&rig.state);
+    config.validate().unwrap();
+    let text = toml::to_string(&config).unwrap();
+    MultiviewConfig::load_from_toml(&text)
+        .unwrap()
+        .validate()
+        .unwrap();
+    let get = body_json(send(&rig.router, get("/api/v1/switcher/me1", FULL)).await).await;
+    assert_eq!(get["keyers"][0]["type"], "chroma", "{get}");
+}
