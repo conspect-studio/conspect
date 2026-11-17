@@ -1332,8 +1332,8 @@ struct KeyerSceneKey {
     keyer: u8,
     rect: KeyerFly,
     weight_bits: u32,
-    /// `KeyKind` as (luma?, clip bits, gain bits).
-    kind: (bool, u32, u32),
+    /// `KeyKind` as (kind tag, clip bits, gain bits, chroma reference).
+    kind: (u8, u32, u32, [u8; 3]),
     invert: bool,
     mask: Option<multiview_compositor::key::KeyMask>,
     has_key: bool,
@@ -1343,9 +1343,14 @@ impl KeyerSceneKey {
     fn of(d: &KeyerDraw) -> Self {
         let kind = match d.params.kind {
             multiview_compositor::key::KeyKind::Luma { clip, gain } => {
-                (true, clip.to_bits(), gain.to_bits())
+                (1, clip.to_bits(), gain.to_bits(), [0; 3])
             }
-            _ => (false, 0, 0),
+            multiview_compositor::key::KeyKind::Chroma {
+                reference,
+                clip,
+                gain,
+            } => (2, clip.to_bits(), gain.to_bits(), reference),
+            _ => (0, 0, 0, [0; 3]),
         };
         Self {
             keyer: d.keyer,

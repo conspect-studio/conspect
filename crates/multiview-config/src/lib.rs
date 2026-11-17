@@ -32,6 +32,7 @@
 pub mod admission;
 pub mod api;
 pub mod audio;
+pub mod cast;
 pub mod cast_dir;
 pub mod catalogues;
 pub mod device;
@@ -604,6 +605,11 @@ pub struct MultiviewConfig {
     /// `[events]`: retention bounds of the raw marker journal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<EventsConfig>,
+    /// `[cast]`: the cast transport ladder (ADR-0114): which rungs
+    /// `POST /cast/<token>/ladder` may offer. Absent ⇒ `["hls"]`; a default
+    /// section does not serialize.
+    #[serde(default, skip_serializing_if = "cast::CastConfig::is_default")]
+    pub cast: cast::CastConfig,
 }
 
 /// Shape-check the id a weather / graphics source references.
@@ -847,6 +853,7 @@ impl MultiviewConfig {
         if let Some(timing) = &self.timing {
             timing.validate()?;
         }
+        self.cast.validate()?;
 
         // Solving + the core structural check covers geometry (rects in 0..1,
         // positive extent, valid cadence) and grid wiring (areas resolve).

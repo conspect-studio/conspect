@@ -69,13 +69,22 @@ fn desired(path: &Path) -> PathBuf {
     path.parent().unwrap().join(".multiview/desired.json")
 }
 
+/// The `install` future, boxed: `MultiviewConfig` is large, and an unboxed
+/// future at each call site trips `clippy::large_futures`.
+type Installed<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = (PathBuf, MultiviewConfig)> + 'a>>;
+
 /// A real accepted envelope written by the control plane's own commit.
-async fn install(dir: &Path) -> (PathBuf, MultiviewConfig) {
-    install_text(dir, BOOT).await
+fn install(dir: &Path) -> Installed<'_> {
+    install_text(dir, BOOT)
 }
 
 /// [`install`] for an explicit boot document.
-async fn install_text(dir: &Path, boot: &str) -> (PathBuf, MultiviewConfig) {
+fn install_text<'a>(dir: &'a Path, boot: &'a str) -> Installed<'a> {
+    Box::pin(install_text_inner(dir, boot))
+}
+
+async fn install_text_inner(dir: &Path, boot: &str) -> (PathBuf, MultiviewConfig) {
     let path = dir.join("conspect.toml");
     std::fs::write(&path, boot).unwrap();
     let config = MultiviewConfig::load_from_toml(boot).unwrap();
@@ -1222,7 +1231,7 @@ async fn the_rejected_bound_holds_when_a_kept_copy_is_reused() {
 #[tokio::test]
 async fn an_unreadable_marker_is_acknowledged_and_removed() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot, text) = fallen_back(dir.path()).await;
+    let (path, boot, text) = Box::pin(fallen_back(dir.path())).await;
     let start = resolve_start_config(boot, text, &path).unwrap();
     let publisher = Arc::new(publisher());
     let (addr, stop, server, _commands) = serve(&start, &path, &publisher).await;

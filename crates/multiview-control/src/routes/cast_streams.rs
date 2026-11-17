@@ -18,6 +18,7 @@ use multiview_config::VideoFeed;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{Action, Principal, Role};
+use crate::cast_streams::ladder::{ReceiverProbe, Transport};
 use crate::cast_streams::{CastFetches, ReceiverFetch, ReceiverReport, StreamView};
 use crate::error::{ControlError, ControlResult};
 use crate::output_routing::RoutedFeed;
@@ -116,6 +117,14 @@ pub struct CastStreamDoc {
     /// The receiver's last report, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_report: Option<ReceiverReport>,
+    /// The receiver's last capability probe (`POST /cast/<token>/ladder`,
+    /// ADR-0114): device claims, shown as received. Owner and Admin only,
+    /// like the rest of this document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<ReceiverProbe>,
+    /// The rung the receiver plays and how it fares (ADR-0114).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport: Option<Transport>,
 }
 
 pub(crate) fn cast_problem(status: u16, reason: &str, detail: impl Into<String>) -> Response {
@@ -157,6 +166,8 @@ pub(crate) fn stream_doc(state: &AppState, view: StreamView, token: Option<&str>
         expires_unix_ms: view.expires_unix_ms,
         fetches: view.fetches,
         last_report: view.last_report,
+        receiver: view.probe,
+        transport: view.transport,
     }
 }
 

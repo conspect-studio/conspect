@@ -378,6 +378,12 @@ where
     }
     if let Some(switcher) = switcher {
         state = state.with_switcher(switcher);
+        // Stored layouts as M/E sources (#307): installed by the run only
+        // when a switcher is attached.
+        #[cfg(feature = "ffmpeg")]
+        if let Some(sources) = crate::me_layouts::installed_me_layouts() {
+            state = state.with_me_layouts(sources);
+        }
     }
     // Output feed routing (ADR-0108 slice 1): the run installs its routing
     // slot before the control plane starts; without one the routes answer
@@ -404,6 +410,8 @@ where
     // wins over `[control] cast_app_id`; an invalid value is a warning and
     // no custom receiver (the sender then uses the Default Media Receiver).
     state = state.with_cast_app_id(cast_app_id(config));
+    // `[cast] ladder` (ADR-0114): the rungs the ladder route may offer.
+    state = state.with_cast_ladder(config.cast.ladder.clone());
     // The running engine's cast outputs (ADR-0111): activation gates behind
     // a lock-free slot, so the control plane never waits on the engine.
     #[cfg(feature = "ffmpeg")]
@@ -691,10 +699,18 @@ where
     };
     #[cfg(not(unix))]
     let reconciler: Option<AbortTask> = configured_cloudflare()?.map(|never| match never {});
+    // Scheduled `[[media_fill]]` refresh (issue #472): a management-plane task
+    // over the same capture/load providers the HTTP routes use. It never runs
+    // on, or is awaited by, the engine; its guard lives with the server.
+    let fill_refresh = AbortTask(multiview_control::fill_refresh::spawn_for_state(
+        &state,
+        &config.media_fills,
+    ));
     // Keep the abort guard inside the server's shutdown future. It also runs if
     // the server future is dropped, so no management task survives the server.
     let shutdown = async move {
         let _reconciler = reconciler;
+        let _fill_refresh = fill_refresh;
         #[cfg(feature = "moq-output")]
         let outgoing = outgoing;
         shutdown.await;
