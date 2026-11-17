@@ -158,6 +158,9 @@ run() {   # run <log name> <timeout s> <command...>: bounded, logged, never abor
   grep -E '^(RESULT|exit=)' "$log" | cut -c1-200
 }
 specs=()
+# probe.js unit checks (ADR-0114 slice 2): no browser
+run probe-unit 60 node "$here/test-probe-unit.mjs"
+specs+=("probe-unit=$out/probe-unit.log")
 node "$here/stream-health.mjs" "$S$media" > "$out/stream-health-before.json" 2>/dev/null
 # (a) the validator on the engine's cast directory
 { "$validator" "$run_dir/cast"; rc=$?; echo "RESULT {\"test\":\"validator\",\"pass\":$([ $rc = 0 ] && echo true || echo false),\"failed\":[$([ $rc = 0 ] || echo "\"cast_validate exit $rc\"")],\"parts\":[]}"; echo "exit=$rc"; } > "$out/validator.log" 2>&1

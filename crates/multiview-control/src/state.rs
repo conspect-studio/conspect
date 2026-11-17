@@ -525,7 +525,10 @@ impl LiveSourceCapability {
     /// Whether the running engine can apply a mutation of this `kind` live.
     #[must_use]
     pub fn is_live(&self, kind: &multiview_config::SourceKind) -> bool {
-        if kind.is_synthetic() {
+        // A media-player binding (ADR-M012) opens nothing: the drain aliases
+        // the id to the player channel at the frame boundary, on every run that
+        // applies sources live at all.
+        if kind.is_synthetic() || matches!(kind, multiview_config::SourceKind::MediaPlayer { .. }) {
             return self.synthetic;
         }
         // RIST is network media but feature-gated: it is live only when the
@@ -1619,6 +1622,13 @@ impl AppState {
     #[must_use]
     pub fn with_cast_app_id(self, app_id: Option<String>) -> Self {
         self.cast_streams.set_receiver_app_id(app_id);
+        self
+    }
+
+    /// Set the rungs `[cast] ladder` enables (ADR-0114; already validated).
+    #[must_use]
+    pub fn with_cast_ladder(self, ladder: Vec<String>) -> Self {
+        self.cast_streams.set_ladder(ladder);
         self
     }
 

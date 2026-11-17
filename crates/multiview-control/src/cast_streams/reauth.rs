@@ -279,6 +279,23 @@ pub(crate) fn on_media(state: &AppState, config_id: &str) {
     report(state, revoked, "engine");
 }
 
+/// THE token check of every `/cast/<token>/…` route (ADR-0114 decision
+/// 5.1): the one admission function. It finds the token (constant time over
+/// every digest), runs the re-authorization barrier ([`on_media`]) on its
+/// output, then admits only a live token armed at the output's CURRENT
+/// authorization generation, and returns the stream, the output and that
+/// generation. Every cast route (media, report, ladder) calls it; the push
+/// rungs of later slices call it too and extend it with their per-component
+/// identity clearance (decision 5.4), so no rung has a check of its own.
+///
+/// Synchronous and short: one routing readback load and the registry lock,
+/// never held across an `.await` (invariant #10).
+pub(crate) fn admit(state: &AppState, token: &str) -> Option<super::Admitted> {
+    let (_, config_id) = state.cast_streams.lookup(token)?;
+    on_media(state, &config_id);
+    state.cast_streams.serve(token)
+}
+
 /// Arm stream `id` on `config_id` for `principal` (a creation): the owner
 /// must be authorized for every feed the gate clears and for what the
 /// output carries now, at the generation it read. A generation that moves

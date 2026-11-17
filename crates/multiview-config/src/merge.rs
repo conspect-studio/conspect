@@ -535,6 +535,7 @@ pub fn merge_file_edit(
         iptv: p_iptv,
         graphics: p_graphics,
         events: p_events,
+        cast: p_cast,
     } = prev_file;
     let n = next_file;
     let a = accepted;
@@ -631,6 +632,7 @@ pub fn merge_file_edit(
             ),
         }),
         events: section(p_events, &n.events, &a.events),
+        cast: section(p_cast, &n.cast, &a.cast),
     }
 }
 

@@ -116,6 +116,7 @@ fn req(k: &FillKey) -> Result<Request, ()> {
             background: Background::Opaque,
             document: "doc".into(),
             capture: multiview_webengine::capture::CaptureOptions::default(),
+            output_cadence: None,
         },
         maximum_bytes: 1000,
         timeout: Duration::from_secs(60),

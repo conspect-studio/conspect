@@ -1742,6 +1742,12 @@ fn unadopt_source_if_modeled(state: &AppState, id: &str) {
 /// ⇒ live `RemoveSource` (stop the stale generator) + restart for the new
 /// document; decoded add/edit ⇒ restart, honestly; any removal ⇒ live
 /// `RemoveSource` (bound tiles ride their `on_loss` slate).
+/// Kinds the drain applies live from a config-file edit: synthetic generators
+/// and media-player bindings (ADR-M012, a pure alias that opens nothing).
+fn applies_live(kind: &multiview_config::SourceKind) -> bool {
+    kind.is_synthetic() || matches!(kind, multiview_config::SourceKind::MediaPlayer { .. })
+}
+
 fn apply_source_changes(
     state: &AppState,
     diff: &ConfigDiff,
@@ -1753,7 +1759,7 @@ fn apply_source_changes(
         match change {
             SourceChange::Added(source) => {
                 described.push(format!("{} added", source.id));
-                if source.kind.is_synthetic() {
+                if applies_live(&source.kind) {
                     if submit(
                         state,
                         Command::UpsertSource {
@@ -1778,7 +1784,7 @@ fn apply_source_changes(
             }
             SourceChange::Changed { previous, next } => {
                 described.push(format!("{} changed", next.id));
-                if next.kind.is_synthetic() {
+                if applies_live(&next.kind) {
                     if submit(
                         state,
                         Command::UpsertSource {

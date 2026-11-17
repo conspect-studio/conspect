@@ -80,6 +80,7 @@ fn page(background: Background) -> Capture {
 <div style='position:absolute;left:214px;top:0;width:106px;height:180px;background:rgba(0,0,255,0.5)'></div></body>"
             .to_owned(),
         capture: multiview_webengine::capture::CaptureOptions::default(),
+        output_cadence: None,
     }
 }
 fn provenance() -> Provenance {

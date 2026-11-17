@@ -1222,7 +1222,7 @@ async fn the_rejected_bound_holds_when_a_kept_copy_is_reused() {
 #[tokio::test]
 async fn an_unreadable_marker_is_acknowledged_and_removed() {
     let dir = tempfile::tempdir().unwrap();
-    let (path, boot, text) = fallen_back(dir.path()).await;
+    let (path, boot, text) = Box::pin(fallen_back(dir.path())).await;
     let start = resolve_start_config(boot, text, &path).unwrap();
     let publisher = Arc::new(publisher());
     let (addr, stop, server, _commands) = serve(&start, &path, &publisher).await;

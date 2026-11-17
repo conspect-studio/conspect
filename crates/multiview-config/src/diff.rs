@@ -210,6 +210,7 @@ impl ConfigDiff {
             iptv: running_iptv,
             graphics: running_graphics,
             events: running_events,
+            cast: running_cast,
         } = running;
         let MultiviewConfig {
             schema_version: next_schema_version,
@@ -246,6 +247,7 @@ impl ConfigDiff {
             iptv: next_iptv,
             graphics: next_graphics,
             events: next_events,
+            cast: next_cast,
         } = next;
 
         // Canvas: the pinned signal is geometry + cadence BY VALUE (the
@@ -281,7 +283,7 @@ impl ConfigDiff {
         let media_changed = running_media_library != next_media_library
             || running_media_players != next_media_players;
         let mut changed_sections = BTreeSet::new();
-        let sectioned: [(&'static str, bool); 29] = [
+        let sectioned: [(&'static str, bool); 30] = [
             (
                 "schema_version",
                 running_schema_version != next_schema_version,
@@ -353,6 +355,9 @@ impl ConfigDiff {
             ("graphics", running_graphics != next_graphics),
             // Read once when the journal starts, so a change waits for a restart.
             ("events", running_events != next_events),
+            // Read when the control plane starts (the ladder route's rung
+            // set), so a change waits for a restart.
+            ("cast", running_cast != next_cast),
         ];
         for (name, changed) in sectioned {
             if changed {
