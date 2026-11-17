@@ -89,6 +89,21 @@ describe('ProductionDesk single-authority completion', { timeout: 15000 }, () =>
     expect(commandCount).toBe(1);
   });
 
+  it('shows why a refused Preview select cannot work, not only "Conflict"', async () => {
+    server.use(
+      http.get('*/api/v1/sources', () => HttpResponse.json([{ id: 'vt-1-src', name: 'VT 1 (Windy)', body: { kind: 'media_player', player: 'vt-1' } }])),
+      http.post('*/api/v1/switcher/commands/select_preview', () => HttpResponse.json(
+        { type: '/problems/source-unavailable', title: 'Selection refused', status: 409, detail: 'media player "vt-9" has no channel in this run; it shows no picture' },
+        { status: 409, headers: { 'Content-Type': 'application/problem+json' } },
+      )),
+    );
+    page();
+    const tile = await screen.findByRole('button', { name: 'Preview VT 1 (Windy)' });
+    await waitFor(() => { expect(tile).toHaveAttribute('aria-disabled', 'false'); }, { timeout: 6000 });
+    await userEvent.click(tile);
+    expect(await screen.findByRole('alert')).toHaveTextContent('Selection refused: media player "vt-9" has no channel in this run; it shows no picture');
+  });
+
   it('AUTO sends duration_frames from the rate field, after a passing plan', async () => {
     let body: unknown;
     server.use(http.post('*/api/v1/switcher/commands/auto', async ({ request }) => { body = await request.json(); commandCount += 1; return HttpResponse.json({ operation_id: 'op-auto', kind: 'auto' }, { status: 202 }); }));

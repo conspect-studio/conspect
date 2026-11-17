@@ -2335,6 +2335,31 @@ pub struct CommandDrain {
     /// [`multiview_config::MAX_ADMITTED_SOURCES`], so the two together never
     /// exceed the source cap however the queue sheds (review #477).
     pending_teardowns: std::collections::BTreeSet<String>,
+    /// Removed `media_player` aliases whose hub unbind was shed (`Full`),
+    /// with the store each was bound to: retried one per tick until accepted
+    /// (review ship-1111 #2), so the hub always withdraws the catalogue entry,
+    /// pins and preview entry. Counted against the source cap with
+    /// `pending_teardowns`; a re-add of the id cancels it (the new binding
+    /// replaces every one of those entries).
+    pending_unbinds:
+        std::collections::BTreeMap<String, Arc<multiview_framestore::TileStore<Nv12Image>>>,
+    /// `media_player` alias bindings the hub shed (`Full`), retried one per
+    /// tick until accepted (review ship-1111 #1): each is the whole ordered
+    /// replace (teardown of a replaced producer, then the binding), so the
+    /// old producer stops and the alias is catalogued without a re-apply.
+    /// Counted against the source cap; a removal or kind change drops it.
+    pending_binds: std::collections::BTreeMap<String, PendingBind>,
+    /// The store of each `media_player` alias the hub last ACCEPTED (review
+    /// ship-1111 round 3), separate from the desired drive binding: a
+    /// removal withdraws exactly what the hub holds, never a store that was
+    /// only on the drive (a repoint still pending). Moved into
+    /// `pending_unbinds` on removal; replaced only by an accepted binding.
+    hub_aliases:
+        std::collections::BTreeMap<String, Arc<multiview_framestore::TileStore<Nv12Image>>>,
+    /// The media-player channels the run booted (ADR-M012). `None` on a run
+    /// that does not say (tests, the software path): a player then counts as
+    /// booted when the drive holds its store.
+    booted_players: Option<Arc<std::collections::BTreeSet<String>>>,
     /// The live source cap ([`multiview_config::MAX_ADMITTED_SOURCES`]; a test
     /// seam lowers it).
     source_cap: usize,
@@ -2391,6 +2416,15 @@ pub struct CommandDrain {
     resolve_spy: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
+/// A `media_player` alias binding awaiting the hub (see `pending_binds`).
+#[derive(Clone)]
+struct PendingBind {
+    source: multiview_config::Source,
+    store: Arc<multiview_framestore::TileStore<Nv12Image>>,
+    unavailable: Option<String>,
+    tear_down_producer: bool,
+}
+
 impl CommandDrain {
     /// Build a drain over `commands` for the working `config`, publishing outcomes
     /// through `publisher`.
@@ -2424,6 +2458,10 @@ impl CommandDrain {
             applied_media,
             unapplied: std::collections::HashSet::new(),
             pending_teardowns: std::collections::BTreeSet::new(),
+            pending_unbinds: std::collections::BTreeMap::new(),
+            pending_binds: std::collections::BTreeMap::new(),
+            hub_aliases: std::collections::BTreeMap::new(),
+            booted_players: None,
             source_cap: multiview_config::MAX_ADMITTED_SOURCES,
             live_overlays: None,
             #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
@@ -2476,6 +2514,15 @@ impl CommandDrain {
     #[doc(hidden)]
     pub fn with_live_sources(mut self, live: crate::live_sources::LiveSourceHandle) -> Self {
         self.live_sources = Some(live);
+        self
+    }
+
+    /// The media-player channels the run booted, so a `media_player` source
+    /// bound to any other player is known to show no picture — even when a
+    /// placeholder store sits under the player id (review ship-1111 #4).
+    #[must_use]
+    pub fn with_booted_players(mut self, players: Arc<std::collections::BTreeSet<String>>) -> Self {
+        self.booted_players = Some(players);
         self
     }
 
@@ -2538,7 +2585,25 @@ impl CommandDrain {
     /// leases (new before old).
     #[cfg(feature = "ffmpeg")]
     #[must_use]
-    fn with_demand(mut self, demand: Option<crate::source_demand::DrainDemand<Nv12Image>>) -> Self {
+    #[doc(hidden)]
+    pub fn with_demand(
+        mut self,
+        demand: Option<crate::source_demand::DrainDemand<Nv12Image>>,
+    ) -> Self {
+        if let Some(demand) = &demand {
+            self.booted_players = Some(Arc::clone(&demand.booted_players));
+            // Boot already catalogued every configured `media_player` alias
+            // (and put its store in the preview map): that is what the hub
+            // holds for it, so a removal before any live upsert withdraws
+            // exactly that binding (review ship-1111 round 4).
+            for (id, entry) in demand.catalogue.load().iter() {
+                if entry.is_alias() {
+                    self.hub_aliases
+                        .entry(id.clone())
+                        .or_insert_with(|| Arc::clone(entry.store()));
+                }
+            }
+        }
         self.demand = demand;
         self
     }
@@ -2624,6 +2689,8 @@ impl CommandDrain {
         }
 
         self.retry_pending_teardown();
+        self.retry_pending_unbind();
+        self.retry_pending_bind();
         // Drain the bus, routing commands. Video re-points are enqueued (batched +
         // bounded); every other command is applied immediately as before.
         #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
@@ -3352,6 +3419,13 @@ impl CommandDrain {
             // (and store) under the player id.
             drive.remove_store(id);
             self.publish_alias(id, None);
+            // A shed alias binding is moot: the producer upsert's own hub
+            // request tears down whatever runs under the id first.
+            self.pending_binds.remove(id);
+            // The producer's own hub request re-catalogues the id; a shed one
+            // must not leave the alias catalogued, so withdraw what the hub
+            // holds (store-guarded: it never touches the producer's entry).
+            self.unbind_accepted_alias(id);
         }
         true
     }
@@ -3396,9 +3470,20 @@ impl CommandDrain {
         if self.over_source_cap(&id) {
             return;
         }
-        if replaced_producer && !is_player_id {
-            self.teardown_replaced_producer(&id);
-        }
+        // Producer -> alias: the old producer is torn down by the hub inside
+        // the SAME ordered BindAlias request (review ship-1111 #1), never by a
+        // separate teardown that could land after the binding. A shed removal
+        // of a producer still pending under this id is folded in the same way.
+        // Judged against the APPLIED identity too, so a re-apply after a shed
+        // bind (the mirror already says alias) still tears the producer down.
+        let applied_producer = self
+            .applied_media
+            .get(&id)
+            .is_some_and(|s| !matches!(s.kind, multiview_config::SourceKind::MediaPlayer { .. }));
+        let tear_down_producer = !is_player_id
+            && (replaced_producer || applied_producer || self.pending_teardowns.contains(&id));
+        let unavailable = (!self.player_booted(player, drive))
+            .then(|| crate::live_sources::no_channel_reason(player));
         // A repoint (alias A -> B) replaces this id's entry with B's store; the
         // previous player's own entry is never touched.
         if id != player || drive.store(player).is_none() {
@@ -3430,41 +3515,184 @@ impl CommandDrain {
             Some(slot) => *slot = source.clone(),
             None => self.config.sources.push(source.clone()),
         }
-        self.applied_media.insert(id.clone(), source.clone());
-        self.unapplied.remove(&id);
+        let Some(store) = drive.store(&id).cloned() else {
+            return;
+        };
+        self.submit_bind(PendingBind {
+            source: source.clone(),
+            store,
+            unavailable,
+            tear_down_producer,
+        });
     }
 
-    /// Stop the producer a `media_player` alias replaces under `id`, through
-    /// the same bounded bookkeeping as [`Self::remove_source`] (review #477):
-    /// a shed (`Full`) teardown of a hub-known producer is kept in
-    /// `pending_teardowns` and retried one per tick, never dropped. While
-    /// the retry is pending the id is both an alias and a pending teardown;
-    /// [`Self::over_source_cap`] counts it once.
-    fn teardown_replaced_producer(&mut self, id: &str) {
+    /// Submit one ordered alias replace to the hub. Accepted: it superseded
+    /// every earlier hub request for the id (its teardown ran first inside
+    /// it, and it replaced any entry a pending unbind would withdraw).
+    /// Shed (`Full`): kept whole in `pending_binds`, retried per tick; the
+    /// drive binding already applies and only the hub side lags.
+    fn submit_bind(&mut self, bind: PendingBind) {
+        let id = bind.source.id.clone();
+        let accepted = self.bind_alias_off_clock(
+            &bind.source,
+            Arc::clone(&bind.store),
+            bind.unavailable.clone(),
+            bind.tear_down_producer,
+        );
+        if accepted {
+            self.applied_media.insert(id.clone(), bind.source);
+            self.unapplied.remove(&id);
+            self.pending_teardowns.remove(&id);
+            // The hub replaced whatever it held under the id with this store.
+            self.pending_unbinds.remove(&id);
+            self.pending_binds.remove(&id);
+            self.hub_aliases.insert(id, bind.store);
+        } else {
+            self.unapplied.insert(id.clone());
+            self.pending_binds.insert(id, bind);
+        }
+    }
+
+    /// Resubmit ONE shed alias binding (non-blocking `try_send`).
+    fn retry_pending_bind(&mut self) {
+        let Some(bind) = self.pending_binds.values().next().cloned() else {
+            return;
+        };
+        if self.live_sources.is_none() {
+            return;
+        }
+        self.submit_bind(bind);
+    }
+
+    /// Drop a shed alias binding the id no longer wants (removed, or edited
+    /// into another kind). One that was to replace a producer leaves that
+    /// producer running at the hub: hand it to the generic teardown (safe —
+    /// the id is never a player's: those never carry a producer teardown).
+    fn drop_pending_bind(&mut self, id: &str) {
+        if let Some(bind) = self.pending_binds.remove(id) {
+            if bind.tear_down_producer && !self.pending_teardowns.contains(id) {
+                self.pending_teardowns.insert(id.to_owned());
+            }
+        }
+    }
+
+    /// Shed alias bindings still awaiting the hub (test seam).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pending_binds(&self) -> usize {
+        self.pending_binds.len()
+    }
+
+    /// Whether `player` has a real channel in this run: the booted set when
+    /// the run gave one (a placeholder store under the player id — an
+    /// identity alias of a player that failed boot — is not a channel), else
+    /// whether the drive holds its store.
+    fn player_booted(&self, player: &str, drive: &CompositorDrive<Nv12Image>) -> bool {
+        self.booted_players.as_ref().map_or_else(
+            || drive.store(player).is_some(),
+            |booted| booted.contains(player),
+        )
+    }
+
+    /// Hand a bound `media_player` alias to the off-clock hub (ADR-M012) in
+    /// ONE ordered request: tear down a replaced producer (when
+    /// `tear_down_producer`), then catalogue the alias for demand (standing
+    /// pins, status, switcher leases) and publish its store to the
+    /// preview/wall map. One non-blocking `try_send` (inv #1/#10). Returns
+    /// whether the hub accepted it; with no hub wired there is nothing to
+    /// tell, which counts as accepted.
+    fn bind_alias_off_clock(
+        &self,
+        source: &multiview_config::Source,
+        store: Arc<multiview_framestore::TileStore<Nv12Image>>,
+        unavailable: Option<String>,
+        tear_down_producer: bool,
+    ) -> bool {
+        let Some(seam) = self.live_sources.as_ref() else {
+            return true;
+        };
+        let outcome = seam.request_bind_alias(crate::live_sources::AliasBind {
+            source: source.clone(),
+            store,
+            unavailable,
+            replaces_producer: tear_down_producer,
+        });
+        if outcome == crate::live_sources::HubSubmit::Accepted {
+            return true;
+        }
+        tracing::warn!(
+            source = %source.id, ?outcome,
+            "media_player alias bound on the drive; its hub registration (status, \
+             preview, replaced-producer teardown) was shed (re-apply the source to retry)"
+        );
+        false
+    }
+
+    /// Withdraw a removed `media_player` alias bound to `store` from the
+    /// hub's catalogue, pins and preview map (non-blocking). A shed (`Full`)
+    /// unbind is kept in `pending_unbinds` and retried one per tick (review
+    /// ship-1111 #2). A player-identical id keeps its preview entry (the
+    /// player channel) and is never handed to a generic teardown.
+    fn unbind_alias_off_clock(
+        &mut self,
+        id: &str,
+        store: Option<Arc<multiview_framestore::TileStore<Nv12Image>>>,
+    ) {
         let Some(seam) = self.live_sources.clone() else {
             return;
         };
-        match seam.request_teardown(id) {
+        let Some(store) = store else {
+            return;
+        };
+        let keep_preview = self.config.media_players.iter().any(|p| p.id == id);
+        match seam.request_unbind_alias(id, &store, keep_preview) {
             crate::live_sources::HubSubmit::Accepted => {
-                self.pending_teardowns.remove(id);
+                self.pending_unbinds.remove(id);
             }
             crate::live_sources::HubSubmit::Full => {
                 tracing::warn!(
                     source = %id,
-                    "live-source hub queue full; the replaced producer's teardown is \
-                     retried each tick"
+                    "live-source hub queue full; media_player alias unbind is retried each tick"
                 );
-                if self.applied_media.contains_key(id) {
-                    self.pending_teardowns.insert(id.to_owned());
-                }
+                self.pending_unbinds.insert(id.to_owned(), store);
             }
             crate::live_sources::HubSubmit::Gone => {
-                tracing::warn!(
-                    source = %id,
-                    "live-source hub gone; the replaced producer stops at run teardown"
-                );
+                self.pending_unbinds.remove(id);
+                tracing::warn!(source = %id, "live-source hub gone; alias unbind dropped");
             }
         }
+    }
+
+    /// A removed alias: withdraw the binding the hub last ACCEPTED (never the
+    /// drive's, which may be a repoint the hub never saw). With none accepted
+    /// the hub holds nothing for it. A pending unbind of an earlier accepted
+    /// binding is never overwritten by one the hub never applied: it only
+    /// changes when a later binding was accepted (which cancelled it).
+    fn unbind_accepted_alias(&mut self, id: &str) {
+        let Some(store) = self.hub_aliases.remove(id) else {
+            return;
+        };
+        self.unbind_alias_off_clock(id, Some(store));
+    }
+
+    /// Resubmit ONE shed alias unbind (non-blocking `try_send`).
+    fn retry_pending_unbind(&mut self) {
+        let Some((id, store)) = self
+            .pending_unbinds
+            .iter()
+            .next()
+            .map(|(id, store)| (id.clone(), Arc::clone(store)))
+        else {
+            return;
+        };
+        self.unbind_alias_off_clock(&id, Some(store));
+    }
+
+    /// Shed alias unbinds still awaiting the hub (test seam).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pending_unbinds(&self) -> usize {
+        self.pending_unbinds.len()
     }
 
     /// An upsert that changes only presentation or standing policy
@@ -3532,6 +3760,8 @@ impl CommandDrain {
                 drive.remove_store(id);
             }
             self.publish_alias(id, None);
+            self.drop_pending_bind(id);
+            self.unbind_accepted_alias(id);
             self.config.sources.retain(|s| s.id != id);
             self.applied_media.remove(id);
             self.unapplied.remove(id);
@@ -3629,16 +3859,29 @@ impl CommandDrain {
     /// Whether a NEW id must be held because hub-known sources plus shed
     /// removals still awaiting their teardown reach the cap (review #477).
     /// Held like a shed submit: re-apply once the hub has caught up.
-    fn over_source_cap(&mut self, id: &str) -> bool {
-        let known = self.applied_media.contains_key(id) || self.pending_teardowns.contains(id);
-        // Distinct ids: a `media_player` alias whose replaced producer's
-        // teardown is still pending is one id, counted once.
+    /// Distinct ids holding hub state or retry work: hub-known sources plus
+    /// shed removals, unbinds and bindings (an id in several counts once).
+    /// What the live source cap bounds (test seam).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn admitted_sources(&self) -> usize {
         let pending_only = self
             .pending_teardowns
             .iter()
+            .chain(self.pending_unbinds.keys())
+            .chain(self.pending_binds.keys())
             .filter(|p| !self.applied_media.contains_key(p.as_str()))
-            .count();
-        if known || self.applied_media.len() + pending_only < self.source_cap {
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        self.applied_media.len() + pending_only
+    }
+
+    fn over_source_cap(&mut self, id: &str) -> bool {
+        let known = self.applied_media.contains_key(id)
+            || self.pending_teardowns.contains(id)
+            || self.pending_unbinds.contains_key(id)
+            || self.pending_binds.contains_key(id);
+        if known || self.admitted_sources() < self.source_cap {
             return false;
         }
         tracing::warn!(
