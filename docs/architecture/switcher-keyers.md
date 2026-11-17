@@ -19,7 +19,7 @@ destination rectangle on the canvas.
 | Per-pixel alpha in both kernels | `Nv12Image` with a straight R8 plane from `AlphaPlanePool` (`crates/multiview-compositor/src/pipeline.rs:172-261`). The CPU multiplies it at the premultiply step (`pipeline.rs:1401`, `:1680`). The GPU uses `a_planes` and `TileParams.dst_size.zw` (`composite.wgsl:60`, `:151`). | `linear` keys read this plane directly. Luma and mask math go next to it. |
 | Fills with alpha | Graphics sources `graphic` and `graphics_channel` publish NV12+A and do their own opacity mix on their generator thread (`docs/architecture/graphics.md`). | DSK fills with alpha (lower thirds, bug, weather). |
 | Key signal from any video | Every source is NV12. Its Y is the luma key. | Self luma key, or a fill and key pair through a second source. |
-| Media with alpha | Not decoded. FFmpeg has no `yuva` path. NDI drops alpha (`crates/multiview-input/src/ndi/convert.rs:369`). | Slice K6. |
+| Media with alpha | Media players decode ProRes 4444, `qtrle`, PNG/TGA and VP9 alpha (`libvpx-vp9`) to NV12+A on every published frame (ADR-0112 §5, #451; load gate and runtime path in K6, §14). Unsupported alpha (`pal8`) and HEVC alpha are refused at load. NDI still drops alpha (`crates/multiview-input/src/ndi/convert.rs`, ADR-0058 §5). | `linear` self keys read the plane (K6, §14). |
 | Descriptor types | `KeySource`, `KeyType`, `KeyerTransition`, `KeyerDescriptor`, `ArmedSet` in `crates/multiview-core/src/switcher/descriptor.rs`. `SwitcherState.keys_on_air` and `arm()` in `crates/multiview-engine/src/switcher.rs`. | Kept and extended. They are not wired to anything today. |
 | Fresh-frame gate | ADR-0104: `state_at(tick.pts).is_live()`, held up to 50 ticks, typed refusal. | Applied to fill and key before a keyer goes on. |
 | Transition weights and masks | AUTO: `elapsed / duration`. DIP: `dip_weights` (lane `transitions`, in progress). WIPE: a per-tile mask (lane `transitions`, in progress). | An armed USK or tied DSK reuses the same weight or mask (§4). |
@@ -475,7 +475,7 @@ data plane). K5 is R2.
 | K3 (#388) | USKs and transitions: arm set, groups for key-changing MIX/DIP/WIPE, key-only transitions, tied DSKs on DIP/WIPE | K2, lane `transitions` DIP and WIPE |
 | K4 (#389) | Control API: verbs, plan with scoped visibility, BOLA row filtering and redaction, persistence after `applied`, OpenAPI/AsyncAPI | K2 (K3 for `arm`) |
 | K5 (#390) | Desk: keyer strip, DSK controls, keyer panel, key tally on the wall | K4 |
-| K6 (#391) | Alpha media: media-player decode of ProRes 4444, qtrle, PNG/TGA and VP9 alpha into NV12+A; NDI alpha; the SW-11 import gate | K2 |
+| K6 (#391) | Alpha media: media-player decode of ProRes 4444, qtrle, PNG/TGA and VP9 alpha into NV12+A; NDI alpha; the SW-11 import gate. Media alpha built, §14; NDI alpha and the import gate deferred | K2 |
 | K7 (#392) | Chroma key (ADR-C007 domain); built, §14 | K1 |
 
 The backlog rows SW-9 (#35) and SW-10 (#36) are superseded by K1 and K2–K3. They predate the
@@ -1273,6 +1273,71 @@ merge (see "K1 GPU key path as built", wipe masks).
     mda001 run.
   - **GPU timing:** the WIPE merge adds one mask evaluation per pixel of a key-changing frame;
     lavapipe proves equality only, and the RTX 4060 figures are still owed with the bench.
+
+### K6 (#391): alpha media fills
+
+- **Decode** came in #451 (ADR-0112 §5): `multiview_ffmpeg::alpha::alpha_layout` maps the
+  libav alpha formats, `DecodedVideoFrame::alpha` carries the decoder's own frame, and the
+  player's `MediaAlpha` writes a straight full-resolution R8 plane from the bounded
+  `AlphaPlanePool` into each `Nv12Image`. The compositor and keyers already consumed
+  `alpha_plane` generically.
+- **The gap K6 closed.** That decode was unreachable. `player/probe.rs` still refused every
+  pixel format with four components (a pre-#391 gate), and the runtime player that every
+  `ffmpeg` build runs (`PlayerOpener` → `player_runtime_body`) converted frames with
+  `TileScaler::convert` alone and opened the default decoder. Only the legacy
+  `open_and_stream` loop attached alpha, and it serves only a player with no runtime.
+- **Load gate.** `multiview_ffmpeg::alpha::alpha_support` classifies the decoder's pixel
+  format through the same `alpha_layout`. A mapped format is `Supported`. A format libav flags
+  `AV_PIX_FMT_FLAG_ALPHA` that the map cannot carry (`pal8`, `ayuv64`) is `Unsupported`. Every
+  other format is `Opaque`. The gate cannot admit alpha that the decode then drops. The opener
+  refuses `Unsupported` with `ProbeError::Alpha`, and the wire code stays `alpha`. The
+  message names the format and the remediation: transcode to ProRes 4444, `qtrle`, VP9
+  alpha (WebM) or a PNG sequence.
+- **HEVC alpha** is an auxiliary layer, and its base-layer pixel format is opaque. libav
+  decodes it opaque (ADR-0058 §3). The opener reads `vps_max_layers_minus1` from the
+  stream's VPS (`hvcC` or Annex-B extradata). The VPS header is fixed-length, so this is a
+  bounded byte read. Any HEVC stream with more than one layer is refused with
+  `ProbeError::HevcAlpha` (code `alpha`). That also refuses multi-layer HEVC that is not
+  alpha (MV-HEVC), which the player could not show correctly either. HEVC whose VPS sits only
+  in-band (no extradata) is not detected and plays opaque, as before.
+- **Runtime path.** The opener opens `libvpx-vp9` for a WebM `alpha_mode=1` VP9 stream
+  (ADR-0112 §5, the same `vp9_alpha_decoder`/`open_named` as the legacy loop). Without it
+  the asset plays opaque with a warning. For an alpha clip the opener builds the `MediaAlpha`
+  off the ingest thread, primes the first image as NV12+A and moves the attacher with the
+  decoder in `StagedClip`. All three runtime decode sites and the legacy loop convert through
+  one `tile_image_with_alpha`. Steady state uses only the pooled plane and the reused scratch
+  frames and scaler. A failed attach drops the frame and keeps last-good. Opaque clips build
+  nothing.
+- **Tests.**
+  - `multiview-ffmpeg` `alpha::alpha_support_agrees_with_the_layout_map`.
+  - `multiview-cli` probe (4):
+    - Supported alpha is accepted and reported. `pal8` is refused with the remediation.
+      This replaces `alpha_is_rejected` in its own commit, because that test encoded the
+      removed behaviour.
+    - The VPS layer count is read from `hvcC` and Annex-B, and malformed input gives `None`.
+    - Multi-layer HEVC is refused, and single-layer HEVC plays.
+  - `multiview-cli` opener (2 new, 1 extended):
+    - A `qtrle` clip stages with `has_alpha` and an exact banded primed alpha plane.
+    - A `pal8` PNG clip fails with `Alpha` and the remediation.
+    - An opaque clip builds no alpha path.
+  - `multiview-cli` runtime, with the real opener, `player_runtime_loop` and `TileStore`
+    (3): `qtrle` (exact), ProRes 4444 (±1) and VP9 alpha (±2) publish the banded alpha on
+    every frame after the commit. VP9 proves the `libvpx-vp9` selection. These tests fail
+    against the previous runtime body or decoder choice.
+  - `multiview-engine` `keyers_dsk`: a DSK with a linear self key over a banded NV12+A fill,
+    run with the real hook and CPU drive, matches an independent per-pixel oracle within 1
+    code value: front half, premultiply once, `over`, back half.
+- **Not done.**
+  - **NDI alpha** (deferred by ADR-0058 §5). NDI ingest keeps dropping BGRA alpha for
+    ordinary sources. The designed shape is Alternative C: an external fill and key pair
+    keyed through `KeySource{fill, key}`, which works today with two NDI sources. A
+    single-source NDI BGRA to NV12+A path would need a decision on which NDI sources may
+    carry alpha, because ordinary video must never pay for it. The #391 item "NDI alpha"
+    stays open for that.
+  - **The SW-11 import gate** (ADR-0057 stinger eligibility, the `trigger_point` and the
+    mezzanine budget). The load-time gate above refuses undecodable alpha. It does not do
+    import-time transcode.
+  - Paletted alpha (`pal8`), HEVC alpha decode, and alpha in P010 (10-bit canvas) media.
 
 ### K7 (#392): chroma key
 

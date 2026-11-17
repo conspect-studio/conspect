@@ -257,12 +257,22 @@ impl ChangeList {
 pub struct OutputLabels {
     lists: SwapCell<Arc<BTreeMap<Component, ChangeList>>>,
     labelled_through: AtomicU64,
-    /// Identities the control plane minted for the changes it requested
-    /// (newest last, at most [`MAX_CHANGES`]): the engine labels a change
-    /// with the control-plane identity only when it is listed here, else in
-    /// the engine's range.
-    requested: SwapCell<Arc<Vec<u64>>>,
+    /// Identities the control plane minted for the changes it requested,
+    /// each with a sequence number (newest last, at most [`MAX_CHANGES`]).
+    /// The control plane is the ONLY writer (serialized by `expecting`);
+    /// the bake consumer only loads it and keeps what it consumed in its own
+    /// [`Consumed`] (PR 516 review round 2: no read-modify-write from two
+    /// threads, so no registration is lost and none is consumed twice).
+    requested: SwapCell<Arc<Vec<(u64, u64)>>>,
+    /// Serializes the control-plane writers of `requested` (never taken by
+    /// the bake consumer).
+    expecting: Mutex<u64>,
 }
+
+/// The requests one labeller already used (owned by the bake consumer; see
+/// [`OutputLabels::label`]). Bounded by the request log it is pruned to.
+#[derive(Debug, Default, Clone)]
+pub struct Consumed(Vec<u64>);
 
 impl Default for OutputLabels {
     fn default() -> Self {
@@ -270,6 +280,7 @@ impl Default for OutputLabels {
             lists: SwapCell::from_pointee(BTreeMap::new()),
             labelled_through: AtomicU64::new(0),
             requested: SwapCell::from_pointee(Vec::new()),
+            expecting: Mutex::new(0),
         }
     }
 }
@@ -282,12 +293,16 @@ impl OutputLabels {
     }
 
     /// The control plane requests a change carrying `ids` (before the
-    /// engine hears of it).
+    /// engine hears of it). Control-plane writers only; serialized.
     pub fn expect(&self, ids: &[u64]) {
+        let mut seq = self
+            .expecting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let mut all = self.requested.load().as_ref().clone();
         for id in ids {
-            all.retain(|known| known != id);
-            all.push(*id);
+            *seq = seq.saturating_add(1);
+            all.push((*seq, *id));
         }
         while all.len() > MAX_CHANGES {
             all.remove(0);
@@ -296,18 +311,26 @@ impl OutputLabels {
     }
 
     /// The label of a change to content identity `id`: `id` when the control
-    /// plane requested it (the request is consumed: one requested change
-    /// labels one change), else `id` in the engine's range.
+    /// plane requested it and `consumed` has not used that request yet (it
+    /// is then recorded there: one request labels one change), else `id` in
+    /// the engine's range. Reads the request log only; `consumed` belongs to
+    /// the one labelling thread and is pruned to the log, so it is bounded.
     #[must_use]
-    pub fn label(&self, id: u64) -> u64 {
+    pub fn label(&self, id: u64, consumed: &mut Consumed) -> u64 {
         let requested = self.requested.load();
-        if !requested.contains(&id) {
-            return engine_minted(id);
+        consumed
+            .0
+            .retain(|seq| requested.iter().any(|(s, _)| s == seq));
+        let found = requested
+            .iter()
+            .find(|(seq, known)| *known == id && !consumed.0.contains(seq));
+        match found {
+            Some((seq, _)) => {
+                consumed.0.push(*seq);
+                id
+            }
+            None => engine_minted(id),
         }
-        let mut rest = requested.as_ref().clone();
-        rest.retain(|known| *known != id);
-        self.requested.store(Arc::new(rest));
-        id
     }
 
     /// Record `(first_tick, id)` on `component` (the bake consumer only).
@@ -758,14 +781,68 @@ mod tests {
     #[test]
     fn a_requested_identity_labels_one_change() {
         let labels = OutputLabels::new();
+        let mut used = Consumed::default();
         labels.expect(&[7]);
-        assert_eq!(labels.label(7), 7);
+        assert_eq!(labels.label(7, &mut used), 7);
         assert_eq!(
-            labels.label(7),
+            labels.label(7, &mut used),
             engine_minted(7),
             "a second change was not requested"
         );
-        assert_eq!(labels.label(8), engine_minted(8));
+        assert_eq!(labels.label(8, &mut used), engine_minted(8));
+        labels.expect(&[7]);
+        assert_eq!(
+            labels.label(7, &mut used),
+            7,
+            "a new request labels a new change"
+        );
+    }
+
+    /// PR 516 review round 2: registrations and consumption from two threads
+    /// never lose a registration nor resurrect a consumed one. The labeller
+    /// never writes the shared log, so in every interleaving a registration
+    /// is either seen (labelled once) or not yet (and stays for later).
+    #[test]
+    fn concurrent_registration_and_consumption_lose_nothing() {
+        let n = u64::try_from(MAX_CHANGES).unwrap();
+        let labels = Arc::new(OutputLabels::new());
+        let writer = {
+            let labels = Arc::clone(&labels);
+            std::thread::spawn(move || {
+                for id in 1..=n {
+                    labels.expect(&[id]);
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let mut used = Consumed::default();
+        let mut labelled = Vec::new();
+        for _ in 0..100_000 {
+            for id in 1..=n {
+                if !labelled.contains(&id) && labels.label(id, &mut used) == id {
+                    labelled.push(id);
+                }
+            }
+            if labelled.len() == MAX_CHANGES {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        writer.join().unwrap();
+        for id in 1..=n {
+            if !labelled.contains(&id) && labels.label(id, &mut used) == id {
+                labelled.push(id);
+            }
+        }
+        labelled.sort_unstable();
+        assert_eq!(labelled, (1..=n).collect::<Vec<_>>(), "each exactly once");
+        for id in 1..=n {
+            assert_eq!(
+                labels.label(id, &mut used),
+                engine_minted(id),
+                "never twice"
+            );
+        }
     }
 
     #[test]

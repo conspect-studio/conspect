@@ -1236,8 +1236,9 @@ input. The control plane and the engine compute it with the same functions, so "
 identity of a change it requests" needs no token passed through the engine's take mailbox: the control plane
 computes it and registers it with the output's labels (`OutputLabels::expect`, bounded at 16) inside
 `reauth::before_change`, before the take is sent. The engine labels a change with that identity only when it is
-registered, and a registration labels one change (it is consumed); any other change gets the same digest with bit
-63 set (`ENGINE_MINTED`), a range the control plane
+registered, and a registration labels one change. The control plane is the only writer of that registration log
+(serialized); the bake consumer only reads it and keeps the sequence numbers it used in its own state, so a
+registration is never lost and never used twice. Any other change gets the same digest with bit 63 set (`ENGINE_MINTED`), a range the control plane
 never computes. A track re-pointed through the audio-routing route is always engine-minted.
 
 **Where the change list attaches.** Not to packets. Packets carry their timestamp, and the timestamp is a function
@@ -1246,7 +1247,8 @@ has one `OutputLabels` per run (in its `CastOutputEntry`, read by the control pl
 per component a change list of at most 16 `(first tick, identity)` entries, published through a `SwapCell`, and a
 monotonic `labelled_through` tick. The gate maps each packet of a window to `(component, tick)` with exact integer
 arithmetic and resolves it there. An audio packet codes a frame of samples (AAC: 1024) that can straddle a tick
-boundary, so it is resolved at the tick of its first and of its last sample, and both must be cleared.
+boundary (at 60 fps it covers up to three ticks), so it is resolved at every tick from its first sample to its last,
+and each must be cleared.
 
 **Who writes it, and when.** `cast_output::CastLabeller`, on the bake consumer, once per iteration, after the router
 tick. Per cast output it compares two fingerprints of what the router says the output carries (picture: the bus and,

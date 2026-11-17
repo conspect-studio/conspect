@@ -4075,7 +4075,14 @@ mod moq_rung {
         let program = identity(&Component::Video, "program");
         assert!(attachment.clearance().clears(&Component::Video, program));
         let labels = rig.cast.labels["cast-1"].clone();
-        assert_eq!(labels.label(program), program, "registered as requested");
+        assert_eq!(
+            labels.label(
+                program,
+                &mut multiview_control::cast_streams::identity::Consumed::default()
+            ),
+            program,
+            "registered as requested"
+        );
         assert!(!attachment.is_fenced());
         let takes_before = rig.routing.takes().len();
         let unreadable = send(

@@ -606,7 +606,7 @@ fn pixel_format_code(format: ffi::AVPixelFormat) -> libc::c_int {
     code
 }
 
-fn descriptor_flags(format: ffi::AVPixelFormat) -> Option<u64> {
+pub(crate) fn descriptor_flags(format: ffi::AVPixelFormat) -> Option<u64> {
     #[allow(unsafe_code)]
     // SAFETY: `av_pix_fmt_desc_get` returns a pointer into libavutil's
     // static, immutable descriptor table, or null for an unknown format; it
