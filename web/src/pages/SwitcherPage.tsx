@@ -20,6 +20,10 @@ import { useJpegPreview } from '../preview/useJpegPreview';
 import { getPatch, planPatch, takePatch } from '../api/patch';
 import type { PatchRequest } from '../api/patch';
 import { MixerInputBank } from '../components/switcher/MixerInputBank';
+import { commandKeyer, planKeyer } from '../api/keyers';
+import type { KeyerRequest } from '../api/keyers';
+import { KeyerStrip } from '../components/switcher/KeyerStrip';
+import { KeyerPanel } from '../components/switcher/KeyerPanel';
 
 const STATE_KEY = ['switcher', 'me1'] as const;
 const PATCH_KEY = ['patch'] as const;
@@ -108,6 +112,22 @@ export function SwitcherPage(): JSX.Element {
   // Unknown (including unobserved/replay) is not permission to take again.
   const settled = operation?.phase === 'applied' || operation?.phase === 'failed';
   const ready = state.data !== undefined && (operationId === undefined || settled) && !mutate.isPending && !repatch.isPending;
+  const keyerReason = ready ? undefined : !state.data ? t`Switcher unavailable` : t`Operation in flight or outcome pending`;
+  const [keyerError, setKeyerError] = useState<string | undefined>();
+  const keyerMutate = useMutation({
+    mutationFn: async (fields: Omit<KeyerRequest, 'me' | 'program'>) => {
+      const { action, ...rest } = fields;
+      const req: KeyerRequest = { me: 'me1', program: 'main', action, ...rest };
+      const plan = await planKeyer(req);
+      if (!plan.can_take) throw new Error(plan.refusal?.detail ?? t`The keyer verb was refused`);
+      return submitTracked(() => commandKeyer(action, req, { idempotencyKey: newIdempotencyKey() }),
+        { topic: 'switcher', resource: 'me1', event: 'switcher.operation', terminal: { kind: 'switcher-operation', me: 'me1' } });
+    },
+    onSuccess: (result) => { setOperationId(result.operationId); setFailureReason(undefined); setKeyerError(undefined); },
+    onError: (reason: Error) => { setKeyerError(reason.message); },
+  });
+  // Canvas size is not carried by the switcher API; the operator sets it once for fly presets.
+  const [canvas] = useState({ w: 1920, h: 1080 });
   return (
     <main className="space-y-5 p-4">
       <PageHeader title={t`Program / Preview switcher`} />
@@ -148,7 +168,49 @@ export function SwitcherPage(): JSX.Element {
         <div className="space-y-1"><Label htmlFor="switcher-duration"><Trans>Auto frames</Trans></Label><Input id="switcher-duration" type="number" min="1" max="1000" value={duration} onChange={(event) => { setDuration(event.target.value); }} /></div>
         <Button disabled={!ready || !Number.isInteger(Number(duration)) || Number(duration) < 1} onClick={() => { mutate.mutate('auto'); }}><Trans>Auto</Trans></Button>
       </div>
-      <p className="text-xs text-muted-foreground"><Trans>Keyers, aux buses, multi-M/E and compositions as sources remain future switcher stages.</Trans></p>
+      {/*
+        TODO(#388): the BKGD/KEY 1-4 arm strip is built behind the presence of
+        USK rows/an `arm` verb in the generated client. K3 (upstream keyers)
+        is not merged — `components['schemas']` has no `arm` field as of this
+        commit — so this renders nothing rather than inventing API types.
+      */}
+      {(state.data?.keyers ?? []).length > 0 && (
+        <section className="space-y-3" aria-label={t`Downstream keyers`}>
+          <h2 className="font-semibold"><Trans>Downstream keyers</Trans></h2>
+          {(state.data?.keyers ?? []).map((row) => (
+            <KeyerStrip
+              key={row.id}
+              row={row}
+              tick={state.data?.tick ?? 0}
+              disabledReason={keyerReason}
+              onTie={(tie) => { keyerMutate.mutate({ action: 'keyer_tie', keyer: row.id, tie }); }}
+              onCut={() => { keyerMutate.mutate({ action: 'keyer_cut', keyer: row.id, on: !row.on_air }); }}
+              onAuto={(rateFrames) => { keyerMutate.mutate({ action: 'keyer_auto', keyer: row.id, on: !row.on_air, duration_frames: rateFrames }); }}
+            />
+          ))}
+          {keyerError !== undefined && <p role="alert" className="text-destructive">{keyerError}</p>}
+          {(state.data?.keyers ?? []).map((row) => (
+            <KeyerPanel
+              key={`panel-${row.id}`}
+              row={row}
+              sources={sources.data ?? []}
+              disabledReason={keyerReason}
+              canvas={canvas}
+              onPlan={async (fields) => planKeyer({ me: 'me1', program: 'main', action: 'keyer_set', keyer: row.id, ...fields })}
+              onApply={async (fields, allow) => {
+                const req: KeyerRequest = { me: 'me1', program: 'main', action: 'keyer_set', keyer: row.id, ...fields, ...(allow ? { on_air: 'allow' } : {}) };
+                const plan = await planKeyer(req);
+                if (!plan.can_take) throw new Error(plan.refusal?.detail ?? t`The keyer_set was refused`);
+                const result = await submitTracked(() => commandKeyer('keyer_set', req, { idempotencyKey: newIdempotencyKey() }),
+                  { topic: 'switcher', resource: 'me1', event: 'switcher.operation', terminal: { kind: 'switcher-operation', me: 'me1' } });
+                setOperationId(result.operationId);
+                setFailureReason(undefined);
+              }}
+            />
+          ))}
+        </section>
+      )}
+      <p className="text-xs text-muted-foreground"><Trans>Aux buses, multi-M/E and compositions as sources remain future switcher stages. Upstream keyers (USK) and the BKGD/KEY arm strip arrive with #388.</Trans></p>
     </main>
   );
 }
