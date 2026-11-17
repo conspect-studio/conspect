@@ -348,7 +348,7 @@ function ProductionDeskBody(): JSX.Element {
   const transitionReason = framesValid ? undefined : t`Enter 1–1000 frames`;
   const keyReason = (k: TransitionKind): string | undefined => k === 'stinger' ? stingReason : transitionReason;
   // A stinger runs for its own pre-roll plus clip, whatever AUTO's frames say.
-  const confirmedStinger = state.data?.transition?.kind === 'stinger' ? state.data.transition : undefined;
+  const confirmedStinger = confirmedTransition?.kind === 'stinger' ? confirmedTransition : undefined;
   const autoFrames = confirmedStinger ? String(confirmedStinger.pre_roll + confirmedStinger.clip_duration) : frames;
   const keyTitle = (k: TransitionKind): string => k === 'mix' ? t`Select a MIX for the next AUTO` : k === 'wipe' ? t`Select a WIPE for the next AUTO` : k === 'dip' ? t`Select a DIP for the next AUTO` : t`Select a STINGER for the next AUTO`;
   const stepFrames = (field: 'preRoll' | 'clipDuration' | 'triggerPoint' | 'mixRate') => (e: { target: { value: string } }): void => { setDraft({ ...draft, [field]: Number(e.target.value) }); };
