@@ -6,7 +6,8 @@
 //! the stream or drift (a "mediastreamvalidator-style" check). It is pure
 //! Rust and reads files only; the example `cast_validate` wraps it.
 //!
-//! What it checks is listed on [`check_cast_dir`]. Findings a player
+//! What it checks is listed on [`check_cast_dir_with`] (every audio and
+//! `WebVTT` subtitle rendition included, #418). Findings a player
 //! tolerates are `warnings`; everything else is an `error`.
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -51,6 +52,14 @@ pub struct CastCheckReport {
     pub discontinuities: usize,
     /// Whether the master lists an audio rendition.
     pub has_audio: bool,
+    /// Audio renditions the master lists (#418).
+    pub audio_renditions: usize,
+    /// Subtitle (`WebVTT`) renditions the master lists.
+    pub subtitle_renditions: usize,
+    /// Segments listed by the first subtitle playlist (0 without subtitles).
+    pub subtitle_segments: usize,
+    /// Cues in all listed `.vtt` segments of every subtitle rendition.
+    pub subtitle_cues: usize,
     /// Whether the segments carry `EXT-X-PROGRAM-DATE-TIME`.
     pub has_program_date_time: bool,
     /// Start time of the first listed video segment, in seconds
@@ -655,6 +664,8 @@ struct Listed {
     pdt_ms: Option<i64>,
     /// Presentation start in seconds, when the segment parsed.
     start: Option<f64>,
+    /// The same start exactly: `(ticks, timescale)`.
+    start_ticks: Option<(u64, u32)>,
 }
 
 /// A checked media playlist.
@@ -672,12 +683,18 @@ fn plain_file_name(uri: &str) -> bool {
     !uri.is_empty() && !uri.contains(['/', '\\', '?', '#']) && uri != "." && uri != ".."
 }
 
+/// `ticks / timescale` seconds. Split into whole seconds and a remainder so
+/// a media time past 2^31 ticks (about 19.9 h at 30 kHz) stays exact to the
+/// microsecond (a plain `Rational::as_f64` clamps its operands to `i32`).
 fn ratio(ticks: u64, timescale: u32) -> f64 {
-    multiview_core::time::Rational::new(
-        i64::try_from(ticks).unwrap_or(i64::MAX),
+    let scale = u64::from(timescale.max(1));
+    let whole = f64::from(u32::try_from(ticks / scale).unwrap_or(u32::MAX));
+    let fraction = multiview_core::time::Rational::new(
+        i64::try_from(ticks % scale).unwrap_or(0),
         i64::from(timescale.max(1)),
     )
-    .as_f64()
+    .as_f64();
+    whole + fraction
 }
 
 fn millis(ms: i64) -> f64 {
@@ -838,6 +855,7 @@ fn check_rendition(
         }
         let info = load_segment(dir, name, uri, video, errors);
         let mut start = None;
+        let mut start_ticks = None;
         if let (Some(info), Some(init)) = (&info, &init) {
             let duration = ratio(info.duration, init.timescale);
             if (duration - entry.extinf).abs() > 0.001 {
@@ -859,7 +877,9 @@ fn check_rendition(
             let first_pts = i64::try_from(info.tfdt)
                 .unwrap_or(i64::MAX)
                 .saturating_add(info.first_offset);
-            start = Some(ratio(u64::try_from(first_pts).unwrap_or(0), init.timescale));
+            let first_pts = u64::try_from(first_pts).unwrap_or(0);
+            start = Some(ratio(first_pts, init.timescale));
+            start_ticks = Some((first_pts, init.timescale));
         } else {
             previous = None;
         }
@@ -868,6 +888,7 @@ fn check_rendition(
             discontinuity_counter: counter,
             pdt_ms: entry.pdt_ms,
             start,
+            start_ticks,
         });
         sequence = sequence.saturating_add(1);
     }
@@ -875,12 +896,62 @@ fn check_rendition(
     Some(rendition)
 }
 
+/// One `EXT-X-MEDIA` entry of the master.
+#[derive(Debug, Clone, Default)]
+struct MediaEntry {
+    uri: String,
+    name: String,
+    default: bool,
+}
+
 /// What the master playlist declares.
 #[derive(Debug, Clone, Default)]
 struct Master {
     codecs: String,
     video_uri: Option<String>,
-    audio_uri: Option<String>,
+    /// The `TYPE=AUDIO` renditions, in order.
+    audio: Vec<MediaEntry>,
+    /// The `TYPE=SUBTITLES` renditions, in order.
+    subtitles: Vec<MediaEntry>,
+}
+
+/// Check one `EXT-X-MEDIA` group: one `GROUP-ID`, unique `NAME`s and (for
+/// audio) exactly one `DEFAULT=YES`.
+fn check_media_group(
+    kind: &str,
+    entries: &[MediaEntry],
+    groups: &[String],
+    errors: &mut Vec<String>,
+) {
+    const NAME: &str = "master.m3u8";
+    if entries.is_empty() {
+        return;
+    }
+    if groups.windows(2).any(|pair| pair.first() != pair.get(1)) {
+        errors.push(format!(
+            "{NAME}: the {kind} renditions use more than one GROUP-ID"
+        ));
+    }
+    for (i, entry) in entries.iter().enumerate() {
+        if entries.iter().take(i).any(|other| other.name == entry.name) {
+            errors.push(format!(
+                "{NAME}: two {kind} renditions are named \"{}\"",
+                entry.name
+            ));
+        }
+        if entries.iter().take(i).any(|other| other.uri == entry.uri) {
+            errors.push(format!(
+                "{NAME}: two {kind} renditions share the URI '{}'",
+                entry.uri
+            ));
+        }
+    }
+    let defaults = entries.iter().filter(|entry| entry.default).count();
+    if kind == "audio" && defaults != 1 {
+        errors.push(format!(
+            "{NAME}: {defaults} audio renditions are DEFAULT=YES (exactly one must be)"
+        ));
+    }
 }
 
 fn parse_master(text: &str, errors: &mut Vec<String>) -> Master {
@@ -892,17 +963,40 @@ fn parse_master(text: &str, errors: &mut Vec<String>) -> Master {
     }
     let mut stream_inf: Option<BTreeMap<String, String>> = None;
     let mut audio_group: Option<String> = None;
+    let mut subtitle_group: Option<String> = None;
+    let (mut audio_groups, mut subtitle_groups) = (Vec::new(), Vec::new());
     let mut variants = 0usize;
     for line in lines {
         if let Some(value) = line.strip_prefix("#EXT-X-MEDIA:") {
             let attrs = parse_attributes(value);
-            if attrs.get("TYPE").map(String::as_str) == Some("AUDIO") {
-                audio_group = attrs.get("GROUP-ID").cloned();
-                master.audio_uri = attrs.get("URI").cloned();
-                if master.audio_uri.is_none() {
-                    errors.push(format!("{NAME}: the audio EXT-X-MEDIA has no URI"));
-                }
-            }
+            let kind = attrs.get("TYPE").map(String::as_str);
+            let (label, entries, groups, group) = match kind {
+                Some("AUDIO") => (
+                    "audio",
+                    &mut master.audio,
+                    &mut audio_groups,
+                    &mut audio_group,
+                ),
+                Some("SUBTITLES") => (
+                    "subtitle",
+                    &mut master.subtitles,
+                    &mut subtitle_groups,
+                    &mut subtitle_group,
+                ),
+                _ => continue,
+            };
+            let Some(uri) = attrs.get("URI").cloned() else {
+                errors.push(format!("{NAME}: the {label} EXT-X-MEDIA has no URI"));
+                continue;
+            };
+            let group_id = attrs.get("GROUP-ID").cloned().unwrap_or_default();
+            groups.push(group_id.clone());
+            *group = Some(group_id);
+            entries.push(MediaEntry {
+                uri,
+                name: attrs.get("NAME").cloned().unwrap_or_default(),
+                default: attrs.get("DEFAULT").map(String::as_str) == Some("YES"),
+            });
         } else if let Some(value) = line.strip_prefix("#EXT-X-STREAM-INF:") {
             stream_inf = Some(parse_attributes(value));
         } else if !line.starts_with('#') {
@@ -929,6 +1023,13 @@ fn parse_master(text: &str, errors: &mut Vec<String>) -> Master {
                     attrs.get("AUDIO")
                 ));
             }
+            if attrs.get("SUBTITLES") != subtitle_group.as_ref() {
+                errors.push(format!(
+                    "{NAME}: the variant's SUBTITLES group {:?} does not match the EXT-X-MEDIA \
+                     GROUP-ID {subtitle_group:?}",
+                    attrs.get("SUBTITLES")
+                ));
+            }
             master.codecs = attrs.get("CODECS").cloned().unwrap_or_default();
             master.video_uri = Some(line.to_owned());
         }
@@ -938,6 +1039,8 @@ fn parse_master(text: &str, errors: &mut Vec<String>) -> Master {
             "{NAME}: expected one variant stream, found {variants}"
         ));
     }
+    check_media_group("audio", &master.audio, &audio_groups, errors);
+    check_media_group("subtitle", &master.subtitles, &subtitle_groups, errors);
     master
 }
 
@@ -949,6 +1052,15 @@ pub fn check_cast_dir(dir: &Path) -> CastCheckReport {
 }
 
 /// Read `dir` as a player would and report every violation.
+///
+/// With several audio renditions (#418) each is checked like the single one
+/// and against the video; the master must list unique `NAME`s, one
+/// `GROUP-ID` per type and exactly one `DEFAULT=YES` audio. Each `WebVTT`
+/// subtitle playlist must list the video's sequence range, `EXTINF`,
+/// discontinuities and program date time, and every `.vtt` must parse
+/// (`WEBVTT` header, `X-TIMESTAMP-MAP` with `MPEGTS` = the video segment start
+/// at 90 kHz modulo 2^33, one `LOCAL` timeline per rendition, cue times that
+/// end after they start, in start order).
 ///
 /// Checked: the master playlist (`BANDWIDTH`, `CODECS`, `RESOLUTION`,
 /// `FRAME-RATE`; every URI is a file in the directory); each media playlist
@@ -977,7 +1089,9 @@ pub fn check_cast_dir_with(dir: &Path, options: CastCheckOptions) -> CastCheckRe
         }
     };
     report.codecs.clone_from(&master.codecs);
-    report.has_audio = master.audio_uri.is_some();
+    report.has_audio = !master.audio.is_empty();
+    report.audio_renditions = master.audio.len();
+    report.subtitle_renditions = master.subtitles.len();
     let check = |uri: Option<&String>, video: bool, errors: &mut Vec<String>| {
         let uri = uri?;
         if !plain_file_name(uri) {
@@ -987,7 +1101,16 @@ pub fn check_cast_dir_with(dir: &Path, options: CastCheckOptions) -> CastCheckRe
         check_rendition(dir, uri, video, options, errors)
     };
     let video = check(master.video_uri.as_ref(), true, &mut errors);
-    let audio = check(master.audio_uri.as_ref(), false, &mut errors);
+    let audio: Vec<(String, Option<Rendition>)> = master
+        .audio
+        .iter()
+        .map(|entry| {
+            (
+                entry.uri.clone(),
+                check(Some(&entry.uri), false, &mut errors),
+            )
+        })
+        .collect();
 
     let mut expected_codecs = Vec::new();
     if let Some(video) = &video {
@@ -1006,11 +1129,21 @@ pub fn check_cast_dir_with(dir: &Path, options: CastCheckOptions) -> CastCheckRe
         report.first_video_start = video.listed.first().and_then(|s| s.start).unwrap_or(0.0);
         expected_codecs.extend(video.codec.clone());
     }
-    if let Some(audio) = &audio {
-        report.audio_segments = audio.listed.len();
+    for (index, (_, audio)) in audio.iter().enumerate() {
+        let Some(audio) = audio else {
+            continue;
+        };
+        if index == 0 {
+            report.audio_segments = audio.listed.len();
+            report.first_audio_start = audio.listed.first().and_then(|s| s.start).unwrap_or(0.0);
+        }
         report.max_extinf = report.max_extinf.max(audio.max_extinf);
-        report.first_audio_start = audio.listed.first().and_then(|s| s.start).unwrap_or(0.0);
-        expected_codecs.extend(audio.codec.clone());
+        // Every distinct audio codec once, in rendition order.
+        if let Some(codec) = &audio.codec {
+            if !expected_codecs.iter().skip(1).any(|listed| listed == codec) {
+                expected_codecs.push(codec.clone());
+            }
+        }
     }
     let expected_codecs = expected_codecs.join(",");
     if !expected_codecs.is_empty() && !master.codecs.is_empty() && master.codecs != expected_codecs
@@ -1020,19 +1153,42 @@ pub fn check_cast_dir_with(dir: &Path, options: CastCheckOptions) -> CastCheckRe
             master.codecs
         ));
     }
-    if let (Some(video), Some(audio)) = (&video, &audio) {
-        cross_check(video, audio, &mut errors, &mut report.warnings);
+    if let Some(video) = &video {
+        for (name, audio) in &audio {
+            if let Some(audio) = audio {
+                cross_check(video, name, audio, &mut errors, &mut report.warnings);
+            }
+        }
+        for (index, entry) in master.subtitles.iter().enumerate() {
+            if !plain_file_name(&entry.uri) {
+                errors.push(format!(
+                    "master.m3u8: URI '{}' is not a file here",
+                    entry.uri
+                ));
+                continue;
+            }
+            let Some(subs) =
+                check_subtitles(dir, &entry.uri, video, &mut errors, &mut report.warnings)
+            else {
+                continue;
+            };
+            if index == 0 {
+                report.subtitle_segments = subs.segments;
+            }
+            report.subtitle_cues = report.subtitle_cues.saturating_add(subs.cues);
+        }
     }
     report.errors = errors;
     report
 }
 
-/// Compare the video and the audio rendition: the same sequence range (one
-/// trailing segment of slack while a publish is in flight), and for every
-/// common sequence number the same discontinuity count and a start time
-/// within 25 ms.
+/// Compare the video and one audio rendition (`name` = its playlist): the
+/// same sequence range (one trailing segment of slack while a publish is in
+/// flight), and for every common sequence number the same discontinuity count
+/// and a start time within 25 ms.
 fn cross_check(
     video: &Rendition,
+    name: &str,
     audio: &Rendition,
     errors: &mut Vec<String>,
     warnings: &mut Vec<String>,
@@ -1047,18 +1203,18 @@ fn cross_check(
     };
     if v_first.abs_diff(a_first) > 1 || v_last.abs_diff(a_last) > 1 {
         errors.push(format!(
-            "video.m3u8 lists media sequences {v_first}..={v_last} but audio.m3u8 lists \
+            "video.m3u8 lists media sequences {v_first}..={v_last} but {name} lists \
              {a_first}..={a_last}"
         ));
     } else if v_first != a_first || v_last != a_last {
         warnings.push(format!(
-            "the playlists are one segment apart (video {v_first}..={v_last}, audio \
+            "the playlists are one segment apart (video {v_first}..={v_last}, {name} \
              {a_first}..={a_last}): a publish was in flight"
         ));
     }
     if video.playlist.target_duration != audio.playlist.target_duration {
         warnings.push(format!(
-            "EXT-X-TARGETDURATION differs: video {:?}, audio {:?}",
+            "EXT-X-TARGETDURATION differs: video {:?}, {name} {:?}",
             video.playlist.target_duration, audio.playlist.target_duration
         ));
     }
@@ -1070,34 +1226,329 @@ fn cross_check(
         common = common.saturating_add(1);
         if v.discontinuity_counter != a.discontinuity_counter {
             errors.push(format!(
-                "media sequence {}: the video discontinuity sequence is {} but the audio one is \
-                 {}",
-                v.sequence, v.discontinuity_counter, a.discontinuity_counter
+                "media sequence {}: the video discontinuity sequence is {} but the {} one is {}",
+                v.sequence,
+                v.discontinuity_counter,
+                rendition_label(name),
+                a.discontinuity_counter
             ));
         }
         if let (Some(video_start), Some(audio_start)) = (v.start, a.start) {
             if (video_start - audio_start).abs() > 0.025 {
                 errors.push(format!(
-                    "media sequence {}: video starts at {video_start:.6} s but audio at \
+                    "media sequence {}: video starts at {video_start:.6} s but {} at \
                      {audio_start:.6} s (more than 25 ms apart)",
-                    v.sequence
+                    v.sequence,
+                    rendition_label(name)
                 ));
             }
         }
         if let (Some(video_pdt), Some(audio_pdt)) = (v.pdt_ms, a.pdt_ms) {
             if video_pdt.abs_diff(audio_pdt) > 25 {
                 errors.push(format!(
-                    "media sequence {}: the video and audio EXT-X-PROGRAM-DATE-TIME are {} ms \
+                    "media sequence {}: the video and {} EXT-X-PROGRAM-DATE-TIME are {} ms \
                      apart",
                     v.sequence,
+                    rendition_label(name),
                     video_pdt.abs_diff(audio_pdt)
                 ));
             }
         }
     }
     if common == 0 {
-        errors.push("video.m3u8 and audio.m3u8 share no media sequence number".to_owned());
+        errors.push(format!(
+            "video.m3u8 and {name} share no media sequence number"
+        ));
     }
+}
+
+/// `audio` for the first audio playlist (the single-audio wording), else
+/// the playlist name.
+fn rendition_label(name: &str) -> &str {
+    if name == "audio.m3u8" {
+        "audio"
+    } else {
+        name
+    }
+}
+
+/// `2^33`: the `MPEGTS` wrap of `X-TIMESTAMP-MAP`.
+const MPEGTS_WRAP: u64 = 1 << 33;
+
+/// What one subtitle playlist holds.
+struct SubtitleSummary {
+    segments: usize,
+    cues: usize,
+}
+
+/// `[HH:]MM:SS.mmm` in milliseconds.
+fn parse_vtt_time(text: &str) -> Option<i64> {
+    let (clock, millis) = text.trim().split_once('.')?;
+    if millis.len() != 3 {
+        return None;
+    }
+    let millis: i64 = millis.parse().ok()?;
+    let parts: Vec<i64> = clock
+        .split(':')
+        .map(|part| part.parse().ok())
+        .collect::<Option<_>>()?;
+    let (hours, minutes, seconds) = match parts.as_slice() {
+        [h, m, s] => (*h, *m, *s),
+        [m, s] => (0, *m, *s),
+        _ => return None,
+    };
+    if minutes > 59 || seconds > 59 {
+        return None;
+    }
+    Some(((hours * 60 + minutes) * 60 + seconds) * 1000 + millis)
+}
+
+/// A parsed `.vtt` segment: `(MPEGTS, LOCAL ms)` and its cues in ms.
+struct VttSegment {
+    mpegts: u64,
+    local_ms: i64,
+    cues: Vec<(i64, i64)>,
+}
+
+/// Parse one `.vtt` segment the way an HLS player does.
+fn parse_vtt(name: &str, text: &str, errors: &mut Vec<String>) -> Option<VttSegment> {
+    let text = text.replace("\r\n", "\n");
+    let mut blocks = text.split("\n\n");
+    let header = blocks.next().unwrap_or_default();
+    let first = header.lines().next().unwrap_or_default();
+    if first != "WEBVTT" && !first.starts_with("WEBVTT ") && !first.starts_with("WEBVTT\t") {
+        return report(errors, name, "does not start with a WEBVTT header");
+    }
+    let Some(map) = header
+        .lines()
+        .find_map(|line| line.strip_prefix("X-TIMESTAMP-MAP="))
+    else {
+        return report(
+            errors,
+            name,
+            "no X-TIMESTAMP-MAP (an HLS player cannot place the cues)",
+        );
+    };
+    let mut mpegts = None;
+    let mut local_ms = None;
+    for part in map.split(',') {
+        if let Some(value) = part.strip_prefix("MPEGTS:") {
+            mpegts = value.trim().parse::<u64>().ok();
+        } else if let Some(value) = part.strip_prefix("LOCAL:") {
+            local_ms = parse_vtt_time(value);
+        }
+    }
+    let (Some(mpegts), Some(local_ms)) = (mpegts, local_ms) else {
+        return report(errors, name, &format!("malformed X-TIMESTAMP-MAP '{map}'"));
+    };
+    if mpegts >= MPEGTS_WRAP {
+        errors.push(format!(
+            "{name}: X-TIMESTAMP-MAP MPEGTS {mpegts} is not reduced modulo 2^33 (Shaka adds \
+             the rollover itself and would place the cues 95443.7 s late)"
+        ));
+    }
+    let mut cues = Vec::new();
+    let mut previous_start = i64::MIN;
+    for block in blocks {
+        let Some(timing) = block.lines().find(|line| line.contains("-->")) else {
+            continue;
+        };
+        let mut sides = timing.splitn(2, "-->");
+        let start = sides.next().and_then(parse_vtt_time);
+        let end = sides
+            .next()
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(parse_vtt_time);
+        let (Some(start), Some(end)) = (start, end) else {
+            errors.push(format!("{name}: unparsable cue timing '{timing}'"));
+            continue;
+        };
+        if end <= start {
+            errors.push(format!(
+                "{name}: cue '{timing}' does not end after it starts"
+            ));
+        }
+        if start < previous_start {
+            errors.push(format!(
+                "{name}: cue '{timing}' starts before the previous cue"
+            ));
+        }
+        previous_start = start;
+        cues.push((start, end));
+    }
+    Some(VttSegment {
+        mpegts,
+        local_ms,
+        cues,
+    })
+}
+
+/// Check one subtitle playlist against the video one: the same sequence
+/// numbers (one trailing segment of slack), `EXTINF`, discontinuities and
+/// program date time; every listed `.vtt` parses, maps its `LOCAL` time to
+/// the video segment start (`MPEGTS` = the 90 kHz media time of the segment
+/// start, modulo 2^33, within 1 ms), keeps one `MPEGTS - LOCAL` base for the
+/// whole rendition, and carries cues that overlap its segment.
+#[allow(clippy::too_many_lines)]
+// reason: one linear pass over the playlist; splitting it hides the order.
+fn check_subtitles(
+    dir: &Path,
+    name: &str,
+    video: &Rendition,
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Option<SubtitleSummary> {
+    let text = match std::fs::read_to_string(dir.join(name)) {
+        Ok(text) => text,
+        Err(e) => {
+            errors.push(format!("{name}: cannot be read: {e}"));
+            return None;
+        }
+    };
+    let playlist = parse_media_playlist(name, &text, errors);
+    if playlist.media_sequence.is_none() {
+        errors.push(format!("{name}: no EXT-X-MEDIA-SEQUENCE"));
+    }
+    if playlist.endlist {
+        errors.push(format!(
+            "{name}: a live playlist must not carry EXT-X-ENDLIST"
+        ));
+    }
+    if playlist.entries.is_empty() {
+        errors.push(format!("{name}: lists no segments"));
+    }
+    let mut summary = SubtitleSummary {
+        segments: playlist.entries.len(),
+        cues: 0,
+    };
+    let first = playlist.media_sequence.unwrap_or(0);
+    let last = first.saturating_add(u64::try_from(playlist.entries.len()).unwrap_or(0));
+    let (v_first, v_last) = (
+        video.listed.first().map_or(0, |s| s.sequence),
+        video
+            .listed
+            .last()
+            .map_or(0, |s| s.sequence.saturating_add(1)),
+    );
+    if v_first.abs_diff(first) > 1 || v_last.abs_diff(last) > 1 {
+        errors.push(format!(
+            "video.m3u8 lists media sequences {v_first}..{v_last} but {name} lists \
+             {first}..{last}"
+        ));
+    }
+    let mut counter = playlist.discontinuity_sequence;
+    let mut base: Option<u64> = None;
+    for (offset, entry) in playlist.entries.iter().enumerate() {
+        let sequence = first.saturating_add(u64::try_from(offset).unwrap_or(0));
+        let uri = entry.uri.as_str();
+        if entry.discontinuity {
+            counter = counter.saturating_add(1);
+        }
+        if entry.map.is_some() {
+            errors.push(format!(
+                "{name}: {uri}: a WebVTT playlist carries EXT-X-MAP"
+            ));
+        }
+        let paired = video
+            .listed
+            .iter()
+            .zip(&video.playlist.entries)
+            .find(|(listed, _)| listed.sequence == sequence);
+        if let Some((listed, video_entry)) = paired {
+            if (video_entry.extinf - entry.extinf).abs() > 0.001 {
+                errors.push(format!(
+                    "{name}: {uri}: EXTINF {} but video segment {sequence} lasts {}",
+                    entry.extinf, video_entry.extinf
+                ));
+            }
+            if listed.discontinuity_counter != counter {
+                errors.push(format!(
+                    "media sequence {sequence}: the video discontinuity sequence is {} but the \
+                     {name} one is {counter}",
+                    listed.discontinuity_counter
+                ));
+            }
+            if let (Some(video_pdt), Some(pdt)) = (listed.pdt_ms, entry.pdt_ms) {
+                if video_pdt.abs_diff(pdt) > 25 {
+                    errors.push(format!(
+                        "media sequence {sequence}: the video and {name} \
+                         EXT-X-PROGRAM-DATE-TIME are {} ms apart",
+                        video_pdt.abs_diff(pdt)
+                    ));
+                }
+            }
+        }
+        if !plain_file_name(uri) {
+            errors.push(format!("{name}: segment URI '{uri}' is not a file here"));
+            continue;
+        }
+        let body = match std::fs::read_to_string(dir.join(uri)) {
+            Ok(body) => body,
+            Err(e) => {
+                errors.push(format!("{name}: segment {uri} cannot be read: {e}"));
+                continue;
+            }
+        };
+        let Some(vtt) = parse_vtt(uri, &body, errors) else {
+            continue;
+        };
+        summary.cues = summary.cues.saturating_add(vtt.cues.len());
+        // MPEGTS maps the segment start on the video media timeline.
+        if let Some((ticks, timescale)) = paired.and_then(|(listed, _)| listed.start_ticks) {
+            let expected = media_90k(ticks, timescale) % MPEGTS_WRAP;
+            let delta = vtt.mpegts.abs_diff(expected);
+            // `render_vtt` moves MPEGTS back by the sub-millisecond part of
+            // LOCAL (at most 90 ticks); allow that plus rounding.
+            if delta.min(MPEGTS_WRAP.saturating_sub(delta)) > 180 {
+                errors.push(format!(
+                    "{uri}: X-TIMESTAMP-MAP MPEGTS {} but the video segment starts at {expected} \
+                     (90 kHz, mod 2^33)",
+                    vtt.mpegts
+                ));
+            }
+        }
+        // One LOCAL timeline per rendition: MPEGTS - LOCAL stays constant.
+        let local_90k = u64::try_from(vtt.local_ms).unwrap_or(0).saturating_mul(90);
+        let this_base =
+            (vtt.mpegts % MPEGTS_WRAP + MPEGTS_WRAP - local_90k % MPEGTS_WRAP) % MPEGTS_WRAP;
+        match base {
+            None => base = Some(this_base),
+            Some(base) => {
+                let delta = base.abs_diff(this_base);
+                if delta.min(MPEGTS_WRAP.saturating_sub(delta)) > 2 {
+                    errors.push(format!(
+                        "{uri}: X-TIMESTAMP-MAP moves the rendition's LOCAL timeline (MPEGTS - \
+                         LOCAL is {this_base}, earlier segments {base})"
+                    ));
+                }
+            }
+        }
+        let extinf_ms = (entry.extinf * 1000.0).round();
+        let (seg_start, seg_end) = (
+            millis(vtt.local_ms),
+            millis(vtt.local_ms) + extinf_ms / 1000.0,
+        );
+        for (start, end) in &vtt.cues {
+            // A cue that ended before the segment is a late cue carried once
+            // (`SlotCues::publish`): harmless, so only a warning.
+            if millis(*end) <= seg_start - 0.001 || millis(*start) >= seg_end + 0.001 {
+                warnings.push(format!(
+                    "{uri}: cue {:.3} --> {:.3} s lies outside its segment {seg_start:.3} .. \
+                     {seg_end:.3} s",
+                    millis(*start),
+                    millis(*end)
+                ));
+            }
+        }
+    }
+    Some(summary)
+}
+
+/// `ticks / timescale` as 90 kHz ticks (round half up).
+fn media_90k(ticks: u64, timescale: u32) -> u64 {
+    let scale = u128::from(timescale.max(1));
+    let value = (u128::from(ticks) * 90_000 * 2 + scale) / (scale * 2);
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

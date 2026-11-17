@@ -67,6 +67,19 @@ try {
   const page_ = await page.evaluate(() => ({ overlay: document.getElementById('overlay').getAttribute('data-state'), shaka: window.shaka && shaka.Player.version, caf: cast.framework.VERSION,
     commands: cast.framework.CastReceiverContext.getInstance().getPlayerManager().getSupportedMediaCommands(),
     elementVolume: window.__probe.video ? window.__probe.video.volume : null }));
+  // Diagnostic (ADR-0114 slice 2): CAF's media-time -> wall mapping against Shaka's own PDT view.
+  const mapping = await page.evaluate(() => {
+    const pm = cast.framework.CastReceiverContext.getInstance().getPlayerManager();
+    const v = window.__probe && window.__probe.video; const ct = v ? v.currentTime : pm.getCurrentTimeSec();
+    const out = { ct, now_s: Date.now() / 1000, abs: null, start: null, st_latency: null, shaka_date: null, range: null };
+    try { out.abs = pm.getAbsoluteTimeForMediaTime(ct); } catch (e) { out.abs = String(e); }
+    try { out.start = pm.getStartAbsoluteTime ? pm.getStartAbsoluteTime() : null; } catch (e) { out.start = String(e); }
+    try { out.st_latency = (pm.getStats() || {}).liveLatency; } catch (e) { /* none */ }
+    try { out.range = pm.getLiveSeekableRange(); } catch (e) { /* none */ }
+    try { const sp = pm.getShakaPlayer ? pm.getShakaPlayer() : null; const d = sp && sp.getPlayheadTimeAsDate(); out.shaka_date = d ? d.getTime() / 1000 : null; } catch (e) { out.shaka_date = String(e); }
+    return out;
+  });
+  console.log('MAPPING ' + JSON.stringify(mapping));
   const csp = await log.csp();
   if (enginePoll) { clearInterval(enginePoll); await sleep(1100); }
   // Engine mode: the engine keeps the last report only, so the polled reports stand in for the list (one POST per
@@ -110,6 +123,10 @@ try {
     checks.push(check('latency reported with a method', methodOk && (tr.latency_method === 'unavailable' ? tr.latency_ms === null : !!tr.latency_ms), tr ? `${tr.latency_method} ${JSON.stringify(tr.latency_ms)}` : 'none', 'frame|playhead|unavailable'));
     const lm = tr && tr.latency_ms;
     checks.push(check('tick-to-present latency by frame, 0.5..20 s, >= 50 samples', !!lm && tr.latency_method === 'frame' && lm.method === 'frame' && lm.median >= 500 && lm.median <= 20000 && lm.p95 >= lm.median && lm.samples >= 50 && typeof lm.clock_error_ms === 'number', lm ? JSON.stringify(lm) : 'none', 'frame, 500..20000 ms'));
+    // Same host, same clock: the tick-to-present figure must agree with Shaka's own view of the playhead's
+    // program date-time (now - getPlayheadTimeAsDate) within 1 s; a wrong media-time -> PDT mapping is seconds off.
+    const shakaBehind = mapping && typeof mapping.shaka_date === 'number' ? (mapping.now_s - mapping.shaka_date) * 1000 : null;
+    checks.push(check('latency agrees with the playhead program date-time (+-1 s)', !!lm && shakaBehind !== null && Math.abs(lm.median - shakaBehind) <= 1000, `${lm ? lm.median : 'none'} ms vs ${shakaBehind === null ? 'none' : Math.round(shakaBehind)} ms`, '+-1000 ms'));
     const ladderCalls = log.console.filter((l) => l.includes('[conspect-cast]') && /ladder: attach hls/.test(l)).length;
     checks.push(check('the receiver logged the ladder answer', ladderCalls >= 1, ladderCalls, '>= 1'));
   }

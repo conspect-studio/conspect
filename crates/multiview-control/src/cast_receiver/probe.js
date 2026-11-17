@@ -9,8 +9,8 @@
  *    with them, and remembers the engine's answer (attach.rung = "hls"; nothing else exists yet);
  *  - the NTP-style clock offset to the engine from each ladder call (t0 sent, t1 received, t2 answered, t3 back),
  *    best of the last 8 by error bound, a clock-only call every 30 s, "unavailable" above 250 ms;
- *  - tick-to-present latency: for each presented frame its engine wall time (CAF's getAbsoluteTimeForMediaTime of
- *    the frame's media time; the playlist's EXT-X-PROGRAM-DATE-TIME is the engine epoch) against the time it was
+ *  - tick-to-present latency: for each presented frame its engine wall time (Shaka's date-time of the playhead,
+ *    moved by the frame's distance from it; the playlist's EXT-X-PROGRAM-DATE-TIME is the engine epoch) against the time it was
  *    shown, moved onto the engine clock. Method "frame" (requestVideoFrameCallback), else "playhead" (currentTime
  *    every 100 ms), else "unavailable". Windows of 5 s from 3 s after the first frame; a sample outside 0..60 s is
  *    invalid; more than 5 invalid in a window make the method "unavailable" for the rest of the load;
@@ -160,9 +160,12 @@
   // ---------------------------------------------------------------- stall watchdog
 
   /**
-   * Counts presented frames (rVFC, else getVideoPlaybackQuality().totalVideoFrames) and calls onChange(stalled)
+   * Counts presented frames (rVFC callbacks, else getVideoPlaybackQuality() totalVideoFrames - droppedVideoFrames:
+   * totalVideoFrames alone also counts dropped frames) and calls onChange(stalled)
    * when no frame was presented for 2 s while the element plays, and again when frames come back. The later rungs
-   * use the same helper for their step-down; on HLS it only reports. `getVideo` returns the current element.
+   * use the same helper for their step-down; on HLS it only reports. `getVideo` returns the current element. The
+   * count starts from zero for each load (a new watchdog per start()); a value lower than the last one (the element
+   * restarted its counts) starts a new count and is not progress.
    * Returns {stop(), stalled(), counter}. `onFrame(now, metadata)` (optional) sees every rVFC callback.
    */
   function FrameWatchdog(getVideo, onChange, onFrame, timers) {
@@ -196,8 +199,13 @@
       if (self.counter === 'quality' && v) {
         var q = null;
         try { q = v.getVideoPlaybackQuality(); } catch (e) { q = null; }
-        var n = q ? q.totalVideoFrames : -1;
-        if (n !== self.lastCount) { self.lastCount = n; self.lastFrameAt = Date.now(); if (self.isStalled) { self.isStalled = false; onChange(false); } }
+        var n = P.presentedFrames(q);
+        if (n !== null && n < self.lastCount) { self.lastCount = n; }   // counts restarted: a new count, not progress
+        else if (n !== null && n > self.lastCount) {
+          var first = self.lastCount < 0;
+          self.lastCount = n;
+          if (!first) { self.lastFrameAt = Date.now(); if (self.isStalled) { self.isStalled = false; onChange(false); } }
+        }
       }
       if (self.counter === 'rvfc' && v && (!handle || handle.v !== v)) { arm(); }   // CAF replaced the element
       var playing = v && !v.paused && v.readyState >= 2;
@@ -205,6 +213,13 @@
       if (!self.isStalled && Date.now() - self.lastFrameAt >= STALL_MS) { self.isStalled = true; onChange(true); }
     }, QUALITY_EVERY_MS);
   }
+  /** Presented frames of a VideoPlaybackQuality: totalVideoFrames - droppedVideoFrames, or null. */
+  P.presentedFrames = function (q) {
+    if (!q || typeof q.totalVideoFrames !== 'number') { return null; }
+    var dropped = typeof q.droppedVideoFrames === 'number' ? q.droppedVideoFrames : 0;
+    return Math.max(0, q.totalVideoFrames - dropped);
+  };
+
   FrameWatchdog.prototype.stop = function () {
     this.stopped = true;
     try { root.clearInterval(this.timer); } catch (e) { /* none */ }
@@ -377,14 +392,26 @@
     } catch (e) { r.ladderStatus = 0; }
   }
 
-  function absoluteUs(r, mediaTime) {
+  /**
+   * The engine wall time (us) of the frame at element time `mediaTime`: the playlist's EXT-X-PROGRAM-DATE-TIME
+   * (the engine epoch) as Shaka maps it for the playhead now (getPlayheadTimeAsDate), moved by the frame's distance
+   * from the playhead: wall(frame) = date(playhead) - (currentTime - mediaTime). Measured in the harness: CAF's
+   * getAbsoluteTimeForMediaTime and Shaka's getPresentationStartTimeAsDate are NOT this mapping (both about 8 s
+   * off the playhead's date-time on a live HLS stream), so neither is used.
+   */
+  P.wallUsForMediaTime = function (playerManager, video, mediaTime) {
+    if (typeof mediaTime !== 'number' || !isFinite(mediaTime) || !video) { return null; }
     try {
-      var abs = r.playerManager.getAbsoluteTimeForMediaTime(mediaTime);
-      if (typeof abs !== 'number' || !isFinite(abs) || abs <= 0) { return null; }
-      // CAF returns seconds since the Unix epoch; accept milliseconds too.
-      return abs > 1e11 ? abs * 1000 : abs * 1e6;
+      var sp = typeof playerManager.getShakaPlayer === 'function' ? playerManager.getShakaPlayer() : null;
+      var date = sp && typeof sp.getPlayheadTimeAsDate === 'function' ? sp.getPlayheadTimeAsDate() : null;
+      var ms = date && typeof date.getTime === 'function' ? date.getTime() : NaN;
+      var ct = video.currentTime;
+      if (!isFinite(ms) || ms <= 0 || typeof ct !== 'number' || !isFinite(ct)) { return null; }
+      return (ms / 1000 - (ct - mediaTime)) * 1e6;
     } catch (e) { return null; }
-  }
+  };
+
+  function absoluteUs(r, mediaTime) { return P.wallUsForMediaTime(r.playerManager, r.video(), mediaTime); }
 
   function onPresented(r, presentUs, mediaTime) {
     if (r.firstFrameUs === null) {
@@ -404,10 +431,10 @@
     P.stop();
     var env = opts.env || root;
     var video = opts.video();
-    var hasAbs = !!(opts.playerManager && typeof opts.playerManager.getAbsoluteTimeForMediaTime === 'function');
+    var hasAbs = !!(opts.playerManager && typeof opts.playerManager.getShakaPlayer === 'function');
     var hasRvfc = !!(video && typeof video.requestVideoFrameCallback === 'function');
     var r = {
-      base: opts.base, playerManager: opts.playerManager, stopped: false,
+      base: opts.base, playerManager: opts.playerManager, video: opts.video, stopped: false,
       loadUs: typeof opts.loadUs === 'number' ? opts.loadUs : monoUs(),
       clock: new Clock(), latency: new Latency(P.methodFor(hasRvfc, hasAbs)),
       firstFrameUs: null, firstFrameMs: null, rung: null, ladderStatus: null,

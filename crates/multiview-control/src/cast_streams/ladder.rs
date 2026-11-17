@@ -44,6 +44,12 @@ pub const MAX_REPORTED_MS: u64 = 600_000;
 pub const MAX_LATENCY_MS: u64 = 60_000;
 /// Largest `t0` accepted (microseconds since the Unix epoch, year 2286).
 pub const MAX_T0_US: f64 = 1.0e16;
+/// Every `failed.stage` the protocol knows (decision 3).
+pub const STAGES: &[&str] = &["connect", "first-frame", "stall", "latency", "hook"];
+/// Rungs that need the receiver's presented-frame counter (`caps.frames`)
+/// for their stall watchdog: left out when it is absent ("Cast media
+/// status", rule 1).
+pub const NEED_FRAME_COUNTER: &[&str] = &["moq", "webrtc"];
 /// Every rung name the protocol knows (decision 2). Only `hls` is served
 /// by this build.
 pub const RUNGS: &[&str] = &["srt", "moq", "webrtc", "hls"];
@@ -160,7 +166,8 @@ pub struct ReceiverProbe {
 pub struct Fallback {
     /// The rung that failed.
     pub rung: String,
-    /// `connect`, `first-frame`, `stall` or `latency`.
+    /// `connect`, `first-frame`, `stall`, `latency` or `hook` (the WebRTC
+    /// media-element hook did not take).
     pub stage: String,
     /// The receiver's figure for it (ms), if any.
     pub ms: Option<u64>,
@@ -228,7 +235,7 @@ pub(super) struct LadderState {
     pub probe: Option<ReceiverProbe>,
     pub transport: Option<Transport>,
     pub fallbacks: VecDeque<Fallback>,
-    /// Live push attachments (MoQ, WebRTC, SRT; none in this build). While
+    /// Live push attachments (`moq`, `webrtc`, `srt`; none in this build). While
     /// any exists a successful ladder call or report counts as a playlist
     /// fetch for the token's liveness (decision 5.5).
     pub push_attachments: u32,
@@ -300,6 +307,38 @@ impl LadderState {
     }
 }
 
+/// The rungs this build serves (ADR-0114 slice 2: HLS only).
+pub const SERVED_RUNGS: &[&str] = &["hls"];
+
+/// The rung to attach and the rest, best first (decision 3, "What the
+/// engine leaves out", in that order): rungs the build or the run cannot
+/// serve (`served`), rungs `[cast] ladder` does not enable (`enabled`, whose
+/// order is the offer order), rungs the caps exclude (no presented-frame
+/// counter: no `moq`, no `webrtc`), and rungs in the device's `skip`. `hls` is
+/// the floor: it needs nothing a receiver claims and is never left out, so
+/// the answer always attaches a rung.
+#[must_use]
+pub fn offer(
+    enabled: &[String],
+    served: &[&'static str],
+    probe: Option<&ReceiverProbe>,
+) -> (&'static str, Vec<&'static str>) {
+    let no_frames = probe.is_none_or(|p| p.caps.frames.is_none());
+    let skipped = |rung: &str| probe.is_some_and(|p| p.skip.iter().any(|s| s.rung == rung));
+    let mut rungs: Vec<&'static str> = enabled
+        .iter()
+        .filter_map(|rung| served.iter().copied().find(|s| *s == rung))
+        .filter(|rung| *rung == "hls" || !(no_frames && NEED_FRAME_COUNTER.contains(rung)))
+        .filter(|rung| *rung == "hls" || !skipped(rung))
+        .collect();
+    rungs.dedup();
+    if !rungs.contains(&"hls") {
+        rungs.push("hls");
+    }
+    let attach = rungs.remove(0);
+    (attach, rungs)
+}
+
 /// A validated ladder request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LadderRequest {
@@ -359,17 +398,17 @@ fn opt_str(obj: &Map<String, Value>, key: &'static str, max: usize) -> Checked<O
 fn opt_u64(obj: &Map<String, Value>, key: &'static str, max: u64) -> Checked<Option<u64>> {
     field(obj, key)
         .map(|v| {
-            let n = v.as_f64().ok_or(Invalid(key))?;
-            if !n.is_finite() || n < 0.0 {
-                return Err(Invalid(key));
+            // An integer, or a float with no fraction (JSON from a browser):
+            // anything else, negative or above `max`, is refused.
+            let n = v.as_u64().or_else(|| {
+                v.as_f64()
+                    .filter(|f| f.is_finite() && *f >= 0.0 && f.fract() == 0.0 && *f <= 9.0e15)
+                    .and_then(|f| format!("{f:.0}").parse().ok())
+            });
+            match n {
+                Some(n) if n <= max => Ok(n),
+                _ => Err(Invalid(key)),
             }
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            // reason: finite, non-negative, and range-checked right below.
-            let n = n.round() as u64;
-            if n > max {
-                return Err(Invalid(key));
-            }
-            Ok(n)
         })
         .transpose()
 }
@@ -457,7 +496,7 @@ fn failed(value: &Value, now: u64) -> Checked<Fallback> {
     let rung = opt_str(obj, "rung", MAX_SHORT)?.ok_or(Invalid("failed.rung"))?;
     let rung = rung_name(&rung, "failed.rung")?;
     let stage = opt_str(obj, "stage", MAX_SHORT)?.ok_or(Invalid("failed.stage"))?;
-    if !["connect", "first-frame", "stall", "latency"].contains(&stage.as_str()) {
+    if !STAGES.contains(&stage.as_str()) {
         return Err(Invalid("failed.stage"));
     }
     Ok(Fallback {
@@ -729,6 +768,96 @@ mod tests {
             assert_eq!(parse(&body).unwrap_err(), Invalid(field), "{body}");
         }
         assert_eq!(parse_request(b"{not json", 0).unwrap_err(), Invalid("json"));
+    }
+
+    #[test]
+    fn the_hook_stage_is_accepted_and_every_stage_listed() {
+        for stage in STAGES {
+            let req =
+                parse(&serde_json::json!({"v": 1, "failed": {"rung": "webrtc", "stage": stage}}))
+                    .unwrap();
+            assert_eq!(req.failed.unwrap().stage, *stage);
+        }
+        assert_eq!(
+            STAGES,
+            ["connect", "first-frame", "stall", "latency", "hook"]
+        );
+    }
+
+    fn probe_with(frames: Option<FrameCounter>, skip: &[&str]) -> ReceiverProbe {
+        ReceiverProbe {
+            caps: ReceiverCaps {
+                frames,
+                ..ReceiverCaps::default()
+            },
+            skip: skip
+                .iter()
+                .map(|r| SkipEntry {
+                    rung: (*r).to_owned(),
+                    seconds: 60,
+                })
+                .collect(),
+            ..ReceiverProbe::default()
+        }
+    }
+
+    #[test]
+    fn the_offer_of_this_build_is_hls_only() {
+        let all: Vec<String> = ["srt", "moq", "webrtc", "hls"].map(String::from).to_vec();
+        let probe = probe_with(Some(FrameCounter::Rvfc), &[]);
+        assert_eq!(offer(&all, SERVED_RUNGS, Some(&probe)), ("hls", vec![]));
+        assert_eq!(
+            offer(&["hls".to_owned()], SERVED_RUNGS, None),
+            ("hls", vec![])
+        );
+        assert_eq!(
+            offer(&[], SERVED_RUNGS, None),
+            ("hls", vec![]),
+            "hls is the floor"
+        );
+    }
+
+    /// The `frames` rule (decision 3, "Cast media status" rule 1), against
+    /// a build that served every rung: without a presented-frame counter no
+    /// `moq` and no `webrtc` is offered; `srt` and `hls` are.
+    #[test]
+    fn without_a_frame_counter_moq_and_webrtc_are_left_out() {
+        let all: Vec<String> = ["srt", "moq", "webrtc", "hls"].map(String::from).to_vec();
+        let every = &["srt", "moq", "webrtc", "hls"];
+        for frames in [Some(FrameCounter::Rvfc), Some(FrameCounter::Quality)] {
+            let probe = probe_with(frames, &[]);
+            assert_eq!(
+                offer(&all, every, Some(&probe)),
+                ("srt", vec!["moq", "webrtc", "hls"]),
+                "{frames:?}"
+            );
+        }
+        let none = probe_with(None, &[]);
+        assert_eq!(
+            offer(&all, every, Some(&none)),
+            ("srt", vec!["hls"]),
+            "frames null"
+        );
+        assert_eq!(
+            offer(&all, every, None),
+            ("srt", vec!["hls"]),
+            "no probe: no counter claimed"
+        );
+        // Absent from the body is the same as null.
+        let req = parse(&serde_json::json!({"v": 1, "caps": {"wt": true}})).unwrap();
+        assert_eq!(req.probe.as_ref().unwrap().caps.frames, None);
+        assert_eq!(offer(&all, every, req.probe.as_ref()), ("srt", vec!["hls"]));
+        // The device's skip list and the config's order apply too.
+        let skip = probe_with(Some(FrameCounter::Rvfc), &["srt", "hls"]);
+        let order: Vec<String> = ["webrtc", "moq", "hls"].map(String::from).to_vec();
+        assert_eq!(
+            offer(&order, every, Some(&skip)),
+            ("webrtc", vec!["moq", "hls"])
+        );
+        assert_eq!(
+            offer(&all, every, Some(&skip)),
+            ("moq", vec!["webrtc", "hls"])
+        );
     }
 
     #[test]

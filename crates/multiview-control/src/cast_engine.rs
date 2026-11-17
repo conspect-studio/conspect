@@ -20,7 +20,9 @@ pub struct CastOutputStatus {
     /// The master playlist and enough segments for a receiver to start are
     /// published.
     pub ready: bool,
-    /// The activation's generation (0 when inactive).
+    /// The generation in the names of the media files served now (#418
+    /// review r7: the running packager's, else one no file carries; it only
+    /// ever increases). Only files of this generation are served.
     pub generation: u64,
     /// Video segments published for this generation.
     pub video_segments: u64,
@@ -29,6 +31,10 @@ pub struct CastOutputStatus {
     /// The last error, if any. An output whose directory is not usable
     /// carries the reason here and cannot be activated.
     pub last_error: Option<String>,
+    /// The output is disabled for the run (its directory is unusable, or
+    /// its stream files could not be removed): nothing of it is served and
+    /// superseded grants never expire through it (#418 review r7).
+    pub disabled: bool,
     /// Encoded picture width in pixels.
     pub width: u32,
     /// Encoded picture height in pixels.

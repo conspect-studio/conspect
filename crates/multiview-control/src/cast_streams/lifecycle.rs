@@ -151,7 +151,8 @@ pub fn finish(state: &AppState, ended: &[super::Ended]) {
 /// Run a sweep now and finish what it ended (the lazy sweep of every API
 /// call and the 5 s timer).
 pub fn sweep_now(state: &AppState) {
-    let ended = state.cast_streams.sweep();
+    let sinks = super::reauth::sinks(state);
+    let ended = state.cast_streams.sweep_with(sinks.as_ref());
     finish(state, &ended);
 }
 

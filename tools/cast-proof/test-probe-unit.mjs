@@ -116,6 +116,12 @@ function feed(lat, fromUs, toUs, everyUs, latencyMs, c = clock) {
 check('rVFC present: method frame', P.methodFor(true, true) === 'frame');
 check('no requestVideoFrameCallback: method playhead', P.methodFor(false, true) === 'playhead');
 check('no absolute-time mapping: method unavailable', P.methodFor(true, false) === 'unavailable');
+{
+  const pm = { getShakaPlayer: () => ({ getPlayheadTimeAsDate: () => new Date(1794898722866) }) };
+  const v = { currentTime: 71.5 };
+  check('frame wall time = playhead date - (currentTime - mediaTime)', Math.abs(P.wallUsForMediaTime(pm, v, 71.4) - (1794898722.866 - 0.1) * 1e6) < 1);
+  check('no player, no date or no element: no wall time', P.wallUsForMediaTime({}, v, 1) === null && P.wallUsForMediaTime({ getShakaPlayer: () => ({ getPlayheadTimeAsDate: () => null }) }, v, 1) === null && P.wallUsForMediaTime(pm, null, 1) === null && P.wallUsForMediaTime(pm, v, NaN) === null);
+}
 check('an unavailable method never measures', new P.Latency('unavailable').locked === true);
 
 // ---- transport report when the clock is unavailable
@@ -129,7 +135,7 @@ check('an unavailable method never measures', new P.Latency('unavailable').locke
   const perf = { timeOrigin: 1.7e12, now: () => t };
   const Q = load({ XMLHttpRequest: FakeXhr, performance: perf, navigator: { userAgent: 'test CrKey' } });
   const video = { paused: false, readyState: 4, currentTime: 0, getVideoPlaybackQuality: () => ({ totalVideoFrames: 1 }) };
-  const pm = { getAbsoluteTimeForMediaTime: (m) => 1.8e9 + m };
+  const pm = { getShakaPlayer: () => ({ getPlayheadTimeAsDate: () => new Date(1.8e12) }) };
   const master = '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS="avc1.640028,mp4a.40.2",RESOLUTION=1280x720\nvideo.m3u8\n';
   Q.start({ base: 'https://e.example/cast/TOKEN/', master, video: () => video, playerManager: pm, storage: null, env: { navigator: { userAgent: 'test CrKey' } } });
   const call = xhrs[0];
@@ -146,6 +152,36 @@ check('an unavailable method never measures', new P.Latency('unavailable').locke
   check('engine clock null: method unavailable and no latency figure', tr.rung === 'hls' && tr.latency_method === 'unavailable' && tr.latency_ms === null && tr.clock_error_ms === null, JSON.stringify(tr));
   Q.stop();
   check('stop() ends the load', Q.transport() === null);
+}
+
+// ---- frame watchdog (Cast media status, rule 1)
+{
+  check('presented = total - dropped', P.presentedFrames({ totalVideoFrames: 100, droppedVideoFrames: 30 }) === 70 && P.presentedFrames(null) === null);
+  let nowMs = 0; const ticks = [];
+  const W = load({ Date: { now: () => nowMs } });
+  const timers = { setInterval: (fn) => { ticks.push(fn); return 1; } };
+  const video = { paused: false, readyState: 4, q: { totalVideoFrames: 0, droppedVideoFrames: 0 }, getVideoPlaybackQuality() { return this.q; } };
+  const changes = [];
+  const wd = new W.FrameWatchdog(() => video, (stalled) => changes.push(stalled), null, timers);
+  const step = (ms, total, dropped) => { nowMs += ms; video.q = { totalVideoFrames: total, droppedVideoFrames: dropped }; ticks[0](); };
+  check('a video without rVFC uses the quality counter', wd.counter === 'quality');
+  step(250, 10, 0); step(250, 20, 0); step(1000, 50, 0);
+  check('frames presented: not stalled', !wd.stalled() && changes.length === 0);
+  // Every new frame is dropped: totalVideoFrames keeps rising, presented does not.
+  for (let i = 0; i < 9; i++) step(250, 60 + i * 10, 10 + i * 10);
+  check('a decoder that drops every frame fires the watchdog (total - dropped)', wd.stalled() && changes[0] === true, JSON.stringify(changes));
+  step(250, 200, 100);
+  check('frames presented again clear it', !wd.stalled() && changes[1] === false);
+  // The element restarted its counts (a new load in CAF): a lower value is a new count, not progress.
+  step(1000, 3, 0);
+  for (let i = 0; i < 4; i++) step(250, 3, 0);
+  check('a lower value starts a new count and is not progress', wd.stalled() && changes[2] === true, JSON.stringify(changes));
+  step(250, 4, 0);
+  check('progress on the new count clears it', !wd.stalled() && changes[3] === false);
+  video.paused = true;
+  for (let i = 0; i < 12; i++) step(250, 4, 0);
+  check('a paused element is never stalled', !wd.stalled());
+  wd.stop();
 }
 
 // ---- capabilities parsing and failure memory

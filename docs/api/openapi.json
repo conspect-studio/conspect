@@ -8311,7 +8311,7 @@
         "operationId": "get_patch",
         "responses": {
           "200": {
-            "description": "`{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, live, source: {source}|{bus}|{layout}|{redacted:true}|null, path: P1|P2|P3|null, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ], subtitle: [ { slot, format, language, name, live, source: {source}|{redacted:true}|null } ] } ] }`. Subtitle slots come from the engine's live route table when the running engine samples that slot (`live: true`), else (no run, the run ended, the output not in this run, or a slot beyond the run's table) from the accepted config (`live: false`), per slot. Video slot 0 comes from the engine's live readback (`live: true`); `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. With no readback (no running engine, routing unavailable, or the output not in this run) `live` is false and `source` and `path` are null: the live state is unknown, never reported as Program. Audio slot 0's `source` is the output's accepted audio feed (`\"follow\"` by default, else `\"program\"`, `\"none\"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{\"redacted\": true}`.",
+            "description": "`{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, live, source: {source}|{bus}|{layout}|{redacted:true}|null, path: P0|P1|P2|P3|null, passthrough: {state, reason}|null, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ], subtitle: [ { slot, format, language, name, live, source: {source}|{redacted:true}|null } ] } ] }`. Subtitle slots come from the engine's live route table when the running engine samples that slot (`live: true`), else (no run, the run ended, the output not in this run, or a slot beyond the run's table) from the accepted config (`live: false`), per slot. Video slot 0 comes from the engine's live readback (`live: true`); `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. `path` is P0 while the output passes its source's compressed video through (#344: 0 decode, 0 encode); `passthrough` is that output's passthrough state (`metering`, `moving`, `passthrough`, `slate`, `bridging`, `returning`, `unavailable`, …) and its reason (a match-rule miss, a bridge reason, or `bridging on slate: no encoder session`), null when the output has no passthrough candidate; a reason never names a source. With no readback (no running engine, routing unavailable, or the output not in this run) `live` is false and `source` and `path` are null: the live state is unknown, never reported as Program. Audio slot 0's `source` is the output's accepted audio feed (`\"follow\"` by default, else `\"program\"`, `\"none\"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{\"redacted\": true}`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8358,7 +8358,7 @@
         "tags": [
           "patch"
         ],
-        "summary": "Plan 1..64 crosspoints: mixer inputs (path, on-air flag, refusals), the\nslots of one output (§12.4 path P1/P2/P3 and cost), or an atomic set\nover many destinations (#308: every member planned, `can_take` only when\nall can and the set's new encoders fit the caller's caps); no change.",
+        "summary": "Plan 1..64 crosspoints: mixer inputs (path, on-air flag, refusals), the\nslots of one output (§12.4 path P0/P1/P2/P3, cost and the first\npassthrough miss), or an atomic set over many destinations (#308: every\nmember planned, `can_take` only when all can and the set's new encoders\nfit the caller's caps); no change.",
         "operationId": "plan_patch",
         "requestBody": {
           "content": {
@@ -16339,11 +16339,33 @@
             "type": "boolean",
             "description": "A receiver can start now."
           },
+          "receiver": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReceiverProbe",
+                "description": "The receiver's last capability probe (`POST /cast/<token>/ladder`,\nADR-0114): device claims, shown as received. Owner and Admin only,\nlike the rest of this document."
+              }
+            ]
+          },
           "segments": {
             "type": "integer",
             "format": "int64",
             "description": "Video segments published (Google's Default Media Receiver starts\nslowly on a young playlist: wait for 8).",
             "minimum": 0
+          },
+          "transport": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Transport",
+                "description": "The rung the receiver plays and how it fares (ADR-0114)."
+              }
+            ]
           }
         }
       },
@@ -17759,6 +17781,40 @@
           }
         }
       },
+      "Fallback": {
+        "type": "object",
+        "description": "One step down the ladder, as the receiver reported it in `failed`.",
+        "required": [
+          "rung",
+          "stage",
+          "at_unix_ms"
+        ],
+        "properties": {
+          "at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was reported (Unix ms).",
+            "minimum": 0
+          },
+          "ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The receiver's figure for it (ms), if any.",
+            "minimum": 0
+          },
+          "rung": {
+            "type": "string",
+            "description": "The rung that failed."
+          },
+          "stage": {
+            "type": "string",
+            "description": "`connect`, `first-frame`, `stall`, `latency` or `hook` (the WebRTC\nmedia-element hook did not take)."
+          }
+        }
+      },
       "FeedStatus": {
         "type": "object",
         "description": "One feed's operator-visible status.",
@@ -17871,6 +17927,14 @@
             "minimum": 0
           }
         }
+      },
+      "FrameCounter": {
+        "type": "string",
+        "description": "Which presented-frame counter the receiver's stall watchdog uses.",
+        "enum": [
+          "rvfc",
+          "quality"
+        ]
       },
       "FreshnessDoc": {
         "type": "object",
@@ -18943,6 +19007,58 @@
           "class_mismatch",
           "over_gpu"
         ]
+      },
+      "LatencyMethod": {
+        "type": "string",
+        "description": "How a latency figure was obtained (decision 2, \"When there is no\ntrustworthy mapping\").",
+        "enum": [
+          "frame",
+          "playhead",
+          "unavailable"
+        ]
+      },
+      "LatencyStats": {
+        "type": "object",
+        "description": "Steady-state tick-to-present latency over the receiver's last window.",
+        "required": [
+          "median",
+          "p95",
+          "samples",
+          "method"
+        ],
+        "properties": {
+          "clock_error_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The clock offset's error bound (ms).",
+            "minimum": 0
+          },
+          "median": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Median (ms).",
+            "minimum": 0
+          },
+          "method": {
+            "$ref": "#/components/schemas/LatencyMethod",
+            "description": "`frame` or `playhead`."
+          },
+          "p95": {
+            "type": "integer",
+            "format": "int64",
+            "description": "95th percentile (ms).",
+            "minimum": 0
+          },
+          "samples": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Valid samples in the window.",
+            "minimum": 0
+          }
+        }
       },
       "Layout": {
         "type": "object",
@@ -21614,6 +21730,69 @@
           }
         }
       },
+      "PassthroughTotals": {
+        "type": "object",
+        "description": "Passthrough (P0) counters of the run (#344 D2b): keys open (no encoder\nsession each) and cumulative AU / repeat / drift-drop / stall / slate /\nbridge counts.",
+        "required": [
+          "keys",
+          "aus",
+          "repeats",
+          "drift_drops",
+          "stalls",
+          "slate_ticks",
+          "bridges",
+          "bridges_refused"
+        ],
+        "properties": {
+          "aus": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Source access units passed through.",
+            "minimum": 0
+          },
+          "bridges": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Moves onto an on-demand picture bridge.",
+            "minimum": 0
+          },
+          "bridges_refused": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bridges that found no encoder session (stayed on the slate).",
+            "minimum": 0
+          },
+          "drift_drops": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Access units dropped by drift corrections.",
+            "minimum": 0
+          },
+          "keys": {
+            "type": "integer",
+            "description": "Passthrough keys open.",
+            "minimum": 0
+          },
+          "repeats": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Repeat (skip) access units emitted by drift corrections.",
+            "minimum": 0
+          },
+          "slate_ticks": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ticks emitted from a format slate.",
+            "minimum": 0
+          },
+          "stalls": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Runs ended by a stall.",
+            "minimum": 0
+          }
+        }
+      },
       "PatchAccepted": {
         "type": "object",
         "description": "`POST /patch/take` 202 answer. The outcome arrives as `switcher.operation`\n(mixer inputs), `route.output` (one output) or, for a set of two or more\ndestinations, `patch.take` (#308).",
@@ -22010,9 +22189,16 @@
             "type": "boolean",
             "description": "Whether the destination input is on Program now (mixer inputs)."
           },
+          "passthrough": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For an output video slot fed by a source that is not P0: the first\npassthrough miss (#344 D2b), e.g. `passthrough-not-supported-on-medium`\nor `not-enough-history`. Never names a source."
+          },
           "path": {
             "type": "string",
-            "description": "The path this crosspoint takes: `mixer-input`, `P1`, `P2`, `P3`\n(§12.4), `follow` (an audio slot riding the video take) or\n`subtitle` (a subtitle slot's route-table re-point)."
+            "description": "The path this crosspoint takes: `mixer-input`, `P0`, `P1`, `P2`, `P3`\n(§12.4), `follow` (an audio slot riding the video take) or\n`subtitle` (a subtitle slot's route-table re-point)."
           },
           "refusal": {
             "oneOf": [
@@ -22689,6 +22875,104 @@
         ],
         "description": "An IS-04 **Receiver**: an ingress flow (a Conspect input)."
       },
+      "ReceiverCaps": {
+        "type": "object",
+        "description": "What the receiver says it can do (`caps` of the probe).",
+        "required": [
+          "rtc_h264"
+        ],
+        "properties": {
+          "adec": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Support",
+                "description": "`AudioDecoder.isConfigSupported` for the stream."
+              }
+            ]
+          },
+          "frames": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FrameCounter",
+                "description": "The presented-frame counter (`null`: none)."
+              }
+            ]
+          },
+          "mse": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Media Source Extensions accept the stream's codec strings."
+          },
+          "rtc": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`RTCPeerConnection` exists."
+          },
+          "rtc_h264": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "H.264 `profile-level-id` values the receiver can take (at most 8)."
+          },
+          "rtc_opus": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Opus receive."
+          },
+          "rvfc": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`requestVideoFrameCallback` exists."
+          },
+          "srt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The libsrt version an Android TV app loaded (`null` on the web)."
+          },
+          "vdec": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Support",
+                "description": "`VideoDecoder.isConfigSupported` for the stream."
+              }
+            ]
+          },
+          "vdec_hw": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "The same with `prefer-hardware`."
+          },
+          "wt": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`WebTransport` exists."
+          }
+        }
+      },
       "ReceiverFetch": {
         "type": "object",
         "description": "The last fetch of the receiver app (no IP).",
@@ -22713,6 +22997,80 @@
               "null"
             ],
             "description": "The fetcher's `User-Agent` (at most 160 characters)."
+          }
+        }
+      },
+      "ReceiverNeed": {
+        "type": "object",
+        "description": "What the session must carry (`need` of the probe).",
+        "properties": {
+          "audio": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The audio track required, if any."
+          },
+          "subtitles": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Subtitles are required."
+          }
+        }
+      },
+      "ReceiverProbe": {
+        "type": "object",
+        "description": "The last capability probe of a stream's receiver.",
+        "required": [
+          "caps",
+          "need",
+          "skip",
+          "received_unix_ms"
+        ],
+        "properties": {
+          "build": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The receiver build (a sha256 prefix of its script)."
+          },
+          "caps": {
+            "$ref": "#/components/schemas/ReceiverCaps",
+            "description": "What it can do."
+          },
+          "kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`web` or `android-tv` (as claimed)."
+          },
+          "need": {
+            "$ref": "#/components/schemas/ReceiverNeed",
+            "description": "What it must carry."
+          },
+          "received_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the probe arrived (Unix ms).",
+            "minimum": 0
+          },
+          "skip": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SkipEntry"
+            },
+            "description": "Rungs in its failure memory (at most 4)."
+          },
+          "ua": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The receiver's user agent (at most 200 characters)."
           }
         }
       },
@@ -22901,6 +23259,35 @@
           "body": {
             "type": "string",
             "description": "The reply text to append to the thread."
+          }
+        }
+      },
+      "Resets": {
+        "type": "object",
+        "description": "Player resets inside the attachment.",
+        "required": [
+          "soft",
+          "hard"
+        ],
+        "properties": {
+          "hard": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Hard resets.",
+            "minimum": 0
+          },
+          "last": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The last cause."
+          },
+          "soft": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Soft resets.",
+            "minimum": 0
           }
         }
       },
@@ -23415,6 +23802,17 @@
             "type": "integer",
             "description": "Video encoders running.",
             "minimum": 0
+          },
+          "passthrough": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PassthroughTotals",
+                "description": "Passthrough (P0) counters (#344 D2b) — whole-system principals only."
+              }
+            ]
           }
         }
       },
@@ -23903,6 +24301,26 @@
             "format": "password",
             "description": "The one-time setup code (8 words) printed on the host.",
             "writeOnly": true
+          }
+        }
+      },
+      "SkipEntry": {
+        "type": "object",
+        "description": "A rung in the device's failure memory.",
+        "required": [
+          "rung",
+          "seconds"
+        ],
+        "properties": {
+          "rung": {
+            "type": "string",
+            "description": "The rung."
+          },
+          "seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds left.",
+            "minimum": 0
           }
         }
       },
@@ -25695,6 +26113,15 @@
           }
         }
       },
+      "Support": {
+        "type": "string",
+        "description": "A decoder check result (`isConfigSupported`).",
+        "enum": [
+          "supported",
+          "unsupported",
+          "absent"
+        ]
+      },
       "SupportEntitlement": {
         "type": "object",
         "description": "The full entitlement-routing answer the `GET /support/entitlement` endpoint\nreturns: whether the machine is eligible for entitled support, the route, and\nthe SLA token (a quiet line for the free tier).",
@@ -27031,6 +27458,88 @@
           "kind": {
             "type": "string",
             "description": "`cut` or `mix`."
+          }
+        }
+      },
+      "Transport": {
+        "type": "object",
+        "description": "The transport a stream's receiver plays on and how it fares.",
+        "required": [
+          "fallbacks",
+          "resets",
+          "stalled"
+        ],
+        "properties": {
+          "fallbacks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Fallback"
+            },
+            "description": "The last steps down (at most 8, oldest first)."
+          },
+          "first_frame_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "From the start of the attempt to the first presented frame (ms).",
+            "minimum": 0
+          },
+          "latency_method": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LatencyMethod",
+                "description": "How the latency is measured (`unavailable`: no figure, by rule)."
+              }
+            ]
+          },
+          "latency_ms": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LatencyStats",
+                "description": "Steady-state latency; `null` when unavailable or not yet measured."
+              }
+            ]
+          },
+          "reported_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the receiver last reported these figures (Unix ms).",
+            "minimum": 0
+          },
+          "resets": {
+            "$ref": "#/components/schemas/Resets",
+            "description": "Player resets."
+          },
+          "rung": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The rung the engine last offered (`hls` in this build)."
+          },
+          "since_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Since when it plays that rung (Unix ms).",
+            "minimum": 0
+          },
+          "stalled": {
+            "type": "boolean",
+            "description": "The receiver's frame watchdog says no frame was presented for 2 s."
           }
         }
       },

@@ -26,7 +26,7 @@ mod runner;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use runner::{run_cast_sink, CastSetup};
+pub(crate) use runner::{run_cast_sink, CastAudioRoutes, CastSetup};
 
 /// Segments listed per playlist of a cast stream.
 pub const CAST_WINDOW: usize = 10;
@@ -84,7 +84,11 @@ pub enum CastGateError {
 pub struct CastGateStatus {
     /// A cast stream is active.
     pub active: bool,
-    /// The activation's generation (0 when inactive).
+    /// The generation in the names of the files served now: the running
+    /// packager's file generation, else a fresh one no file carries. Never
+    /// 0, never an activation id, and it only ever increases (#418 review
+    /// r7: the control plane serves only files of this generation and
+    /// treats a change as the old files' retirement).
     pub generation: u64,
     /// The master playlist and at least [`CAST_READY_SEGMENTS`] segments are
     /// published for this generation.
@@ -101,6 +105,9 @@ pub struct CastGateStatus {
     pub last_publish_unix_ms: u64,
     /// The last error, if any.
     pub last_error: Option<String>,
+    /// The output is disabled for this run (nothing is published; the
+    /// reason is `last_error`).
+    pub disabled: bool,
 }
 
 /// A hook the sink thread calls before it feeds the packager (tests only):
@@ -117,8 +124,15 @@ pub(crate) type CastTestHook = Arc<dyn Fn() + Send + Sync>;
 pub struct CastGate {
     /// `generation << 1 | preroll`; 0 = inactive.
     state: AtomicU64,
-    /// The generation the progress fields below describe.
-    progress_generation: AtomicU64,
+    /// #418 review r7: the ONLY generation the status reports — the
+    /// file-name generation of the running packager, else a fresh one no
+    /// file carries. Every store is of a value minted after the one it
+    /// replaces, so it only ever increases: a status can never go back to
+    /// an earlier generation (whose leftovers it would authorize).
+    file_generation: AtomicU64,
+    /// The activation the running packager belongs to (0 = none): `ready`
+    /// is reported only for the activation that is active now.
+    file_activation: AtomicU64,
     ready: AtomicBool,
     video_segments: AtomicU64,
     audio_segments: AtomicU64,
@@ -132,6 +146,8 @@ pub struct CastGate {
     last_error: Mutex<Option<String>>,
     #[cfg(test)]
     hook: Mutex<Option<CastTestHook>>,
+    #[cfg(test)]
+    transition_hook: Mutex<Option<CastTestHook>>,
 }
 
 impl Default for CastGate {
@@ -154,7 +170,8 @@ impl CastGate {
     pub fn new() -> Self {
         Self {
             state: AtomicU64::new(0),
-            progress_generation: AtomicU64::new(0),
+            file_generation: AtomicU64::new(next_generation()),
+            file_activation: AtomicU64::new(0),
             ready: AtomicBool::new(false),
             video_segments: AtomicU64::new(0),
             audio_segments: AtomicU64::new(0),
@@ -166,6 +183,8 @@ impl CastGate {
             last_error: Mutex::new(None),
             #[cfg(test)]
             hook: Mutex::new(None),
+            #[cfg(test)]
+            transition_hook: Mutex::new(None),
         }
     }
 
@@ -188,19 +207,36 @@ impl CastGate {
                     .unwrap_or_else(|| "cast output disabled".to_owned()),
             ));
         }
-        let mut current = self.state.load(Ordering::Acquire);
         loop {
+            // The file generation is read BEFORE the activation: a sink
+            // that installed its packager's generation did so after it saw
+            // an activation, so `files` then is never a running packager's
+            // while `state` reads inactive.
+            let files = self.file_generation.load(Ordering::SeqCst);
+            let current = self.state.load(Ordering::SeqCst);
             if current != 0 {
                 return Ok(current >> 1);
             }
+            // #418 review r7: before the activation is visible, a fresh
+            // generation no file carries, so the new activation never
+            // reports (and never serves) a generation of an earlier one's
+            // packager that the sink has not stopped yet. Conditional, so
+            // it never replaces a packager generation installed meanwhile.
+            if self
+                .file_generation
+                .compare_exchange(files, next_generation(), Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                continue;
+            }
             let generation = next_generation();
             let next = (generation << 1) | u64::from(preroll);
-            match self
+            if self
                 .state
-                .compare_exchange(0, next, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(0, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
             {
-                Ok(_) => return Ok(generation),
-                Err(seen) => current = seen,
+                return Ok(generation);
             }
         }
     }
@@ -208,14 +244,14 @@ impl CastGate {
     /// Deactivate the output (idempotent). The sink thread closes the stream
     /// and removes its files when it next handles a packet.
     pub fn deactivate(&self) {
-        self.state.store(0, Ordering::Release);
+        self.state.store(0, Ordering::SeqCst);
     }
 
     /// The current activation as `(generation, preroll)`; `None` when
     /// inactive. Wait-free; the sink thread calls this per packet.
     #[must_use]
     pub fn activation(&self) -> Option<(u64, bool)> {
-        let state = self.state.load(Ordering::Acquire);
+        let state = self.state.load(Ordering::SeqCst);
         (state != 0).then_some((state >> 1, state & 1 == 1))
     }
 
@@ -246,47 +282,47 @@ impl CastGate {
             .clone()
     }
 
-    /// A point-in-time status for the control plane. Progress is reported
-    /// only for the generation that is active now.
+    /// A point-in-time status for the control plane. `generation` is the
+    /// file generation, always (#418 review r7: no fallback). It is read
+    /// BEFORE the counters, which the sink zeroes before it installs a new
+    /// generation: a reader never sees a new generation with the previous
+    /// one's (higher) counts; at worst it sees the old generation with
+    /// zeroed counts, which only delays a retirement proven by segment
+    /// count (it errs on the side of NOT expiring history).
     #[must_use]
     pub fn status(&self) -> CastGateStatus {
         let activation = self.activation();
-        let generation = activation.map_or(0, |(generation, _)| generation);
-        let current =
-            generation != 0 && self.progress_generation.load(Ordering::Acquire) == generation;
-        let count = |cell: &AtomicU64| {
-            if current {
-                cell.load(Ordering::Acquire)
-            } else {
-                0
-            }
-        };
+        let activated = activation.map_or(0, |(generation, _)| generation);
+        let generation = self.file_generation.load(Ordering::SeqCst);
+        let current = activated != 0 && self.file_activation.load(Ordering::SeqCst) == activated;
         CastGateStatus {
             active: activation.is_some(),
             generation,
-            ready: current && self.ready.load(Ordering::Acquire),
-            video_segments: count(&self.video_segments),
-            audio_segments: count(&self.audio_segments),
+            ready: current && self.ready.load(Ordering::SeqCst),
+            video_segments: self.video_segments.load(Ordering::SeqCst),
+            audio_segments: self.audio_segments.load(Ordering::SeqCst),
             dropped_packets: self.dropped_packets(),
             restarts: self.restarts.load(Ordering::Acquire),
             last_publish_unix_ms: self.last_publish_unix_ms.load(Ordering::Acquire),
             last_error: self.last_error(),
+            disabled: self.is_disabled(),
         }
     }
 
     /// Disable the output for the run with `reason` (the text names the fix)
-    /// and deactivate it.
+    /// and deactivate it; the status names a generation no file carries.
     pub(crate) fn disable(&self, reason: String) {
         self.set_error(Some(reason));
-        self.disabled.store(true, Ordering::Release);
+        self.disabled.store(true, Ordering::SeqCst);
         self.deactivate();
+        self.install_no_files();
     }
 
     /// The run ended: the output can no longer be activated.
     pub(crate) fn end(&self) {
         self.ended.store(true, Ordering::Release);
         self.deactivate();
-        self.ready.store(false, Ordering::Release);
+        self.install_no_files();
     }
 
     /// Record (or with `None` clear) the last error.
@@ -297,13 +333,47 @@ impl CastGate {
             .unwrap_or_else(PoisonError::into_inner) = error;
     }
 
-    /// A packager for `generation` starts: its progress is zero.
-    pub(crate) fn begin_generation(&self, generation: u64) {
-        self.ready.store(false, Ordering::Release);
-        self.video_segments.store(0, Ordering::Release);
-        self.audio_segments.store(0, Ordering::Release);
-        self.progress_generation
-            .store(generation, Ordering::Release);
+    /// Zero the progress (before a new generation is installed).
+    fn reset_progress(&self) {
+        self.ready.store(false, Ordering::SeqCst);
+        self.video_segments.store(0, Ordering::SeqCst);
+        self.audio_segments.store(0, Ordering::SeqCst);
+    }
+
+    /// A packager of `activation` is about to start (sink thread): install
+    /// a FRESH file generation for it, BEFORE it writes any file, and
+    /// return it. `None` when `activation` is no longer the active one (the
+    /// next packet starts the new one). Conditional on the generation it
+    /// read, so it never replaces the fresh one an activation installed
+    /// meanwhile (#418 review r7).
+    pub(crate) fn install_files(&self, activation: u64) -> Option<u64> {
+        loop {
+            let expected = self.file_generation.load(Ordering::SeqCst);
+            if self.activation().map(|(generation, _)| generation) != Some(activation) {
+                return None;
+            }
+            self.reset_progress();
+            self.file_activation.store(activation, Ordering::SeqCst);
+            // Minted after `expected` was read, so it is larger.
+            let files = next_generation();
+            if self
+                .file_generation
+                .compare_exchange(expected, files, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Some(files);
+            }
+        }
+    }
+
+    /// No packager runs (failed, stopped, disabled): install a fresh
+    /// generation no file carries (never 0, never an activation id, never
+    /// an earlier one: `fetch_max` keeps a later one installed meanwhile).
+    pub(crate) fn install_no_files(&self) {
+        self.reset_progress();
+        self.file_activation.store(0, Ordering::SeqCst);
+        self.file_generation
+            .fetch_max(next_generation(), Ordering::SeqCst);
     }
 
     /// Publish the packager's progress (sink thread, atomics only).
@@ -329,6 +399,30 @@ impl CastGate {
     #[cfg(all(test, feature = "gpl-codecs"))]
     pub(crate) fn set_test_hook(&self, hook: Option<CastTestHook>) {
         *self.hook.lock().unwrap_or_else(PoisonError::into_inner) = hook;
+    }
+
+    /// Install the hook the sink thread calls right after every generation
+    /// it installs (tests only): a test pauses there, before any file of a
+    /// new generation is written.
+    #[cfg(test)]
+    pub(crate) fn set_transition_hook(&self, hook: Option<CastTestHook>) {
+        *self
+            .transition_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = hook;
+    }
+
+    /// Run the transition hook, if one is installed (tests only).
+    #[cfg(test)]
+    pub(crate) fn run_transition_hook(&self) {
+        let hook = self
+            .transition_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// Run the sink-thread hook, if one is installed (tests only).
@@ -436,12 +530,29 @@ fn restrict_to_owner(dir: &Path) {
     let _ = dir;
 }
 
+/// Why a cast output is disabled after its stream files could not be
+/// removed (#418 review r7).
+pub(crate) fn unlink_failed(id: &str, dir: &Path) -> String {
+    format!(
+        "cast output {id:?}: could not remove its stream files from {}; make the directory and \
+         its files deletable by the engine (or remove them), then restart the engine",
+        dir.display()
+    )
+}
+
 /// Remove the stream files of the cast output `id` from `dir`: only when the
 /// directory still carries this output's marker, and only files the packager
-/// writes (never the marker, never anything else).
-pub(crate) fn purge_owned(dir: &Path, id: &str) {
+/// writes (never the marker, never anything else). Returns whether no
+/// packager-named entry is left (see
+/// [`purge_dir`](multiview_output::hls::cast::purge_dir)); a directory that
+/// lost its marker counts as clean only when it is gone.
+#[must_use]
+pub(crate) fn purge_owned(dir: &Path, id: &str) -> bool {
     if has_marker(dir, id) {
-        multiview_output::hls::cast::purge_dir(dir);
+        multiview_output::hls::cast::purge_dir(dir)
+    } else {
+        std::fs::symlink_metadata(dir)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
     }
 }
 
@@ -452,7 +563,13 @@ pub(crate) fn purge_owned(dir: &Path, id: &str) {
 /// written or deleted): it never fails the run.
 pub(crate) fn prepare_cast_dir(dir: &Path, id: &str, gate: &CastGate) {
     match inspect_cast_dir(dir, id) {
-        Ok(CastDirState::Owned) => multiview_output::hls::cast::purge_dir(dir),
+        Ok(CastDirState::Owned) => {
+            if !multiview_output::hls::cast::purge_dir(dir) {
+                let reason = unlink_failed(id, dir);
+                tracing::warn!(output = id, %reason, "cast output disabled for this run");
+                gate.disable(reason);
+            }
+        }
         Ok(CastDirState::Absent | CastDirState::Empty) => {}
         Err(reason) => {
             tracing::warn!(output = id, %reason, "cast output disabled for this run");
@@ -556,6 +673,7 @@ impl multiview_control::cast_engine::CastEngine for CastEngineAdapter {
                     video_segments: status.video_segments,
                     dropped_packets: status.dropped_packets,
                     last_error: status.last_error,
+                    disabled: status.disabled,
                     width: entry.width,
                     height: entry.height,
                     fps_num: u32::try_from(entry.fps.num).unwrap_or(0),
@@ -611,8 +729,7 @@ pub fn clock_pair(
     if !map.rate.is_valid() {
         return None;
     }
-    let media_ns = map.media_at(wall_now_unix_ns);
-    let media_us = media_ns.div_euclid(1000);
+    let media_us = map.media_at(wall_now_unix_ns).div_euclid(1000);
     let wall_ns = map.wall_at(media_us.saturating_mul(1000));
     Some(multiview_control::cast_engine::CastClock {
         epoch_generation: generation,

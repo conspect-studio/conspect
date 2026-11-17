@@ -135,14 +135,33 @@ async fn preflight(
     with_cors(no_store(response), headers.get(header::ORIGIN))
 }
 
-/// The directory of the active cast output `config_id`.
-fn output_dir(state: &AppState, config_id: &str) -> Option<std::path::PathBuf> {
+/// The directory of the active cast output `config_id`, when `file` may be
+/// served from it now: a file whose name carries a generation (segments,
+/// init files, `.vtt`) only when that is the output's CURRENT generation
+/// (#418 review ABUSE-HISTORY-R4: a stale file a best-effort purge left
+/// behind, of a superseded activation or a failed packager, is never
+/// served). Playlists carry none: they are always the current activation's.
+/// A disabled output serves nothing (#418 review r7: files it could not
+/// remove may be left in its directory).
+fn output_dir(state: &AppState, config_id: &str, file: &str) -> Option<std::path::PathBuf> {
     let engine = state.cast_engine.as_ref()?;
-    engine
+    let output = engine
         .outputs()
         .into_iter()
-        .find(|o| o.id == config_id && o.active)
-        .map(|o| o.dir)
+        .find(|o| o.id == config_id && o.active && !o.disabled)?;
+    current_generation_file(file, output.generation).then_some(output.dir)
+}
+
+/// Whether `file` may be served while the output's files are of
+/// `generation`: a playlist always, a generation-carrying media file only
+/// of that generation.
+fn current_generation_file(file: &str, generation: u64) -> bool {
+    let playlist = std::path::Path::new(file)
+        .extension()
+        .is_some_and(|e| e == "m3u8");
+    playlist
+        || multiview_output::hls::cast::packager_file_generation(file)
+            .is_some_and(|g| g != 0 && g == generation)
 }
 
 async fn media(
@@ -180,7 +199,7 @@ async fn serve_media(
         config_id,
         ..
     } = admitted;
-    let Some(dir) = output_dir(state, &config_id) else {
+    let Some(dir) = output_dir(state, &config_id, &file) else {
         return not_found();
     };
     state.cast_streams.run_before_open().await;
@@ -204,6 +223,7 @@ async fn serve_media(
     // the answer is the generic 404.
     if !crate::cast_streams::reauth::admit(state, &token)
         .is_some_and(|again| again.stream_id == stream_id && again.config_id == config_id)
+        || output_dir(state, &config_id, &file).is_none()
     {
         return not_found();
     }
@@ -314,10 +334,14 @@ async fn take_ladder(state: &AppState, token: &str, body: Body) -> Response {
         .cast_engine
         .as_ref()
         .and_then(|engine| engine.clock(&again.config_id, t1.saturating_mul(1000)));
-    let offer = request
-        .full
-        .then(|| ladder_offer(&state.cast_streams.ladder()));
-    let (attach, then) = offer.unwrap_or((None, Vec::new()));
+    let offer = request.full.then(|| {
+        crate::cast_streams::ladder::offer(
+            &state.cast_streams.ladder(),
+            crate::cast_streams::ladder::SERVED_RUNGS,
+            request.probe.as_ref(),
+        )
+    });
+    let (attach, then) = offer.map_or((None, Vec::new()), |(attach, then)| (Some(attach), then));
     let full = request.full;
     let t0 = request.t0_us;
     if state
@@ -354,19 +378,6 @@ async fn take_ladder(state: &AppState, token: &str, body: Body) -> Response {
         answer.to_string(),
     )
         .into_response()
-}
-
-/// The rung to attach and the rest, from the enabled ladder: what the build
-/// and the run can serve, in `[cast] ladder` order (decision 3, "What the
-/// engine leaves out"). Only `hls` exists, and it is never left out: it is
-/// the floor and needs nothing the receiver claims.
-fn ladder_offer(enabled: &[String]) -> (Option<&'static str>, Vec<&'static str>) {
-    let servable: Vec<&'static str> = enabled
-        .iter()
-        .filter_map(|rung| (rung == "hls").then_some("hls"))
-        .collect();
-    let attach = servable.first().copied().unwrap_or("hls");
-    (Some(attach), Vec::new())
 }
 
 async fn receiver_redirect() -> Response {

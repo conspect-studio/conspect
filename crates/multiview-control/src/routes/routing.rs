@@ -464,6 +464,9 @@ pub struct RoutingBuses {
     /// `"N of M in use"` — whole-system principals only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoder_sessions: Option<String>,
+    /// Passthrough (P0) counters (#344 D2b) — whole-system principals only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough: Option<crate::output_routing::PassthroughTotals>,
 }
 
 /// How an output's feed relates to the switcher (ADR-0108 §8 tally).
@@ -607,6 +610,7 @@ pub(crate) async fn get_routing(
         encoder_sessions: principal
             .is_global()
             .then(|| format!("{} of {} in use", live.sessions_in_use, live.sessions_max)),
+        passthrough: principal.is_global().then_some(live.passthrough),
     });
     Ok((StatusCode::OK, Json(RoutingState { outputs, buses })).into_response())
 }

@@ -17,6 +17,24 @@ Design: [ADR-0111](../decisions/ADR-0111-cast-output.md), [cast-output.md](../ar
    ```
 
    A canvas faster than 30 fps cannot carry a cast output yet (#343); validation says so.
+
+   Audio languages and subtitles (#418) are slots of the cast output, declared like on an HLS output; the device
+   and the Cast panel's Audio and Subtitles pickers list them:
+
+   ```toml
+   [[outputs.slots.audio]]            # slot 0: the program mix
+   language = "en"
+   [[outputs.slots.audio]]            # slot 1: a discrete track ([audio] route target_track = "commentary")
+   track = "commentary"
+   language = "de"
+   [[outputs.slots.subtitle]]
+   language = "en"
+   name = "English"
+   source = "cam1"                    # the source whose captions it carries; re-patch on the Routing page
+   ```
+
+   Several pictures (for example two cameras) are several cast outputs: a Chromecast decodes one video at a time,
+   and the Cast panel's Video picker moves the device to another cast output.
 2. The host name must resolve on public DNS (Cast devices use their own resolvers and ignore LAN DNS) and serve a
    certificate chain the device's firmware trusts, on port 443.
 3. Receiver application id. The Conspect receiver is registered as application `8E05190C`

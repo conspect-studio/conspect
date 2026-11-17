@@ -90,7 +90,7 @@ impl CastConfig {
                     "cast.ladder: unknown rung {rung:?}; this build serves {SERVABLE_RUNGS:?}"
                 )));
             }
-            if self.ladder[..i].contains(rung) {
+            if self.ladder.iter().take(i).any(|r| r == rung) {
                 return Err(ConfigError::Validation(format!(
                     "cast.ladder lists {rung:?} twice"
                 )));

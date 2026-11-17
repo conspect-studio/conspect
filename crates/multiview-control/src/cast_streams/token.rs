@@ -120,14 +120,15 @@ pub fn well_formed(token: &str) -> bool {
 }
 
 /// Whether `file` is a servable cast file name:
-/// `^[A-Za-z0-9._-]{1,96}\.(m3u8|m4s|mp4)$` and no `..`.
+/// `^[A-Za-z0-9._-]{1,96}\.(m3u8|m4s|mp4|vtt)$` and no `..` (`.vtt`: the
+/// `WebVTT` subtitle segments, #418).
 #[must_use]
 pub fn file_allowed(file: &str) -> bool {
     let Some((stem, ext)) = file.rsplit_once('.') else {
         return false;
     };
     (1..=96).contains(&stem.len())
-        && matches!(ext, "m3u8" | "m4s" | "mp4")
+        && matches!(ext, "m3u8" | "m4s" | "mp4" | "vtt")
         && !file.contains("..")
         && stem
             .bytes()
@@ -159,6 +160,8 @@ mod tests {
             "video-g1.m3u8",
             "seg_00001.m4s",
             "init-g2.mp4",
+            "subs0.m3u8",
+            "sub0-17-3.vtt",
         ] {
             assert!(file_allowed(ok), "{ok}");
         }
@@ -166,7 +169,13 @@ mod tests {
             "..m3u8",
             "a..b.m4s",
             "x.ts",
-            "x.vtt",
+            "x.srt",
+            "x.webvtt",
+            "x.VTT",
+            ".vtt",
+            "..vtt",
+            "a/b.vtt",
+            "sub0.vtt.tmp",
             ".m3u8",
             "a/b.m4s",
             "%2e%2e.m3u8",
@@ -177,5 +186,7 @@ mod tests {
         }
         assert!(!file_allowed(&format!("{}.m4s", "a".repeat(97))));
         assert!(file_allowed(&format!("{}.m4s", "a".repeat(96))));
+        assert!(!file_allowed(&format!("{}.vtt", "a".repeat(97))));
+        assert!(file_allowed(&format!("{}.vtt", "a".repeat(96))));
     }
 }
