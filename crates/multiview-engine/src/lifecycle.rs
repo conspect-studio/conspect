@@ -607,14 +607,15 @@ mod tests {
         recovers_only_after_confirmed_teardown(&h);
     }
 
-    /// #434: the same, with teardown recovering before the kind's retry cap
-    /// is reached. The operator Start still holds the source, so the manager
+    /// #434: the same, with teardown recovering at once (without the 300 ms
+    /// hold, so usually before the kind's retry cap is reached; the helper
+    /// presses Start in case it was). The operator Start still holds the source, so the manager
     /// restarts it by itself right after the confirmed teardown: the old
     /// scope's removal is a moment, not a state, and must not be asserted as
     /// one. What must hold is the order: generation 1 confirmed stopped, then
     /// (and only then) a new generation started.
     #[test]
-    fn a_teardown_confirmed_before_the_retry_cap_restarts_on_a_new_generation() {
+    fn a_teardown_confirmed_at_once_restarts_on_a_new_generation() {
         let h = harness();
         h.owner.hang_start.store(true, Ordering::SeqCst);
         h.owner.hang_stop.store(true, Ordering::SeqCst);
@@ -637,7 +638,9 @@ mod tests {
     /// catching a momentarily empty registry) that generation 1 was confirmed
     /// stopped before any later start, and that a new generation then runs.
     /// The confirmation may come from a fresh stop or from the kill path of a
-    /// stop that was already pending while the stop still hung.
+    /// stop that was already pending while the stop still hung. Later starts
+    /// (a recovery start that itself timed out under load) are allowed, each
+    /// only after the previous generation's teardown was confirmed.
     fn recovers_only_after_confirmed_teardown(h: &Harness) {
         h.owner.hang_start.store(false, Ordering::SeqCst);
         h.owner.hang_stop.store(false, Ordering::SeqCst);
@@ -645,11 +648,15 @@ mod tests {
         wait("teardown confirmed", || !h.scopes.is_current("web", 1));
         // The kind's retry cap may have been reached meanwhile: Start retries.
         h.manager.start_source("web");
+        // Read the owner's own call log (under its lock), never a counter
+        // bumped before the log entry, so the snapshot holds what was waited on.
+        let calls = || lock(&h.owner.calls).clone();
         wait("restarted after confirmed teardown", || {
-            h.owner.starts.load(Ordering::SeqCst) == 2
-                && h.scopes.get("web").is_some_and(|s| s.generation > 1)
+            calls()
+                .iter()
+                .any(|c| matches!(c, Call::Start(g) if *g > 1))
         });
-        let calls = lock(&h.owner.calls).clone();
+        let calls = calls();
         let stopped = calls
             .iter()
             .position(|c| *c == Call::Stopped(1))
@@ -662,11 +669,24 @@ mod tests {
             stopped < restarted,
             "a new start ran before teardown was confirmed: {calls:?}"
         );
-        assert_eq!(
-            calls.iter().filter(|c| matches!(c, Call::Start(_))).count(),
-            2,
-            "one timed-out start, one restart: {calls:?}"
-        );
+        // A recovery start descheduled past its own deadline is legitimately
+        // torn down and retried on a later generation: allow that, but every
+        // start still runs only after the previous generation confirmed its
+        // teardown, and generations only grow.
+        let mut confirmed: Option<u64> = None;
+        let mut last: Option<u64> = None;
+        for call in &calls {
+            match *call {
+                Call::Start(g) => {
+                    assert!(
+                        last.is_none_or(|prev| g > prev && confirmed == Some(prev)),
+                        "start {g} before generation {last:?} confirmed its teardown: {calls:?}"
+                    );
+                    last = Some(g);
+                }
+                Call::Stopped(g) => confirmed = Some(g),
+            }
+        }
         h.manager.shutdown();
     }
 

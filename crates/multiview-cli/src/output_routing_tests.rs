@@ -1076,88 +1076,126 @@ impl LiveEncoder for SlowFinish {
     }
 }
 
+/// One gated [`SlowFinish`] close: where it is, and its release.
+struct HeldClose {
+    entered: Arc<AtomicBool>,
+    exited: Arc<AtomicBool>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
 /// Test 6: closing an encoder whose finish never returns on its own never
-/// blocks the consumer (#501). Proven by causality, not by a wall-clock bound
-/// on a router call (which measured host preemption on a loaded runner): the
-/// close lands on its linger tick, `finish()` is entered, and the router then
-/// runs [`SLOW_FINISH_TICKS`] more ticks (Program cadence intact) while
-/// `finish()` is provably still inside, held by the test. Only then is the
-/// close released, and the reaper (not the router) takes it.
+/// blocks the consumer (#501).
+///
+/// Causal part: each close lands on its linger tick, `finish()` is entered,
+/// and the router then runs [`SLOW_FINISH_TICKS`] more ticks (Program cadence
+/// intact) while `finish()` is provably still inside, held by the test. A
+/// router that waits for the close to complete cannot pass this.
+///
+/// Bounded-wait part: a router that waits a bounded time on a close (a timed
+/// join) would still tick on, so each repetition also records the longest
+/// router call from just before the close through the held window. A real
+/// wait costs that time on EVERY repetition; host preemption (the #501 flake,
+/// 83 ms on a loaded 2-core run) lands on a given window only sometimes. So
+/// the bound applies to the shortest such window over [`SLOW_CLOSES`]
+/// repetitions: one clean window proves the close path itself never waits
+/// 50 ms, without the test measuring the host.
 #[test]
 fn a_slow_close_never_blocks_the_consumer() {
-    /// Ticks the router must run while the close is held: 3 s at 5 fps,
-    /// the span of the old 3 s `finish()`.
+    /// Ticks the router must run while a close is held: 3 s at 5 fps, the
+    /// span of the old 3 s `finish()`.
     const SLOW_FINISH_TICKS: u64 = 16;
+    /// Independent slow closes.
+    const SLOW_CLOSES: usize = 5;
     let encoded = Arc::new(AtomicUsize::new(0));
-    let entered = Arc::new(AtomicBool::new(false));
-    let exited = Arc::new(AtomicBool::new(false));
-    let (release, gate) = std::sync::mpsc::channel::<()>();
-    let gate = Arc::new(std::sync::Mutex::new(Some(gate)));
-    let (enc, ent, ext) = (
-        Arc::clone(&encoded),
-        Arc::clone(&entered),
-        Arc::clone(&exited),
-    );
+    let held: Arc<std::sync::Mutex<Vec<HeldClose>>> = Arc::default();
+    let (enc, opened) = (Arc::clone(&encoded), Arc::clone(&held));
     let open: OpenFn = Box::new(move |_| {
-        let Some(rx) = gate.lock().unwrap().take() else {
-            return Err("one slow encoder per test".to_owned());
-        };
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let entered = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
+        opened.lock().unwrap().push(HeldClose {
+            entered: Arc::clone(&entered),
+            exited: Arc::clone(&exited),
+            release,
+        });
         let e: Box<dyn LiveEncoder> = Box::new(SlowFinish {
             inner: FakeEnc {
                 forced: false,
                 encoded: Arc::clone(&enc),
             },
-            entered: Arc::clone(&ent),
-            exited: Arc::clone(&ext),
-            release: std::sync::Mutex::new(rx),
+            entered,
+            exited,
+            release: std::sync::Mutex::new(gate),
         });
         Ok(e)
     });
     let mut x = harness(2, 6, Some(open));
     x.tick(0);
-    x.h.try_take(take("a", 1, src())).unwrap();
     let mut t = 1;
-    while !x.results().contains(&TakeResult::Applied) {
-        x.tick(t);
-        t += 1;
-        assert!(t < 60, "applied");
+    let mut windows = Vec::new();
+    for rep in 0..SLOW_CLOSES {
+        x.h.try_take(take(&format!("a{rep}"), 1, src())).unwrap();
+        let by = t + 60;
+        while !x.results().contains(&TakeResult::Applied) {
+            x.tick(t);
+            t += 1;
+            assert!(t < by, "applied ({rep})");
+        }
+        x.h.try_take(take(&format!("b{rep}"), 1, PictureBus::Program))
+            .unwrap();
+        let by = t + 60;
+        while !x.results().contains(&TakeResult::Applied) {
+            x.tick(t);
+            t += 1;
+            assert!(t < by, "back on Program ({rep})");
+        }
+        // Run to the linger close; measure from before the close.
+        x.max_router = std::time::Duration::ZERO;
+        let close_by = t + LINGER_TICKS + 2;
+        while x.h.snapshot().dynamic_encoders_live > 0 {
+            x.tick(t);
+            t += 1;
+            assert!(t <= close_by, "closed at its linger tick ({rep})");
+        }
+        let (entered, exited) = {
+            let held = held.lock().unwrap();
+            assert_eq!(held.len(), rep + 1, "one encoder per take");
+            let h = &held[rep];
+            (Arc::clone(&h.entered), Arc::clone(&h.exited))
+        };
+        // The closing worker reaches `finish()` on its own thread; keep
+        // ticking until it does (a bound on the worker, not on the router).
+        let reached = Instant::now() + SETTLE_BOUND;
+        while !entered.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < reached,
+                "the close reached finish() ({rep})"
+            );
+            x.tick(t);
+            t += 1;
+        }
+        // The router ticks on while the close is held inside `finish()`.
+        for _ in 0..SLOW_FINISH_TICKS {
+            x.tick(t);
+            t += 1;
+        }
+        assert!(
+            !exited.load(Ordering::SeqCst),
+            "the router ran {SLOW_FINISH_TICKS} ticks only after finish() returned: it waited on the close ({rep})"
+        );
+        windows.push(x.max_router);
+        held.lock().unwrap()[rep].release.send(()).unwrap();
+        let done = Instant::now() + SETTLE_BOUND;
+        while !exited.load(Ordering::SeqCst) {
+            assert!(Instant::now() < done, "the released close finishes ({rep})");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
-    x.h.try_take(take("b", 1, PictureBus::Program)).unwrap();
-    while !x.results().contains(&TakeResult::Applied) {
-        x.tick(t);
-        t += 1;
-        assert!(t < 120, "back on Program");
-    }
-    // Run to the linger close.
-    let close_by = t + LINGER_TICKS + 2;
-    while x.h.snapshot().dynamic_encoders_live > 0 {
-        x.tick(t);
-        t += 1;
-        assert!(t <= close_by, "closed at its linger tick");
-    }
-    // The closing worker reaches `finish()` on its own thread; keep ticking
-    // until it does (a bound on the worker, not on the router).
-    let reached = Instant::now() + SETTLE_BOUND;
-    while !entered.load(Ordering::SeqCst) {
-        assert!(Instant::now() < reached, "the close reached finish()");
-        x.tick(t);
-        t += 1;
-    }
-    // The router ticks on while the close is held inside `finish()`.
-    for _ in 0..SLOW_FINISH_TICKS {
-        x.tick(t);
-        t += 1;
-    }
+    let shortest = windows.iter().min().copied().unwrap();
     assert!(
-        !exited.load(Ordering::SeqCst),
-        "the router ran {SLOW_FINISH_TICKS} ticks only after finish() returned: it waited on the close"
+        shortest < std::time::Duration::from_millis(50),
+        "the longest router call during a held close, in every one of {SLOW_CLOSES} closes, was >= 50 ms: {windows:?}"
     );
-    release.send(()).unwrap();
-    let done = Instant::now() + SETTLE_BOUND;
-    while !exited.load(Ordering::SeqCst) {
-        assert!(Instant::now() < done, "the released close finishes");
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
     x.tick(t);
     t += 1;
     assert_eq!(
