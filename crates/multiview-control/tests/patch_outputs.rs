@@ -149,7 +149,13 @@ struct FakeState {
     reformat_busy: bool,
     paths: HashMap<(String, RoutedFeed), (PlanPath, bool, u8)>,
     live: Option<RoutingLive>,
+    /// Per output: its passthrough miss in the plan and its live state
+    /// (#344 D2b).
+    passthrough: HashMap<String, FakePassthrough>,
 }
+
+/// A fake output's passthrough: its plan miss and its live (state, reason).
+type FakePassthrough = (Option<String>, Option<(String, Option<String>)>);
 
 struct Fake {
     state: Mutex<FakeState>,
@@ -231,7 +237,27 @@ impl OutputRouting for Fake {
                 ..cost
             },
             converts,
+            passthrough: self
+                .state
+                .lock()
+                .unwrap()
+                .passthrough
+                .get(output)
+                .and_then(|p| p.0.clone()),
         })
+    }
+    fn current_passthrough(
+        &self,
+        output: &str,
+    ) -> Option<multiview_control::output_routing::PassthroughLive> {
+        let state = self.state.lock().unwrap();
+        let (_, live) = state.passthrough.get(output)?;
+        live.as_ref().map(
+            |(state, reason)| multiview_control::output_routing::PassthroughLive {
+                state: state.clone(),
+                reason: reason.clone(),
+            },
+        )
     }
     fn plan_audio(
         &self,
@@ -258,6 +284,17 @@ impl OutputRouting for Fake {
         Ok(())
     }
     fn current_path(&self, output: &str) -> Option<PlanPath> {
+        if self
+            .state
+            .lock()
+            .unwrap()
+            .passthrough
+            .get(output)
+            .and_then(|p| p.1.as_ref())
+            .is_some_and(|(state, _)| state == "passthrough")
+        {
+            return Some(PlanPath::P0);
+        }
         (output == OUT_B).then_some(PlanPath::P3)
     }
     fn try_take(&self, take: OutputTakeRequest) -> Result<(), TakeSubmitError> {
@@ -2036,4 +2073,84 @@ async fn an_identical_put_is_a_no_op() {
         0,
         "no reset"
     );
+}
+
+/// #344 D2b: the plan reports P0 with 0 encoders and 0 converts, a non-P0
+/// source plan names its first passthrough miss, and `GET /patch` reports
+/// slot path P0 with the output's passthrough state.
+#[tokio::test]
+async fn plan_and_get_report_p0_and_the_passthrough_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(&dir.path().join("boot.toml"));
+    rig.fake.set_path(
+        OUT_A,
+        RoutedFeed::Source("bars".into()),
+        PlanPath::P0,
+        false,
+        0,
+    );
+    rig.fake.set_path(
+        OUT_B,
+        RoutedFeed::Source("bars".into()),
+        PlanPath::P3,
+        true,
+        1,
+    );
+    {
+        let mut state = rig.fake.state.lock().unwrap();
+        state.passthrough.insert(
+            OUT_A.to_owned(),
+            (None, Some(("passthrough".to_owned(), None))),
+        );
+        state.passthrough.insert(
+            OUT_B.to_owned(),
+            (Some("passthrough-not-supported-on-medium".to_owned()), None),
+        );
+        state.live = Some(RoutingLive {
+            outputs: HashMap::from([(
+                OUT_A.to_owned(),
+                OutputLive {
+                    bus: "src:bars".to_owned(),
+                    since_tick: 1,
+                    pending: None,
+                    degraded: false,
+                    audio: None,
+                    pending_audio: None,
+                    private_audio: false,
+                },
+            )]),
+            ..RoutingLive::default()
+        });
+    }
+    let (status, p0) = plan(
+        &rig,
+        OPERATOR_TOKEN,
+        patch(vec![video("output-0", json!({"source": "bars"}))]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{p0}");
+    let xp = &p0["crosspoints"][0];
+    assert_eq!(xp["path"], "P0", "{p0}");
+    assert_eq!(xp["cost"]["new_encoders"], 0);
+    assert_eq!(xp["cost"]["converts"], 0);
+    assert!(xp.get("passthrough").is_none(), "no miss on P0: {xp}");
+    let (_, p3) = plan(
+        &rig,
+        OPERATOR_TOKEN,
+        patch(vec![video("output-1", json!({"source": "bars"}))]),
+    )
+    .await;
+    assert_eq!(p3["crosspoints"][0]["path"], "P3");
+    assert_eq!(
+        p3["crosspoints"][0]["passthrough"],
+        "passthrough-not-supported-on-medium"
+    );
+    let all = body_json(send(&rig.router, get("/api/v1/patch", OPERATOR_TOKEN)).await).await;
+    let a = &all["outputs"][0]["video"][0];
+    assert_eq!(a["path"], "P0", "{all}");
+    assert_eq!(
+        a["passthrough"],
+        json!({"state": "passthrough", "reason": null})
+    );
+    assert!(all["outputs"][1]["video"][0]["passthrough"].is_null());
 }

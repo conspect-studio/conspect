@@ -25,6 +25,11 @@
  *  - After a stall Shaka resumes where it froze, so the player stays later by the length of the stall (see tick).
  *  - CAF loads Shaka from a protocol-relative URL: this page must be served over HTTPS for the CSP to allow it.
  *  - supportedCommands only advertises: CAF still executes a PAUSE or SEEK that a sender sends anyway.
+ *  - Tracks (#418, measured in tools/cast-proof/test-receiver-tracks.mjs): for an HLS master with EXT-X-MEDIA AUDIO
+ *    and SUBTITLES renditions CAF itself publishes media.tracks (AUDIO with NAME/LANGUAGE, TEXT text/vtt SUBTITLE)
+ *    and activeTrackIds in MEDIA_STATUS, and executes EDIT_TRACKS_INFO / EDIT_AUDIO_TRACKS through Shaka. Track ids
+ *    are assigned per load (they may differ after a reload), so this file remembers the choice as language + name.
+ *    The track managers (getAudioTracksManager/getTextTracksManager) throw until PLAYER_LOAD_COMPLETE.
  * Things only a real device can show are marked UNVERIFIED.
  * No secrets here. A token is never logged: only its first 6 characters.
  */
@@ -50,6 +55,10 @@
   var CATCH_UP_BEHIND_S = 5;                  // this far behind the live position after a stall ...
   var CATCH_UP_AFTER_PLAYING_MS = 120000;     // ... and playing cleanly for 2 minutes: seek to the live edge
   var PROBE_MIN_GAP_MS = 3000;
+  var MAX_REPORT_BODY = 2000;                 // the engine refuses report bodies over 2 KiB (MAX_REPORT_BYTES)
+  var MAX_TRACKS = 16;                        // per kind, in reports
+  var MAX_TRACK_TEXT = 64;                    // characters of a track name or language, in reports and preferences
+  var TRACK_CAPTURE_MS = 800;                 // after an EDIT_TRACKS_INFO / EDIT_AUDIO_TRACKS: read what is active
 
   // Measured in harness/ on the 2 s / 10-segment reference stream (REPORT.md): the picture moves 0.3 to 1.4 s
   // after LOAD (CAF's default rebufferingGoal of 10 s: 4.3 to 6.5 s). Shaka starts PRESENTATION_DELAY_S behind
@@ -85,7 +94,10 @@
   var elErrSentence = document.getElementById('error-sentence');
   var elErrCode = document.getElementById('error-code');
 
-  // The last accepted load: {url, base, tag, title, at, media, customData, codecs}. null = nothing to play.
+  // The last accepted load: {url, base, tag, title, at, media, customData, codecs, choice, pendingIds}. null = nothing
+  // to play. choice = the track choice to keep across this file's own reloads: {audio: {language, name} | null (no
+  // preference), text: {language, name} | null (subtitles off) | undefined (no preference)}. pendingIds = the
+  // LoadRequest's activeTrackIds, resolved against the manifest's tracks once the load completes.
   var current = null;
   var state = 'idle';            // idle | loading | buffering | playing | error
   var lastError = null;          // the error part of a report
@@ -106,6 +118,7 @@
   var lastProbeAt = 0;
   var stalls = 0;                // BUFFERING entered after the first PLAYING of a load
   var hadPlaying = false;
+  var tracksReady = false;       // PLAYER_LOAD_COMPLETE seen for the load in the player: the track managers answer
   // Bumped on every accepted LOAD that is not our own retry, and on stop/finish. An in-flight probe (token check,
   // retry, buffering watchdog) or report POST started under an older generation must not act on `current`: it may
   // have been replaced (a new LOAD) or cleared (stop/finish) by the time an old XMLHttpRequest answers.
@@ -224,6 +237,221 @@
     try { return window.shaka && window.shaka.Player ? String(window.shaka.Player.version) : ''; } catch (e) { return ''; }
   }
 
+  // ---------------------------------------------------------------- tracks (#418)
+
+  /** A track name or language safe for reports and comparisons: no control characters, at most 64 characters. */
+  function cleanText(v) {
+    if (typeof v !== 'string') { return null; }
+    var s = v.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, '').slice(0, MAX_TRACK_TEXT);
+    return s.length ? s : null;
+  }
+
+  /** {audio: [Track], text: [Track], audioActive: id|null, textActive: [id]} or null before PLAYER_LOAD_COMPLETE. */
+  function loadedTracks() {
+    if (!tracksReady) { return null; }     // the managers would log an error (and throw) until the load completes
+    try {
+      var atm = playerManager.getAudioTracksManager();
+      var ttm = playerManager.getTextTracksManager();
+      var audio = atm.getTracks() || [];
+      var text = ttm.getTracks() || [];
+      var active = atm.getActiveId();
+      return {
+        audio: audio, text: text,
+        audioActive: typeof active === 'number' ? active : null,
+        textActive: ttm.getActiveIds() || []
+      };
+    } catch (e) { return null; }     // nothing loaded (the managers throw until the load completes)
+  }
+
+  function trackDoc(track, active) {
+    return {
+      id: typeof track.trackId === 'number' ? track.trackId : null,
+      name: cleanText(track.name), language: cleanText(track.language), active: !!active
+    };
+  }
+
+  /** The report's tracks part: {audio: [{id, name, language, active}], text: [...]} (at most 16 each), or null. */
+  function buildTracks() {
+    if (!current) { return null; }
+    var t = loadedTracks();
+    if (!t) { return null; }
+    var audio = [];
+    var text = [];
+    for (var i = 0; i < t.audio.length && audio.length < MAX_TRACKS; i++) {
+      audio.push(trackDoc(t.audio[i], t.audio[i].trackId === t.audioActive));
+    }
+    for (var j = 0; j < t.text.length && text.length < MAX_TRACKS; j++) {
+      text.push(trackDoc(t.text[j], t.textActive.indexOf(t.text[j].trackId) >= 0));
+    }
+    return { audio: audio, text: text };
+  }
+
+  function choiceOf(track) {
+    return track ? { language: cleanText(track.language), name: cleanText(track.name) } : null;
+  }
+
+  /** The track of `list` that best matches a remembered choice: language + name, else name, else language. */
+  function bestTrack(list, want) {
+    if (!want || (!want.name && !want.language)) { return null; }
+    var byName = null;
+    var byLanguage = null;
+    for (var i = 0; i < list.length; i++) {
+      var name = cleanText(list[i].name);
+      var language = cleanText(list[i].language);
+      var nameOk = !!want.name && name === want.name;
+      var languageOk = !!want.language && !!language && language.toLowerCase() === want.language.toLowerCase();
+      if (nameOk && (languageOk || !want.language)) { return list[i]; }
+      if (nameOk && byName === null) { byName = list[i]; }
+      if (languageOk && byLanguage === null) { byLanguage = list[i]; }
+    }
+    return byName || byLanguage;
+  }
+
+  /**
+   * The sender's preference from a LOAD's customData: audioLanguage/audioName, textLanguage/textName (textLanguage
+   * null = subtitles off). Returns {audio, text} in the `current.choice` shape.
+   */
+  function choiceFromCustom(custom) {
+    var choice = { audio: null, text: undefined };
+    var al = cleanText(custom.audioLanguage);
+    var an = cleanText(custom.audioName);
+    if (al || an) { choice.audio = { language: al, name: an }; }
+    if (custom.textLanguage === null) {
+      choice.text = null;
+    } else {
+      var tl = cleanText(custom.textLanguage);
+      var tn = cleanText(custom.textName);
+      if (tl || tn) { choice.text = { language: tl, name: tn }; }
+    }
+    return choice;
+  }
+
+  /** LoadRequest.activeTrackIds: kept for PLAYER_LOAD_COMPLETE (integers only, bounded); anything else = none. */
+  function trackIds(raw) {
+    if (!raw || typeof raw.length !== 'number') { return null; }
+    var ids = [];
+    for (var i = 0; i < raw.length && ids.length < 2 * MAX_TRACKS; i++) {
+      if (typeof raw[i] === 'number' && isFinite(raw[i]) && Math.floor(raw[i]) === raw[i]) { ids.push(raw[i]); }
+    }
+    return ids.length ? ids : null;
+  }
+
+  /** Once loaded: LoadRequest.activeTrackIds name manifest tracks (unknown ids are ignored) and win per kind. */
+  function resolvePendingIds(t) {
+    var ids = current.pendingIds;
+    current.pendingIds = null;
+    if (!ids) { return; }
+    var audio = null;
+    var text = null;
+    for (var i = 0; i < ids.length; i++) {
+      for (var a = 0; a < t.audio.length; a++) { if (t.audio[a].trackId === ids[i]) { audio = t.audio[a]; } }
+      for (var b = 0; b < t.text.length; b++) { if (t.text[b].trackId === ids[i]) { text = t.text[b]; } }
+    }
+    if (audio) { current.choice.audio = choiceOf(audio); }
+    if (text) { current.choice.text = choiceOf(text); }
+    // activeTrackIds lists every active track: known ids without a text track mean subtitles off, unless the
+    // sender's customData asked for a text track explicitly.
+    else if (audio && current.choice.text === undefined) { current.choice.text = null; }
+  }
+
+  /** PLAYER_LOAD_COMPLETE (every load, our reloads included): put the remembered choice on the manifest's tracks. */
+  function applyChoice() {
+    if (!current) { return; }
+    var t = loadedTracks();
+    if (!t) { return; }
+    resolvePendingIds(t);
+    var choice = current.choice;
+    try {
+      var audio = bestTrack(t.audio, choice.audio);
+      if (audio && audio.trackId !== t.audioActive) {
+        info('audio track ->', cleanText(audio.name), cleanText(audio.language));
+        playerManager.getAudioTracksManager().setActiveById(audio.trackId);
+      }
+      if (choice.text === null) {
+        if (t.textActive.length) { info('subtitles off'); playerManager.getTextTracksManager().setActiveByIds([]); }
+      } else if (choice.text) {
+        var text = bestTrack(t.text, choice.text);
+        if (text && t.textActive.indexOf(text.trackId) < 0) {
+          info('text track ->', cleanText(text.name), cleanText(text.language));
+          playerManager.getTextTracksManager().setActiveByIds([text.trackId]);
+        }
+      }
+    } catch (e) { info('track choice not applied:', e && e.message); }
+  }
+
+  /** After a sender changed tracks: remember what is active now (language + name; ids change across reloads). */
+  function captureChoice() {
+    if (!current) { return; }
+    var t = loadedTracks();
+    if (!t) { return; }
+    var audio = null;
+    var text = null;
+    for (var i = 0; i < t.audio.length; i++) { if (t.audio[i].trackId === t.audioActive) { audio = t.audio[i]; } }
+    for (var j = 0; j < t.text.length; j++) { if (t.textActive.indexOf(t.text[j].trackId) >= 0) { text = t.text[j]; } }
+    if (audio) { current.choice.audio = choiceOf(audio); }
+    current.choice.text = text ? choiceOf(text) : null;
+    info('track choice: audio', JSON.stringify(current.choice.audio), 'text', JSON.stringify(current.choice.text));
+    report('tracks');
+  }
+
+  function scheduleCapture() {
+    var generation = loadGeneration;
+    setTimeout(function () { if (generation === loadGeneration) { captureChoice(); } }, TRACK_CAPTURE_MS);
+  }
+
+  /**
+   * EDIT_TRACKS_INFO from a sender. CAF itself refuses a request naming an id that is not in media.tracks
+   * (INVALID_REQUEST, before this interceptor; measured): nothing changes and the choice stays. Defence in depth
+   * here: only ids of the manifest's tracks pass, a language is bounded. A sender cannot add tracks (that needs a
+   * LOAD, whose media.tracks this file drops).
+   */
+  function onEditTracks(request) {
+    if (request && request.activeTrackIds) {
+      var t = loadedTracks();
+      var ids = trackIds(request.activeTrackIds) || [];
+      var known = [];
+      for (var i = 0; t && i < ids.length; i++) {
+        var hit = false;
+        for (var a = 0; a < t.audio.length; a++) { if (t.audio[a].trackId === ids[i]) { hit = true; } }
+        for (var b = 0; b < t.text.length; b++) { if (t.text[b].trackId === ids[i]) { hit = true; } }
+        if (hit && known.indexOf(ids[i]) < 0) { known.push(ids[i]); }
+      }
+      if (known.length !== request.activeTrackIds.length) { info('EDIT_TRACKS_INFO: unknown track ids dropped'); }
+      request.activeTrackIds = known;
+    }
+    if (request && request.language !== undefined) { request.language = cleanText(request.language) || undefined; }
+    scheduleCapture();
+    return request;
+  }
+
+  function onEditAudioTracks(request) {
+    if (request && request.language !== undefined) { request.language = cleanText(request.language) || undefined; }
+    scheduleCapture();
+    return request;
+  }
+
+  /**
+   * Per load: Shaka starts on the remembered audio language/name (no switch after the start). The configured
+   * playbackConfig is copied, never changed: the preference belongs to this load only.
+   */
+  function playbackInfo(loadRequest, playbackConfig) {
+    var want = current && current.choice ? current.choice.audio : null;
+    if (!want || !playbackConfig) { return playbackConfig; }
+    try {
+      var copy = new cast.framework.PlaybackConfig();
+      for (var k in playbackConfig) {
+        if (Object.prototype.hasOwnProperty.call(playbackConfig, k)) { copy[k] = playbackConfig[k]; }
+      }
+      var shakaConfig = {};
+      var base = playbackConfig.shakaConfig || {};
+      for (var s in base) { if (Object.prototype.hasOwnProperty.call(base, s)) { shakaConfig[s] = base[s]; } }
+      if (want.language) { shakaConfig.preferredAudioLanguage = want.language; }
+      if (want.name) { shakaConfig.preferredAudioLabel = want.name; }
+      copy.shakaConfig = shakaConfig;
+      return copy;
+    } catch (e) { info('playback config not adapted:', e && e.message); return playbackConfig; }
+  }
+
   function buildReport() {
     return {
       v: 1,
@@ -234,6 +462,7 @@
         severity: lastError.severity, message: lastError.message
       } : null,
       stats: buildStats(),
+      tracks: buildTracks(),
       shaka: shakaVersion(),
       caf: String(cast.framework.VERSION || ''),
       device: String(navigator.userAgent).slice(0, 200),
@@ -248,6 +477,18 @@
     } catch (e) { info('custom message not sent:', redact(e && e.message ? e.message : e)); }
   }
 
+  /** The UTF-8 byte length of a string (lone surrogates count 3, as they are sent replaced). */
+  function utf8Length(text) {
+    var n = 0;
+    for (var i = 0; i < text.length; i++) {
+      var c = text.charCodeAt(i);
+      if (c < 0x80) { n += 1; } else if (c < 0x800) { n += 2; }
+      else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < text.length && (text.charCodeAt(i + 1) & 0xFC00) === 0xDC00) { n += 4; i++; }
+      else { n += 3; }
+    }
+    return n;
+  }
+
   /** POST the report to <token base>report: at most one per second, dropped (not queued) when too soon. */
   function post(report) {
     if (!current || terminal) { return; }
@@ -256,8 +497,11 @@
     if (t - lastPostAt < POST_MIN_GAP_MS) { return; }
     lastPostAt = t;
     var body = JSON.stringify(report);
-    if (body.length > 2000) { report.device = report.device.slice(0, 60); body = JSON.stringify(report); }
-    if (body.length > 2000) { return; }
+    // Over the engine's limit (in UTF-8 bytes, as the engine counts): the tracks go first (the sender has them in
+    // MEDIA_STATUS), then the device string.
+    if (utf8Length(body) > MAX_REPORT_BODY && report.tracks) { report.tracks = null; body = JSON.stringify(report); }
+    if (utf8Length(body) > MAX_REPORT_BODY) { report.device = report.device.slice(0, 60); body = JSON.stringify(report); }
+    if (utf8Length(body) > MAX_REPORT_BODY) { return; }
     try {
       var xhr = new XMLHttpRequest();
       xhr.open('POST', current.base + 'report', true);
@@ -478,6 +722,7 @@
   function onFinished(e) {
     var reason = e && e.endedReason;
     info('media finished:', reason);
+    tracksReady = false;
     pausedTimer = clear(pausedTimer);
     bufferingTimer = clear(bufferingTimer);
     playingResetTimer = clear(playingResetTimer);
@@ -491,6 +736,7 @@
     // A sender stopped the stream.
     if (state === 'error' && !current) { return; }   // keep the rejected-LOAD screen
     current = null;
+    tracksReady = false;
     lastError = null;
     retryTimer = clear(retryTimer);
     loadGeneration += 1;    // invalidates every probe/report in flight for the stream that just stopped (MEDIA-2)
@@ -502,6 +748,7 @@
   // ---------------------------------------------------------------- player events
 
   function onLoading() {
+    tracksReady = false;
     idleTimer = clear(idleTimer);
     stopTimer = clear(stopTimer);
     hadPlaying = false;
@@ -699,7 +946,7 @@
       stalls = 0;
       liveSeekAt = 0;
       lastError = null;
-      current = { at: now(), codec: '' };
+      current = { at: now(), codec: '', choice: choiceFromCustom(custom), pendingIds: trackIds(request.activeTrackIds) };
       // A new load (not our own retry of the same stream): any probe or report POST still in flight for the
       // previous `current` must be ignored once it answers (MEDIA-2). A retry keeps the generation: it is the
       // same stream, still current, and its own in-flight probe below must be allowed to complete.
@@ -721,6 +968,10 @@
     media.hlsSegmentFormat = messages.HlsSegmentFormat.FMP4;
     media.hlsVideoSegmentFormat = messages.HlsVideoSegmentFormat.FMP4;
     media.duration = -1;
+    // Only the manifest's tracks: a sender-supplied track list (side-loaded text URLs) is dropped, and the
+    // requested activeTrackIds are resolved against the manifest after the load (applyChoice), not by CAF.
+    media.tracks = undefined;
+    request.activeTrackIds = undefined;
     if (!media.metadata) {
       // Senders show this title. It also stops CAF logging "Cannot find section metadata" as an error on every
       // live load (its live programme-guide lookup runs only when media.metadata is absent).
@@ -743,6 +994,10 @@
   // ---------------------------------------------------------------- start
 
   playerManager.setMessageInterceptor(messages.MessageType.LOAD, onLoad);
+  playerManager.setMessageInterceptor(messages.MessageType.EDIT_TRACKS_INFO, onEditTracks);
+  playerManager.setMessageInterceptor(messages.MessageType.EDIT_AUDIO_TRACKS, onEditAudioTracks);
+  playerManager.setMediaPlaybackInfoHandler(playbackInfo);
+  playerManager.addEventListener(EventType.PLAYER_LOAD_COMPLETE, function () { tracksReady = true; applyChoice(); report('loaded'); });
   playerManager.addEventListener(EventType.PLAYER_LOADING, onLoading);
   playerManager.addEventListener(EventType.BUFFERING, onBuffering);
   playerManager.addEventListener(EventType.PLAYING, onPlaying);

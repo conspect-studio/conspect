@@ -20,5 +20,8 @@ pub use clock::{
     BridgeReason, ClockCounters, ClockState, Emission, PassthroughClock, RepeatSource, SlateAu,
     SlateLoop, SlotGate, MAX_PRESENTATION_DELAY,
 };
-pub use match_rules::{evaluate, profile_rank, MatchMiss, SlotSpec, SourceTraits, StreamMeter};
+pub use match_rules::{
+    evaluate, evaluate_relaxed, evaluate_traits, profile_rank, MatchMiss, SlotSpec, SourceTraits,
+    StreamMeter,
+};
 pub use tap::{CompressedTap, TapAu, TapReader, MAX_AU_BYTES, MAX_TAP_CONSUMERS, TAP_CAPACITY};

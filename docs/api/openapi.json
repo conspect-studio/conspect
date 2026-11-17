@@ -8311,7 +8311,7 @@
         "operationId": "get_patch",
         "responses": {
           "200": {
-            "description": "`{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, live, source: {source}|{bus}|{layout}|{redacted:true}|null, path: P1|P2|P3|null, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ], subtitle: [ { slot, format, language, name, live, source: {source}|{redacted:true}|null } ] } ] }`. Subtitle slots come from the engine's live route table when the running engine samples that slot (`live: true`), else (no run, the run ended, the output not in this run, or a slot beyond the run's table) from the accepted config (`live: false`), per slot. Video slot 0 comes from the engine's live readback (`live: true`); `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. With no readback (no running engine, routing unavailable, or the output not in this run) `live` is false and `source` and `path` are null: the live state is unknown, never reported as Program. Audio slot 0's `source` is the output's accepted audio feed (`\"follow\"` by default, else `\"program\"`, `\"none\"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{\"redacted\": true}`.",
+            "description": "`{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, live, source: {source}|{bus}|{layout}|{redacted:true}|null, path: P0|P1|P2|P3|null, passthrough: {state, reason}|null, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ], subtitle: [ { slot, format, language, name, live, source: {source}|{redacted:true}|null } ] } ] }`. Subtitle slots come from the engine's live route table when the running engine samples that slot (`live: true`), else (no run, the run ended, the output not in this run, or a slot beyond the run's table) from the accepted config (`live: false`), per slot. Video slot 0 comes from the engine's live readback (`live: true`); `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. `path` is P0 while the output passes its source's compressed video through (#344: 0 decode, 0 encode); `passthrough` is that output's passthrough state (`metering`, `moving`, `passthrough`, `slate`, `bridging`, `returning`, `unavailable`, …) and its reason (a match-rule miss, a bridge reason, or `bridging on slate: no encoder session`), null when the output has no passthrough candidate; a reason never names a source. With no readback (no running engine, routing unavailable, or the output not in this run) `live` is false and `source` and `path` are null: the live state is unknown, never reported as Program. Audio slot 0's `source` is the output's accepted audio feed (`\"follow\"` by default, else `\"program\"`, `\"none\"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{\"redacted\": true}`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8358,7 +8358,7 @@
         "tags": [
           "patch"
         ],
-        "summary": "Plan 1..64 crosspoints: mixer inputs (path, on-air flag, refusals), the\nslots of one output (§12.4 path P1/P2/P3 and cost), or an atomic set\nover many destinations (#308: every member planned, `can_take` only when\nall can and the set's new encoders fit the caller's caps); no change.",
+        "summary": "Plan 1..64 crosspoints: mixer inputs (path, on-air flag, refusals), the\nslots of one output (§12.4 path P0/P1/P2/P3, cost and the first\npassthrough miss), or an atomic set over many destinations (#308: every\nmember planned, `can_take` only when all can and the set's new encoders\nfit the caller's caps); no change.",
         "operationId": "plan_patch",
         "requestBody": {
           "content": {
@@ -21614,6 +21614,69 @@
           }
         }
       },
+      "PassthroughTotals": {
+        "type": "object",
+        "description": "Passthrough (P0) counters of the run (#344 D2b): keys open (no encoder\nsession each) and cumulative AU / repeat / drift-drop / stall / slate /\nbridge counts.",
+        "required": [
+          "keys",
+          "aus",
+          "repeats",
+          "drift_drops",
+          "stalls",
+          "slate_ticks",
+          "bridges",
+          "bridges_refused"
+        ],
+        "properties": {
+          "aus": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Source access units passed through.",
+            "minimum": 0
+          },
+          "bridges": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Moves onto an on-demand picture bridge.",
+            "minimum": 0
+          },
+          "bridges_refused": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bridges that found no encoder session (stayed on the slate).",
+            "minimum": 0
+          },
+          "drift_drops": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Access units dropped by drift corrections.",
+            "minimum": 0
+          },
+          "keys": {
+            "type": "integer",
+            "description": "Passthrough keys open.",
+            "minimum": 0
+          },
+          "repeats": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Repeat (skip) access units emitted by drift corrections.",
+            "minimum": 0
+          },
+          "slate_ticks": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ticks emitted from a format slate.",
+            "minimum": 0
+          },
+          "stalls": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Runs ended by a stall.",
+            "minimum": 0
+          }
+        }
+      },
       "PatchAccepted": {
         "type": "object",
         "description": "`POST /patch/take` 202 answer. The outcome arrives as `switcher.operation`\n(mixer inputs), `route.output` (one output) or, for a set of two or more\ndestinations, `patch.take` (#308).",
@@ -22010,9 +22073,16 @@
             "type": "boolean",
             "description": "Whether the destination input is on Program now (mixer inputs)."
           },
+          "passthrough": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For an output video slot fed by a source that is not P0: the first\npassthrough miss (#344 D2b), e.g. `passthrough-not-supported-on-medium`\nor `not-enough-history`. Never names a source."
+          },
           "path": {
             "type": "string",
-            "description": "The path this crosspoint takes: `mixer-input`, `P1`, `P2`, `P3`\n(§12.4), `follow` (an audio slot riding the video take) or\n`subtitle` (a subtitle slot's route-table re-point)."
+            "description": "The path this crosspoint takes: `mixer-input`, `P0`, `P1`, `P2`, `P3`\n(§12.4), `follow` (an audio slot riding the video take) or\n`subtitle` (a subtitle slot's route-table re-point)."
           },
           "refusal": {
             "oneOf": [
@@ -23415,6 +23485,17 @@
             "type": "integer",
             "description": "Video encoders running.",
             "minimum": 0
+          },
+          "passthrough": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PassthroughTotals",
+                "description": "Passthrough (P0) counters (#344 D2b) — whole-system principals only."
+              }
+            ]
           }
         }
       },

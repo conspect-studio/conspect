@@ -44,7 +44,9 @@ fn to_json(report: &CastCheckReport) -> String {
         "{{\"ok\":{},\"errors\":{},\"warnings\":{},\"video_segments\":{},\"audio_segments\":{},\
          \"codecs\":{},\"target_duration\":{},\"max_extinf\":{:.6},\"media_sequence\":{},\
          \"discontinuity_sequence\":{},\"discontinuities\":{},\"has_audio\":{},\
-         \"has_program_date_time\":{},\"first_video_start\":{:.6},\"first_audio_start\":{:.6}}}",
+         \"has_program_date_time\":{},\"first_video_start\":{:.6},\"first_audio_start\":{:.6},\
+         \"audio_renditions\":{},\"subtitle_renditions\":{},\"subtitle_segments\":{},\
+         \"subtitle_cues\":{}}}",
         report.is_ok(),
         json_list(&report.errors),
         json_list(&report.warnings),
@@ -60,6 +62,10 @@ fn to_json(report: &CastCheckReport) -> String {
         report.has_program_date_time,
         report.first_video_start,
         report.first_audio_start,
+        report.audio_renditions,
+        report.subtitle_renditions,
+        report.subtitle_segments,
+        report.subtitle_cues,
     )
 }
 
@@ -67,7 +73,8 @@ fn print_text(report: &CastCheckReport) {
     println!(
         "codecs            {}\nvideo segments    {}\naudio segments    {}\ntarget duration   {} s\n\
          max EXTINF        {:.6} s\nmedia sequence    {}\ndiscontinuities   {} listed, sequence \
-         {}\nprogram date time {}\nfirst start       video {:.6} s, audio {:.6} s",
+         {}\nprogram date time {}\nfirst start       video {:.6} s, audio {:.6} s\n\
+         renditions        {} audio, {} subtitle ({} subtitle segments, {} cues)",
         report.codecs,
         report.video_segments,
         report.audio_segments,
@@ -79,6 +86,10 @@ fn print_text(report: &CastCheckReport) {
         if report.has_program_date_time { "yes" } else { "no" },
         report.first_video_start,
         report.first_audio_start,
+        report.audio_renditions,
+        report.subtitle_renditions,
+        report.subtitle_segments,
+        report.subtitle_cues,
     );
     for warning in &report.warnings {
         println!("warning: {warning}");

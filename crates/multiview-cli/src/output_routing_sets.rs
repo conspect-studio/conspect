@@ -163,6 +163,27 @@ impl OutputRouter {
             .and_then(|p| p.group)
     }
 
+    /// Test seam: an admitted set of `principal` holding `reserved`
+    /// unissued encoder opens (a set whose members are still priming).
+    #[cfg(test)]
+    pub(super) fn reserve_for_test(&mut self, principal: &str, reserved: usize, tick: u64) {
+        let id = self.sets.next_id;
+        self.sets.next_id = self.sets.next_id.wrapping_add(1);
+        self.sets.active.push(ActiveSet {
+            id,
+            operation_id: "reserved".to_owned(),
+            principal: principal.to_owned(),
+            members: Vec::new(),
+            arm: None,
+            admitted: tick,
+            reserved,
+            proposed: None,
+            grouped: false,
+        });
+        // A reservation is a holding (#308).
+        self.holdings_dirty = true;
+    }
+
     /// Unissued open reservations of every set, and of `principal`'s.
     pub(super) fn set_reservations(&self, principal: &str) -> (usize, usize) {
         self.sets.active.iter().fold((0, 0), |(all, mine), s| {
@@ -231,7 +252,7 @@ impl OutputRouter {
 
     /// Encoders charged to `principal`: live keys, opens in flight and its
     /// sets' unissued reservations.
-    fn principal_held(&self, principal: &str) -> usize {
+    pub(super) fn principal_held(&self, principal: &str) -> usize {
         self.dynamic
             .iter()
             .filter(|d| d.principal == principal)
@@ -524,6 +545,12 @@ impl OutputRouter {
             }
             set.operation_id.clone_into(&mut m.operation_id);
             set.principal.clone_into(&mut m.principal);
+            // A set member is a video take like any other: it ends the
+            // output's passthrough candidate for another feed (#344 D2b
+            // review R1-I-1/A-3).
+            if let Some(bus) = m.bus.as_ref() {
+                self.pass_take_started(index, bus);
+            }
             if let Some(out) = self.outputs.get_mut(index) {
                 out.pending = Some(Pending {
                     take: m,
@@ -631,6 +658,7 @@ impl OutputRouter {
             settings,
             bus: bus.clone(),
             reformat: reset.clone(),
+            passthrough: None,
         }) {
             Ok(()) => {
                 if let Some(s) = self.sets.active.iter_mut().find(|s| s.id == group) {
@@ -647,6 +675,7 @@ impl OutputRouter {
                         principal: principal.to_owned(),
                         deadline: tick.saturating_add(OPEN_DEADLINE_TICKS),
                         waiter: Some(index),
+                        bridge_for: None,
                     },
                 );
                 if let Some(p) = self.outputs.get_mut(index).and_then(|o| o.pending.as_mut()) {

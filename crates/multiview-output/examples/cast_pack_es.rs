@@ -30,7 +30,8 @@ use std::path::PathBuf;
 
 use multiview_core::time::Rational;
 use multiview_output::hls::cast::{
-    AudioUnit, CastAudioConfig, CastPackager, CastPackagerConfig, CastVideoConfig, VideoUnit,
+    AudioUnit, CastAudioConfig, CastAudioRendition, CastPackager, CastPackagerConfig,
+    CastVideoConfig, VideoUnit,
 };
 use multiview_output::hls::cmaf;
 
@@ -156,13 +157,20 @@ fn main() {
             bit_rate: None,
             extradata: if extradata { sets } else { None },
         },
-        audio: has_audio.then_some(CastAudioConfig {
-            time_base: Rational::new(1, i64::from(rate)),
-            sample_rate: rate,
-            channels,
-            bit_rate: None,
-            audio_specific_config: None,
-        }),
+        audio: has_audio
+            .then(|| {
+                CastAudioRendition::program(CastAudioConfig {
+                    time_base: Rational::new(1, i64::from(rate)),
+                    sample_rate: rate,
+                    channels,
+                    bit_rate: None,
+                    audio_specific_config: None,
+                })
+            })
+            .into_iter()
+            .collect(),
+        subtitles: Vec::new(),
+        subtitle_feed: None,
         epoch: None,
         wall_anchor: None,
     })
@@ -195,10 +203,13 @@ fn main() {
             if !dropped(drop_audio, next_audio) {
                 let data = frames[usize::try_from(next_audio).unwrap() % frames.len()];
                 packager
-                    .push_audio(AudioUnit {
-                        pts: next_audio * 1024,
-                        data,
-                    })
+                    .push_audio(
+                        0,
+                        AudioUnit {
+                            pts: next_audio * 1024,
+                            data,
+                        },
+                    )
                     .expect("push audio");
             }
             next_audio += 1;
