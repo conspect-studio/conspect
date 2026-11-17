@@ -23,7 +23,7 @@
 //! The token is a path segment: it is never logged by this crate (no layer
 //! here records request paths), never audited and never published.
 
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};

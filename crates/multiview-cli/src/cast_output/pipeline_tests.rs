@@ -1904,6 +1904,7 @@ struct LadderFlood {
 /// same isolation assertions as (e), with the same control run and the
 /// negative controls (n) proving they see a shared stall.
 #[test]
+#[allow(clippy::too_many_lines)] // One linear chaos scenario: control plane, epoch writer, flood, assertions.
 fn l_a_ladder_flood_costs_the_clock_zero_ticks_and_the_hls_output_zero_packets() {
     let control = chaos_run("cast_l0", Setup::LIVE, None, None);
     let seen = Arc::new(Mutex::new((ChaosSeen::default(), LadderFlood::default())));
