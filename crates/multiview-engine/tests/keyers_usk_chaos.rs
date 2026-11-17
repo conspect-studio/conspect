@@ -1,12 +1,14 @@
 //! Upstream keyer chaos (ADR-0113, design note §11.5, slice K3; invariants
-//! #1 and #10): armed-key sources that stall, vanish and come back while
-//! key-changing AUTOs (MIX, DIP, WIPE, key-only) run back to back, with an
-//! `arm` flood from tokio tasks. Program ticks stay contiguous and correctly
-//! stamped, nothing repeats, every take gets exactly one terminal outcome,
-//! and the pooled odometers never move after warm-up (the no-per-tick-
-//! allocation gate; the workspace forbids the `unsafe` a counting allocator
-//! needs, see K2a Concerns).
+//! #1 and #10), restructured after review K3-INV-2 into deterministic
+//! scenarios with count/bound assertions: armed-key sources stalling and
+//! vanishing DURING a key-changing AUTO (clock-driven, the loss asserted
+//! in flight); a bounded `arm`/take flood whose accepted operation ids are
+//! compared exactly with the terminal outcomes; a stalled outcome reader's
+//! counted overflow; and the pooled odometers over 6 000 key-changing ticks
+//! (the no-per-tick-allocation gate; the workspace forbids the `unsafe` a
+//! counting allocator needs, see K2a Concerns).
 #![allow(
+    clippy::print_stdout,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
@@ -18,7 +20,7 @@
 mod rig;
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use multiview_core::switcher::{ArmedSet, FrameCount, TransitionDescriptor};
@@ -61,19 +63,33 @@ fn usks() -> Vec<multiview_config::UpstreamKeyerConfig> {
     ]
 }
 
-/// The run: the clock ticks against a manual time source; armed-key sources
-/// k1..k3 each live on their own duty cycle (k3 vanishes for good at tick
-/// 400), so keys stall and reach the loss trigger mid-AUTO. A task floods
-/// `arm`, transition selections, AUTOs and CUTs through the bounded mailbox.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stalling_and_vanishing_armed_key_sources_never_stall_or_skip_a_tick() {
-    const TICKS: u64 = 1_500;
+/// Review K3-INV-2, scenario 1 (deterministic, clock-driven): a
+/// key-changing AUTO is in flight when the armed keys' sources stall and
+/// then vanish DURING it. The runtime's clock ticks against a manual time
+/// source; the frame callback publishes sources by tick index, so the
+/// sequence is the same on any runner. Each cycle: arm usk1 (going on) and
+/// usk3 (going off), start a 40-tick AUTO at phase 0, stop k1 at phase 5 and
+/// k3 at phase 8 (both reach the 6-tick loss ladder mid-flight), let the
+/// AUTO end, then bring them back. Asserted: every loss happened while a
+/// transition was in flight (counted in the frame callback from the
+/// committed snapshot), Program ticks are contiguous with PTS from the tick
+/// counter, and no frame repeats.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn armed_key_sources_vanishing_during_an_auto_never_stall_or_skip_a_tick() {
+    const CYCLE: u64 = 100;
+    const CYCLES: u64 = 8;
+    const TICKS: u64 = CYCLE * CYCLES;
     let mut rig = Rig::new(&["a", "b"]);
     for id in ["k1", "k2", "k3"] {
         rig.fast(id);
     }
     rig.publish_background(0);
+    for id in ["k1", "k3"] {
+        rig.publish(id, LUMA_FILL, 0);
+    }
     let (handle, hook, drive) = rig.build_usk(&[], &usks(), 100.0, "a", "b");
+    // usk3 starts on air so each AUTO takes one key on and one off.
+    let mut outcomes = handle.outcomes();
     let clock = Arc::new(ManualTimeSource::new());
     let ts: Arc<dyn TimeSource> = clock.clone();
     let mut runtime = EngineRuntime::new(
@@ -84,42 +100,22 @@ async fn stalling_and_vanishing_armed_key_sources_never_stall_or_skip_a_tick() {
     );
     let repeated = runtime.frames_repeated_counter();
     let publisher = EnginePublisher::<u8, ()>::new(16);
-    let mut outcomes = handle.outcomes();
-    let done = Arc::new(AtomicBool::new(false));
-    let accepted = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let busy = Arc::new(AtomicU64::new(0));
-    let flood = {
-        let handle = handle.clone();
-        let done = Arc::clone(&done);
-        let accepted = Arc::clone(&accepted);
-        let busy = Arc::clone(&busy);
-        tokio::spawn(async move {
-            let mut n = 0_u64;
-            while !done.load(Ordering::Acquire) {
-                let verb = match n % 6 {
-                    0 => arm(n % 4 != 0, &[1 + u32::try_from(n % 3).unwrap()]),
-                    1 => arm(false, &[1, 2, 3]),
-                    2 => transition(n / 6),
-                    3 => SwitcherVerb::Auto(FrameCount::try_from(6).unwrap()),
-                    4 => SwitcherVerb::Cut,
-                    _ => arm(true, &[2]),
-                };
-                let op = format!("c-{n}");
-                if handle.try_send(cmd(&op, verb)).is_ok() {
-                    accepted.lock().unwrap().push(op);
-                } else {
-                    busy.fetch_add(1, Ordering::Relaxed);
-                }
-                if n % 4 == 0 {
-                    tokio::task::yield_now().await;
-                }
-                n += 1;
-            }
-            n
-        })
-    };
+    let counters = handle.keyer_counters();
     let mut frames = Vec::new();
+    let mut lost_in_flight = 0_u64;
+    let mut lost_outside = 0_u64;
+    let mut flights = 0_u64;
+    let mut last_lost = counters.source_lost();
     let pace = Arc::clone(&clock);
+    let control = handle.clone();
+    // Commands are enqueued from the frame callback at fixed phases, so the
+    // drain order is deterministic: at most 3 per tick, far below the
+    // mailbox (64) and the per-tick drain (16).
+    let send = move |op: String, verb: SwitcherVerb| {
+        control.try_send(cmd(&op, verb)).unwrap();
+    };
+    send("setup-arm".into(), arm(false, &[3]));
+    send("setup-mix".into(), transition(0));
     runtime
         .run_for_with_frame_control(
             &publisher,
@@ -130,18 +126,44 @@ async fn stalling_and_vanishing_armed_key_sources_never_stall_or_skip_a_tick() {
                 pace.advance(std::time::Duration::from_nanos(
                     u64::try_from(TICK_NS).unwrap(),
                 ));
-                let next = frame.tick.index + 1;
+                let k = frame.tick.index;
+                // The loss counter moved on this committed frame: where was
+                // the M/E?
+                let lost = counters.source_lost();
+                if lost > last_lost {
+                    if handle.snapshot().is_some_and(|s| s.in_flight) {
+                        lost_in_flight += lost - last_lost;
+                    } else {
+                        lost_outside += lost - last_lost;
+                    }
+                    last_lost = lost;
+                }
+                if handle.snapshot().is_some_and(|s| s.in_flight) && k % CYCLE == 1 {
+                    flights += 1;
+                }
+                let next = k + 1;
                 rig.publish_background(next);
-                // k1 stalls 10 of every 30 ticks, k2 25 of every 70, k3 is
-                // live until tick 400 and then vanishes for good.
-                if next % 30 < 20 {
+                let phase = next % CYCLE;
+                // Warm-up: put usk3 on before the first cycle.
+                if next == 1 {
+                    send("setup-cut".into(), SwitcherVerb::Cut);
+                }
+                // k1 / k3 are live outside the stall window [5, 60).
+                if !(5..60).contains(&phase) {
                     rig.publish("k1", LUMA_FILL, next);
                 }
-                if next % 70 < 45 {
-                    rig.publish("k2", 200, next);
-                }
-                if next < 400 {
+                if !(8..60).contains(&phase) {
                     rig.publish("k3", 150, next);
+                }
+                match phase {
+                    // Re-arm after any loss took a key off: usk1 on, usk3 off
+                    // (or back on, whatever their state; both toggle).
+                    90 => send(format!("arm-{next}"), arm(false, &[1, 3])),
+                    0 if next >= CYCLE => send(
+                        format!("auto-{next}"),
+                        SwitcherVerb::Auto(FrameCount::try_from(40).unwrap()),
+                    ),
+                    _ => {}
                 }
                 0
             },
@@ -150,11 +172,6 @@ async fn stalling_and_vanishing_armed_key_sources_never_stall_or_skip_a_tick() {
         )
         .await
         .unwrap();
-    done.store(true, Ordering::Release);
-    let sent = flood.await.unwrap();
-    assert!(sent > 0);
-    // Invariant #1: exactly one frame per tick, contiguous, stamped from the
-    // tick counter, none repeated.
     assert_eq!(u64::try_from(frames.len()).unwrap(), TICKS);
     for (i, (index, pts)) in frames.iter().enumerate() {
         assert_eq!(*index, u64::try_from(i).unwrap(), "contiguous ticks");
@@ -165,24 +182,160 @@ async fn stalling_and_vanishing_armed_key_sources_never_stall_or_skip_a_tick() {
         );
     }
     assert_eq!(repeated.load(Ordering::Acquire), 0, "no repeated frame");
-    // Invariant #10: the mailbox is bounded (some sends were refused), and
-    // every accepted command got exactly one terminal outcome (the ring is
-    // drained here, after the run; a lag would only make this weaker, so it
-    // must be zero for the check to hold).
-    let (got, lagged) = drain(&mut outcomes);
-    if lagged == 0 {
-        let mut seen = HashSet::new();
-        for o in &got {
-            assert!(
-                seen.insert(o.operation_id.clone()),
-                "one outcome per op: {o:?}"
-            );
-        }
-    }
-    let _ = busy.load(Ordering::Relaxed);
+    println!("flights={flights} lost_in_flight={lost_in_flight} lost_outside={lost_outside}");
+    assert!(flights >= CYCLES - 2, "AUTOs were in flight: {flights}");
     assert!(
-        handle.keyer_counters().source_lost() > 0,
-        "armed keys reached the loss trigger during the run"
+        lost_in_flight >= CYCLES - 2,
+        "armed keys were lost during the active transition ({lost_in_flight} in flight, \
+         {lost_outside} outside)"
+    );
+    // Every operation got exactly one terminal outcome (the ring holds them
+    // all: a few per cycle, far below 256).
+    let (got, lagged) = drain(&mut outcomes);
+    assert_eq!(lagged, 0);
+    let mut seen = HashSet::new();
+    for o in &got {
+        assert!(
+            seen.insert(o.operation_id.clone()),
+            "one outcome per op: {o:?}"
+        );
+    }
+    assert!(
+        seen.iter().filter(|op| op.starts_with("auto-")).count()
+            >= usize::try_from(CYCLES - 2).unwrap()
+    );
+}
+
+/// Review K3-INV-2, scenario 2: a bounded flood of `arm` / AUTO / CUT from
+/// 8 tasks while the clock runs. The producers stop before a bounded drain,
+/// then every ACCEPTED operation id has exactly one terminal outcome and
+/// every refused send was a full mailbox (counted, never accepted). The
+/// outcome stream is drained by a reader task every tick, so the ring never
+/// overflows here (asserted: zero lag).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bounded_arm_and_take_flood_accounts_for_every_operation() {
+    const PER_TASK: u64 = 400;
+    const TASKS: u64 = 8;
+    let rig = Rig::new(&["a", "b", "k1", "k2", "k3"]);
+    rig.publish_background(0);
+    let (handle, mut hook, mut drive) = rig.build_usk(&[], &usks(), 100.0, "a", "b");
+    let mut outcomes = handle.outcomes();
+    let accepted = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let busy = Arc::new(AtomicU64::new(0));
+    let mut tasks = Vec::new();
+    for t in 0..TASKS {
+        let handle = handle.clone();
+        let accepted = Arc::clone(&accepted);
+        let busy = Arc::clone(&busy);
+        tasks.push(tokio::spawn(async move {
+            for i in 0..PER_TASK {
+                let n = t * PER_TASK + i;
+                let verb = match n % 5 {
+                    0 => arm(n % 2 == 0, &[1 + u32::try_from(n % 3).unwrap()]),
+                    1 => transition(n),
+                    2 => SwitcherVerb::Auto(FrameCount::try_from(3).unwrap()),
+                    3 => SwitcherVerb::Cut,
+                    _ => arm(true, &[]),
+                };
+                let op = format!("f-{n}");
+                if handle.try_send(cmd(&op, verb)).is_ok() {
+                    accepted.lock().unwrap().push(op);
+                } else {
+                    busy.fetch_add(1, Ordering::Relaxed);
+                }
+                if i % 8 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }));
+    }
+    // The clock drains while the producers run, then a bounded drain after.
+    let mut got = Vec::new();
+    let mut lagged = 0;
+    let mut k = 0_u64;
+    let mut ticks = Vec::new();
+    while tasks.iter().any(|t| !t.is_finished()) {
+        rig.publish_background(k);
+        for id in ["k1", "k2", "k3"] {
+            rig.publish(id, LUMA_FILL, k);
+        }
+        ticks.push(step(&mut hook, &mut drive, k).tick.index);
+        let (items, lag) = drain(&mut outcomes);
+        got.extend(items);
+        lagged += lag;
+        k += 1;
+        tokio::task::yield_now().await;
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    // Bounded drain: the mailbox holds at most 64 commands, drained 16 per
+    // tick; a held take resolves within its 50-tick deadline and an AUTO of
+    // 3 ticks completes; 80 ticks bound all of it.
+    for _ in 0..80 {
+        rig.publish_background(k);
+        for id in ["k1", "k2", "k3"] {
+            rig.publish(id, LUMA_FILL, k);
+        }
+        ticks.push(step(&mut hook, &mut drive, k).tick.index);
+        let (items, lag) = drain(&mut outcomes);
+        got.extend(items);
+        lagged += lag;
+        k += 1;
+    }
+    assert!(
+        ticks.windows(2).all(|w| w[1] == w[0] + 1),
+        "contiguous ticks"
+    );
+    assert_eq!(lagged, 0, "the per-tick reader never lags");
+    let accepted = accepted.lock().unwrap().clone();
+    let busy = busy.load(Ordering::Relaxed);
+    assert_eq!(
+        u64::try_from(accepted.len()).unwrap() + busy,
+        TASKS * PER_TASK,
+        "every send was accepted or refused busy"
+    );
+    let mut outcome_ids = HashSet::new();
+    for o in &got {
+        assert!(
+            outcome_ids.insert(o.operation_id.clone()),
+            "one outcome per op: {o:?}"
+        );
+    }
+    let accepted: HashSet<String> = accepted.into_iter().collect();
+    assert_eq!(
+        outcome_ids, accepted,
+        "terminal outcomes are exactly the accepted operations"
+    );
+}
+
+/// Review K3-INV-2, scenario 3: a reader that never reads while more
+/// outcomes than the ring holds are produced sees exactly the ring (256)
+/// and a counted lag for the rest; nothing blocks the clock.
+#[test]
+fn a_stalled_outcome_reader_sees_the_ring_and_a_counted_lag() {
+    let rig = Rig::new(&["a", "b", "k1", "k2", "k3"]);
+    let (handle, mut hook, mut drive) = rig.build_usk(&[], &usks(), 100.0, "a", "b");
+    let mut stalled = handle.outcomes();
+    let mut produced = 0_u64;
+    for k in 0..60_u64 {
+        // 10 refused arms per tick (key 4 is not defined): one outcome each.
+        for i in 0..10 {
+            handle
+                .try_send(cmd(&format!("x-{k}-{i}"), arm(false, &[4])))
+                .unwrap();
+            produced += 1;
+        }
+        rig.publish_background(k);
+        step(&mut hook, &mut drive, k);
+    }
+    assert!(produced > 256);
+    let (items, lagged) = drain(&mut stalled);
+    assert_eq!(items.len(), 256, "the ring is retained");
+    assert_eq!(
+        u64::try_from(items.len()).unwrap() + lagged,
+        produced,
+        "the rest is a counted lag"
     );
 }
 
