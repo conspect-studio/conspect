@@ -28,7 +28,8 @@
 //! A stored layout registered as an M/E source (#307, [`MeLayoutCompose`]) is
 //! composed here too, after the routed feeds, with its own [`LayoutCanvas`]
 //! and published into its `layout:<id>` [`TileStore`] at the tick's pts; the
-//! Program drive samples that store like any source, one tick later.
+//! Program drive samples that store like any source, one tick later. In
+//! overlay builds it carries the same overlay bake as a routed layout.
 //!
 //! A panic in a tick body, or any other exit, raises `failed`; the consumer
 //! then moves every output on an aux bus back to Program (§4.4). An M/E layout
@@ -521,7 +522,7 @@ struct AuxState {
     per_feed: HashMap<Arc<str>, FeedState>,
     me_seen: Option<Arc<Vec<MeLayoutCompose>>>,
     /// Per M/E layout key: its compose state (rebuilt when the body changes).
-    per_me_layout: HashMap<Arc<str>, Option<crate::aux_layout::LayoutCanvas>>,
+    per_me_layout: HashMap<Arc<str>, MeLayoutState>,
     /// Set when the feed set or a layout body changed: `wanted` is
     /// recomputed at the end of that tick only (never per tick).
     #[cfg(feature = "overlay")]
@@ -532,14 +533,39 @@ struct AuxState {
     pending: Vec<PendingBake>,
 }
 
+/// One M/E layout source's compose state (#307): its canvas and, in
+/// overlay builds, its overlay bake (both rebuilt when the body changes).
+#[derive(Default)]
+struct MeLayoutState {
+    /// `None`: a body for another canvas size (never composed).
+    canvas: Option<crate::aux_layout::LayoutCanvas>,
+    /// The layout's overlay bake (`None`: every layer off, no overlay
+    /// inputs, or no canvas). Rebuilt with `canvas`.
+    #[cfg(feature = "overlay")]
+    bake: Option<crate::aux_overlays::LayoutOverlayBake>,
+}
+
+/// Where a baked layout picture is published.
+#[cfg(feature = "overlay")]
+enum BakeTarget {
+    /// A routed layout's picture-bus slot (its state lives in `per_feed`).
+    Bus {
+        slot: Arc<PictureBusSlot>,
+        generation: u64,
+    },
+    /// An M/E layout source's `layout:<id>` store (its state lives in
+    /// `per_me_layout`), published at the tick's pts.
+    MeStore { store: Arc<TileStore<Nv12Image>> },
+}
+
 /// One composed layout picture awaiting its overlay bake this tick. The
-/// feed's canvas and bake are moved out of its [`FeedState`] for the bake
-/// (so several bakes can run at once) and moved back after it.
+/// layout's canvas and bake are moved out of its [`FeedState`] (or
+/// [`MeLayoutState`]) for the bake (so several bakes can run at once) and
+/// moved back after it.
 #[cfg(feature = "overlay")]
 struct PendingBake {
     key: Arc<str>,
-    slot: Arc<PictureBusSlot>,
-    generation: u64,
+    target: BakeTarget,
     picture: Arc<Nv12Image>,
     canvas: crate::aux_layout::LayoutCanvas,
     bake: crate::aux_overlays::LayoutOverlayBake,
@@ -686,26 +712,41 @@ impl AuxState {
             if item.out.is_none() {
                 run(&mut item);
             }
+            // A failed bake (or none) publishes the clean picture.
             let frame = item.out.take().unwrap_or_else(|| Arc::clone(&item.picture));
-            if !Arc::ptr_eq(&frame, &item.picture) {
-                item.slot.baked.fetch_add(1, Ordering::Relaxed);
-            }
-            item.slot.latest.store(Some(Arc::new(AuxFrame {
-                tick: tick.index,
-                generation: item.generation,
-                frame,
-            })));
-            item.slot.composed.fetch_add(1, Ordering::Relaxed);
-            if let Some(entry) = self.per_feed.get_mut(&item.key) {
-                entry.layout = Some(item.canvas);
-                entry.bake = Some(item.bake);
+            match item.target {
+                BakeTarget::Bus { slot, generation } => {
+                    if !Arc::ptr_eq(&frame, &item.picture) {
+                        slot.baked.fetch_add(1, Ordering::Relaxed);
+                    }
+                    slot.latest.store(Some(Arc::new(AuxFrame {
+                        tick: tick.index,
+                        generation,
+                        frame,
+                    })));
+                    slot.composed.fetch_add(1, Ordering::Relaxed);
+                    if let Some(entry) = self.per_feed.get_mut(&item.key) {
+                        entry.layout = Some(item.canvas);
+                        entry.bake = Some(item.bake);
+                    }
+                }
+                BakeTarget::MeStore { store } => {
+                    store.publish_arc(frame, tick.pts);
+                    // Latch our own frame (see `compose_me_layouts`).
+                    let _ = store.state_at(tick.pts);
+                    if let Some(entry) = self.per_me_layout.get_mut(&item.key) {
+                        entry.canvas = Some(item.canvas);
+                        entry.bake = Some(item.bake);
+                    }
+                }
             }
         }
     }
 
-    /// Raise `wanted` while some active layout feed bakes overlays (the bake
-    /// consumer then publishes its signals). Recomputed only when the feed
-    /// set changed or a body was rebuilt — not per tick.
+    /// Raise `wanted` while some active layout feed or M/E layout source
+    /// bakes overlays (the bake consumer then publishes its signals).
+    /// Recomputed only when the feed set, the M/E layout set or a body
+    /// changed — not per tick.
     #[cfg(feature = "overlay")]
     fn refresh_wanted(&mut self, inputs: &AuxInputs) {
         if !std::mem::take(&mut self.bakes_changed) {
@@ -713,13 +754,22 @@ impl AuxState {
         }
         if let Some(overlays) = inputs.overlays.as_ref() {
             // Bounded by construction: at most MAX_PARALLEL_BAKES baking
-            // layouts (config caps routed layouts at the same bound) of at
-            // most MAX_BAKED_CELLS cells each (larger layouts get no bake).
-            let sources: std::collections::HashSet<String> = self
+            // routed layouts (config caps routed layouts at the same bound)
+            // plus at most MAX_ME_LAYOUT_SOURCES M/E layout sources, of at
+            // most MAX_BAKED_CELLS cells each (larger layouts get no bake),
+            // and at most MAX_WANTED_SOURCES ids in total.
+            let routed = self
                 .per_feed
                 .values()
                 .filter_map(|f| f.bake.as_ref())
-                .take(MAX_PARALLEL_BAKES)
+                .take(MAX_PARALLEL_BAKES);
+            let me = self
+                .per_me_layout
+                .values()
+                .filter_map(|m| m.bake.as_ref())
+                .take(multiview_engine::switcher_layouts::MAX_ME_LAYOUT_SOURCES);
+            let sources: std::collections::HashSet<String> = routed
+                .chain(me)
                 .flat_map(|bake| {
                     bake.bound_sources()
                         .take(crate::aux_overlays::MAX_BAKED_CELLS)
@@ -727,7 +777,8 @@ impl AuxState {
                 .take(crate::aux_overlays::MAX_WANTED_SOURCES)
                 .map(str::to_owned)
                 .collect();
-            let wanted = self.per_feed.values().any(|f| f.bake.is_some());
+            let wanted = self.per_feed.values().any(|f| f.bake.is_some())
+                || self.per_me_layout.values().any(|m| m.bake.is_some());
             overlays.wanted_sources.store(Arc::new(sources));
             overlays.wanted.store(wanted, Ordering::Relaxed);
         }
@@ -737,7 +788,10 @@ impl AuxState {
 impl AuxState {
     /// Compose every stored layout registered as an M/E source into its
     /// store at `tick.pts` (#307). Per-key state is forgotten for keys that
-    /// left the set; a body swap (another `Arc`) rebuilds that key's canvas.
+    /// left the set; a body swap (another `Arc`) rebuilds that key's canvas
+    /// and (overlay builds) its overlay bake. A layout with overlays is
+    /// published after its bake this tick (`bake_layouts`), exactly like a
+    /// routed layout; one without is published now.
     fn compose_me_layouts(&mut self, inputs: &AuxInputs, tick: AuxTick) {
         let Some(set) = inputs.me_layouts.as_ref() else {
             return;
@@ -748,30 +802,70 @@ impl AuxState {
             .as_ref()
             .is_none_or(|seen| !Arc::ptr_eq(seen, &set));
         if changed {
+            // A key that left the set with a bake changes `wanted`.
+            #[cfg(feature = "overlay")]
+            {
+                self.bakes_changed |= self.per_me_layout.iter().any(|(key, state)| {
+                    state.bake.is_some() && !set.iter().any(|entry| entry.key == *key)
+                });
+            }
             self.per_me_layout
                 .retain(|key, _| set.iter().any(|entry| entry.key == *key));
             self.me_seen = Some(Arc::clone(&set));
         }
         for entry in set.iter() {
-            let canvas = self
+            let layout_state = self
                 .per_me_layout
                 .entry(Arc::clone(&entry.key))
                 .or_default();
-            let stale = canvas
+            let stale = layout_state
+                .canvas
                 .as_ref()
                 .is_none_or(|c| !Arc::ptr_eq(c.layout(), &entry.body));
             if stale {
-                *canvas = crate::aux_layout::LayoutCanvas::new(
+                layout_state.canvas = crate::aux_layout::LayoutCanvas::new(
                     Arc::clone(&entry.body),
                     inputs.layout_canvas,
                 );
+                #[cfg(feature = "overlay")]
+                {
+                    let had = layout_state.bake.is_some();
+                    layout_state.bake = rebuild_bake(
+                        layout_state.bake.take(),
+                        layout_state.canvas.as_mut(),
+                        &entry.body,
+                        inputs.overlays.as_ref(),
+                    );
+                    // Only a bake that came, went or was rebuilt changes
+                    // `wanted` (a body for another canvas size re-checks
+                    // every tick and must not recompute it every tick).
+                    self.bakes_changed |= had || layout_state.bake.is_some();
+                }
             }
-            let Some(canvas) = canvas.as_mut() else {
+            let Some(canvas) = layout_state.canvas.as_mut() else {
                 continue; // another canvas size: never composed (the store ages)
             };
             let Some(picture) = canvas.compose(&inputs.stores, tick.pts) else {
                 continue; // every buffer in use downstream: the store holds
             };
+            #[cfg(feature = "overlay")]
+            if layout_state.bake.is_some() {
+                if let (Some(canvas), Some(bake)) =
+                    (layout_state.canvas.take(), layout_state.bake.take())
+                {
+                    self.pending.push(PendingBake {
+                        key: Arc::clone(&entry.key),
+                        target: BakeTarget::MeStore {
+                            store: Arc::clone(&entry.store),
+                        },
+                        picture,
+                        canvas,
+                        bake,
+                        out: None,
+                    });
+                }
+                continue;
+            }
             entry.store.publish_arc(picture, tick.pts);
             // Latch our own frame: a registered layout that no bus reads yet
             // (patched to an input only) still lets the store prune its ring,
@@ -802,26 +896,12 @@ impl AuxState {
             entry.generation = entry.generation.wrapping_add(1);
             #[cfg(feature = "overlay")]
             {
-                entry.bake = match (entry.bake.take(), inputs.overlays.as_ref()) {
-                    (_, None) => None,
-                    _ if entry.layout.is_none() => None,
-                    // An edited body of the same layout keeps its fonts and
-                    // meter ballistics.
-                    (Some(mut bake), Some(overlays)) => {
-                        bake.rebuild(&layout.body, &overlays.labels).then_some(bake)
-                    }
-                    (None, Some(overlays)) => {
-                        crate::aux_overlays::LayoutOverlayBake::new(&layout.body, overlays)
-                    }
-                };
-                if let Some(canvas) = entry.layout.as_mut() {
-                    canvas.keep_frames(
-                        entry
-                            .bake
-                            .as_ref()
-                            .is_some_and(crate::aux_overlays::LayoutOverlayBake::wants_frames),
-                    );
-                }
+                entry.bake = rebuild_bake(
+                    entry.bake.take(),
+                    entry.layout.as_mut(),
+                    &layout.body,
+                    inputs.overlays.as_ref(),
+                );
                 self.bakes_changed = true;
             }
         }
@@ -838,8 +918,10 @@ impl AuxState {
             if let (Some(canvas), Some(bake)) = (entry.layout.take(), entry.bake.take()) {
                 self.pending.push(PendingBake {
                     key: Arc::clone(&feed.key),
-                    slot: Arc::clone(&feed.slot),
-                    generation: entry.generation,
+                    target: BakeTarget::Bus {
+                        slot: Arc::clone(&feed.slot),
+                        generation: entry.generation,
+                    },
                     picture,
                     canvas,
                     bake,
@@ -855,6 +937,31 @@ impl AuxState {
         })));
         feed.slot.composed.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// The overlay bake for a (re)built layout `canvas` of `body`: `None`
+/// without overlay inputs or a canvas, or when every layer is off; an edited
+/// body of the same layout keeps its fonts and meter ballistics (`previous`
+/// is rebuilt in place). Also tells `canvas` whether to keep per-cell frames.
+/// Shared by routed layouts and M/E layout sources.
+#[cfg(feature = "overlay")]
+fn rebuild_bake(
+    previous: Option<crate::aux_overlays::LayoutOverlayBake>,
+    canvas: Option<&mut crate::aux_layout::LayoutCanvas>,
+    body: &Arc<crate::aux_layout::RoutedLayout>,
+    overlays: Option<&crate::aux_overlays::AuxOverlayInputs>,
+) -> Option<crate::aux_overlays::LayoutOverlayBake> {
+    let canvas = canvas?;
+    let overlays = overlays?;
+    let bake = match previous {
+        Some(mut bake) => bake.rebuild(body, &overlays.labels).then_some(bake),
+        None => crate::aux_overlays::LayoutOverlayBake::new(body, overlays),
+    };
+    canvas.keep_frames(
+        bake.as_ref()
+            .is_some_and(crate::aux_overlays::LayoutOverlayBake::wants_frames),
+    );
+    bake
 }
 
 impl FeedState {
@@ -2058,6 +2165,146 @@ codec = "h264"
             !handle.failed.load(Ordering::Acquire),
             "no scoped thread ran"
         );
+    }
+
+    /// M/E layout sources with overlays wired: the aux thread over no routed
+    /// feed and the M/E set `set`, at 1920x1080 on the `aux_overlays`
+    /// fixtures. Returns the overlay inputs too (for `wanted`).
+    #[cfg(feature = "overlay")]
+    fn spawn_me_baking(
+        set: &MeLayoutComposeSet,
+        stores: StoreLookup,
+    ) -> (
+        multiview_engine::AuxTickSender,
+        RoutingAuxHandle,
+        crate::aux_overlays::AuxOverlayInputs,
+    ) {
+        use crate::aux_overlays::tests as fx;
+        let signals = crate::aux_overlays::signals_slot();
+        signals.store(Arc::new(fx::signals()));
+        let overlays = crate::aux_overlays::AuxOverlayInputs {
+            signals,
+            wanted: Arc::new(AtomicBool::new(false)),
+            wanted_sources: crate::aux_overlays::wanted_sources(),
+            labels: fx::labels(),
+            watermark: None,
+            wall_clock: crate::wallclock::WallClockSource::system(),
+            canvas_color: CanvasColor::default(),
+            source_probes: Arc::default(),
+        };
+        let (tx, rx) = aux_tick_channel();
+        tx.me_layout_flag().store(true, Ordering::Release);
+        let mut inputs = me_inputs(rx, Vec::new(), stores, None, set);
+        inputs.layout_canvas = fx::spec(1920, 1080);
+        inputs.overlays = Some(overlays.clone());
+        let handle = spawn_routing_aux(inputs).unwrap();
+        (tx, handle, overlays)
+    }
+
+    /// A `NewsOne` M/E layout source `layout:<id>` with `overlays`.
+    #[cfg(feature = "overlay")]
+    fn me_newsone(id: &str, overlays: multiview_config::LayoutOverlays) -> MeLayoutCompose {
+        let mut body =
+            Arc::unwrap_or_clone(crate::aux_overlays::tests::newsone(overlays, 1920, 1080));
+        body.id = id.to_owned();
+        let key: Arc<str> = Arc::from(format!("layout:{id}"));
+        MeLayoutCompose {
+            store: Arc::new(TileStore::<Nv12Image>::with_defaults(Arc::clone(&key))),
+            key,
+            body: Arc::new(body),
+        }
+    }
+
+    /// The clean compose of `body` at `pts` from `stores` (what an M/E
+    /// layout without overlays publishes).
+    #[cfg(feature = "overlay")]
+    fn clean_compose(
+        body: &Arc<crate::aux_layout::RoutedLayout>,
+        stores: &StoreLookup,
+        pts: MediaTime,
+    ) -> Vec<u8> {
+        let mut canvas = crate::aux_layout::LayoutCanvas::new(
+            Arc::clone(body),
+            crate::aux_overlays::tests::spec(1920, 1080),
+        )
+        .unwrap();
+        canvas.compose(stores, pts).unwrap().y_plane().to_vec()
+    }
+
+    /// LEAD-NOTE (overlay builds): an M/E layout source carries the same
+    /// overlay bake as a routed layout. With its layers on, the picture
+    /// published into its `layout:<id>` store at the tick's pts carries the
+    /// per-cell chrome (it differs from the clean compose); with every layer
+    /// off the store gets exactly the clean compose, as before.
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn an_me_layout_with_overlays_publishes_its_baked_picture() {
+        let (stores, _keep) = crate::aux_overlays::tests::stores(&[], 1920, 1080);
+        let baked = me_newsone("news", multiview_config::LayoutOverlays::default());
+        let clean = me_newsone("plain", multiview_config::LayoutOverlays::none());
+        let (baked_store, clean_store) = (Arc::clone(&baked.store), Arc::clone(&clean.store));
+        let (baked_body, clean_body) = (Arc::clone(&baked.body), Arc::clone(&clean.body));
+        let set: MeLayoutComposeSet = Arc::new(SwapCell::from_pointee(vec![baked, clean]));
+        let lookup = with_me_layouts(Arc::clone(&stores), Some(Arc::clone(&set)));
+        let (tx, handle, overlays) = spawn_me_baking(&set, Arc::clone(&stores));
+        for i in 0..3 {
+            tx.offer(tick(i));
+            assert!(
+                wait_for(|| baked_store.read_at(tick(i).pts).frame().is_some()
+                    && clean_store.read_at(tick(i).pts).frame().is_some()
+                    && baked_store.sequence() == i + 1
+                    && clean_store.sequence() == i + 1),
+                "tick {i}: both M/E layouts published"
+            );
+        }
+        assert!(!handle.failed.load(Ordering::Acquire));
+        let pts = tick(2).pts;
+        assert!(baked_store.state_at(pts).is_live());
+        let expected_baked = clean_compose(&baked_body, &lookup, pts);
+        let got_baked = baked_store.read_at(pts).frame().unwrap().y_plane().to_vec();
+        assert_ne!(
+            got_baked, expected_baked,
+            "the overlay chrome is baked into the M/E layout's picture"
+        );
+        let expected_clean = clean_compose(&clean_body, &lookup, pts);
+        let got_clean = clean_store.read_at(pts).frame().unwrap().y_plane().to_vec();
+        assert_eq!(
+            got_clean, expected_clean,
+            "overlays off: exactly the clean compose"
+        );
+        assert!(
+            overlays.wanted.load(Ordering::Relaxed),
+            "a baking M/E layout wants signals"
+        );
+    }
+
+    /// The baking M/E layout's bound sources are in `wanted_sources` (the
+    /// bake consumer publishes their meters/faults/tally); unregistered, the
+    /// set empties and `wanted` drops.
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn an_me_layout_bake_wants_its_sources_until_unregistered() {
+        let (stores, _keep) = crate::aux_overlays::tests::stores(&[], 1920, 1080);
+        let entry = me_newsone("news", multiview_config::LayoutOverlays::default());
+        let store = Arc::clone(&entry.store);
+        let set: MeLayoutComposeSet = Arc::new(SwapCell::from_pointee(vec![entry]));
+        let (tx, handle, overlays) = spawn_me_baking(&set, stores);
+        tx.offer(tick(0));
+        assert!(wait_for(
+            || store.sequence() == 1 && overlays.wanted_sources.load().len() == 9
+        ));
+        let wanted = overlays.wanted_sources.load();
+        for i in 0..9 {
+            assert!(wanted.contains(&format!("s{i}")), "s{i} is wanted");
+        }
+        assert!(overlays.wanted.load(Ordering::Relaxed));
+        // Unregistered: nothing bakes, nothing is wanted.
+        set.store(Arc::new(Vec::new()));
+        tx.offer(tick(1));
+        assert!(wait_for(|| overlays.wanted_sources.load().is_empty()
+            && !overlays.wanted.load(Ordering::Relaxed)));
+        assert_eq!(store.sequence(), 1, "a removed key is not fed");
+        assert!(!handle.failed.load(Ordering::Acquire));
     }
 
     /// Cost (no timing assert): two 1+8 `NewsOne` layouts at 1920x1080 with

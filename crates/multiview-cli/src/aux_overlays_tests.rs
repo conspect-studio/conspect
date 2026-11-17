@@ -368,6 +368,27 @@ fn the_publisher_is_inert_until_a_layout_wants_signals_and_aux_is_active() {
     assert!(slot.load().program.contains("s1"));
 }
 
+/// An M/E layout source ticks the aux thread with no routed feed (#307):
+/// the publisher then counts it as active through the M/E layout flag.
+#[test]
+fn the_publisher_wants_signals_for_an_me_layout_bake_with_nothing_routed() {
+    let wanted = Arc::new(AtomicBool::new(true));
+    let active = Arc::new(AtomicBool::new(false));
+    let me = Arc::new(AtomicBool::new(false));
+    let publisher = AuxSignalsPublisher::new(
+        signals_slot(),
+        Arc::clone(&wanted),
+        wanted_sources(),
+        Arc::clone(&active),
+    )
+    .with_me_layout_flag(Arc::clone(&me));
+    assert!(!publisher.wanted(), "nothing routed, no M/E layout");
+    me.store(true, Ordering::Relaxed);
+    assert!(publisher.wanted(), "an M/E layout source ticks the aux");
+    wanted.store(false, Ordering::Relaxed);
+    assert!(!publisher.wanted(), "nothing bakes");
+}
+
 /// Cost (no timing assert): one aux bake of a 1 + 8 `NewsOne` layout at
 /// 1920x1080 with every default layer on. Run with `--nocapture`.
 #[test]

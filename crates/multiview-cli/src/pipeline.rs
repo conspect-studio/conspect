@@ -4325,7 +4325,8 @@ impl Pipeline {
         };
         (
             inputs,
-            crate::aux_overlays::AuxSignalsPublisher::new(signals, wanted, wanted_sources, active),
+            crate::aux_overlays::AuxSignalsPublisher::new(signals, wanted, wanted_sources, active)
+                .with_me_layout_flag(self.me_layouts.active_flag()),
         )
     }
 

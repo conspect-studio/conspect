@@ -295,6 +295,10 @@ pub struct AuxSignalsPublisher {
     /// The clock's aux-tick active flag: false while nothing is routed (the
     /// aux thread then never ticks, so `wanted` may be stale).
     active: Arc<AtomicBool>,
+    /// The aux tick channel's M/E layout flag (#307): raised while a stored
+    /// layout is registered as an M/E source, which also ticks the aux
+    /// thread (and may bake). `None`: no M/E layout sources.
+    me_active: Option<Arc<AtomicBool>>,
 }
 
 impl std::fmt::Debug for AuxSignalsPublisher {
@@ -320,7 +324,16 @@ impl AuxSignalsPublisher {
             wanted,
             sources,
             active,
+            me_active: None,
         }
+    }
+
+    /// Also count the aux thread as ticking while the M/E layout flag
+    /// `flag` is raised (an M/E layout source bakes with no routed feed).
+    #[must_use]
+    pub fn with_me_layout_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.me_active = Some(flag);
+        self
     }
 
     /// Publish the signals of exactly the wanted sources: meters and faults
@@ -352,10 +365,16 @@ impl AuxSignalsPublisher {
         self.publish(signals);
     }
 
-    /// Whether some active routed layout bakes overlays (two relaxed loads).
+    /// Whether some active routed layout or M/E layout source bakes
+    /// overlays (at most three relaxed loads).
     #[must_use]
     pub fn wanted(&self) -> bool {
-        self.active.load(Ordering::Relaxed) && self.wanted.load(Ordering::Relaxed)
+        let ticking = self.active.load(Ordering::Relaxed)
+            || self
+                .me_active
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed));
+        ticking && self.wanted.load(Ordering::Relaxed)
     }
 
     /// Publish the newest signals (wait-free store).
