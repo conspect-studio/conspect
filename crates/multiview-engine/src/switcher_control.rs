@@ -888,6 +888,20 @@ impl SwitcherTickDriver {
     /// Bounded by the drive's store count (the drain bounds that).
     pub fn sync_live_stores(&mut self, stores: &HashMap<String, Arc<TileStore<Nv12Image>>>) {
         self.live_stores.clone_from(stores);
+        // K4 `keyer_set` resolves fills and keys off the clock from the
+        // shared cell: republish the same view `store_for` uses (the drive's
+        // current set first, then the boot map), so a live-added source can
+        // be keyed and a re-added id resolves its new store. Operator-paced
+        // like the resync itself; the publish never waits on a reader.
+        if let Some(boot) = self.primed_stores.as_ref() {
+            let mut view = boot.clone();
+            view.extend(
+                self.live_stores
+                    .iter()
+                    .map(|(id, store)| (id.clone(), Arc::clone(store))),
+            );
+            self.stores.publish(view);
+        }
     }
 
     /// The drive's current store for `source`, if any (the PVW monitor reads

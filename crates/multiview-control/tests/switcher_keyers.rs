@@ -51,7 +51,7 @@ use multiview_engine::EnginePublisher;
 use multiview_events::Event;
 use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
 use serde_json::{json, Value};
-use support::{body_json, get, post_json, send};
+use support::{body_json, etag, get, post_json, put_json, send};
 
 const DOC: &str = r##"
 schema_version = 1
@@ -1372,4 +1372,71 @@ async fn a_stale_settlement_never_overwrites_a_newer_definition() {
         .map(|i| &*i.id)
         .collect();
     assert_eq!(dsk2, vec!["gfx2"], "the demand set went back to N");
+}
+
+/// Issue #464 regression (merge with K4): the on-air media-edit guard
+/// (`switcher_bus_consumers` → `declared_keyers`) must use the committed
+/// runtime keyer definitions `keyer_definitions()` (K4 `keyer_set` changes
+/// them after boot), not only the boot adopted config. After `keyer_set`
+/// repoints `dsk1`'s fill from `gfx` to `gfx2`, a media edit of `gfx2` is
+/// refused 409 naming `keyer fill main/dsk1`, and a media edit of `gfx`
+/// (the OLD fill) is no longer refused by the keyer guard.
+#[tokio::test]
+async fn keyer_set_repointing_a_fill_moves_the_media_edit_guard_to_the_new_fill() {
+    let (_dir, path) = temp_boot(DOC);
+    let mut rig = rig(&path);
+    let mut outcomes = rig.handle.outcomes();
+
+    // dsk1 starts off-air, on `gfx`: no `allow` is needed to repoint it.
+    assert!(!rig.handle.snapshot().unwrap().keyers[0].unwrap().on_air);
+    let change = body("keyer_set", json!({"keyer":"dsk1","fill":"gfx2"}));
+    let accepted = command(&rig, FULL, "repoint", &change).await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    tick(&mut rig.driver, 1);
+    assert!(outcomes.try_recv().unwrap().event.completed);
+    let defs = rig.handle.keyer_definitions().unwrap();
+    assert_eq!(&*defs.defs[0].as_ref().unwrap().fill_id, "gfx2");
+
+    // A media edit of the NEW fill (`gfx2`) is refused, naming the keyer.
+    let current = send(&rig.router, get("/api/v1/sources/gfx2", FULL)).await;
+    assert_eq!(current.status(), StatusCode::OK);
+    let tag = etag(&current).unwrap();
+    let resp = send(
+        &rig.router,
+        put_json(
+            "/api/v1/sources/gfx2",
+            FULL,
+            Some(&tag),
+            &json!({ "name": "gfx2", "body": {"id": "gfx2", "kind": "solid", "color": "#ff00ff"} }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let detail = body_json(resp).await["detail"].as_str().unwrap().to_owned();
+    assert!(
+        detail.contains("keyer fill main/dsk1"),
+        "the refusal must name the keyer now protecting its NEW fill: {detail}"
+    );
+
+    // A media edit of the OLD fill (`gfx`) is no longer refused by the
+    // keyer guard: the committed runtime definition moved on.
+    let current = send(&rig.router, get("/api/v1/sources/gfx", FULL)).await;
+    assert_eq!(current.status(), StatusCode::OK);
+    let tag = etag(&current).unwrap();
+    let resp = send(
+        &rig.router,
+        put_json(
+            "/api/v1/sources/gfx",
+            FULL,
+            Some(&tag),
+            &json!({ "name": "gfx", "body": {"id": "gfx", "kind": "solid", "color": "#00ff00"} }),
+        ),
+    )
+    .await;
+    assert_ne!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "the old fill must no longer be guarded by the keyer: {:?}",
+        body_json(resp).await
+    );
 }

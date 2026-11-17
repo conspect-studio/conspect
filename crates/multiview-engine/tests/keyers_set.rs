@@ -17,7 +17,9 @@ use multiview_engine::keyer::{
     REFUSE_KEYER_ON_AIR_PROTECTED, REFUSE_KEYER_SET_DEADLINE, REFUSE_KEYER_STALE,
 };
 use multiview_engine::switcher_control::SwitcherVerb;
-use rig::{cmd, drain, dsk, probe, step, tick, Rig, LUMA_A, LUMA_B, LUMA_FILL, SIDE};
+use rig::{cmd, drain, dsk, probe, pts, step, tick, Rig, LUMA_A, LUMA_B, LUMA_FILL, SIDE};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 fn rig() -> Rig {
     Rig::new(&["a", "b", "gfx", "gfx2", "matte"])
@@ -435,4 +437,58 @@ fn a_tick_refusal_publishes_once_per_command_and_never_on_steady_ticks() {
     }
     assert!(drain(&mut outcomes).0.is_empty(), "a steady tick published");
     drop(clean);
+}
+
+/// Issue #464 regression (merge with K4): `sync_live_stores` must republish
+/// the shared `stores` `LatestState` (the boot map overlaid with the drive's
+/// live stores), not just the driver's private `live_stores`, so
+/// `SwitcherControl::resolve_keyer` (used by `keyer_set`) can resolve a
+/// source added live and a removed-then-re-added id resolves to its NEW
+/// store, not the stale boot one.
+#[test]
+fn sync_live_stores_republishes_the_shared_view_resolve_keyer_reads() {
+    let rig = rig();
+    let (handle, mut hook, mut drive) = rig.build(&[], 3.0, "a", "b");
+    fresh(&rig, 0);
+    step(&mut hook, &mut drive, 0);
+
+    // Before any live sync, "late" has no store anywhere: resolving a keyer
+    // fill against it fails honestly.
+    assert!(
+        handle
+            .resolve_keyer(&dsk("dsk-late", "late", None, 1))
+            .is_err(),
+        "late is not registered yet"
+    );
+
+    // A live add: a brand-new source joins the drive's store set (not the
+    // boot map). The drive is the source of truth the hook resyncs from.
+    let late_store = Arc::new(multiview_framestore::TileStore::with_defaults("late"));
+    late_store.publish(Rig::solid(LUMA_FILL, SIDE, SIDE), pts(1));
+    let mut live = HashMap::new();
+    live.insert("late".to_owned(), Arc::clone(&late_store));
+    // A re-added id: "gfx" gets a brand-new Arc, distinct from the boot one.
+    let new_gfx = Arc::new(multiview_framestore::TileStore::with_defaults("gfx"));
+    new_gfx.publish(Rig::solid(LUMA_B, SIDE, SIDE), pts(1));
+    live.insert("gfx".to_owned(), Arc::clone(&new_gfx));
+    hook.driver.sync_live_stores(&live);
+
+    // "late" now resolves: a keyer fill on a live-added source is buildable.
+    let late_def = handle
+        .resolve_keyer(&dsk("dsk-late", "late", None, 1))
+        .expect("resolve_keyer must see the live-added store after sync");
+    assert!(Arc::ptr_eq(&late_def.0.fill, &late_store));
+
+    // "gfx" resolves to the NEW store, not the stale boot `Arc`.
+    let gfx_def = handle
+        .resolve_keyer(&dsk("dsk-gfx", "gfx", None, 2))
+        .expect("resolve_keyer must see gfx");
+    assert!(
+        Arc::ptr_eq(&gfx_def.0.fill, &new_gfx),
+        "resolve_keyer must resolve the re-added id to its NEW store, not the boot one"
+    );
+    assert!(
+        !Arc::ptr_eq(&gfx_def.0.fill, rig.store("gfx")),
+        "the resolved fill must not be the stale boot store"
+    );
 }
