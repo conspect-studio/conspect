@@ -1,9 +1,22 @@
 // K5 desk integration: the keyer strip/panel wired into SwitcherPage against
-// the real plan→command flow (design note §10, K5).
+// the real plan→command flow (design note §10, K5): the shared submission
+// gate, realtime refresh on `switcher.keyer`, stream freshness, the ramp clock.
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import type { Envelope } from '../realtime/envelope';
+import type { RealtimeStatus } from '../realtime/connection';
 
-vi.mock('../realtime/shared', () => ({ subscribeRealtime: () => () => undefined }));
-import { render, screen, waitFor, within } from '@testing-library/react';
+const realtime = vi.hoisted(() => ({
+  listeners: [] as { onEnvelope: (e: Envelope) => void; onStatus?: (s: RealtimeStatus) => void }[],
+}));
+vi.mock('../realtime/shared', () => ({
+  subscribeRealtime: (_topic: string, onEnvelope: (e: Envelope) => void, onStatus?: (s: RealtimeStatus) => void) => {
+    const entry = { onEnvelope, ...(onStatus ? { onStatus } : {}) };
+    realtime.listeners.push(entry);
+    onStatus?.('open');
+    return () => { realtime.listeners.splice(realtime.listeners.indexOf(entry), 1); };
+  },
+}));
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
 import { setupServer } from 'msw/node';
@@ -18,37 +31,44 @@ i18n.load('en', messages);
 i18n.activate('en');
 
 const DSK1 = {
-  id: 'dsk1', family: 'dsk', fill: 'gfx-channel-1', key: null, type: 'linear',
-  fly: null, mask: null, on_air: false, tie: false, ramp: null, rate: 15,
-  loss: 'drop_to_off_air', stale: false, pending: false,
+  id: 'dsk1', family: 'dsk', fill: 'gfx-channel-1', key: null, type: 'linear', clip: 0, gain: 1, invert: false,
+  fly: null, mask: null, max_source: null, on_air: false, tie: false, ramp: null as null | { start_tick: number; rate: number; to_on: boolean }, rate: 15,
+  loss: 'drop_to_off_air', loss_trigger: 'reconnecting', stale: false, pending: false,
 };
-let state = { program_source: 'cam-1', preview_source: 'cam-2', tick: 7, in_flight: false, keyers: [DSK1], tally: { program: [], preview: [] } };
-let keyerPlans: unknown[] = [];
-let keyerCommands: { action: string; body: unknown }[] = [];
+const BASE_STATE = {
+  program_source: 'cam-1', preview_source: 'cam-2', tick: 7, in_flight: false,
+  canvas_width: 1280, canvas_height: 720, fps_num: 25, fps_den: 1, keyers: [DSK1], tally: { program: [], preview: [] },
+  transition: { kind: 'cut' },
+};
+let state = BASE_STATE;
+let calls: { path: string; key: string | null; body: unknown }[] = [];
 let planAnswer: unknown = { can_take: true, class: 'class1', keyer: 'main/dsk1', on_air: false };
+let planGate: Promise<void> | undefined;
+let commandAnswer: () => Response = () => HttpResponse.json({ operation_id: 'op-x', kind: 'x' }, { status: 202 });
 
 const server = setupServer(
   http.get('*/api/v1/switcher/me1', () => HttpResponse.json(state)),
+  http.get('*/api/v1/patch', () => HttpResponse.json({ title: 'not found', status: 404 }, { status: 404 })),
   http.get('*/api/v1/sources', () => HttpResponse.json([{ id: 'gfx-channel-1', name: 'GFX 1', body: { kind: 'bars' } }, { id: 'cam-1', name: 'Cam 1', body: { kind: 'bars' } }])),
   http.post('*/api/v1/switcher/plan', async ({ request }) => {
-    const body: unknown = await request.json();
-    keyerPlans.push(body);
+    calls.push({ path: 'plan', key: request.headers.get('Idempotency-Key'), body: await request.json() });
+    if (planGate) await planGate;
     return HttpResponse.json(planAnswer as object);
   }),
   http.post('*/api/v1/switcher/commands/:kind', async ({ request, params }) => {
-    const body: unknown = await request.json();
-    const kind = String(params.kind);
-    keyerCommands.push({ action: kind, body });
-    return HttpResponse.json({ operation_id: `op-${kind}`, kind }, { status: 202 });
+    calls.push({ path: `commands/${String(params.kind)}`, key: request.headers.get('Idempotency-Key'), body: await request.json() });
+    return commandAnswer();
   }),
 );
 beforeAll(() => { server.listen(); });
 afterEach(() => {
   server.resetHandlers();
-  keyerPlans = [];
-  keyerCommands = [];
+  calls = [];
   planAnswer = { can_take: true, class: 'class1', keyer: 'main/dsk1', on_air: false };
-  state = { ...state, keyers: [DSK1] };
+  planGate = undefined;
+  commandAnswer = () => HttpResponse.json({ operation_id: 'op-x', kind: 'x' }, { status: 202 });
+  state = BASE_STATE;
+  vi.useRealTimers();
 });
 afterAll(() => { server.close(); });
 
@@ -56,64 +76,124 @@ function page() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
   return render(<QueryClientProvider client={client}><I18nProvider i18n={i18n}><MemoryRouter><SwitcherPage /></MemoryRouter></I18nProvider></QueryClientProvider>);
 }
+function emit(envelope: Partial<Envelope> & Pick<Envelope, 't' | 'data'>): void {
+  act(() => { for (const l of [...realtime.listeners]) l.onEnvelope({ v: 1, topic: 'switcher', seq: 1, ts: 0, ...envelope }); });
+}
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve = (): void => undefined;
+  const promise = new Promise<void>((r) => { resolve = r; });
+  return { promise, resolve };
+}
 
 describe('SwitcherPage keyer desk (K5)', () => {
-  it('renders the DSK strip and panel from the snapshot keyers[]', async () => {
+  it('CUT plans before it commands keyer_cut, with an Idempotency-Key', async () => {
     page();
-    expect(await screen.findByTestId('keyer-strip-dsk1')).toBeTruthy();
-    expect(screen.getByTestId('keyer-panel-dsk1')).toBeTruthy();
-    expect(screen.getByTestId('keyer-lamp-dsk1')).toHaveAttribute('data-on-air', 'false');
-  });
-
-  it('CUT plans then commands keyer_cut with the toggled target state', async () => {
-    page();
-    await screen.findByTestId('keyer-strip-dsk1');
-    const strip = screen.getByTestId('keyer-strip-dsk1');
+    const strip = await screen.findByTestId('keyer-strip-dsk1');
     await userEvent.click(within(strip).getByRole('button', { name: 'Cut' }));
-    await waitFor(() => { expect(keyerCommands).toHaveLength(1); });
-    expect(keyerCommands[0]).toEqual({ action: 'keyer_cut', body: expect.objectContaining({ keyer: 'dsk1', on: true, action: 'keyer_cut' }) });
+    await waitFor(() => { expect(calls.map((c) => c.path)).toEqual(['plan', 'commands/keyer_cut']); });
+    expect(calls[1]?.body).toMatchObject({ keyer: 'dsk1', on: true, action: 'keyer_cut' });
+    expect(calls[1]?.key).toMatch(/[0-9a-f-]{36}/);
   });
 
-  it('TIE toggles via keyer_tie', async () => {
+  it('K5-05: repeated clicks across controls while a plan is in flight submit exactly one command', async () => {
+    const gate = deferred();
+    planGate = gate.promise;
+    page();
+    const strip = await screen.findByTestId('keyer-strip-dsk1');
+    const cut = within(strip).getByRole('button', { name: 'Cut' });
+    await userEvent.click(cut);
+    await waitFor(() => { expect(cut).toHaveProperty('disabled', true); });
+    expect(cut).toHaveAttribute('title', 'A switcher request is in flight');
+    // Every switcher and keyer control is behind the same gate.
+    const backgroundCut = screen.getAllByRole('button', { name: 'Cut' }).find((b) => !strip.contains(b));
+    expect(backgroundCut).toHaveProperty('disabled', true);
+    expect(screen.getByRole('button', { name: 'Review' })).toHaveProperty('disabled', true);
+    expect(within(strip).getByRole('checkbox', { name: 'Tie' })).toHaveProperty('disabled', true);
+    gate.resolve();
+    await waitFor(() => { expect(calls.filter((c) => c.path.startsWith('commands/'))).toHaveLength(1); });
+    expect(calls.filter((c) => c.path === 'plan')).toHaveLength(1);
+  });
+
+  it('K5-05: a keyer review in flight disables the background CUT too', async () => {
+    const gate = deferred();
+    planGate = gate.promise;
+    page();
+    await screen.findByTestId('keyer-panel-dsk1');
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Invert matte' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Review' }));
+    const strip = screen.getByTestId('keyer-strip-dsk1');
+    const backgroundCut = screen.getAllByRole('button', { name: 'Cut' }).find((b) => !strip.contains(b));
+    await waitFor(() => { expect(backgroundCut).toHaveProperty('disabled', true); });
+    gate.resolve();
+    await waitFor(() => { expect(backgroundCut).toHaveProperty('disabled', false); });
+    expect(calls.filter((c) => c.path.startsWith('commands/'))).toHaveLength(0);
+  });
+
+  it('K5-06: a source-loss switcher.keyer event (no operation outcome) updates the lamp', async () => {
+    state = { ...BASE_STATE, keyers: [{ ...DSK1, on_air: true }] };
+    page();
+    await waitFor(() => { expect(screen.getByTestId('keyer-lamp-dsk1')).toHaveAttribute('data-on-air', 'true'); });
+    state = { ...BASE_STATE, tick: 40, keyers: [{ ...DSK1, on_air: false }] };
+    emit({ t: 'switcher.keyer', id: 'main/dsk1', data: { me: 'me1', program: 'main', keyer: 'main/dsk1', tick: 40, on_air: false, stale: false, reason: 'source-lost', fill: 'gfx-channel-1' } });
+    await waitFor(() => { expect(screen.getByTestId('keyer-lamp-dsk1')).toHaveAttribute('data-on-air', 'false'); });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('K5-06: a stream that is not open shows a stale indicator', async () => {
     page();
     await screen.findByTestId('keyer-strip-dsk1');
-    const strip = screen.getByTestId('keyer-strip-dsk1');
-    await userEvent.click(within(strip).getByRole('checkbox', { name: 'Tie' }));
-    await waitFor(() => { expect(keyerCommands).toHaveLength(1); });
-    expect(keyerCommands[0]).toEqual({ action: 'keyer_tie', body: expect.objectContaining({ keyer: 'dsk1', tie: true }) });
+    expect(screen.queryByTestId('keyer-stream-stale')).toBeNull();
+    act(() => { for (const l of realtime.listeners) l.onStatus?.('reconnecting'); });
+    expect(screen.getByTestId('keyer-stream-stale')).toBeTruthy();
   });
 
-  it('a capacity plan refusal is shown and nothing is applied', async () => {
+  it('K5-06: ramp progress advances between snapshots at the API cadence', async () => {
+    state = { ...BASE_STATE, tick: 100, keyers: [{ ...DSK1, on_air: true, ramp: { start_tick: 100, rate: 50, to_on: true } }] };
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    page();
+    const ramp = await screen.findByTestId('keyer-ramp-dsk1');
+    const first = Number(ramp.getAttribute('data-weight'));
+    expect(first).toBeLessThan(0.2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); }); // 25 ticks at 25/1
+    const later = Number(screen.getByTestId('keyer-ramp-dsk1').getAttribute('data-weight'));
+    expect(later).toBeGreaterThan(first + 0.3);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('K5-07: a plan refusal submits no command', async () => {
     planAnswer = { can_take: false, class: 'class1', keyer: 'main/dsk1', on_air: false, cost: { delta: 1.5, fits: false }, refusal: { type: 'capacity', detail: 'DSK budget exceeded' } };
     page();
-    await screen.findByTestId('keyer-panel-dsk1');
-    const panel = screen.getByTestId('keyer-panel-dsk1');
-    await userEvent.click(within(panel).getByRole('button', { name: 'Review & apply' }));
+    const panel = await screen.findByTestId('keyer-panel-dsk1');
+    await userEvent.click(within(panel).getByRole('checkbox', { name: 'Invert matte' }));
+    await userEvent.click(within(panel).getByRole('button', { name: 'Review' }));
     expect(await within(panel).findByTestId('keyer-refusal-dsk1')).toHaveTextContent('DSK budget exceeded');
-    expect(keyerCommands).toHaveLength(0);
+    expect(within(panel).getByRole('button', { name: 'Apply' })).toHaveProperty('disabled', true);
+    expect(calls.map((c) => c.path)).toEqual(['plan']);
   });
 
-  it('an on-air fill change is refused on-air-protected, then applies after the explicit allow confirm', async () => {
-    state = { ...state, keyers: [{ ...DSK1, on_air: true }] };
-    planAnswer = { can_take: false, class: 'class1', keyer: 'main/dsk1', on_air: true, refusal: { type: 'on-air-protected', detail: 'needs allow' } };
+  it('K5-07: plan passes, command 409 on-air-protected → fresh plan, explicit allow, one more command', async () => {
     page();
-    await screen.findByTestId('keyer-panel-dsk1');
-    const panel = screen.getByTestId('keyer-panel-dsk1');
+    const panel = await screen.findByTestId('keyer-panel-dsk1');
     await userEvent.selectOptions(within(panel).getByLabelText('Fill'), 'cam-1');
-    await userEvent.click(within(panel).getByRole('button', { name: 'Review & apply' }));
+    await userEvent.click(within(panel).getByRole('button', { name: 'Review' }));
+    await waitFor(() => { expect(within(panel).getByRole('button', { name: 'Apply' })).toHaveProperty('disabled', false); });
+    commandAnswer = () => HttpResponse.json({ type: '/problems/on-air-protected', title: 'Keyer request refused', status: 409, detail: 'on air' }, { status: 409 });
+    planAnswer = { can_take: false, class: 'class1', keyer: 'main/dsk1', on_air: true, refusal: { type: 'on-air-protected', detail: 'needs allow' } };
+    await userEvent.click(within(panel).getByRole('button', { name: 'Apply' }));
     const confirm = await screen.findByRole('alertdialog', { name: 'Confirm on-air keyer change' });
-    expect(keyerCommands).toHaveLength(0);
-    planAnswer = { can_take: true, class: 'class1', keyer: 'main/dsk1', on_air: true };
+    expect(calls.map((c) => c.path)).toEqual(['plan', 'commands/keyer_set', 'plan']);
+    commandAnswer = () => HttpResponse.json({ operation_id: 'op-set', kind: 'keyer_set' }, { status: 202 });
     await userEvent.click(within(confirm).getByRole('button', { name: 'Allow on-air change' }));
-    await waitFor(() => { expect(keyerCommands).toHaveLength(1); });
-    expect(keyerCommands[0]?.action).toBe('keyer_set');
-    expect(keyerCommands[0]?.body).toMatchObject({ on_air: 'allow', fill: 'cam-1' });
+    await waitFor(() => { expect(calls).toHaveLength(4); });
+    expect(calls[3]?.body).toEqual({ me: 'me1', program: 'main', action: 'keyer_set', keyer: 'dsk1', fill: 'cam-1', on_air: 'allow' });
+    expect(calls[3]?.key).not.toBe(calls[1]?.key);
   });
 
   it('renders nothing when the snapshot carries no keyers (no backend keyers deployed)', async () => {
-    state = { ...state, keyers: [] };
+    state = { ...BASE_STATE, keyers: [] };
     page();
-    await screen.findByRole('button', { name: 'Cut' }); // the background CUT still renders
+    await screen.findByRole('button', { name: 'Cut' });
     expect(screen.queryByText('Downstream keyers')).toBeNull();
+    expect(screen.queryByTestId('keyer-arm-bkgd')).toBeNull();
   });
 });

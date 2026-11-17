@@ -11,13 +11,12 @@ i18n.load('en', messages);
 i18n.activate('en');
 
 const BASE_ROW: KeyerRow = {
-  id: 'dsk1', family: 'dsk', fill: 'gfx-channel-1', key: null, type: 'linear',
-  fly: null, mask: null, on_air: false, tie: false, ramp: null, rate: 15,
-  loss: 'drop_to_off_air', stale: false, pending: false,
+  id: 'dsk1', family: 'dsk', fill: 'gfx-channel-1', key: null, type: 'linear', clip: 0, gain: 1, invert: false,
+  fly: null, mask: null, max_source: null, on_air: false, tie: false, ramp: null, rate: 15,
+  loss: 'drop_to_off_air', loss_trigger: 'reconnecting', stale: false, pending: false,
 };
-/** `ramp` is a free-form object in the generated schema; build a row with a concrete ramp shape. */
-function withRamp(row: KeyerRow, ramp: Record<string, unknown>): KeyerRow {
-  return { ...row, ramp } as unknown as KeyerRow;
+function withRamp(row: KeyerRow, ramp: NonNullable<KeyerRow['ramp']>): KeyerRow {
+  return { ...row, ramp };
 }
 
 function withI18n(node: React.ReactNode) {
@@ -95,5 +94,22 @@ describe('KeyerStrip', () => {
     expect(auto).toHaveProperty('disabled', true);
     expect(auto.getAttribute('title')).toMatch(/1–300/);
     expect(screen.getByRole('button', { name: 'Cut' })).toHaveProperty('disabled', false);
+  });
+
+  it('K5-09: every disabled strip control (incl. the rate input) carries the reason', () => {
+    withI18n(<KeyerStrip row={BASE_ROW} tick={100} disabledReason="A switcher request is in flight" onTie={vi.fn()} onCut={vi.fn()} onAuto={vi.fn()} />);
+    const controls = screen.getByTestId('keyer-strip-dsk1').querySelectorAll<HTMLElement>('button, input');
+    expect(controls.length).toBe(4);
+    for (const control of controls) {
+      expect(control).toHaveProperty('disabled', true);
+      expect(control.getAttribute('title')).toBe('A switcher request is in flight');
+      expect(document.getElementById(control.getAttribute('aria-describedby') ?? '')?.textContent).toBe('A switcher request is in flight');
+    }
+  });
+
+  it('the rate follows the committed rate until edited', () => {
+    const view = withI18n(<KeyerStrip row={BASE_ROW} tick={100} disabledReason={undefined} onTie={vi.fn()} onCut={vi.fn()} onAuto={vi.fn()} />);
+    view.rerender(<I18nProvider i18n={i18n}><KeyerStrip row={{ ...BASE_ROW, rate: 40 }} tick={100} disabledReason={undefined} onTie={vi.fn()} onCut={vi.fn()} onAuto={vi.fn()} /></I18nProvider>);
+    expect(screen.getByLabelText<HTMLInputElement>('Rate in frames for dsk1').value).toBe('40');
   });
 });

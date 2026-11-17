@@ -1,6 +1,6 @@
 // Program/Preview switcher: all controls are disabled until a real dual-bus
 // engine publishes state. Accepted operations are never labelled applied.
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { JSX } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Trans, useLingui } from '@lingui/react/macro';
@@ -20,8 +20,9 @@ import { useJpegPreview } from '../preview/useJpegPreview';
 import { getPatch, planPatch, takePatch } from '../api/patch';
 import type { PatchRequest } from '../api/patch';
 import { MixerInputBank } from '../components/switcher/MixerInputBank';
-import { commandKeyer, planKeyer } from '../api/keyers';
-import type { KeyerRequest } from '../api/keyers';
+import { commandKeyer, extrapolatedTick, keyerRampWeight, planKeyer } from '../api/keyers';
+import type { KeyerFields, KeyerRequest } from '../api/keyers';
+import type { RealtimeStatus } from '../realtime/connection';
 import { KeyerStrip } from '../components/switcher/KeyerStrip';
 import { KeyerPanel } from '../components/switcher/KeyerPanel';
 
@@ -57,19 +58,48 @@ export function SwitcherPage(): JSX.Element {
   const operation = useOperationFeedback(operationId);
   const [failureReason, setFailureReason] = useState<string | undefined>();
   const [error, setError] = useState<string | undefined>();
-  useEffect(() => subscribeRealtime('switcher', (envelope) => {
-    if (envelope.t !== 'switcher.operation') return;
-    // Display-only reason: the shared tracker, not this page, decides the phase.
-    const evidence = switcherOperationEvidence(envelope);
-    if (evidence !== undefined && evidence.corr === operationId && evidence.resource === 'me1' && evidence.verdict === 'failed') {
-      setFailureReason(evidence.reason);
+  const [stream, setStream] = useState<RealtimeStatus>('connecting');
+  useEffect(() => {
+    const refresh = (): void => {
+      void queryClient.invalidateQueries({ queryKey: STATE_KEY });
+      void queryClient.invalidateQueries({ queryKey: PATCH_KEY });
+    };
+    return subscribeRealtime('switcher', (envelope) => {
+      // A keyer state change (operator, tie, source lost/recovered, a new
+      // definition) carries no operation outcome: refresh the snapshot.
+      if (envelope.t === 'switcher.keyer') {
+        void queryClient.invalidateQueries({ queryKey: STATE_KEY });
+        return;
+      }
+      if (envelope.t !== 'switcher.operation') return;
+      // Display-only reason: the shared tracker, not this page, decides the phase.
+      const evidence = switcherOperationEvidence(envelope);
+      if (evidence !== undefined && evidence.corr === operationId && evidence.resource === 'me1' && evidence.verdict === 'failed') {
+        setFailureReason(evidence.reason);
+      }
+      refresh();
+    }, (next) => {
+      setStream(next);
+      // Back from a disconnect: events may have been missed.
+      if (next === 'open') refresh();
+    }, refresh);
+  }, [queryClient, operationId]);
+  // One submission gate for every switcher and keyer control, held from the
+  // plan through the 202 (or the refusal): a second click while a request is
+  // in flight is refused here, never enqueued with another Idempotency-Key.
+  const gateRef = useRef(false);
+  const [submitting, setSubmitting] = useState(false);
+  const gated = useCallback(async <T,>(run: () => Promise<T>): Promise<T | undefined> => {
+    if (gateRef.current) return undefined;
+    gateRef.current = true;
+    setSubmitting(true);
+    try {
+      return await run();
+    } finally {
+      gateRef.current = false;
+      setSubmitting(false);
     }
-    void queryClient.invalidateQueries({ queryKey: STATE_KEY });
-    void queryClient.invalidateQueries({ queryKey: PATCH_KEY });
-  }, undefined, () => {
-    void queryClient.invalidateQueries({ queryKey: STATE_KEY });
-    void queryClient.invalidateQueries({ queryKey: PATCH_KEY });
-  }), [queryClient, operationId]);
+  }, []);
   const mutate = useMutation({
     mutationFn: async (intent: Intent) => {
       const action = typeof intent === 'string' ? intent : intent.action;
@@ -111,23 +141,47 @@ export function SwitcherPage(): JSX.Element {
   });
   // Unknown (including unobserved/replay) is not permission to take again.
   const settled = operation?.phase === 'applied' || operation?.phase === 'failed';
-  const ready = state.data !== undefined && (operationId === undefined || settled) && !mutate.isPending && !repatch.isPending;
-  const keyerReason = ready ? undefined : !state.data ? t`Switcher unavailable` : t`Operation in flight or outcome pending`;
+  const ready = state.data !== undefined && (operationId === undefined || settled) && !submitting;
+  const keyerReason = ready ? undefined : !state.data ? t`Switcher unavailable` : submitting ? t`A switcher request is in flight` : t`Operation in flight or outcome pending`;
   const [keyerError, setKeyerError] = useState<string | undefined>();
   const keyerMutate = useMutation({
     mutationFn: async (fields: Omit<KeyerRequest, 'me' | 'program'>) => {
-      const { action, ...rest } = fields;
-      const req: KeyerRequest = { me: 'me1', program: 'main', action, ...rest };
+      const req: KeyerRequest = { me: 'me1', program: 'main', ...fields };
       const plan = await planKeyer(req);
       if (!plan.can_take) throw new Error(plan.refusal?.detail ?? t`The keyer verb was refused`);
-      return submitTracked(() => commandKeyer(action, req, { idempotencyKey: newIdempotencyKey() }),
+      return submitTracked(() => commandKeyer(fields.action, req, { idempotencyKey: newIdempotencyKey() }),
         { topic: 'switcher', resource: 'me1', event: 'switcher.operation', terminal: { kind: 'switcher-operation', me: 'me1' } });
     },
     onSuccess: (result) => { setOperationId(result.operationId); setFailureReason(undefined); setKeyerError(undefined); },
     onError: (reason: Error) => { setKeyerError(reason.message); },
   });
-  // Canvas size is not carried by the switcher API; the operator sets it once for fly presets.
-  const [canvas] = useState({ w: 1920, h: 1080 });
+  const keyerVerb = (fields: Omit<KeyerRequest, 'me' | 'program'>): void => {
+    void gated(() => keyerMutate.mutateAsync(fields)).catch(() => undefined);
+  };
+  const take = (intent: Intent): void => { void gated(() => mutate.mutateAsync(intent)).catch(() => undefined); };
+  // The output tick now, extrapolated from the snapshot at the exact cadence
+  // so a ramp's progress advances between (change-only) snapshots.
+  const ramping = (state.data?.keyers ?? []).some((row) => row.ramp !== null && row.ramp !== undefined);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!ramping) return undefined;
+    const timer = setInterval(() => { setNow(Date.now()); }, 100);
+    return () => { clearInterval(timer); };
+  }, [ramping]);
+  const tickNow = state.data === undefined ? 0
+    : extrapolatedTick(state.data.tick, state.dataUpdatedAt, Math.max(now, state.dataUpdatedAt), state.data.fps_num, state.data.fps_den);
+  // A ramp that has run to its end ends without a guaranteed event: refresh once.
+  const rampDone = (state.data?.keyers ?? []).some((row) => {
+    const weight = keyerRampWeight(row, tickNow);
+    return weight !== undefined && row.ramp !== null && row.ramp !== undefined && weight === (row.ramp.to_on ? 1 : 0);
+  });
+  useEffect(() => {
+    if (rampDone) void queryClient.invalidateQueries({ queryKey: STATE_KEY });
+  }, [rampDone, queryClient]);
+  const canvas = state.data === undefined ? undefined : { w: state.data.canvas_width, h: state.data.canvas_height };
+  const keyerSet = (keyer: string, fields: KeyerFields, allow: boolean): KeyerRequest => ({
+    ...fields, me: 'me1', program: 'main', action: 'keyer_set', keyer, ...(allow ? { on_air: 'allow' } : {}),
+  });
   return (
     <main className="space-y-5 p-4">
       <PageHeader title={t`Program / Preview switcher`} />
@@ -150,8 +204,8 @@ export function SwitcherPage(): JSX.Element {
         mixer={mixer}
         sources={sources.data ?? []}
         disabled={!ready}
-        onSelect={(action, input) => { mutate.mutate({ action, input }); }}
-        onRepatch={async (request) => { await repatch.mutateAsync(request).catch(() => undefined); }}
+        onSelect={(action, input) => { take({ action, input }); }}
+        onRepatch={async (request) => { await gated(() => repatch.mutateAsync(request)).catch(() => undefined); }}
       />}
       {mixer === undefined && <div className="flex flex-wrap items-end gap-3">
         <div className="space-y-1"><Label htmlFor="switcher-source"><Trans>Source</Trans></Label>
@@ -160,13 +214,13 @@ export function SwitcherPage(): JSX.Element {
             {sources.data?.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}
           </select>
         </div>
-        <Button disabled={!ready || selected === ''} onClick={() => { mutate.mutate('select_preview'); }}><Trans>Select PVW</Trans></Button>
-        <Button disabled={!ready || selected === ''} onClick={() => { mutate.mutate('select_program'); }}><Trans>Punch PGM</Trans></Button>
+        <Button disabled={!ready || selected === ''} onClick={() => { take('select_preview'); }}><Trans>Select PVW</Trans></Button>
+        <Button disabled={!ready || selected === ''} onClick={() => { take('select_program'); }}><Trans>Punch PGM</Trans></Button>
       </div>}
       <div className="flex flex-wrap items-end gap-3">
-        <Button disabled={!ready} onClick={() => { mutate.mutate('cut'); }}><Trans>Cut</Trans></Button>
+        <Button disabled={!ready} onClick={() => { take('cut'); }}><Trans>Cut</Trans></Button>
         <div className="space-y-1"><Label htmlFor="switcher-duration"><Trans>Auto frames</Trans></Label><Input id="switcher-duration" type="number" min="1" max="1000" value={duration} onChange={(event) => { setDuration(event.target.value); }} /></div>
-        <Button disabled={!ready || !Number.isInteger(Number(duration)) || Number(duration) < 1} onClick={() => { mutate.mutate('auto'); }}><Trans>Auto</Trans></Button>
+        <Button disabled={!ready || !Number.isInteger(Number(duration)) || Number(duration) < 1} onClick={() => { take('auto'); }}><Trans>Auto</Trans></Button>
       </div>
       {/*
         TODO(#388): the BKGD/KEY 1-4 arm strip is built behind the presence of
@@ -174,18 +228,23 @@ export function SwitcherPage(): JSX.Element {
         is not merged — `components['schemas']` has no `arm` field as of this
         commit — so this renders nothing rather than inventing API types.
       */}
-      {(state.data?.keyers ?? []).length > 0 && (
+      {(state.data?.keyers ?? []).length > 0 && canvas !== undefined && (
         <section className="space-y-3" aria-label={t`Downstream keyers`}>
           <h2 className="font-semibold"><Trans>Downstream keyers</Trans></h2>
+          {stream !== 'open' && (
+            <p role="status" className="rounded border border-amber-600 p-2" data-testid="keyer-stream-stale">
+              <Trans>Realtime updates are not connected: keyer lamps and tally may be stale.</Trans>
+            </p>
+          )}
           {(state.data?.keyers ?? []).map((row) => (
             <KeyerStrip
               key={row.id}
               row={row}
-              tick={state.data?.tick ?? 0}
+              tick={tickNow}
               disabledReason={keyerReason}
-              onTie={(tie) => { keyerMutate.mutate({ action: 'keyer_tie', keyer: row.id, tie }); }}
-              onCut={() => { keyerMutate.mutate({ action: 'keyer_cut', keyer: row.id, on: !row.on_air }); }}
-              onAuto={(rateFrames) => { keyerMutate.mutate({ action: 'keyer_auto', keyer: row.id, on: !row.on_air, duration_frames: rateFrames }); }}
+              onTie={(tie) => { keyerVerb({ action: 'keyer_tie', keyer: row.id, tie }); }}
+              onCut={() => { keyerVerb({ action: 'keyer_cut', keyer: row.id, on: !row.on_air }); }}
+              onAuto={(rateFrames) => { keyerVerb({ action: 'keyer_auto', keyer: row.id, on: !row.on_air, duration_frames: rateFrames }); }}
             />
           ))}
           {keyerError !== undefined && <p role="alert" className="text-destructive">{keyerError}</p>}
@@ -196,13 +255,12 @@ export function SwitcherPage(): JSX.Element {
               sources={sources.data ?? []}
               disabledReason={keyerReason}
               canvas={canvas}
-              onPlan={async (fields) => planKeyer({ me: 'me1', program: 'main', action: 'keyer_set', keyer: row.id, ...fields })}
+              onPlan={async (fields) => gated(() => planKeyer(keyerSet(row.id, fields, false)))}
               onApply={async (fields, allow) => {
-                const req: KeyerRequest = { me: 'me1', program: 'main', action: 'keyer_set', keyer: row.id, ...fields, ...(allow ? { on_air: 'allow' } : {}) };
-                const plan = await planKeyer(req);
-                if (!plan.can_take) throw new Error(plan.refusal?.detail ?? t`The keyer_set was refused`);
-                const result = await submitTracked(() => commandKeyer('keyer_set', req, { idempotencyKey: newIdempotencyKey() }),
-                  { topic: 'switcher', resource: 'me1', event: 'switcher.operation', terminal: { kind: 'switcher-operation', me: 'me1' } });
+                // The reviewed draft, submitted as reviewed; refusals reject.
+                const result = await gated(() => submitTracked(() => commandKeyer('keyer_set', keyerSet(row.id, fields, allow), { idempotencyKey: newIdempotencyKey() }),
+                  { topic: 'switcher', resource: 'me1', event: 'switcher.operation', terminal: { kind: 'switcher-operation', me: 'me1' } }));
+                if (result === undefined) throw new Error(t`Another switcher request is in flight`);
                 setOperationId(result.operationId);
                 setFailureReason(undefined);
               }}

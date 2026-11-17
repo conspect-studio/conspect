@@ -12,6 +12,7 @@ import { keyerRampWeight, keyerRamping } from '../../api/keyers';
 
 export interface KeyerStripProps {
   readonly row: KeyerRow;
+  /** The output tick now: the snapshot's authoritative tick, extrapolated at the exact cadence between snapshots. */
   readonly tick: number;
   /** Non-empty reason disables every control on the strip (engine unavailable, stale, in-flight command, …). */
   readonly disabledReason: string | undefined;
@@ -26,7 +27,9 @@ const MAX_RATE = 300;
 /** One DSK's TIE/CUT/AUTO/rate/lamp row. */
 export function KeyerStrip({ row, tick, disabledReason, onTie, onCut, onAuto }: KeyerStripProps): JSX.Element {
   const { t } = useLingui();
-  const [rateInput, setRateInput] = useState(String(row.rate));
+  // Follows the committed rate until the operator types one.
+  const [rateEdit, setRateEdit] = useState<string>();
+  const rateInput = rateEdit ?? String(row.rate);
   const parsedRate = Number(rateInput);
   const rateValid = Number.isInteger(parsedRate) && parsedRate >= MIN_RATE && parsedRate <= MAX_RATE;
   const rateReason = rateValid ? undefined : t`Rate must be a whole number of frames, 1–300`;
@@ -49,7 +52,7 @@ export function KeyerStrip({ row, tick, disabledReason, onTie, onCut, onAuto }: 
         className={`rounded px-1 text-xs text-white ${row.on_air ? 'bg-red-600' : 'bg-muted-foreground'}`}
       >
         {row.on_air ? t`ON AIR` : t`OFF AIR`}
-        {ramping && weight !== undefined && <span data-testid={`keyer-ramp-${row.id}`}> · {Math.round(weight * 100)}%</span>}
+        {ramping && weight !== undefined && <span data-testid={`keyer-ramp-${row.id}`} data-weight={weight.toFixed(3)}> · {Math.round(weight * 100)}%</span>}
       </span>
       {row.stale && <span role="status" className="rounded bg-amber-600 px-1 text-xs text-white" data-testid={`keyer-stale-${row.id}`}><Trans>Stale</Trans></span>}
       {row.pending && <span role="status" className="rounded bg-amber-700 px-1 text-xs text-white" data-testid={`keyer-pending-${row.id}`}><Trans>Pending</Trans></span>}
@@ -81,8 +84,11 @@ export function KeyerStrip({ row, tick, disabledReason, onTie, onCut, onAuto }: 
         max={MAX_RATE}
         value={rateInput}
         disabled={reason !== undefined}
+        title={reason}
+        aria-describedby={reason !== undefined ? describedById : undefined}
+        aria-invalid={!rateValid}
         className="w-20"
-        onChange={(event) => { setRateInput(event.target.value); }}
+        onChange={(event) => { setRateEdit(event.target.value); }}
       />
       <Button
         size="sm"
@@ -93,9 +99,7 @@ export function KeyerStrip({ row, tick, disabledReason, onTie, onCut, onAuto }: 
       >
         <Trans>Auto</Trans>
       </Button>
-      {(cutReason !== undefined || autoReason !== undefined || tieReason !== undefined) && (
-        <span className="sr-only" id={describedById}>{cutReason ?? autoReason ?? tieReason}</span>
-      )}
+      <span className="sr-only" id={describedById}>{reason ?? rateReason}</span>
     </div>
   );
 }

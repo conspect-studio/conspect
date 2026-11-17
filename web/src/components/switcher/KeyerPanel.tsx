@@ -1,291 +1,323 @@
 // A keyer panel (design note §10, K5): fill and key pickers limited to
 // sources the caller may read (inputs `in:<n>` are never offered), type
 // (luma|linear) with clip/gain/invert, mask, fly x/y/w/h with corner presets,
-// and the loss policy. Edits go through `keyer_set` with the plan shown
-// first: cost/capacity refusal, and the on-air-protected 409 offers the
-// explicit "allow" choice before a fill/key change of a keyer on air.
+// and the loss policy.
+//
+// Every value shown is the authoritative committed value from the snapshot
+// row unless the operator edited that field; untouched fields follow each new
+// snapshot. Only edited fields that differ from the committed value are sent
+// (K4 `keyer_set` merge: an omitted field is preserved). Review (plan: class,
+// cost, refusal) and Apply are separate steps; Apply sends exactly the
+// reviewed draft and any later edit — or a snapshot change that alters the
+// draft — invalidates the review. A command-time 409 `on-air-protected`
+// re-plans and asks for the explicit `on_air: "allow"` confirmation.
 import { useState } from 'react';
 import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import { Label } from '../ui/label';
-import type { KeyerFields, KeyerKind, KeyerLossPolicy, KeyerPlan, KeyerRow, KeyerSize } from '../../api/keyers';
-import { FLY_PRESETS, flyPresetRect, keyerFillRedacted, keyerFillSource, keyerKeyRedacted, keyerKeySource, keyerMaskRect } from '../../api/keyers';
-import type { FlyPreset } from '../../api/keyers';
+import type { FlyPreset, KeyerFields, KeyerKind, KeyerLossPolicy, KeyerPlan, KeyerRect, KeyerRow, KeyerSize } from '../../api/keyers';
+import { FLY_PRESETS, flyPresetRect, keyerFillRedacted, keyerFillSource, keyerKeyRedacted, keyerKeySource } from '../../api/keyers';
+import { OperationApiError } from '../../api/operations';
 
 export interface KeyerPanelProps {
   readonly row: KeyerRow;
   readonly sources: readonly { readonly id: string; readonly name: string }[];
+  /** Non-empty reason disables every control (engine unavailable, a request or outcome in flight, …). */
   readonly disabledReason: string | undefined;
-  /** The canvas size used to compute fly corner/centre presets (operator-entered; the API carries no canvas size). */
+  /** The output canvas (from `GET /switcher/{me}`), the space `fly` is in. */
   readonly canvas: KeyerSize;
-  /** Classify a `keyer_set` draft without applying it. */
-  readonly onPlan: (fields: KeyerFields) => Promise<KeyerPlan>;
-  /** Apply a `keyer_set` draft; `allow` is `on_air: "allow"` once the operator confirms the protected change. */
+  /** Classify a `keyer_set` draft without applying it; `undefined` when another request holds the submission gate. */
+  readonly onPlan: (fields: KeyerFields) => Promise<KeyerPlan | undefined>;
+  /** Submit a reviewed `keyer_set`; `allow` adds `on_air: "allow"`. Rejects with the RFC 9457 problem. */
   readonly onApply: (fields: KeyerFields, allow: boolean) => Promise<void>;
 }
 
+interface RectDraft { readonly x: string; readonly y: string; readonly w: string; readonly h: string }
+interface Edits {
+  readonly fill?: string;
+  readonly key?: string;
+  readonly type?: KeyerKind;
+  readonly clip?: string;
+  readonly gain?: string;
+  readonly invert?: boolean;
+  readonly loss?: KeyerLossPolicy;
+  readonly fly?: RectDraft | null;
+  readonly mask?: RectDraft | null;
+}
+interface Review { readonly json: string; readonly fields: KeyerFields; readonly plan: KeyerPlan }
+
 const LOSS_POLICIES: readonly KeyerLossPolicy[] = ['drop_to_off_air', 'hold_last_good'];
+const AXES = ['x', 'y', 'w', 'h'] as const;
 
-/** The draft fields this panel edits, pre-filled from the current row. */
-function draftFromRow(row: KeyerRow): {
-  fill: string; key: string; type: KeyerKind; clip: string; gain: string; invert: boolean;
-  loss: KeyerLossPolicy; fly: { x: string; y: string; w: string; h: string } | undefined;
-} {
-  return {
-    fill: keyerFillSource(row) ?? '',
-    key: keyerKeySource(row) ?? '',
-    type: row.type === 'luma' ? 'luma' : 'linear',
-    clip: '0',
-    gain: '1',
-    invert: false,
-    loss: row.loss === 'hold_last_good' ? 'hold_last_good' : 'drop_to_off_air',
-    fly: undefined,
-  };
+function rectDraft(rect: KeyerRect): RectDraft {
+  return { x: String(rect.x), y: String(rect.y), w: String(rect.w), h: String(rect.h) };
+}
+function parseRect(draft: RectDraft): KeyerRect | undefined {
+  if (!AXES.every((axis) => /^\d+$/.test(draft[axis]))) return undefined;
+  const rect = { x: Number(draft.x), y: Number(draft.y), w: Number(draft.w), h: Number(draft.h) };
+  return rect.w >= 1 && rect.h >= 1 ? rect : undefined;
+}
+function sameRect(a: KeyerRect | null | undefined, b: KeyerRect | null | undefined): boolean {
+  if (!a || !b) return !a && !b;
+  return a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h;
 }
 
-/** A non-negative integer typed as the mask box fields accept (empty/invalid is rejected, not clamped). */
-function isNonNegativeInteger(value: string): boolean {
-  return /^\d+$/.test(value);
+/**
+ * The `keyer_set` fields of `edits` against the committed `row`: only edited
+ * fields whose value differs, or the reason the draft is invalid.
+ */
+function keyerSetFields(row: KeyerRow, edits: Edits): { readonly fields: KeyerFields; readonly changed: boolean; readonly invalid?: 'clip' | 'gain' | 'fly' | 'mask' } {
+  const fields: { -readonly [K in keyof KeyerFields]: KeyerFields[K] } = { keyer: row.id };
+  if (edits.fill !== undefined && edits.fill !== '' && edits.fill !== keyerFillSource(row)) fields.fill = edits.fill;
+  if (edits.key !== undefined && !keyerKeyRedacted(row) && edits.key !== (keyerKeySource(row) ?? '')) fields.key = edits.key;
+  const rowType: KeyerKind = row.type === 'luma' ? 'luma' : 'linear';
+  if (edits.type !== undefined && edits.type !== rowType) fields.type = edits.type;
+  let invalid: 'clip' | 'gain' | 'fly' | 'mask' | undefined;
+  if (edits.clip !== undefined) {
+    const clip = Number(edits.clip);
+    if (edits.clip.trim() === '' || !Number.isFinite(clip) || clip < 0 || clip > 1) invalid = 'clip';
+    else if (clip !== row.clip) fields.clip = clip;
+  }
+  if (edits.gain !== undefined) {
+    const gain = Number(edits.gain);
+    if (edits.gain.trim() === '' || !Number.isFinite(gain) || gain < 0) invalid = 'gain';
+    else if (gain !== row.gain) fields.gain = gain;
+  }
+  if (edits.invert !== undefined && edits.invert !== row.invert) fields.invert = edits.invert;
+  const rowLoss: KeyerLossPolicy = row.loss === 'hold_last_good' ? 'hold_last_good' : 'drop_to_off_air';
+  if (edits.loss !== undefined && edits.loss !== rowLoss) fields.loss = edits.loss;
+  for (const name of ['fly', 'mask'] as const) {
+    const edit = edits[name];
+    if (edit === undefined) continue;
+    const rect = edit === null ? null : parseRect(edit);
+    if (rect === undefined) invalid = name;
+    else if (!sameRect(rect, row[name])) fields[name] = rect;
+  }
+  const changed = Object.keys(fields).length > 1;
+  return invalid === undefined ? { fields, changed } : { fields, changed, invalid };
 }
 
-const MASK_DEFAULT_BOX = { x: '0', y: '0', w: '100', h: '100' };
-
-/** One keyer's fill/key/type/geometry/loss editor, gated by a plan-first apply. */
+/** One keyer's fill/key/type/geometry/loss editor: Review (plan) then Apply. */
 export function KeyerPanel({ row, sources, disabledReason, canvas, onPlan, onApply }: KeyerPanelProps): JSX.Element {
   const { t } = useLingui();
-  const [draft, setDraft] = useState(() => draftFromRow(row));
-  const [flyPreset, setFlyPreset] = useState<FlyPreset>('full');
-  const [flyBox, setFlyBox] = useState({ w: String(Math.round(canvas.w / 2)), h: String(Math.round(canvas.h / 2)) });
-  const initialMask = keyerMaskRect(row);
-  const [maskEnabled, setMaskEnabled] = useState(initialMask !== undefined);
-  const [maskBox, setMaskBox] = useState(
-    initialMask ? { x: String(initialMask.x), y: String(initialMask.y), w: String(initialMask.w), h: String(initialMask.h) } : MASK_DEFAULT_BOX,
-  );
-  const [plan, setPlan] = useState<KeyerPlan>();
-  const [planning, setPlanning] = useState(false);
-  const [applying, setApplying] = useState(false);
+  const [edits, setEdits] = useState<Edits>({});
+  const [review, setReview] = useState<Review>();
   const [confirmAllow, setConfirmAllow] = useState(false);
   const [error, setError] = useState<string>();
   const fillRedacted = keyerFillRedacted(row);
   const keyRedacted = keyerKeyRedacted(row);
-  const sourceChoices = sources; // `useSources()` already excludes unreadable/`in:<n>` entries.
-
-  const maskFieldsValid = Object.values(maskBox).every(isNonNegativeInteger);
-
-  const buildFields = (): KeyerFields => {
-    const fly = flyPreset === 'full' ? undefined : flyPresetRect(flyPreset, canvas, { w: Number(flyBox.w) || 0, h: Number(flyBox.h) || 0 });
-    const mask = maskEnabled && maskFieldsValid
-      ? { x: Number(maskBox.x), y: Number(maskBox.y), w: Number(maskBox.w), h: Number(maskBox.h) }
-      : null;
-    return {
-      keyer: row.id,
-      ...(draft.fill === '' ? {} : { fill: draft.fill }),
-      key: draft.key === '' ? null : draft.key,
-      type: draft.type,
-      ...(draft.type === 'luma' ? { clip: Number(draft.clip), gain: Number(draft.gain) } : {}),
-      invert: draft.invert,
-      loss: draft.loss,
-      ...(fly === undefined ? {} : { fly }),
-      mask,
-    };
+  const edit = (next: Partial<Edits>): void => {
+    setEdits({ ...edits, ...next });
+    setConfirmAllow(false);
+    setError(undefined);
   };
 
-  const changesSources = draft.fill !== (keyerFillSource(row) ?? '') || draft.key !== (keyerKeySource(row) ?? '');
-  const disabled = disabledReason !== undefined;
-  const maskReason = disabledReason ?? (maskEnabled && !maskFieldsValid ? t`Mask x/y/w/h must be whole non-negative numbers` : undefined);
-  const reviewDisabled = disabled || planning || (maskEnabled && !maskFieldsValid);
+  // Displayed values: the edit, else the authoritative committed value.
+  const fill = edits.fill ?? keyerFillSource(row) ?? '';
+  const key = edits.key ?? keyerKeySource(row) ?? '';
+  const type: KeyerKind = edits.type ?? (row.type === 'luma' ? 'luma' : 'linear');
+  const clip = edits.clip ?? String(row.clip);
+  const gain = edits.gain ?? String(row.gain);
+  const invert = edits.invert ?? row.invert;
+  const loss: KeyerLossPolicy = edits.loss ?? (row.loss === 'hold_last_good' ? 'hold_last_good' : 'drop_to_off_air');
+  const fly: RectDraft | null = edits.fly !== undefined ? edits.fly : row.fly ? rectDraft(row.fly) : null;
+  const mask: RectDraft | null = edits.mask !== undefined ? edits.mask : row.mask ? rectDraft(row.mask) : null;
+  const maskDefault: KeyerRect = { x: 0, y: 0, w: row.max_source?.w ?? canvas.w, h: row.max_source?.h ?? canvas.h };
 
-  const runPlan = async (): Promise<KeyerPlan | undefined> => {
-    setPlanning(true);
+  const draft = keyerSetFields(row, edits);
+  const json = JSON.stringify(draft.fields);
+  const reviewed = review?.json === json ? review : undefined;
+  const changesSources = (reviewed?.fields ?? draft.fields).fill !== undefined || (reviewed?.fields ?? draft.fields).key !== undefined;
+
+  const invalidReason = draft.invalid === 'clip' ? t`Clip must be a number from 0 to 1`
+    : draft.invalid === 'gain' ? t`Gain must be a number of 0 or more`
+    : draft.invalid === 'fly' ? t`Fly x/y must be whole numbers of 0 or more and width/height at least 1`
+    : draft.invalid === 'mask' ? t`Mask x/y must be whole numbers of 0 or more and width/height at least 1`
+    : undefined;
+  const reviewReason = disabledReason ?? invalidReason ?? (draft.changed ? undefined : t`No changes to review`);
+  const applyReason = disabledReason ?? (reviewed === undefined ? t`Review this change first` : !reviewed.plan.can_take ? t`The reviewed change was refused` : undefined);
+  const reasonId = `keyer-panel-reason-${row.id}`;
+  /** Disabled state plus its reason as `title` and `aria-describedby` (design note §10). */
+  const gate = (reason: string | undefined, describedBy = reasonId): { disabled: boolean; title?: string; 'aria-describedby'?: string } =>
+    reason === undefined ? { disabled: false } : { disabled: true, title: reason, 'aria-describedby': describedBy };
+  const base = gate(disabledReason);
+
+  const runReview = async (): Promise<Review | undefined> => {
     setError(undefined);
+    setConfirmAllow(false);
+    const fields = draft.fields;
     try {
-      const result = await onPlan(buildFields());
-      setPlan(result);
-      return result;
+      const plan = await onPlan(fields);
+      if (plan === undefined) return undefined;
+      const next = { json: JSON.stringify(fields), fields, plan };
+      setReview(next);
+      if (plan.refusal?.type === 'on-air-protected' && changesSources) setConfirmAllow(true);
+      return next;
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       return undefined;
-    } finally {
-      setPlanning(false);
     }
   };
 
   const apply = async (allow: boolean): Promise<void> => {
-    setApplying(true);
+    if (reviewed === undefined) return;
     setError(undefined);
     try {
-      await onApply(buildFields(), allow);
+      await onApply(reviewed.fields, allow);
+      setEdits({});
+      setReview(undefined);
       setConfirmAllow(false);
-      setPlan(undefined);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setApplying(false);
+      if (err instanceof OperationApiError && err.problemType?.endsWith('on-air-protected') === true) {
+        // The keyer went on air after the review: re-plan, then ask.
+        setConfirmAllow(false);
+        const fresh = await runReview();
+        if (fresh !== undefined && fresh.plan.refusal?.type !== 'on-air-protected') {
+          setError(t`The keyer state changed; review the new plan before applying`);
+        }
+        return;
+      }
+      setError(err instanceof OperationApiError && err.detail !== undefined ? `${err.message}: ${err.detail}` : err instanceof Error ? err.message : String(err));
     }
   };
 
-  const onReview = async (): Promise<void> => {
-    const result = await runPlan();
-    if (!result) return;
-    if (result.refusal?.type === 'on-air-protected' && changesSources) {
-      setConfirmAllow(true);
-      return;
-    }
-    if (result.can_take) await apply(false);
+  const presetLabel = (preset: FlyPreset): string => preset === 'top_left' ? t`TL` : preset === 'top_right' ? t`TR`
+    : preset === 'bottom_left' ? t`BL` : preset === 'bottom_right' ? t`BR` : preset === 'centre' ? t`Centre` : t`Full`;
+  const presetName = (preset: FlyPreset): string => preset === 'top_left' ? t`Fly to the top left corner`
+    : preset === 'top_right' ? t`Fly to the top right corner` : preset === 'bottom_left' ? t`Fly to the bottom left corner`
+    : preset === 'bottom_right' ? t`Fly to the bottom right corner` : preset === 'centre' ? t`Fly to the centre` : t`Full canvas (no fly)`;
+  const axisLabel = (axis: (typeof AXES)[number]): string => axis === 'x' ? t`X` : axis === 'y' ? t`Y` : axis === 'w' ? t`Width` : t`Height`;
+  const flyBox = (): KeyerSize => {
+    const current = fly ? parseRect(fly) : undefined;
+    return current ? { w: current.w, h: current.h } : { w: Math.round(canvas.w / 2), h: Math.round(canvas.h / 2) };
   };
 
   return (
     <section className="space-y-2 rounded border p-3" aria-label={t`Keyer ${row.id} panel`} data-testid={`keyer-panel-${row.id}`}>
       <h3 className="font-semibold uppercase">{row.id}</h3>
+      <span className="sr-only" id={reasonId}>{disabledReason}</span>
       <div className="flex flex-wrap items-end gap-3">
         <div className="space-y-1">
           <Label htmlFor={`keyer-fill-${row.id}`}><Trans>Fill</Trans></Label>
           {fillRedacted
             ? <p id={`keyer-fill-${row.id}`} role="status" data-testid={`keyer-fill-redacted-${row.id}`}><Trans>redacted</Trans></p>
-            : <select
-                id={`keyer-fill-${row.id}`}
-                className="rounded border bg-background p-2"
-                value={draft.fill}
-                disabled={disabled}
-                onChange={(event) => { setDraft({ ...draft, fill: event.target.value }); }}
-              >
+            : <select id={`keyer-fill-${row.id}`} className="rounded border bg-background p-2" value={fill} {...base}
+                onChange={(event) => { edit({ fill: event.target.value }); }}>
                 <option value="">{t`Choose a source`}</option>
-                {sourceChoices.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}
+                {sources.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}
               </select>}
         </div>
         <div className="space-y-1">
           <Label htmlFor={`keyer-key-${row.id}`}><Trans>Key</Trans></Label>
           {keyRedacted
             ? <p id={`keyer-key-${row.id}`} role="status" data-testid={`keyer-key-redacted-${row.id}`}><Trans>redacted</Trans></p>
-            : <select
-                id={`keyer-key-${row.id}`}
-                className="rounded border bg-background p-2"
-                value={draft.key}
-                disabled={disabled}
-                onChange={(event) => { setDraft({ ...draft, key: event.target.value }); }}
-              >
-                <option value=""><Trans>Self key (fill alpha)</Trans></option>
-                {sourceChoices.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}
+            : <select id={`keyer-key-${row.id}`} className="rounded border bg-background p-2" value={key} {...base}
+                onChange={(event) => { edit({ key: event.target.value }); }}>
+                <option value="">{t`Self key (fill alpha)`}</option>
+                {sources.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}
               </select>}
         </div>
         <div className="space-y-1">
           <Label htmlFor={`keyer-type-${row.id}`}><Trans>Type</Trans></Label>
-          <select
-            id={`keyer-type-${row.id}`}
-            className="rounded border bg-background p-2"
-            value={draft.type}
-            disabled={disabled}
-            onChange={(event) => { setDraft({ ...draft, type: event.target.value === 'luma' ? 'luma' : 'linear' }); }}
-          >
+          <select id={`keyer-type-${row.id}`} className="rounded border bg-background p-2" value={type} {...base}
+            onChange={(event) => { edit({ type: event.target.value === 'luma' ? 'luma' : 'linear' }); }}>
             <option value="linear">{t`Linear`}</option>
             <option value="luma">{t`Luma`}</option>
           </select>
         </div>
       </div>
-      {draft.type === 'luma' && (
+      {type === 'luma' && (
         <div className="flex flex-wrap items-end gap-3">
           <div className="space-y-1"><Label htmlFor={`keyer-clip-${row.id}`}><Trans>Clip</Trans></Label>
-            <Input id={`keyer-clip-${row.id}`} type="number" min="0" max="1" step="0.01" value={draft.clip} disabled={disabled} className="w-24" onChange={(event) => { setDraft({ ...draft, clip: event.target.value }); }} /></div>
+            <Input id={`keyer-clip-${row.id}`} type="number" min="0" max="1" step="0.01" value={clip} {...base} aria-invalid={draft.invalid === 'clip'} className="w-24" onChange={(event) => { edit({ clip: event.target.value }); }} /></div>
           <div className="space-y-1"><Label htmlFor={`keyer-gain-${row.id}`}><Trans>Gain</Trans></Label>
-            <Input id={`keyer-gain-${row.id}`} type="number" min="0" step="0.01" value={draft.gain} disabled={disabled} className="w-24" onChange={(event) => { setDraft({ ...draft, gain: event.target.value }); }} /></div>
+            <Input id={`keyer-gain-${row.id}`} type="number" min="0" step="0.01" value={gain} {...base} aria-invalid={draft.invalid === 'gain'} className="w-24" onChange={(event) => { edit({ gain: event.target.value }); }} /></div>
         </div>
       )}
       <label className="flex items-center gap-1 text-sm">
-        <input type="checkbox" checked={draft.invert} disabled={disabled} onChange={(event) => { setDraft({ ...draft, invert: event.target.checked }); }} />
+        <input type="checkbox" checked={invert} {...base} onChange={(event) => { edit({ invert: event.target.checked }); }} />
         <Trans>Invert matte</Trans>
       </label>
-      <fieldset className="space-y-1" disabled={disabled}>
-        <legend className="text-sm font-medium"><Trans>Fly</Trans></legend>
+      <fieldset className="space-y-1" data-testid={`keyer-fly-fieldset-${row.id}`}>
+        <legend className="text-sm font-medium"><Trans>Fly (canvas {canvas.w}×{canvas.h})</Trans></legend>
         <div className="flex flex-wrap items-end gap-2" role="group" aria-label={t`Fly preset`}>
-          {FLY_PRESETS.map((preset) => (
-            <Button key={preset} type="button" size="sm" variant={flyPreset === preset ? 'default' : 'outline'} disabled={disabled} onClick={() => { setFlyPreset(preset); }}>
-              {preset === 'top_left' ? t`TL` : preset === 'top_right' ? t`TR` : preset === 'bottom_left' ? t`BL` : preset === 'bottom_right' ? t`BR` : preset === 'centre' ? t`Centre` : t`Full`}
-            </Button>
-          ))}
+          {FLY_PRESETS.map((preset) => {
+            const rect = flyPresetRect(preset, canvas, flyBox());
+            const active = preset === 'full' ? fly === null : rect !== null && fly !== null && sameRect(parseRect(fly), rect);
+            return (
+              <Button key={preset} type="button" size="sm" variant={active ? 'default' : 'outline'} aria-label={presetName(preset)} aria-pressed={active} {...base}
+                onClick={() => { edit({ fly: rect === null ? null : rectDraft(rect) }); }}>
+                {presetLabel(preset)}
+              </Button>
+            );
+          })}
         </div>
-        {flyPreset !== 'full' && (
+        {fly !== null && (
           <div className="flex flex-wrap items-end gap-2">
-            <div className="space-y-1"><Label htmlFor={`keyer-fly-w-${row.id}`}><Trans>Width</Trans></Label>
-              <Input id={`keyer-fly-w-${row.id}`} type="number" min="1" value={flyBox.w} disabled={disabled} className="w-24" onChange={(event) => { setFlyBox({ ...flyBox, w: event.target.value }); }} /></div>
-            <div className="space-y-1"><Label htmlFor={`keyer-fly-h-${row.id}`}><Trans>Height</Trans></Label>
-              <Input id={`keyer-fly-h-${row.id}`} type="number" min="1" value={flyBox.h} disabled={disabled} className="w-24" onChange={(event) => { setFlyBox({ ...flyBox, h: event.target.value }); }} /></div>
+            {AXES.map((axis) => (
+              <div className="space-y-1" key={axis}>
+                <Label htmlFor={`keyer-fly-${axis}-${row.id}`}><Trans>Fly {axisLabel(axis)}</Trans></Label>
+                <Input id={`keyer-fly-${axis}-${row.id}`} type="number" min={axis === 'w' || axis === 'h' ? '1' : '0'} step="1" value={fly[axis]} {...base}
+                  aria-invalid={draft.invalid === 'fly'} className="w-24" onChange={(event) => { edit({ fly: { ...fly, [axis]: event.target.value } }); }} />
+              </div>
+            ))}
           </div>
         )}
       </fieldset>
-      <fieldset className="space-y-1" disabled={disabled} data-testid={`keyer-mask-fieldset-${row.id}`}>
+      <fieldset className="space-y-1" data-testid={`keyer-mask-fieldset-${row.id}`}>
         <legend className="text-sm font-medium"><Trans>Mask</Trans></legend>
         <label className="flex items-center gap-1 text-sm">
-          <input
-            type="checkbox"
-            checked={maskEnabled}
-            disabled={disabled}
-            onChange={(event) => {
-              setMaskEnabled(event.target.checked);
-              if (!event.target.checked) setMaskBox(MASK_DEFAULT_BOX);
-            }}
-          />
+          <input type="checkbox" checked={mask !== null} {...base}
+            onChange={(event) => { edit({ mask: event.target.checked ? (row.mask ? rectDraft(row.mask) : rectDraft(maskDefault)) : null }); }} />
           <Trans>Enable mask</Trans>
         </label>
-        {maskEnabled && (
+        {mask !== null && (
           <div className="flex flex-wrap items-end gap-2">
-            {(['x', 'y', 'w', 'h'] as const).map((axis) => (
+            {AXES.map((axis) => (
               <div className="space-y-1" key={axis}>
-                <Label htmlFor={`keyer-mask-${axis}-${row.id}`}>{axis === 'x' ? t`X` : axis === 'y' ? t`Y` : axis === 'w' ? t`Width` : t`Height`}</Label>
-                <Input
-                  id={`keyer-mask-${axis}-${row.id}`}
-                  type="number"
-                  min="0"
-                  step="1"
-                  value={maskBox[axis]}
-                  disabled={disabled}
-                  aria-invalid={!isNonNegativeInteger(maskBox[axis])}
-                  className="w-24"
-                  onChange={(event) => { setMaskBox({ ...maskBox, [axis]: event.target.value }); }}
-                />
+                <Label htmlFor={`keyer-mask-${axis}-${row.id}`}><Trans>Mask {axisLabel(axis)}</Trans></Label>
+                <Input id={`keyer-mask-${axis}-${row.id}`} type="number" min={axis === 'w' || axis === 'h' ? '1' : '0'} step="1" value={mask[axis]} {...base}
+                  aria-invalid={draft.invalid === 'mask'} className="w-24" onChange={(event) => { edit({ mask: { ...mask, [axis]: event.target.value } }); }} />
               </div>
             ))}
-            <Button type="button" size="sm" variant="outline" disabled={disabled} onClick={() => { setMaskBox(MASK_DEFAULT_BOX); }}>
-              <Trans>Full (reset)</Trans>
+            <Button type="button" size="sm" variant="outline" {...base} onClick={() => { edit({ mask: null }); }}>
+              <Trans>Full (clear mask)</Trans>
             </Button>
           </div>
         )}
-        {maskEnabled && !maskFieldsValid && (
-          <p role="alert" data-testid={`keyer-mask-error-${row.id}`}><Trans>Mask x/y/w/h must be whole non-negative numbers</Trans></p>
-        )}
+        {invalidReason !== undefined && <p role="alert" data-testid={`keyer-invalid-${row.id}`}>{invalidReason}</p>}
       </fieldset>
       <div className="space-y-1">
         <Label htmlFor={`keyer-loss-${row.id}`}><Trans>Loss policy</Trans></Label>
-        <select
-          id={`keyer-loss-${row.id}`}
-          className="rounded border bg-background p-2"
-          value={draft.loss}
-          disabled={disabled}
-          onChange={(event) => { setDraft({ ...draft, loss: event.target.value === 'hold_last_good' ? 'hold_last_good' : 'drop_to_off_air' }); }}
-        >
+        <select id={`keyer-loss-${row.id}`} className="rounded border bg-background p-2" value={loss} {...base}
+          onChange={(event) => { edit({ loss: event.target.value === 'hold_last_good' ? 'hold_last_good' : 'drop_to_off_air' }); }}>
           {LOSS_POLICIES.map((policy) => <option key={policy} value={policy}>{policy === 'hold_last_good' ? t`Hold last good` : t`Drop to off air`}</option>)}
         </select>
       </div>
       <div className="flex flex-wrap items-center gap-2">
-        <Button disabled={reviewDisabled} title={maskReason} aria-describedby={maskReason !== undefined ? `keyer-panel-reason-${row.id}` : undefined} onClick={() => { void onReview(); }}>
-          {planning ? t`Reviewing…` : t`Review & apply`}
-        </Button>
-        {maskReason !== undefined && <span className="sr-only" id={`keyer-panel-reason-${row.id}`}>{maskReason}</span>}
-        {plan?.cost && (
-          <span role="status" data-testid={`keyer-cost-${row.id}`}>
-            <Trans>Cost delta {plan.cost.delta.toFixed(2)} — {plan.cost.fits ? t`fits the budget` : t`exceeds the budget`}</Trans>
+        <Button {...gate(reviewReason, `keyer-review-reason-${row.id}`)} onClick={() => { void runReview(); }}><Trans>Review</Trans></Button>
+        <span className="sr-only" id={`keyer-review-reason-${row.id}`}>{reviewReason}</span>
+        <Button {...gate(applyReason, `keyer-apply-reason-${row.id}`)} onClick={() => { void apply(false); }}><Trans>Apply</Trans></Button>
+        <span className="sr-only" id={`keyer-apply-reason-${row.id}`}>{applyReason}</span>
+        {reviewed !== undefined && (
+          <span role="status" data-testid={`keyer-plan-${row.id}`}>
+            {reviewed.plan.class === 'class1' ? t`Class 1 (seamless, one tick)` : t`Class 2 (controlled reset)`}
+            {reviewed.plan.cost && <> · {reviewed.plan.cost.fits
+              ? t`cost delta ${reviewed.plan.cost.delta.toFixed(2)} canvas folds, fits the budget`
+              : t`cost delta ${reviewed.plan.cost.delta.toFixed(2)} canvas folds, exceeds the budget`}</>}
           </span>
         )}
-        {plan?.refusal && plan.refusal.type !== 'on-air-protected' && (
-          <span role="alert" data-testid={`keyer-refusal-${row.id}`}>{plan.refusal.detail}</span>
+        {reviewed?.plan.refusal && reviewed.plan.refusal.type !== 'on-air-protected' && (
+          <span role="alert" data-testid={`keyer-refusal-${row.id}`}>{reviewed.plan.refusal.detail}</span>
         )}
       </div>
-      {confirmAllow && (
+      {confirmAllow && reviewed !== undefined && (
         <div role="alertdialog" aria-label={t`Confirm on-air keyer change`} className="flex items-center gap-2 rounded border border-red-600 p-2">
           <span><Trans>{row.id} is on air: this fill/key change needs explicit confirmation to allow it.</Trans></span>
-          <Button size="sm" variant="destructive" disabled={applying} onClick={() => { void apply(true); }}><Trans>Allow on-air change</Trans></Button>
-          <Button size="sm" variant="outline" disabled={applying} onClick={() => { setConfirmAllow(false); }}><Trans>Cancel</Trans></Button>
+          <Button size="sm" variant="destructive" {...base} onClick={() => { void apply(true); }}><Trans>Allow on-air change</Trans></Button>
+          <Button size="sm" variant="outline" onClick={() => { setConfirmAllow(false); }}><Trans>Cancel</Trans></Button>
         </div>
       )}
       {error !== undefined && <p role="alert" className="text-destructive">{error}</p>}
