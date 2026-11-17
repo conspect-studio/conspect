@@ -379,6 +379,13 @@ impl multiview_control::SourceDemandProvider for ControlDemand {
         ))))
     }
 
+    fn select_refusal(&self, id: &str) -> Option<String> {
+        self.catalogue
+            .load()
+            .get(id)
+            .and_then(|entry| entry.unavailable().map(str::to_owned))
+    }
+
     fn session_lease(
         &self,
         id: &str,

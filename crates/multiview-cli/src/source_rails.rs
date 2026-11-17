@@ -21,6 +21,9 @@ use multiview_framestore::{NoSignalPolicy, SwapCell, TileStore, TileThresholds};
 struct Catalogued {
     source: Source,
     store: Arc<TileStore<Nv12Image>>,
+    /// A `media_player` alias whose player has no channel in this run: why it
+    /// can never show a picture (ADR-M012). `None` for every other entry.
+    unavailable: Option<String>,
 }
 
 /// The live-updatable catalogue of configured sources.
@@ -41,6 +44,56 @@ impl CatalogEntry {
     pub fn store(&self) -> &Arc<TileStore<Nv12Image>> {
         &self.0.store
     }
+
+    /// Whether this entry is a `media_player` alias (ADR-M012): its store IS
+    /// the player channel's, fed by the player boot, so demand never starts,
+    /// stops or clears a producer for it.
+    #[must_use]
+    pub fn is_alias(&self) -> bool {
+        is_alias(&self.0.source.kind)
+    }
+
+    /// Why an alias can never show a picture (its player has no channel).
+    #[must_use]
+    pub fn unavailable(&self) -> Option<&str> {
+        self.0.unavailable.as_deref()
+    }
+}
+
+/// Whether `kind` is a `media_player` alias (ADR-M012).
+#[must_use]
+pub const fn is_alias(kind: &SourceKind) -> bool {
+    matches!(kind, SourceKind::MediaPlayer { .. })
+}
+
+/// The status detail of an alias whose player has no channel in this run.
+#[must_use]
+pub fn no_channel_reason(player: &str) -> String {
+    format!("media player {player:?} has no channel in this run; it shows no picture")
+}
+
+/// Catalogue a `media_player` alias with its player's `store` (ADR-M012), so
+/// demand reports it and a consumer can lease it. `unavailable` is set when
+/// the player has no channel. Off the output clock (hub worker or build).
+pub fn catalogue_alias(
+    catalogue: &Catalogue,
+    source: &Source,
+    store: &Arc<TileStore<Nv12Image>>,
+    unavailable: Option<&str>,
+) {
+    let unavailable = unavailable.map(str::to_owned);
+    catalogue.rcu(|current| {
+        let mut next = current.as_ref().clone();
+        next.insert(
+            source.id.clone(),
+            Arc::new(CatalogEntry(Catalogued {
+                source: source.clone(),
+                store: Arc::clone(store),
+                unavailable: unavailable.clone(),
+            })),
+        );
+        next
+    });
 }
 
 /// A fresh frame store for source `id`. Allocating one costs a few atomics and
@@ -70,6 +123,7 @@ pub fn catalogue<'a, S: std::hash::BuildHasher>(
                 Arc::new(CatalogEntry(Catalogued {
                     source: source.clone(),
                     store,
+                    unavailable: None,
                 })),
             )
         })
@@ -92,6 +146,7 @@ pub fn catalogue_upsert(catalogue: &Catalogue, source: &Source) -> Arc<TileStore
             Arc::new(CatalogEntry(Catalogued {
                 source: source.clone(),
                 store: kept,
+                unavailable: None,
             })),
         );
         next
@@ -112,6 +167,7 @@ pub fn catalogue_upsert_with(
             Arc::new(CatalogEntry(Catalogued {
                 source: source.clone(),
                 store: Arc::clone(store),
+                unavailable: None,
             })),
         );
         next
@@ -197,6 +253,10 @@ pub struct SourceRails {
     registry: crate::live_sources::StopRegistry,
     spawner: Arc<dyn RailSpawner>,
     owned: Mutex<HashMap<String, Owned>>,
+    /// Ids last seen catalogued as a `media_player` alias: a rail change of
+    /// one never touches the stop registry, even after its entry is gone (an
+    /// alias may share its player's id, whose producer is the player channel).
+    aliases: Mutex<std::collections::HashSet<String>>,
 }
 
 /// Producer handles a rail owns, for a bounded join on stop.
@@ -219,6 +279,50 @@ impl SourceRails {
             registry,
             spawner,
             owned: Mutex::new(HashMap::new()),
+            aliases: Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    fn aliases(&self) -> MutexGuard<'_, std::collections::HashSet<String>> {
+        self.aliases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether `id` is (or last was) a `media_player` alias, recording what
+    /// its current entry says.
+    fn alias_rails(&self, id: &str, entry: Option<&Arc<CatalogEntry>>) -> bool {
+        match entry {
+            Some(entry) if entry.is_alias() => {
+                self.aliases().insert(id.to_owned());
+                true
+            }
+            Some(_) => {
+                self.aliases().remove(id);
+                false
+            }
+            None => self.aliases().remove(id),
+        }
+    }
+
+    /// A `media_player` alias's rail change (ADR-M012): the player boot owns
+    /// the producer, so the video rail "runs" exactly while consumed and
+    /// nothing is started, stopped or cleared. An alias whose player has no
+    /// channel fails with that reason.
+    fn alias_transition(
+        entry: Option<&Arc<CatalogEntry>>,
+        to: Rails,
+    ) -> Result<Rails, RailFailure> {
+        let running = Rails {
+            video: to.video,
+            audio: false,
+        };
+        match entry.and_then(|entry| entry.unavailable()) {
+            Some(reason) if running.video => Err(RailFailure {
+                running: Rails::NONE,
+                reason: reason.to_owned(),
+            }),
+            _ => Ok(running),
         }
     }
 
@@ -282,6 +386,9 @@ impl RailDriver<Nv12Image> for SourceRails {
         requested: Option<RequestedSize>,
     ) -> Result<Rails, RailFailure> {
         let entry = self.entry(id);
+        if self.alias_rails(id, entry.as_ref()) {
+            return Self::alias_transition(entry.as_ref(), to);
+        }
         // The audio-only/anchored choice depends on video, so a video change
         // rebuilds a running audio rail too.
         let audio_mode_changes = from.audio && to.audio && from.video != to.video;
@@ -334,6 +441,9 @@ impl RailDriver<Nv12Image> for SourceRails {
     }
 
     fn teardown(&self, id: &str, rails: Rails) {
+        if self.alias_rails(id, self.entry(id).as_ref()) {
+            return;
+        }
         let handles = self.owned().remove(id).map_or_else(Vec::new, |owned| {
             owned.video.into_iter().chain(owned.audio).collect()
         });
@@ -342,7 +452,8 @@ impl RailDriver<Nv12Image> for SourceRails {
 
     fn retire(&self, id: &str, rails: Rails) {
         if rails.video {
-            if let Some(entry) = self.entry(id) {
+            // Never clear an alias: its store is the player channel's.
+            if let Some(entry) = self.entry(id).filter(|entry| !entry.is_alias()) {
                 entry.store().clear();
             }
         }
@@ -366,8 +477,10 @@ impl RailDriver<Nv12Image> for SourceRails {
         // A file ends by itself, and a static generator (bars, solid, a still
         // graphic) publishes once and holds: silence after the first frame is
         // not a stall for either.
+        // A media player holds, ends or idles under transport control.
         self.entry(id).is_some_and(|entry| {
-            matches!(entry.source().kind, SourceKind::File { .. })
+            entry.is_alias()
+                || matches!(entry.source().kind, SourceKind::File { .. })
                 || crate::synth::SyntheticKind::from_source_kind(&entry.source().kind)
                     .is_some_and(|kind| !kind.animated())
         })

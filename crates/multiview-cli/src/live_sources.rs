@@ -244,6 +244,35 @@ pub trait IngestSpawner: Send + Sync {
 
     /// A source left the run. Hub worker only.
     fn source_removed(&self, _id: &str) {}
+
+    /// Catalogue a `media_player` alias (ADR-M012) over its player's `store`
+    /// so demand reports and leases it; `unavailable` says why it can show no
+    /// picture (its player has no channel). Returns `true` on a
+    /// demand-managed run. Never starts a producer. Hub worker only.
+    fn catalogue_alias(
+        &self,
+        _source: &multiview_config::Source,
+        _store: &Arc<TileStore<Nv12Image>>,
+        _unavailable: Option<String>,
+    ) -> bool {
+        false
+    }
+
+    /// A `media_player` alias left the run (removed, or edited into another
+    /// kind). Its store is the player channel's and is never cleared. Hub
+    /// worker only.
+    fn alias_removed(&self, _id: &str) {}
+}
+
+/// A live `media_player` alias binding (ADR-M012) for the hub: no producer,
+/// only the catalogue entry and the preview/wall store map.
+pub struct AliasBind {
+    /// The alias source document.
+    pub source: multiview_config::Source,
+    /// The player channel's store (or a never-fed one when it has none).
+    pub store: Arc<TileStore<Nv12Image>>,
+    /// Why the alias can show no picture, when its player has no channel.
+    pub unavailable: Option<String>,
 }
 
 /// A request travelling from the frame-boundary drain to the hub worker.
@@ -259,6 +288,18 @@ enum HubRequest {
     Teardown {
         /// The source id whose producer goes away.
         id: String,
+    },
+    /// Bind (or repoint) a `media_player` alias: catalogue it and publish its
+    /// store to the preview/wall map. Never spawns anything. Boxed: it carries
+    /// a full config `Source`.
+    BindAlias(Box<AliasBind>),
+    /// A `media_player` alias left: withdraw its catalogue entry and, unless
+    /// the id is the player's own channel, its preview entry.
+    UnbindAlias {
+        /// The alias id.
+        id: String,
+        /// Keep the preview entry (the id is the player channel itself).
+        keep_preview: bool,
     },
     /// Stop the worker (run over): tear down + join every owned producer and
     /// exit. Sent by [`LiveSourceHub::shutdown`] — an explicit request because
@@ -379,6 +420,30 @@ impl LiveSourceHandle {
             return forced;
         }
         let request = HubRequest::Teardown { id: id.to_owned() };
+        Self::submit_outcome(&self.tx.try_send(request))
+    }
+
+    /// Request a `media_player` alias binding (ADR-M012). Never blocks; a shed
+    /// request is reported as [`HubSubmit::Full`]/[`HubSubmit::Gone`] (the
+    /// drive binding already applied; only its status/preview entry lags).
+    #[must_use]
+    pub fn request_bind_alias(&self, bind: AliasBind) -> HubSubmit {
+        if let Some(forced) = self.forced() {
+            return forced;
+        }
+        Self::submit_outcome(&self.tx.try_send(HubRequest::BindAlias(Box::new(bind))))
+    }
+
+    /// Request a `media_player` alias unbinding. Never blocks.
+    #[must_use]
+    pub fn request_unbind_alias(&self, id: &str, keep_preview: bool) -> HubSubmit {
+        if let Some(forced) = self.forced() {
+            return forced;
+        }
+        let request = HubRequest::UnbindAlias {
+            id: id.to_owned(),
+            keep_preview,
+        };
         Self::submit_outcome(&self.tx.try_send(request))
     }
 
@@ -520,6 +585,25 @@ fn worker_loop(
                     ingest.source_removed(&id);
                 }
                 preview_remove(preview, &id);
+            }
+            HubRequest::BindAlias(bind) => {
+                let AliasBind {
+                    source,
+                    store,
+                    unavailable,
+                } = *bind;
+                preview_insert(preview, &source.id, &store);
+                if let Some(ingest) = ingest {
+                    ingest.catalogue_alias(&source, &store, unavailable);
+                }
+            }
+            HubRequest::UnbindAlias { id, keep_preview } => {
+                if let Some(ingest) = ingest {
+                    ingest.alias_removed(&id);
+                }
+                if !keep_preview {
+                    preview_remove(preview, &id);
+                }
             }
             HubRequest::Shutdown => break,
         }

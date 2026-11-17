@@ -3391,6 +3391,10 @@ impl CommandDrain {
         if replaced_producer && !is_player_id {
             self.teardown_replaced_producer(&id);
         }
+        let unavailable = drive
+            .store(player)
+            .is_none()
+            .then(|| crate::source_rails::no_channel_reason(player));
         // A repoint (alias A -> B) replaces this id's entry with B's store; the
         // previous player's own entry is never touched.
         if id != player || drive.store(player).is_none() {
@@ -3424,6 +3428,51 @@ impl CommandDrain {
         }
         self.applied_media.insert(id.clone(), source.clone());
         self.unapplied.remove(&id);
+        if let Some(store) = drive.store(&id).cloned() {
+            self.bind_alias_off_clock(source, store, unavailable);
+        }
+    }
+
+    /// Hand a bound `media_player` alias to the off-clock hub (ADR-M012): it
+    /// catalogues the alias for demand (standing pins, status, leases for a
+    /// switcher select) and publishes its store to the preview/wall map. One
+    /// non-blocking `try_send` (inv #1/#10); a shed request leaves the drive
+    /// binding applied and only the status/preview lagging, retried by a
+    /// re-apply.
+    fn bind_alias_off_clock(
+        &self,
+        source: &multiview_config::Source,
+        store: Arc<multiview_framestore::TileStore<Nv12Image>>,
+        unavailable: Option<String>,
+    ) {
+        let Some(seam) = self.live_sources.as_ref() else {
+            return;
+        };
+        let outcome = seam.request_bind_alias(crate::live_sources::AliasBind {
+            source: source.clone(),
+            store,
+            unavailable,
+        });
+        if outcome != crate::live_sources::HubSubmit::Accepted {
+            tracing::warn!(
+                source = %source.id, ?outcome,
+                "media_player alias bound on the drive; its status/preview registration \
+                 was shed (re-apply the source to retry)"
+            );
+        }
+    }
+
+    /// Withdraw a `media_player` alias from the hub's catalogue and preview
+    /// map (non-blocking, as [`Self::bind_alias_off_clock`]).
+    fn unbind_alias_off_clock(&self, id: &str) {
+        let Some(seam) = self.live_sources.as_ref() else {
+            return;
+        };
+        let keep_preview = self.config.media_players.iter().any(|p| p.id == id);
+        let outcome = seam.request_unbind_alias(id, keep_preview);
+        if outcome != crate::live_sources::HubSubmit::Accepted {
+            tracing::warn!(source = %id, ?outcome, "media_player alias unbind shed");
+        }
     }
 
     /// Stop the producer a `media_player` alias replaces under `id`, through
@@ -3524,6 +3573,7 @@ impl CommandDrain {
                 drive.remove_store(id);
             }
             self.publish_alias(id, None);
+            self.unbind_alias_off_clock(id);
             self.config.sources.retain(|s| s.id != id);
             self.applied_media.remove(id);
             self.unapplied.remove(id);
