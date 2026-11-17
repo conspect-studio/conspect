@@ -208,3 +208,76 @@ export function isTerminalCaptureState(state: string): boolean {
     || state === 'cancelled'
     || state === 'uncertain';
 }
+
+/** Per-fill scheduled refresh status (`GET /api/v1/media/fills/{id}/refresh`). */
+export type FillRefreshStatus = components['schemas']['FillRefreshStatus'];
+
+/** Refresh interval bounds, matching `[[media_fill]] refresh.minutes`. */
+export const MIN_REFRESH_MINUTES = 1;
+export const MAX_REFRESH_MINUTES = 1440;
+
+/** Body of `PUT /api/v1/media/fills/{id}/refresh`. */
+export interface RefreshScheduleBody {
+  readonly minutes: number;
+  readonly then?: 'cue' | 'resume';
+  readonly capture: CaptureBody;
+  readonly start_now?: boolean;
+}
+
+function isFillRefreshStatus(value: unknown): value is FillRefreshStatus {
+  return (
+    isRecord(value)
+    && typeof value.fill_id === 'string'
+    && typeof value.minutes === 'number'
+    && typeof value.in_flight === 'boolean'
+  );
+}
+
+function refreshPath(fillId: string): string {
+  return `/api/v1/media/fills/${encodeURIComponent(fillId)}/refresh`;
+}
+
+/**
+ * The scheduled refresh status of one fill, or `null` when no schedule
+ * exists (404) — a fill that refreshes only on demand.
+ */
+export async function getFillRefresh(
+  fillId: string,
+  options: RequestOptions = {},
+): Promise<FillRefreshStatus | null> {
+  const response = await fetch(apiUrl(options, refreshPath(fillId)), {
+    method: 'GET',
+    headers: buildHeaders(options, false),
+  });
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    throw await readProblem(response);
+  }
+  const body: unknown = await response.json();
+  if (!isFillRefreshStatus(body)) {
+    throw new OperationApiError('The server returned an unexpected refresh status body.');
+  }
+  return body;
+}
+
+/** Install (or replace) the scheduled refresh of a fill; it runs as the caller's key. */
+export async function putFillRefresh(
+  fillId: string,
+  body: RefreshScheduleBody,
+  options: RequestOptions = {},
+): Promise<FillRefreshStatus> {
+  const response = await sendCommand(refreshPath(fillId), options, { method: 'PUT', body });
+  const parsed: unknown = await response.json();
+  if (!isFillRefreshStatus(parsed)) {
+    throw new OperationApiError('The server returned an unexpected refresh status body.');
+  }
+  return parsed;
+}
+
+/** Stop the scheduled refresh of a fill; the current clip keeps playing. */
+export async function deleteFillRefresh(
+  fillId: string,
+  options: RequestOptions = {},
+): Promise<void> {
+  await sendCommand(refreshPath(fillId), options, { method: 'DELETE' });
+}

@@ -48,13 +48,19 @@ import type { ArtifactRef, LoadFailureCode, LoadThen, MediaPlayer } from '../api
 import { useLoadMediaPlayerArtifact, useMediaPlayerLoadOperation } from '../api/media-playersQueries';
 import { newIdempotencyKey, OperationApiError } from '../api/operations';
 import {
+  MAX_REFRESH_MINUTES,
+  MIN_REFRESH_MINUTES,
   useCancelCapture,
   useCaptureCapabilities,
   useCaptureJob,
   useCreateCapture,
+  useDeleteFillRefresh,
+  useFillRefresh,
+  usePutFillRefresh,
 } from '../api/web-captureQueries';
 import type { CaptureBody, CaptureView } from '../api/web-captureQueries';
 import { WINDY_TERMS_VERSION, windyFillId } from '../api/web-capture';
+import { FillRefreshSummary } from './FillRefreshStatus';
 import { Button } from '../components/ui/button';
 import {
   Dialog,
@@ -345,6 +351,15 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
   const createCapture = useCreateCapture();
   const cancelCapture = useCancelCapture();
   const loadArtifact = useLoadMediaPlayerArtifact();
+  const refreshStatus = useFillRefresh(player !== null ? windyFillId(player.id) : undefined);
+  const putRefresh = usePutFillRefresh();
+  const deleteRefresh = useDeleteFillRefresh();
+  // Scheduled refresh (issue #472): "once" is the plain capture+load; "every"
+  // additionally registers a server-side schedule that re-captures this same
+  // view every N minutes and reloads the player (keeping the last good clip
+  // on air until each new one is natively adopted).
+  const [refreshMode, setRefreshMode] = useState<'once' | 'every'>('once');
+  const [refreshMinutes, setRefreshMinutes] = useState(5);
 
   // The parent mounts this component with `key={player.id}`, so a fresh
   // mount per player is the reset mechanism — no effect needs to clear
@@ -481,7 +496,13 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
   // Finding 3: block submit on an obviously invalid field (fps/frames/
   // zoom/lat/lon out of the server's documented range) before it ever
   // round-trips to a 422.
-  const draftInvalid = !isDraftValid(draft, isStepsMode);
+  const minutesInvalid =
+    refreshMode === 'every'
+    && (!Number.isInteger(refreshMinutes)
+      || refreshMinutes < MIN_REFRESH_MINUTES
+      || refreshMinutes > MAX_REFRESH_MINUTES);
+  const draftInvalid = !isDraftValid(draft, isStepsMode) || minutesInvalid;
+  const schedule = refreshStatus.data ?? null;
 
   /** Build the current draft's `CaptureBody` (never submits by itself). */
   const buildCaptureBody = (): CaptureBody => {
@@ -546,6 +567,13 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
     setLoadStarted(false);
     loadTriggeredRef.current = false;
     submitAttempt(attempt);
+    if (refreshMode === 'every') {
+      // The schedule starts at the NEXT slot: this capture is the first clip.
+      putRefresh.mutate({
+        fillId: attempt.body.fill_id,
+        body: { minutes: refreshMinutes, then: draft.then, capture: attempt.body, start_now: false },
+      });
+    }
   };
 
   /** Re-capture: always a brand-new attempt (new key, new body, new job). */
@@ -903,7 +931,16 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
                 <Trans>Refresh</Trans>
               </Label>
               <div className="flex items-center gap-2">
-                <input id="windy-refresh-once" type="radio" name="windy-refresh" checked readOnly className="size-4" />
+                <input
+                  id="windy-refresh-once"
+                  type="radio"
+                  name="windy-refresh"
+                  checked={refreshMode === 'once'}
+                  onChange={(): void => {
+                    setRefreshMode('once');
+                  }}
+                  className="size-4"
+                />
                 <Label htmlFor="windy-refresh-once">
                   <Trans>Once</Trans>
                 </Label>
@@ -913,13 +950,75 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
                   id="windy-refresh-scheduled"
                   type="radio"
                   name="windy-refresh"
-                  disabled
+                  checked={refreshMode === 'every'}
+                  onChange={(): void => {
+                    setRefreshMode('every');
+                  }}
                   className="size-4"
                 />
-                <Label htmlFor="windy-refresh-scheduled" className="text-muted-foreground">
-                  <Trans>Every N minutes (coming soon — no scheduler yet)</Trans>
+                <Label htmlFor="windy-refresh-scheduled">
+                  <Trans>Every N minutes</Trans>
                 </Label>
+                <Input
+                  id="windy-refresh-minutes"
+                  type="number"
+                  aria-label={t`Refresh interval (minutes)`}
+                  className="w-24"
+                  min={MIN_REFRESH_MINUTES}
+                  max={MAX_REFRESH_MINUTES}
+                  step={1}
+                  disabled={refreshMode !== 'every'}
+                  value={Number.isFinite(refreshMinutes) ? refreshMinutes : ''}
+                  onChange={(e): void => {
+                    setRefreshMinutes(e.target.valueAsNumber);
+                  }}
+                />
               </div>
+              {minutesInvalid ? (
+                <p role="alert" className="text-xs text-destructive">
+                  <Trans>
+                    The refresh interval must be a whole number of minutes from {MIN_REFRESH_MINUTES} to{' '}
+                    {MAX_REFRESH_MINUTES}.
+                  </Trans>
+                </p>
+              ) : null}
+              {refreshMode === 'every' ? (
+                <p className="text-xs text-muted-foreground">
+                  <Trans>
+                    The server re-captures this view on schedule as your key and reloads the player;
+                    the current clip keeps playing until each new one is ready, and a failed refresh
+                    keeps the previous clip.
+                  </Trans>
+                </p>
+              ) : null}
+              {putRefresh.isError ? (
+                <p role="alert" className="text-xs text-destructive">
+                  <Trans>Schedule not saved</Trans>: {errorText(putRefresh.error)}
+                </p>
+              ) : null}
+              {schedule !== null ? (
+                <div className="grid gap-1">
+                  <FillRefreshSummary status={schedule} />
+                  {schedule.source === 'api' ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="justify-self-start"
+                      disabled={deleteRefresh.isPending}
+                      onClick={(): void => {
+                        deleteRefresh.mutate({ fillId: schedule.fill_id });
+                      }}
+                    >
+                      <Trans>Stop scheduled refresh</Trans>
+                    </Button>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">
+                      <Trans>This schedule is declared in the configuration ([[media_fill]]).</Trans>
+                    </p>
+                  )}
+                </div>
+              ) : null}
             </div>
 
             <div className="grid gap-1.5 rounded-md border p-3">
