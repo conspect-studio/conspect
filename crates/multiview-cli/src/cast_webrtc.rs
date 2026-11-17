@@ -133,14 +133,10 @@ impl CliCastWebRtc {
         {
             let mut feeds = self.feeds();
             feeds.retain(|id, feed| {
-                let live = feed
-                    .viewers
-                    .lock()
-                    .map(|mut v| {
-                        v.retain(|a| !a.is_fenced());
-                        !v.is_empty()
-                    })
-                    .unwrap_or(false);
+                let live = feed.viewers.lock().is_ok_and(|mut v| {
+                    v.retain(|a| !a.is_fenced());
+                    !v.is_empty()
+                });
                 if !live {
                     gone.push(id.clone());
                 }
@@ -389,7 +385,7 @@ impl FeedWorker {
             let pts = packet.pts()?;
             match packet.kind() {
                 StreamKind::Video => {
-                    out.push((Component::Video, tick_of(pts, self.video, self.cadence)?))
+                    out.push((Component::Video, tick_of(pts, self.video, self.cadence)?));
                 }
                 StreamKind::Audio => {
                     let (base, span) = self.audio?;

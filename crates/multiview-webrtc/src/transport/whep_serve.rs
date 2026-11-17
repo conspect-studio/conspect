@@ -258,6 +258,7 @@ impl WhepServeHandle {
         self.negotiate_gated(output_id, offer, true, Some(gate))
     }
 
+    #[allow(clippy::too_many_lines)] // One admission, kept in one place.
     fn negotiate_gated(
         &self,
         output_id: &str,
@@ -401,7 +402,6 @@ impl WhepServeHandle {
         true
     }
 
-    /// The number of live viewers on `output_id` (telemetry / tests).
     /// Remove output `output_id`'s registration (the cast rung's last viewer
     /// left); its viewers are ended by the driver as their feed is gone.
     pub fn unregister_output(&self, output_id: &str) {
@@ -410,6 +410,7 @@ impl WhepServeHandle {
         }
     }
 
+    /// The number of live viewers on `output_id` (telemetry / tests).
     #[must_use]
     pub fn live_viewer_count(&self, output_id: &str) -> usize {
         self.inner

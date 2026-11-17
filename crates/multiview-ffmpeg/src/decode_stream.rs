@@ -668,7 +668,8 @@ impl StreamAudioDecoder {
         // else aliases the pointer.
         unsafe {
             let raw = ctx.as_mut_ptr();
-            let padded = asc.len() + ffmpeg::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize;
+            let padded = asc.len()
+                + usize::try_from(ffmpeg::ffi::AV_INPUT_BUFFER_PADDING_SIZE).unwrap_or(64);
             let buf = ffmpeg::ffi::av_mallocz(padded).cast::<u8>();
             if buf.is_null() {
                 return Err(FfmpegError::FrameMismatch("aac config allocation"));
