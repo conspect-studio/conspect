@@ -72,7 +72,10 @@ use multiview_ffmpeg::{
 };
 use multiview_framestore::SwapCell;
 
-use super::probe::{resolve_geometry, validate_alpha, validate_cadence, ProbeError, ProbedClip};
+use super::probe::{
+    hevc_vps_max_layers, resolve_geometry, validate_alpha, validate_cadence, PixelAlpha,
+    ProbeError, ProbedClip,
+};
 use super::{
     player_audio_budget, AudioDeckLease, ClipSpec, Generation, LoadCoordinator, LoadRequest,
     PlayoutGeometry,
@@ -130,6 +133,12 @@ pub struct StagedClip {
     pub audio_lease: Option<AudioDeckLease>,
     /// Reusable scaler moved with the decoder, retired with this clip.
     pub(crate) scaler: TileScaler,
+    /// NV12+A attacher (ADR-0058, #391): the bounded `AlphaPlanePool` plus
+    /// reused scratch frames and scaler. `Some` exactly when the clip's pixel
+    /// format carries supported alpha; built once here, off the ingest thread,
+    /// and moved with the decoder, so every published frame of an alpha clip
+    /// carries its straight alpha plane and an opaque clip pays nothing.
+    pub(crate) alpha: Option<crate::pipeline::MediaAlpha>,
     /// Descriptor capability outlives demuxer/decoder destruction (field drop order).
     pub artifact_lease: Option<super::clip::ImmutableArtifactLease>,
 }
@@ -151,7 +160,8 @@ pub enum LoadFailureReason {
     Vfr,
     /// The clip declares no frame rate.
     NoCadence,
-    /// The clip carries an alpha plane.
+    /// The clip carries alpha the player cannot decode (unsupported pixel
+    /// format, or HEVC alpha, which libav decodes opaque).
     Alpha,
     /// The container has no video stream.
     NoVideoStream,
@@ -655,7 +665,7 @@ fn open_one(
     if stop.load(Ordering::Acquire) || coordinator.is_superseded(generation) {
         return Err(OpenAbort::Abandoned);
     }
-    validate_alpha(&facts.pix_fmt, facts.has_alpha)
+    let has_alpha = validate_alpha(&facts.pix_fmt, facts.alpha, facts.hevc_layers)
         .map_err(|error| failed(probe_reason(&error), error))?;
     let cadence = validate_cadence(
         config.canvas_cadence,
@@ -670,7 +680,7 @@ fn open_one(
         cadence,
         frames: facts.frames,
         has_audio: facts.has_audio,
-        has_alpha: facts.has_alpha,
+        has_alpha,
         pix_fmt: facts.pix_fmt,
     };
     let geometry = resolve_geometry(&request.spec, &probed, config.canvas_cadence)
@@ -678,9 +688,28 @@ fn open_one(
     if stop.load(Ordering::Acquire) || coordinator.is_superseded(generation) {
         return Err(OpenAbort::Abandoned);
     }
-    let mut decoder = StreamVideoDecoder::new(facts.parameters, facts.time_base)
-        .map_err(|error| failed(LoadFailureReason::DecoderOpen, error))?
-        .with_declared_fps(Some(cadence));
+    // VP9 with alpha (WebM `alpha_mode=1`) opens `libvpx-vp9`, the only libav
+    // decoder that merges the alpha side stream (ADR-0112 §5); without it the
+    // asset plays opaque with a warning, exactly as the legacy player path.
+    let vp9_alpha = crate::pipeline::vp9_alpha_decoder(
+        "player-opener",
+        true,
+        demuxer.input(),
+        facts.stream_index,
+    );
+    let decoder = match vp9_alpha.and_then(|name| {
+        crate::pipeline::open_named_decoder(
+            "player-opener",
+            facts.parameters.clone(),
+            facts.time_base,
+            name,
+        )
+    }) {
+        Some(decoder) => decoder,
+        None => StreamVideoDecoder::new(facts.parameters, facts.time_base)
+            .map_err(|error| failed(LoadFailureReason::DecoderOpen, error))?,
+    };
+    let mut decoder = decoder.with_declared_fps(Some(cadence));
     demuxer.arm_deadline(config.prime_timeout);
     let primed = prime(
         &mut demuxer,
@@ -698,10 +727,15 @@ fn open_one(
         return Err(OpenAbort::Abandoned);
     }
     let mut scaler = TileScaler::new(config.tile_width, config.tile_height);
+    let mut alpha = has_alpha.then(crate::pipeline::MediaAlpha::default);
     let first_image = Arc::new(
-        scaler
-            .convert(&first_frame.frame, config.canvas_color.output_tag())
-            .map_err(|error| failed(LoadFailureReason::InvalidData, error))?,
+        crate::pipeline::tile_image_with_alpha(
+            &mut scaler,
+            &mut alpha,
+            &first_frame,
+            config.canvas_color.output_tag(),
+        )
+        .map_err(|error| failed(LoadFailureReason::InvalidData, error))?,
     );
     if stop.load(Ordering::Acquire) || coordinator.is_superseded(generation) {
         return Err(OpenAbort::Abandoned);
@@ -733,6 +767,7 @@ fn open_one(
         audio,
         audio_lease,
         scaler,
+        alpha,
         artifact_lease: request.spec.artifact_lease.clone(),
     })
 }
@@ -901,7 +936,8 @@ struct VideoFacts {
     height: u32,
     frames: Option<u64>,
     has_audio: bool,
-    has_alpha: bool,
+    alpha: PixelAlpha,
+    hevc_layers: Option<u8>,
     pix_fmt: String,
 }
 
@@ -938,9 +974,21 @@ fn probe_facts(demuxer: &Demuxer) -> Result<VideoFacts, OpenAbort> {
     let pix_fmt = pixel
         .descriptor()
         .map_or_else(|| format!("{pixel:?}"), |desc| desc.name().to_owned());
-    let has_alpha = pixel
-        .descriptor()
-        .is_some_and(|desc| desc.nb_components() >= 4);
+    // The same layout map the decode uses (single source of truth): the gate
+    // admits exactly the alpha formats `DecodedVideoFrame::alpha` carries.
+    let alpha = match multiview_ffmpeg::alpha::alpha_support(pixel) {
+        multiview_ffmpeg::alpha::AlphaSupport::Opaque => PixelAlpha::Opaque,
+        multiview_ffmpeg::alpha::AlphaSupport::Supported(_) => PixelAlpha::Supported,
+        multiview_ffmpeg::alpha::AlphaSupport::Unsupported => PixelAlpha::Unsupported,
+    };
+    // HEVC alpha rides an auxiliary layer the base-layer pixel format does not
+    // reveal (and libav decodes opaque, ADR-0058 §3): read the VPS layer count.
+    let hevc_layers = (parameters.id() == ffmpeg::codec::Id::HEVC)
+        .then(|| {
+            let facts = multiview_ffmpeg::video_stream_facts(&parameters);
+            hevc_vps_max_layers(&facts.extradata)
+        })
+        .flatten();
     Ok(VideoFacts {
         stream_index,
         parameters,
@@ -952,7 +1000,8 @@ fn probe_facts(demuxer: &Demuxer) -> Result<VideoFacts, OpenAbort> {
         height,
         frames,
         has_audio,
-        has_alpha,
+        alpha,
+        hevc_layers,
         pix_fmt,
     })
 }
@@ -1072,7 +1121,7 @@ fn probe_reason(error: &ProbeError) -> LoadFailureReason {
         ProbeError::Cadence { .. } => LoadFailureReason::WrongCadence,
         ProbeError::NoCadence => LoadFailureReason::NoCadence,
         ProbeError::Vfr { .. } => LoadFailureReason::Vfr,
-        ProbeError::Alpha { .. } => LoadFailureReason::Alpha,
+        ProbeError::Alpha { .. } | ProbeError::HevcAlpha { .. } => LoadFailureReason::Alpha,
         ProbeError::NoVideo => LoadFailureReason::NoVideoStream,
         ProbeError::UnknownLength => LoadFailureReason::UnknownLength,
         ProbeError::Window(_) => LoadFailureReason::InvalidWindow,

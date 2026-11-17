@@ -90,11 +90,30 @@ pub enum ProbeError {
         /// Nominal frame rate denominator.
         nom_den: i64,
     },
-    /// The clip carries an alpha plane (rejected in this step, decision 2).
-    #[error("clip pixel format {pix_fmt} carries an alpha plane, which is rejected")]
+    /// The clip carries alpha in a pixel format the player's NV12+A decode
+    /// cannot carry (ADR-0058 §3, ADR-0112 §5): playing it would silently
+    /// drop the alpha, so the load is refused with a remediation.
+    #[error(
+        "clip pixel format {pix_fmt} carries alpha the player cannot decode; \
+         transcode to ProRes 4444, QuickTime Animation (qtrle), VP9 alpha (WebM) \
+         or a PNG sequence"
+    )]
     Alpha {
         /// The pixel format that carries alpha.
         pix_fmt: String,
+    },
+    /// The clip is HEVC with more than one layer: HEVC with alpha carries its
+    /// alpha in an auxiliary layer that libav decodes opaque (ADR-0058 §3,
+    /// Alternative E), so a stinger would cover Program. Refused rather than
+    /// played opaque.
+    #[error(
+        "clip is HEVC with {layers} layers (HEVC alpha decodes opaque); \
+         transcode to ProRes 4444, QuickTime Animation (qtrle), VP9 alpha (WebM) \
+         or a PNG sequence"
+    )]
+    HevcAlpha {
+        /// `vps_max_layers_minus1 + 1` from the stream's VPS.
+        layers: u8,
     },
     /// The container has no video stream.
     #[error("container has no video stream")]
@@ -157,19 +176,116 @@ pub(super) fn validate_cadence(
     Ok(avg)
 }
 
-/// Reject a clip whose video pixel format carries an alpha plane (design 0, 4.3).
+/// What the decoder's pixel format says about alpha, classified by
+/// `multiview_ffmpeg::alpha::alpha_support` (the same layout map the decode
+/// uses, so the gate can never admit a format the alpha path cannot carry).
+/// Kept libav-free here so the decision is unit-tested in the default build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PixelAlpha {
+    /// No alpha: an ordinary opaque clip.
+    Opaque,
+    /// Alpha the NV12+A decode carries (ProRes 4444, qtrle, PNG, TGA, VP9
+    /// alpha via `libvpx-vp9`, ...).
+    Supported,
+    /// Alpha the layout map cannot carry (e.g. paletted `pal8`).
+    Unsupported,
+}
+
+/// The alpha gate of a runtime clip load (keyers K6, #391; ADR-0058 §3).
+///
+/// Returns whether the clip's video carries alpha the player will publish as
+/// NV12+A. `hevc_layers` is `Some(vps_max_layers)` for an HEVC stream whose
+/// VPS could be read, `None` otherwise.
 ///
 /// # Errors
 ///
-/// [`ProbeError::Alpha`] when `has_alpha` is set.
-pub(super) fn validate_alpha(pix_fmt: &str, has_alpha: bool) -> Result<(), ProbeError> {
-    if has_alpha {
-        Err(ProbeError::Alpha {
-            pix_fmt: pix_fmt.to_owned(),
-        })
-    } else {
-        Ok(())
+/// * [`ProbeError::Alpha`] when the pixel format carries alpha the decode
+///   cannot carry.
+/// * [`ProbeError::HevcAlpha`] when an HEVC stream declares more than one
+///   layer: HEVC alpha is an auxiliary layer libav decodes opaque, and the
+///   base layer's pixel format does not reveal it.
+pub(super) fn validate_alpha(
+    pix_fmt: &str,
+    alpha: PixelAlpha,
+    hevc_layers: Option<u8>,
+) -> Result<bool, ProbeError> {
+    if let Some(layers) = hevc_layers.filter(|layers| *layers > 1) {
+        return Err(ProbeError::HevcAlpha { layers });
     }
+    match alpha {
+        PixelAlpha::Opaque => Ok(false),
+        PixelAlpha::Supported => Ok(true),
+        PixelAlpha::Unsupported => Err(ProbeError::Alpha {
+            pix_fmt: pix_fmt.to_owned(),
+        }),
+    }
+}
+
+/// `vps_max_layers_minus1 + 1` of the first HEVC VPS in `extradata`, either an
+/// `hvcC` record (first byte `1`) or Annex-B parameter sets; `None` when no
+/// VPS is found or the record is malformed. Bounded: walks at most the record's
+/// declared arrays, never past `extradata`.
+///
+/// The VPS header is fixed-length (H.265 §7.3.2.1): after the two-byte NAL
+/// header come `vps_video_parameter_set_id` u(4),
+/// `vps_base_layer_internal_flag` u(1), `vps_base_layer_available_flag` u(1)
+/// and `vps_max_layers_minus1` u(6), so the layer count is in payload bytes 0-1
+/// (no emulation-prevention byte can occur there: the NAL header is `0x40`).
+#[must_use]
+pub(super) fn hevc_vps_max_layers(extradata: &[u8]) -> Option<u8> {
+    let vps = if extradata.first() == Some(&1) {
+        hvcc_vps(extradata)?
+    } else {
+        annex_b_vps(extradata)?
+    };
+    let (&b0, &b1) = (vps.get(2)?, vps.get(3)?);
+    Some((((b0 & 0x03) << 4) | (b1 >> 4)) + 1)
+}
+
+/// HEVC NAL unit type of a NAL whose first byte is `header`.
+const fn hevc_nal_type(header: u8) -> u8 {
+    (header >> 1) & 0x3F
+}
+
+const HEVC_VPS: u8 = 32;
+
+/// The first VPS NAL of an `hvcC` record (ISO/IEC 14496-15 §8.3.3.1: 22 fixed
+/// bytes, `numOfArrays`, then per array a type byte, `numNalus` u16 and
+/// `nalUnitLength` u16-prefixed NALs).
+fn hvcc_vps(record: &[u8]) -> Option<&[u8]> {
+    let arrays = *record.get(22)?;
+    let mut at = 23_usize;
+    for _ in 0..arrays {
+        let kind = *record.get(at)? & 0x3F;
+        let count = u16::from_be_bytes([*record.get(at + 1)?, *record.get(at + 2)?]);
+        at += 3;
+        for _ in 0..count {
+            let len = usize::from(u16::from_be_bytes([*record.get(at)?, *record.get(at + 1)?]));
+            let nal = record.get(at + 2..at + 2 + len)?;
+            if kind == HEVC_VPS && nal.first().map(|h| hevc_nal_type(*h)) == Some(HEVC_VPS) {
+                return Some(nal);
+            }
+            at += 2 + len;
+        }
+    }
+    None
+}
+
+/// The first VPS NAL of Annex-B parameter sets (`00 00 01` start codes).
+fn annex_b_vps(bytes: &[u8]) -> Option<&[u8]> {
+    let mut i = 0_usize;
+    while let Some(window) = bytes.get(i..i + 3) {
+        if window == [0, 0, 1] {
+            let nal = bytes.get(i + 3..)?;
+            if nal.first().map(|h| hevc_nal_type(*h)) == Some(HEVC_VPS) {
+                return Some(nal);
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 /// Resolve the clip out-point from the declared and probed lengths.

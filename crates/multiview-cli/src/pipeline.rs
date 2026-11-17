@@ -18574,8 +18574,10 @@ fn player_runtime_body(
                                             frame_index = index.saturating_add(1);
                                             match player.on_decoded(index) {
                                                 PlayerAction::Publish { at } => {
-                                                    if let Ok(image) = clip.scaler.convert(
-                                                        &decoded.frame,
+                                                    if let Ok(image) = tile_image_with_alpha(
+                                                        &mut clip.scaler,
+                                                        &mut clip.alpha,
+                                                        &decoded,
                                                         plan.canvas_color.output_tag(),
                                                     ) {
                                                         last = Arc::new(image);
@@ -18680,8 +18682,10 @@ fn player_runtime_body(
                                         frame_index = index.saturating_add(1);
                                         match player.on_decoded(index) {
                                             PlayerAction::Publish { at } => {
-                                                if let Ok(image) = clip.scaler.convert(
-                                                    &decoded.frame,
+                                                if let Ok(image) = tile_image_with_alpha(
+                                                    &mut clip.scaler,
+                                                    &mut clip.alpha,
+                                                    &decoded,
                                                     plan.canvas_color.output_tag(),
                                                 ) {
                                                     last = Arc::new(image);
@@ -18799,8 +18803,10 @@ fn player_runtime_body(
                                                 frame_index = frame_index.saturating_add(1);
                                                 match player.on_decoded(index) {
                                                     PlayerAction::Publish { at } => {
-                                                        if let Ok(image) = clip.scaler.convert(
-                                                            &decoded.frame,
+                                                        if let Ok(image) = tile_image_with_alpha(
+                                                            &mut clip.scaler,
+                                                            &mut clip.alpha,
+                                                            &decoded,
                                                             plan.canvas_color.output_tag(),
                                                         ) {
                                                             last = Arc::new(image);
@@ -20778,6 +20784,9 @@ fn open_and_stream(
 /// Media-player NV12+A: attaches a decoded asset's straight alpha plane (#391).
 #[path = "pipeline_alpha.rs"]
 mod media_alpha;
+pub(crate) use media_alpha::{
+    open_named as open_named_decoder, tile_image_with_alpha, vp9_alpha_decoder, MediaAlpha,
+};
 
 /// Convert a source frame index to a libav `AV_TIME_BASE` (microsecond) seek
 /// target at the given `cadence`, using exact integer rationals — never float
