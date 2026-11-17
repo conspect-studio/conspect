@@ -10050,8 +10050,9 @@ fn run_webrtc_output(
     // packet PTS in encoder ticks rescales to 90 kHz video RTP units. Audio
     // packets are stamped in `1/sample_rate` already; the AAC→Opus distinction
     // does not change the 48 kHz Opus RTP clock the driver writes them at.
-    let video_rtp = Rational::new(1, 90_000);
-    let audio_rtp = Rational::new(1, 48_000);
+    // `EgressMedia::rtp_timestamp` wraps the 64-bit result mod 2^32 (RFC 3550;
+    // #492) — never a clamp, which froze viewers at 0 after ~13 h / ~24.9 h.
+    let audio_time_base = Rational::new(1, 48_000);
     let mut delivered = 0usize;
     let mut dropped = 0u64;
     // Block on each fanned packet; the iterator ends when the channel closes
@@ -10063,18 +10064,18 @@ fn run_webrtc_output(
             continue;
         };
         let (media, rtp_timestamp) = match packet.kind() {
-            StreamKind::Video => {
-                let ts =
-                    multiview_core::time::rescale(packet.pts().unwrap_or(0), time_base, video_rtp);
-                (EgressMedia::Video, u32::try_from(ts.max(0)).unwrap_or(0))
-            }
+            StreamKind::Video => (
+                EgressMedia::Video,
+                EgressMedia::Video.rtp_timestamp(packet.pts().unwrap_or(0), time_base),
+            ),
             StreamKind::Audio => {
                 // Audio packets carry their PTS in the audio encoder time-base
                 // (1/sample_rate); it is already the 48 kHz Opus RTP clock unit, so
                 // the rescale is identity — kept explicit for the timeline contract.
-                let ts =
-                    multiview_core::time::rescale(packet.pts().unwrap_or(0), audio_rtp, audio_rtp);
-                (EgressMedia::Audio, u32::try_from(ts.max(0)).unwrap_or(0))
+                (
+                    EgressMedia::Audio,
+                    EgressMedia::Audio.rtp_timestamp(packet.pts().unwrap_or(0), audio_time_base),
+                )
             }
             // A future elementary-stream kind is not carried over WebRTC.
             _ => continue,
@@ -10102,6 +10103,99 @@ fn run_webrtc_output(
         line: format!("{label}: {delivered} packet(s) fanned to WebRTC egress"),
         playlist: None,
         frames: delivered,
+    }
+}
+
+/// #492: the WebRTC output egress stamps RTP timestamps modulo 2^32 (RFC 3550),
+/// never clamped to 0, for a program that has run past the 32-bit boundary
+/// (video ≈ 13 h 15 min at 90 kHz, audio ≈ 24.9 h at 48 kHz).
+#[cfg(all(test, feature = "webrtc-native"))]
+mod webrtc_rtp_wrap_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::run_webrtc_output;
+    use crate::binding_delivery::{BindingDelivery, BindingPolicy, DeliveryLimits};
+    use multiview_core::time::Rational;
+    use multiview_ffmpeg::{EncodedPacket, StreamKind};
+    use multiview_webrtc::egress::{egress_feed, EgressMedia};
+    use std::time::{Duration, Instant};
+
+    fn packet(kind: StreamKind, pts: i64, key: bool) -> EncodedPacket {
+        let mut packet =
+            ffmpeg_next::Packet::copy(&[0, 0, 0, 1, if key { 0x65 } else { 0x41 }, 0x88]);
+        packet.set_pts(Some(pts));
+        packet.set_dts(Some(pts));
+        if key {
+            packet.set_flags(ffmpeg_next::packet::Flags::KEY);
+        }
+        EncodedPacket::with_kind(packet, kind)
+    }
+
+    /// Drive 30 fps video ticks and 20 ms Opus frames whose PTS straddle each
+    /// media's 2^32 RTP boundary through the real fan-out → `run_webrtc_output`
+    /// → egress feed, and check every consecutive stamp advances by exactly one
+    /// frame duration modulo 2^32 (and that none is pinned to 0).
+    #[test]
+    fn webrtc_egress_rtp_timestamps_wrap_mod_2_32_through_the_fan_out() {
+        const N: i64 = 12;
+        let fps30 = Rational::new(1, 30);
+        let max = i64::from(u32::MAX);
+        // Video: the last 90 kHz-RTP frame before the wrap is n = ⌊max/3000⌋.
+        let v0 = max / 3000 - 5;
+        // Audio: start 5 Opus frames (960 samples) before the 48 kHz wrap.
+        let a0 = max - (max % 960) - 5 * 960;
+
+        let (mut delivery, mut receivers) = BindingDelivery::new(
+            vec![BindingPolicy::Bounded],
+            DeliveryLimits::default(),
+            vec![None],
+        );
+        let rx = receivers.pop().unwrap();
+        let (sink, feed) = egress_feed();
+        let runner = std::thread::spawn(move || run_webrtc_output(&sink, "webrtc-test", rx, fps30));
+        let now = Instant::now();
+        for i in 0..N {
+            delivery.stage(&[
+                packet(StreamKind::Video, v0 + i, i == 0),
+                packet(StreamKind::Audio, a0 + i * 960, false),
+            ]);
+            delivery.flush_tick(now, Duration::from_millis(33));
+        }
+        delivery.finish();
+        drop(delivery);
+        let outcome = runner.join().unwrap();
+        assert_eq!(outcome.frames, usize::try_from(2 * N).unwrap());
+
+        let mut video = Vec::new();
+        let mut audio = Vec::new();
+        while let Some(sample) = feed.pop() {
+            match sample.media {
+                EgressMedia::Video => video.push(sample.rtp_timestamp),
+                EgressMedia::Audio => audio.push(sample.rtp_timestamp),
+                _ => panic!("unexpected media"),
+            }
+        }
+        assert_eq!(video.len(), usize::try_from(N).unwrap());
+        assert_eq!(audio.len(), usize::try_from(N).unwrap());
+        assert_eq!(i64::from(video[0]), v0 * 3000, "exact below the wrap");
+        assert_eq!(i64::from(audio[0]), a0, "exact below the wrap");
+        for (stamps, step, name) in [(&video, 3000_u32, "video"), (&audio, 960_u32, "audio")] {
+            for pair in stamps.windows(2) {
+                assert_eq!(
+                    pair[1].wrapping_sub(pair[0]),
+                    step,
+                    "{name} RTP timestamps advance one frame mod 2^32: {stamps:?}"
+                );
+            }
+            assert!(
+                stamps.windows(2).any(|p| p[1] < p[0]),
+                "{name} crossed the 2^32 boundary in this run: {stamps:?}"
+            );
+            assert!(
+                stamps.iter().filter(|&&t| t == 0).count() <= 1,
+                "{name} stamps were not clamped to 0: {stamps:?}"
+            );
+        }
     }
 }
 
