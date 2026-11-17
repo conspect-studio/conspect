@@ -358,6 +358,19 @@ pub enum StabilityTierDoc {
     Soft,
 }
 
+/// `OpenAPI` mirror of [`multiview_config::YoutubeAddressFamily`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum YoutubeAddressFamilyDoc {
+    /// System default first; a bot-checked resolve is repeated over IPv4.
+    Auto,
+    /// Always IPv4.
+    V4,
+    /// Always IPv6.
+    V6,
+}
+
 /// `OpenAPI` mirror of [`multiview_core::stream::DataKind`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -1035,6 +1048,10 @@ pub enum SourceKindDoc {
     Youtube {
         /// Watch/live/channel URL.
         url: String,
+        /// Address family of the `yt-dlp` resolve (issue #498). Absent ⇒
+        /// `[system.youtube] address_family`, else `auto`.
+        #[serde(default)]
+        address_family: Option<YoutubeAddressFamilyDoc>,
     },
     /// MPEG-TS input.
     Ts {

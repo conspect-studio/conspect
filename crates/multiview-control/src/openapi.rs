@@ -627,6 +627,7 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::openapi_schemas::StreamDetailDoc,
         crate::openapi_schemas::DataKindDoc,
         crate::openapi_schemas::TcSourceKindDoc,
+        crate::openapi_schemas::YoutubeAddressFamilyDoc,
         // Per-stream crosspoint routing (RT-11): plan/take request + response.
         crate::openapi_schemas::StreamSelectorDoc,
         crate::openapi_schemas::StreamRefDoc,

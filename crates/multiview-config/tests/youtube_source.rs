@@ -54,7 +54,7 @@ fn youtube_source_round_trips_with_its_url() {
     cfg.validate().expect("a youtube source validates");
 
     match &cfg.sources[0].kind {
-        SourceKind::Youtube { url: parsed } => assert_eq!(parsed, url),
+        SourceKind::Youtube { url: parsed, .. } => assert_eq!(parsed, url),
         other => panic!("expected Youtube, got {other:?}"),
     }
 
@@ -83,5 +83,39 @@ fn youtube_kind_round_trips_through_json() {
     assert!(
         matches!(back.sources[0].kind, SourceKind::Youtube { .. }),
         "the round-tripped kind is still Youtube"
+    );
+}
+
+#[test]
+fn youtube_source_address_family_is_optional_and_round_trips() {
+    use multiview_config::YoutubeAddressFamily;
+    let url = "https://youtu.be/abcdEFGH123";
+    let doc = config_with_source(&format!(
+        "kind = \"youtube\"\nurl = \"{url}\"\naddress_family = \"v4\""
+    ));
+    let cfg = MultiviewConfig::load_from_toml(&doc).expect("parse");
+    cfg.validate().expect("validates");
+    match &cfg.sources[0].kind {
+        SourceKind::Youtube { address_family, .. } => {
+            assert_eq!(*address_family, Some(YoutubeAddressFamily::V4));
+        }
+        other => panic!("expected Youtube, got {other:?}"),
+    }
+    let json = serde_json::to_string(&cfg).expect("to json");
+    assert!(json.contains(r#""address_family":"v4""#), "{json}");
+    let back: MultiviewConfig = serde_json::from_str(&json).expect("from json");
+    assert_eq!(cfg, back);
+    // Absent stays absent on the wire (no churn for existing documents).
+    let plain = MultiviewConfig::load_from_toml(&config_with_source(&format!(
+        "kind = \"youtube\"\nurl = \"{url}\""
+    )))
+    .expect("parse");
+    assert!(!plain.to_toml().expect("toml").contains("address_family"));
+    // An unknown family is refused.
+    assert!(
+        MultiviewConfig::load_from_toml(&config_with_source(&format!(
+            "kind = \"youtube\"\nurl = \"{url}\"\naddress_family = \"v5\""
+        )))
+        .is_err()
     );
 }

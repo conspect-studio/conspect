@@ -15,6 +15,12 @@
 //! comes first. When a `node` binary is found, `--js-runtimes node:<path>` is
 //! passed so the `n`-signature can be solved (`yt-dlp` enables only Deno by
 //! default); an older `yt-dlp` that rejects the flag is retried without it.
+//!
+//! Address family (issue #498): [`ResolverConfig::family`] forces `-4` / `-6`,
+//! or (`auto`, the default) runs with the system default and repeats an
+//! invocation that `YouTube` bot-checked ("confirm you're not a bot") once with
+//! `-4`. The family that succeeded is recorded on the [`ResolvedHls`], so the
+//! media fetch can be pinned to the family the URL was signed for.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -22,7 +28,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use super::{resolve::parse_info_dict, ResolvedHls, YoutubeError};
+use super::{resolve::parse_info_dict, ResolveFamily, ResolvedHls, YoutubeError};
 
 /// The explicit player clients the single fallback attempt asks for when the
 /// default-client attempt fails (issue #420). `ios` is deliberately absent: it
@@ -46,14 +52,19 @@ pub struct ResolverConfig {
     /// resolve it on `PATH`.
     pub yt_dlp_path: String,
     /// Hard per-invocation deadline; on expiry the child is killed. A resolve
-    /// runs at most four invocations (default clients and fallback clients,
+    /// runs at most six invocations (default clients and fallback clients,
     /// each possibly repeated once without `--js-runtimes` on an old
-    /// `yt-dlp`), each under this deadline.
+    /// `yt-dlp`; under `auto` family the first bot-checked attempt is repeated
+    /// once over IPv4, which then also serves the fallback), each under this
+    /// deadline.
     pub timeout: Duration,
     /// The JavaScript runtime handed to `yt-dlp` as `--js-runtimes node:<path>`
     /// (an absolute path). `None` passes no runtime flag. [`Self::default`] and
     /// [`Self::new`] fill it from [`find_node`].
     pub js_runtime: Option<String>,
+    /// The address family `yt-dlp` resolves over (issue #498). Default
+    /// [`ResolveFamily::Auto`]: system default, bot check retried over IPv4.
+    pub family: ResolveFamily,
 }
 
 impl Default for ResolverConfig {
@@ -62,6 +73,7 @@ impl Default for ResolverConfig {
             yt_dlp_path: "yt-dlp".to_owned(),
             timeout: DEFAULT_TIMEOUT,
             js_runtime: find_node(),
+            family: ResolveFamily::Auto,
         }
     }
 }
@@ -77,7 +89,15 @@ impl ResolverConfig {
             yt_dlp_path: yt_dlp_path.into(),
             timeout,
             js_runtime: find_node(),
+            family: ResolveFamily::Auto,
         }
+    }
+
+    /// Replace the resolve address family (issue #498).
+    #[must_use]
+    pub fn with_family(mut self, family: ResolveFamily) -> Self {
+        self.family = family;
+        self
     }
 
     /// Replace the JavaScript runtime path (`None` disables the flag).
@@ -127,7 +147,22 @@ pub fn resolve_args(
     player_clients: Option<&str>,
     url: &str,
 ) -> Vec<String> {
+    resolve_args_with_family(ResolveFamily::Auto, js_runtime, player_clients, url)
+}
+
+/// [`resolve_args`] with the address-family flag of `family` (`-4` / `-6`,
+/// none for [`ResolveFamily::Auto`]) right after `--no-warnings`.
+#[must_use]
+pub fn resolve_args_with_family(
+    family: ResolveFamily,
+    js_runtime: Option<&str>,
+    player_clients: Option<&str>,
+    url: &str,
+) -> Vec<String> {
     let mut args = vec!["-J".to_owned(), "--no-warnings".to_owned()];
+    if let Some(flag) = family.flag() {
+        args.push(flag.to_owned());
+    }
     if let Some(node) = js_runtime {
         args.push("--js-runtimes".to_owned());
         args.push(format!("node:{node}"));
@@ -145,6 +180,15 @@ pub fn resolve_args(
 /// (an older `yt-dlp`), so the attempt is worth repeating without it.
 fn rejected_js_runtimes(stderr: &str) -> bool {
     stderr.contains("no such option") && stderr.contains("js-runtimes")
+}
+
+/// Whether a failed `yt-dlp` run was `YouTube`'s anti-bot gate ("Sign in to
+/// confirm you're not a bot"), which is per client address: the `auto`
+/// family repeats such a run over IPv4 (issue #498).
+#[must_use]
+pub fn is_bot_check(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("not a bot")
 }
 
 /// Truncate captured stderr to a bounded length for logging, so a misbehaving
@@ -281,20 +325,49 @@ async fn run_once(config: &ResolverConfig, args: &[String]) -> Result<String, Yo
 
 /// One attempt with a given client list, retrying once without
 /// `--js-runtimes` when this `yt-dlp` does not know that option.
-async fn attempt(
+async fn attempt_over(
     config: &ResolverConfig,
+    family: ResolveFamily,
     clients: Option<&str>,
     url: &str,
 ) -> Result<ResolvedHls, YoutubeError> {
     let js = config.js_runtime.as_deref();
-    let first = run_once(config, &resolve_args(js, clients, url)).await;
+    let first = run_once(config, &resolve_args_with_family(family, js, clients, url)).await;
     let json = match first {
         Err(YoutubeError::Resolve(stderr)) if js.is_some() && rejected_js_runtimes(&stderr) => {
-            run_once(config, &resolve_args(None, clients, url)).await?
+            run_once(
+                config,
+                &resolve_args_with_family(family, None, clients, url),
+            )
+            .await?
         }
         other => other?,
     };
-    parse_info_dict(&json)
+    Ok(parse_info_dict(&json)?.with_resolved_over(family))
+}
+
+/// One attempt with a given client list over `*family`. Under
+/// [`ResolveFamily::Auto`] a bot-checked run is repeated once over IPv4, and
+/// `*family` becomes [`ResolveFamily::V4`] so later attempts of this resolve
+/// skip the address `YouTube` refused.
+async fn attempt(
+    config: &ResolverConfig,
+    family: &mut ResolveFamily,
+    clients: Option<&str>,
+    url: &str,
+) -> Result<ResolvedHls, YoutubeError> {
+    match attempt_over(config, *family, clients, url).await {
+        Err(YoutubeError::Resolve(stderr))
+            if *family == ResolveFamily::Auto && is_bot_check(&stderr) =>
+        {
+            tracing::info!(
+                "yt-dlp was bot-checked over the default address family; retrying over IPv4"
+            );
+            *family = ResolveFamily::V4;
+            attempt_over(config, ResolveFamily::V4, clients, url).await
+        }
+        other => other,
+    }
 }
 
 /// Resolve a `YouTube` watch/live URL to a live HLS master by spawning
@@ -309,6 +382,11 @@ async fn attempt(
 /// (we tail the live edge). `url` is a single argument after `--` with no
 /// shell interpolation. When both attempts fail the error names both reasons.
 ///
+/// Address family (issue #498): see [`ResolverConfig::family`]. Under `auto` a
+/// bot-checked invocation is repeated once with `-4` (so a resolve runs at most
+/// twice as many invocations), and the returned [`ResolvedHls::resolved_over`]
+/// names the family that succeeded.
+///
 /// # Errors
 ///
 /// - [`YoutubeError::Unavailable`] if `yt-dlp` cannot be spawned or times out.
@@ -316,12 +394,13 @@ async fn attempt(
 /// - the [`parse_info_dict`] errors ([`YoutubeError::Json`] /
 ///   [`YoutubeError::NotLive`] / [`YoutubeError::NoHlsMaster`]) on its output.
 pub async fn resolve(config: &ResolverConfig, url: &str) -> Result<ResolvedHls, YoutubeError> {
-    let first = match attempt(config, None, url).await {
+    let mut family = config.family;
+    let first = match attempt(config, &mut family, None, url).await {
         Ok(resolved) => return Ok(resolved),
         Err(e @ (YoutubeError::Unavailable(_) | YoutubeError::NotLive(_))) => return Err(e),
         Err(e) => e,
     };
-    match attempt(config, Some(FALLBACK_PLAYER_CLIENTS), url).await {
+    match attempt(config, &mut family, Some(FALLBACK_PLAYER_CLIENTS), url).await {
         Ok(resolved) => Ok(resolved),
         Err(YoutubeError::Resolve(second)) => {
             let first = match first {

@@ -151,7 +151,15 @@ async fn both_attempts_failing_reports_both_yt_dlp_errors() {
     assert!(message.contains("fallback clients"), "{message}");
     assert!(!message.contains("SECRET"), "{message}");
     assert!(message.contains("<url>"), "{message}");
-    assert_eq!(calls(dir.path()).len(), 2);
+    // A bot check under the default `auto` family is repeated once over IPv4
+    // (issue #498), which the fallback-clients attempt then keeps.
+    let calls = calls(dir.path());
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert!(!calls[0].contains(" -4 "), "{calls:?}");
+    assert!(
+        calls[1].contains(" -4 ") && calls[2].contains(" -4 "),
+        "{calls:?}"
+    );
 }
 
 #[tokio::test]
