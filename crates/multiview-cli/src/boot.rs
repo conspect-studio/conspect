@@ -708,6 +708,10 @@ pub fn build_with_fallback<T>(
     retry: &RetryPolicy,
     build: impl Fn(&MultiviewConfig) -> Result<T, BuildFailure>,
 ) -> Result<(StartConfig, T), String> {
+    // #508: a capability this binary lacks is not a state fault: refuse the
+    // start outright (no retry, no fallback that would silently drop the
+    // operator's subtitle slots), and check the last-good candidate too.
+    crate::outputs::ensure_subtitle_slots_supported(&start.running.outputs)?;
     let (error, attempts) = match build_retrying(&start.running, retry, &build) {
         Ok(engine) => return Ok((start, engine)),
         Err(failed) => failed,
@@ -742,6 +746,12 @@ pub fn build_with_fallback<T>(
     )
     // Nothing different to fall back to: the original build error, verbatim.
     .map_err(|planned| if planned == reason { error.clone() } else { planned })?;
+    if let Err(refusal) = crate::outputs::ensure_subtitle_slots_supported(&planned.running.outputs)
+    {
+        return Err(format!(
+            "{reason}; the last-good state cannot start in this build either: {refusal}"
+        ));
+    }
     match build_retrying(&planned.running, retry, &build) {
         Ok(engine) => Ok((planned, engine)),
         Err((second, attempts)) if second.class == FailureClass::Environment => {
@@ -769,16 +779,33 @@ pub fn preflight_start(
     boot_path: &Path,
 ) -> Result<(), PreflightRefusal> {
     match resolve_start_config(boot.clone(), boot_text.to_owned(), boot_path) {
-        Ok(start) => match start.pending_fallback {
-            Some(pending) => Err(PreflightRefusal {
-                reason: pending.reason,
-                falls_back: true,
-            }),
-            None => crate::last_good::admit(&start.running).map_err(|reason| PreflightRefusal {
-                reason,
-                falls_back: false,
-            }),
-        },
+        Ok(start) => {
+            // #508: the state a start would build (accepted or last-good) must
+            // also fit this binary's features, or the start fails outright.
+            let capability =
+                crate::outputs::ensure_subtitle_slots_supported(&start.running.outputs);
+            match start.pending_fallback {
+                Some(pending) => Err(match capability {
+                    Ok(()) => PreflightRefusal {
+                        reason: pending.reason,
+                        falls_back: true,
+                    },
+                    Err(refusal) => PreflightRefusal {
+                        reason: format!(
+                            "{}; the last-good state cannot start in this build either: {refusal}",
+                            pending.reason
+                        ),
+                        falls_back: false,
+                    },
+                }),
+                None => crate::last_good::admit(&start.running)
+                    .and(capability)
+                    .map_err(|reason| PreflightRefusal {
+                        reason,
+                        falls_back: false,
+                    }),
+            }
+        }
         Err(reason) => Err(PreflightRefusal {
             reason,
             falls_back: false,

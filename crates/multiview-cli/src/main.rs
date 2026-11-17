@@ -404,10 +404,6 @@ async fn run_run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // a hard startup error, never a silent plain-HTTP front door.
     multiview_cli::tls_cli::ensure_acme_supported(&start.running)
         .map_err(|reason| anyhow::anyhow!(reason))?;
-    // #508: subtitle slots in a build without `overlay` (no caption sources)
-    // would publish renditions that never carry a cue: a startup error.
-    multiview_cli::outputs::ensure_subtitle_slots_supported(&start.running.outputs)
-        .map_err(|reason| anyhow::anyhow!(reason))?;
 
     if args.software {
         return Box::pin(run_software(&start, &args)).await;
@@ -1733,6 +1729,9 @@ async fn run_pipeline(
              back to the last-good copy and raise the accepted-state-rejected warning"
         );
     }
+    // #508: never report "ready" for subtitle slots this build cannot fill.
+    multiview_cli::outputs::ensure_subtitle_slots_supported(&config.outputs)
+        .map_err(|reason| anyhow::anyhow!(reason))?;
     let engine =
         SoftwareEngine::build_gated(config, plane.level()).map_err(|e| anyhow::anyhow!("{e}"))?;
     println!(
