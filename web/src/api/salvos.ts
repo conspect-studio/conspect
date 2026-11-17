@@ -16,12 +16,15 @@
 import {
   apiUrl,
   buildHeaders,
+  newIdempotencyKey,
   OperationApiError,
   readProblem,
   submitOperation,
 } from './operations';
 import type { AcceptedBody, RequestOptions } from './operations';
 import type { components } from './types';
+import { isPatchPlanResponse } from './patch';
+import type { PatchPlanResponse } from './patch';
 
 /** A salvo definition, exactly as the control plane returns it. */
 export type Salvo = components['schemas']['SalvoDoc'];
@@ -151,4 +154,71 @@ export function cancelSalvo(
   options: RequestOptions = {},
 ): Promise<AcceptedBody> {
   return submitOperation(`${itemPath(id)}/cancel`, options);
+}
+
+/** The patch salvo `202` (#308): no `kind` field, so it does not fit {@link AcceptedBody}. */
+export interface PatchSalvoAccepted {
+  readonly operation_id: string;
+  readonly status: string;
+  /** Present when the salvo also recalls layout/sources/tally/UMD. */
+  readonly recall_operation_id?: string | null;
+}
+
+function isPatchSalvoAccepted(value: unknown): value is PatchSalvoAccepted {
+  return (
+    isRecord(value) &&
+    typeof value.operation_id === 'string' &&
+    typeof value.status === 'string'
+  );
+}
+
+/**
+ * Plan a salvo's patch crosspoints (`POST /api/v1/salvos/{id}/plan`, #308): the
+ * same `PatchPlan`/`SetPlan` answer as `POST /patch/plan`, without applying.
+ */
+export async function planSalvo(
+  id: string,
+  options: RequestOptions = {},
+): Promise<PatchPlanResponse> {
+  const response = await fetch(apiUrl(options, `${itemPath(id)}/plan`), {
+    method: 'POST',
+    headers: buildHeaders(options, false),
+  });
+  if (!response.ok) {
+    throw await readProblem(response);
+  }
+  const body: unknown = await response.json();
+  // The salvo plan route answers the identical shape as `/patch/plan`; share
+  // one guard so the two never drift.
+  if (!isPatchPlanResponse(body)) {
+    throw new OperationApiError('The server returned an unexpected salvo plan.');
+  }
+  return body;
+}
+
+/**
+ * Take a patch salvo (`POST /api/v1/salvos/{id}/take`, #308): its crosspoints
+ * apply atomically through the same set path as `POST /patch/take` (outcome
+ * `patch.take`, one destination too); a legacy recall, when also present, is
+ * submitted too (`recall_operation_id`). A fresh `Idempotency-Key` per attempt,
+ * matching `takePatch`.
+ */
+export async function takePatchSalvo(
+  id: string,
+  options: RequestOptions & { readonly head?: string } = {},
+): Promise<PatchSalvoAccepted> {
+  const requestOptions = { ...options, idempotencyKey: options.idempotencyKey ?? newIdempotencyKey() };
+  const query = options.head !== undefined ? `?head=${encodeURIComponent(options.head)}` : '';
+  const response = await fetch(apiUrl(requestOptions, `${itemPath(id)}/take${query}`), {
+    method: 'POST',
+    headers: buildHeaders(requestOptions, false),
+  });
+  if (!response.ok) {
+    throw await readProblem(response);
+  }
+  const body: unknown = await response.json();
+  if (!isPatchSalvoAccepted(body)) {
+    throw new OperationApiError('The server returned an unexpected salvo take body.');
+  }
+  return body;
 }

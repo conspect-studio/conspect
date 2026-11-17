@@ -519,6 +519,14 @@ pub struct OutputRoutingHandle {
     // reason: only the overlay-gated layout-bake pipeline tests read it.
     #[cfg_attr(not(feature = "overlay"), allow(dead_code))]
     pub(crate) aux_feeds: AuxFeeds,
+    /// One past the last tick the router ran (test observation, #461: the
+    /// pipeline tests pace their synthetic clock on it).
+    #[cfg(test)]
+    pub(crate) ticked: Arc<AtomicU64>,
+    /// The largest backlog (items accepted, not yet encoded) of any live
+    /// worker at the router's last tick (test observation, #461).
+    #[cfg(test)]
+    pub(crate) worker_lag: Arc<AtomicU64>,
     takes: SyncSender<RouterMsg>,
     reformats: SyncSender<Reformat>,
     layout_changes: LayoutInbox,
@@ -1237,6 +1245,9 @@ pub struct AuxWiring {
     /// Aux sizing (§2.4): the cells of every composing layout, for the
     /// decoders (`None`: no decode follows them, e.g. tests).
     pub sizing: Option<crate::display_size::AuxSizingSlot>,
+    /// Direct source routes (#469): each routed `src:<id>` feed's source at
+    /// the size it is composed at, for the decoders (`None`: none follow).
+    pub source_sizing: Option<crate::display_size::SourceSizingSlot>,
 }
 
 /// What the opener receives: the rendition settings index (which already
@@ -1498,6 +1509,12 @@ pub struct OutputRouter {
     /// concurrent producer refills the mailbox from here).
     #[cfg(test)]
     drain_hook: Option<Box<dyn FnMut() + Send>>,
+    /// Shared with [`OutputRoutingHandle::ticked`].
+    #[cfg(test)]
+    ticked: Arc<AtomicU64>,
+    /// Shared with [`OutputRoutingHandle::worker_lag`].
+    #[cfg(test)]
+    worker_lag: Arc<AtomicU64>,
 }
 
 /// The router's start-up (boot) take state, O(outputs).
@@ -1591,7 +1608,15 @@ impl OutputRouter {
         let snapshot = Arc::new(SwapCell::from_pointee(RoutingSnapshot::default()));
         #[cfg(test)]
         let audio_tap = crate::routing_audio::AudioTapCell::default();
+        #[cfg(test)]
+        let ticked = Arc::new(AtomicU64::new(0));
+        #[cfg(test)]
+        let worker_lag = Arc::new(AtomicU64::new(0));
         let handle = OutputRoutingHandle {
+            #[cfg(test)]
+            ticked: Arc::clone(&ticked),
+            #[cfg(test)]
+            worker_lag: Arc::clone(&worker_lag),
             #[cfg(test)]
             audio_tap: Arc::clone(&audio_tap),
             #[cfg(test)]
@@ -1660,6 +1685,10 @@ impl OutputRouter {
             takes_drained: 0,
             #[cfg(test)]
             drain_hook: None,
+            #[cfg(test)]
+            ticked,
+            #[cfg(test)]
+            worker_lag,
         };
         router.publish_snapshot();
         Ok((router, handle))
@@ -1695,6 +1724,21 @@ impl OutputRouter {
         if let Some(audio) = self.audio.as_mut() {
             audio.program_config = config;
         }
+    }
+
+    /// Test observation (#461): the progress of every encode thread this
+    /// router owns (live video workers and private audio buses).
+    #[cfg(test)]
+    pub(crate) fn worker_progress(&self) -> Vec<Arc<crate::rendition_workers::WorkerProgress>> {
+        let video = self
+            .dynamic
+            .iter()
+            .filter_map(|d| d.worker.as_ref().map(|w| Arc::clone(w.progress())));
+        let audio = self
+            .audio
+            .iter()
+            .flat_map(crate::routing_audio::RoutedAudio::worker_progress);
+        video.chain(audio).collect()
     }
 
     /// Test seam: inject the private-bus encode thread's per-job hook.
@@ -1904,6 +1948,22 @@ impl OutputRouter {
                 .any(|o| o.pending.is_some() || o.reformat.is_some())
         {
             self.publish_snapshot_at(tick);
+        }
+        #[cfg(test)]
+        {
+            let lag = self
+                .worker_progress()
+                .iter()
+                .map(|p| {
+                    p.offered
+                        .load(Ordering::Acquire)
+                        .saturating_sub(p.done.load(Ordering::Acquire))
+                })
+                .max()
+                .unwrap_or(0);
+            self.worker_lag.store(lag, Ordering::Release);
+            self.ticked
+                .fetch_max(tick.saturating_add(1), Ordering::Release);
         }
         Ok(())
     }
@@ -3702,6 +3762,7 @@ impl OutputRouter {
     /// sizing). Runs only when the feed set or a layout body changes; one
     /// O(cells) allocation and a wait-free store, never per tick.
     fn publish_sizing(&self) {
+        self.publish_source_sizing();
         let Some(slot) = &self.aux.sizing else {
             return;
         };
@@ -3715,6 +3776,32 @@ impl OutputRouter {
         }
         if *slot.load() != cells {
             slot.store(Arc::new(cells));
+        }
+    }
+
+    /// Publish every source routed to an output as a bare `src:<id>` feed,
+    /// at the size it is composed at (#469): the feed's format, or the
+    /// canvas (`u32::MAX`, capped to the canvas by the reader). Same cadence
+    /// as [`Self::publish_sizing`]: a feed-set change only, never per tick.
+    fn publish_source_sizing(&self) {
+        let Some(slot) = &self.aux.source_sizing else {
+            return;
+        };
+        let mut routes: Vec<(Arc<str>, (u32, u32))> = self
+            .feeds
+            .keys()
+            .filter_map(|(bus, format)| match bus {
+                PictureBus::Source(id) => Some((
+                    Arc::from(id.as_str()),
+                    format.map_or((u32::MAX, u32::MAX), |f| (f.width, f.height)),
+                )),
+                _ => None,
+            })
+            .collect();
+        routes.sort_unstable();
+        routes.dedup();
+        if *slot.load() != routes {
+            slot.store(Arc::new(routes));
         }
     }
 
