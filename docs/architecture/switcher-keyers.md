@@ -144,10 +144,20 @@ buffer `key_params` (binding 6, one entry per tile, parallel to `tiles`, pooled 
 the tile buffer) carries:
 
 ```text
-KeyParams { key_layer, key_w, key_h, kind|invert|group (u32 bits),
-            key_luma_scale, key_luma_off, clip, gain,
-            mask: vec4<u32>, merge: vec4<f32> /* kind, p | d, i */ }
+KeyParams { key_layer, key_w, key_h, kind|invert|has_table|group (u32 bits),
+            table_base: u32,
+            mask: vec4<u32>, merge: vec4<f32> /* kind, p | d, i */, dip_colour }
 ```
+
+A matte from a signal (luma, or linear with a key source) is a pure function of the signal's
+8-bit Y code, its resolved range, clip, gain and invert. So the CPU builds it per keyed tile as
+a 256-entry `f32` table with the oracle's own functions (`range::expand_luma`, then
+`key::luma_matte` or `key::unit`, then invert), using the key source's range, or the fill's for
+a luma self key. The tables live in a second storage buffer `mattes` (binding 7, pooled and
+refilled in place like `key_params`); the shader rounds the texel to its integer code and looks
+it up at `table_base + code`. This is exact by construction: a huge or infinite gain makes the
+matte a step at the clip, and a shader evaluation of `(y − clip) × gain` could flip whole
+pixels on float fuzz (review MEDIA-1).
 
 Nothing is borrowed from the fill's `TileParams`, so fill and key can differ in size and range.
 Layer count: at most 1 Program cell + 3 transition tiles + 6 keyers × 2 (fill, key) = 16 ≤ 64.
@@ -481,20 +491,20 @@ keyers.
   tile or the end of the list. While any tile is grouped the band's accumulator spans the whole
   band, because a DIP merge colours pixels no tile covers. Frames with no grouped tile keep the
   covered-span path unchanged.
-- **Deviation: WIPE merge and the GPU key path are not in K1.** `SceneMerge::Wipe` lands with K3 on
-  top of lane `transitions`' mask. The WGSL key path (`key_params`, binding 6) is not merged before
-  #395. Until it is, `GpuCompositor` refuses a frame with a keyed or grouped tile with a typed
-  `GpuLimit`, and `RunBackend` routes a keyed or grouped frame (an allocation-free scan, before
-  any GPU work) to a **persistent** CPU reference owned by the GPU compositor, whose LUT cache and
-  band/scene scratch survive across ticks (counted in `gpu_cpu_fallback_frames`; its pool is what
-  `scratch_alloc_count` reports on a GPU backend). It is never drawn without its key. A genuine
-  GPU failure falls back through the same persistent backend. The LUT cache checks a frame's transfer set
-  in place (no per-frame list is built unless the set changed). The parallel CPU path still spawns
-  its scoped band threads each frame, as it did before K1: a fixed, bounded cost, tracked in #416
-  (persistent band workers). #395 (the bounded GPU readback, PR #424) merged after K1 was written; the
-  persistent fallback is now main's `cpu_fallback_backend`, and the WGSL key path is the next GPU
-  step (owed, tracked on #386). ADR-0113 §9 already bounds this:
-  the default budget is 1 full-canvas DSK until the mda001 run passes.
+- **Deviation: WIPE merge is not in K1.** `SceneMerge::Wipe` lands with K3 on top of lane
+  `transitions`' mask. The GPU key path was first held back until #395 (the bounded GPU
+  readback, PR #424). Until it landed, `GpuCompositor` refused a keyed or grouped frame with a
+  typed `GpuLimit`, and `RunBackend` composed it on the persistent CPU fallback. That
+  deviation is closed; see "K1 GPU key path as built" below. A genuine GPU failure, and a
+  keyed frame the GPU cannot hold, still fall back through the same **persistent** CPU
+  reference owned by the GPU backend (`cpu_fallback_backend`). Its LUT cache and band/scene
+  scratch survive across ticks, its frames are counted in `gpu_cpu_fallback_frames`, its pool
+  is what `scratch_alloc_count` reports on a GPU backend, and it never draws a keyer without
+  its key. The LUT cache checks a frame's transfer set in place, so no per-frame list is
+  built unless the set changed. The parallel CPU path still spawns its scoped band threads
+  each frame, as it did before K1. That is a fixed, bounded cost, tracked in #416
+  (persistent band workers). ADR-0113 §9 bounds this: the default budget is 1 full-canvas
+  DSK until the mda001 run passes.
 - Tests: `tests/keyers_cpu.rs` (20: goldens for linear self key with alpha used once, linear key
   source, luma clip/gain/invert, luma on a key source, mask with a flying key, unequal fill/key
   sizes up and down, mixed ranges, premultiply-once after primaries, weight; a monotonic and
@@ -503,12 +513,79 @@ keyers.
   reads as 0; the tile-driven kernel equal to the oracle with keys and groups at 1-4 threads, on a
   small canvas (proptest) and on a 320x256 canvas above the parallel threshold with tiles across
   band edges; no scratch growth over 50 grouped composites) and `tests/keyers_gpu_fallback.rs`
-  (`wgpu`: the refusal, the oracle-equal fallback, and no scratch growth or LUT rebuild over 20
-  repeated keyed and grouped fallback frames).
+  (`wgpu`: the layer-limit refusal, the oracle-equal fallback, and no scratch growth or LUT
+  rebuild over 20 repeated keyed and grouped fallback frames).
 - Bench: `examples/keyer_composite_bench.rs`. CPU figures from a shared 56-core devcontainer (not
   the target host; median ms at 1080p): 0 keyers 30.0, 1 full-canvas alpha DSK 41.1, 2 full-canvas
   keyers 54.5, 2 flying 576x324 31.2, 1080p source in a 128x72 fly 27.6, key-changing MIX + DSK
-  58.9. The calibration of `u` and `fold` on the RTX 4060 is owed with the GPU key path.
+  58.9. The calibration of `u` and `fold` on the RTX 4060 is owed (lead), on the GPU key path below.
+
+### K1 GPU key path as built (#386 part 2)
+
+- **Where.** `composite.wgsl` draws keyed tiles and scene groups itself. `GpuComposer::draws_keys`
+  is `true` for the wgpu compositor, so `OffClockGpu` no longer routes a keyed frame to the CPU
+  before GPU work. The simulated chaos GPU keeps the CPU route, so the engine's slow-fallback
+  epoch tests are unchanged.
+- **Parameters (§3.3).** `KeyParams` (80 bytes) is binding 6, one entry per tile, parallel to
+  `tiles`. It holds:
+  - `head`: key layer, key w and h, and the flags (kind, invert, has-source, has-mask,
+    has-table, and the 2-bit group).
+  - `table`: the base of the tile's matte table in `mattes`.
+  - `mask`: a `vec4<u32>` in fill-source pixels.
+  - `merge`: kind, p or d, and i, plus the DIP colour.
+
+  `mattes` is binding 7: one 256-entry `f32` table per signal-keyed tile (see §3.3). Both
+  buffers are allocated once at `MAX_TILES` entries (tables) and refilled in place, like the
+  tile buffer. The CPU-side `TileParams`/`KeyParams`/matte scratch lives in `SurfacePool` and is
+  cleared and refilled, so a steady-state tick allocates no `Vec`.
+- **Key sources.** Each key source uploads only its Y plane, into its own `y_planes` layer
+  after the fill layers. It is sampled with its own nearest map, `kx = floor(ddx × key_w / dst_w)`,
+  and its matte table is built with its own range. The matte reads the Y code only (the input
+  of range expand), never the colour math. `mask × matte`
+  multiplies into alpha before the single premultiply, so the #8 order is unchanged and nothing
+  is materialised as RGBA (#5).
+- **Matte math is the oracle's.**
+  - A linear self key is 1 and ignores invert.
+  - The mask test is half-open and compares offsets, so it cannot overflow.
+  - Every signal matte is the oracle's own value for the Y code: the shader computes
+    `round(texel × 255)` clamped to [0, 255] and reads the CPU-built table, so degenerate
+    parameters (NaN, negative, zero or infinite gain; NaN, infinite or subnormal clip) and the
+    step of a huge gain cannot diverge from the CPU, and the shader never clamps a NaN.
+  - A NaN tile opacity reads as 0, as on the CPU.
+- **Scene groups.** Two extra `vec4` registers (outgoing and incoming) hold the open segment.
+  It merges (MIX, DIP) at the next `Top` tile or the end of the list, and the last grouped
+  tile's merge wins. A grouped tile that covers nothing still opens its segment and sets its
+  merge, matching the CPU oracle.
+- **Still refused (typed `GpuLimit`, then the CPU fallback).**
+  - Tiles plus key sources past the 64-layer tile array. §3.3's worst case is 16 layers.
+  - A fill or key larger than the device's `max_texture_dimension_2d`.
+- **Tests.**
+  - `tests/keyers_gpu.rs` (`wgpu`, 5 tests) compares GPU and CPU oracle output (SSIM ≥ 0.98,
+    PSNR ≥ 40 dB on Y and UV) across 18 frames, plus the MEDIA-1 frames below. The cases cover:
+    - a luma self key, and a luma key with a key source of another size and range (up- and
+      downscaled tile);
+    - a linear key with a key source, and a linear self key with fill alpha;
+    - luma and linear invert, and a mask on a flying key;
+    - two keyers at non-unit scale, and degenerate parameters;
+    - MIX at p 0, 0.3, 0.5 and 1, and DIP at three (d, i);
+    - two segments with an off-canvas grouped tile whose merge wins;
+    - review MEDIA-1: a full-range black key source, clip −1e-40, gain +∞ (matte 1, and
+      inverted 0) under a white fill, and a limited-range key whose codes sit one below, on and
+      one above the clip with gain 1e30 and +∞. These also bound every pixel to |ΔY| ≤ 2, so a
+      flipped step pixel fails.
+
+    The suite also checks that a keyed or grouped frame on the GPU backend leaves
+    `gpu_cpu_fallback_frames` at 0, that there is no GPU pool growth over 30 keyed and grouped
+    composites, and that the layer-limit refusal falls back to the oracle.
+  - On lavapipe (llvmpipe, Vulkan) the minima were SSIM 0.99998 and PSNR 60.9 dB, with a
+    maximum |ΔY| of 2 codes.
+  - GPU-free `KeyParams` packing unit tests run in `cargo test` without an adapter, including
+    a check that the matte table equals `key::luma_matte` for all 256 codes over NaN, negative
+    and infinite gains and NaN, ±∞ and subnormal clips, in both ranges.
+- **Bench.** `keyer_composite_bench` times the GPU key path. It prints the adapter and a
+  per-case fallback delta, which must be 0. RTX 4060 figures and the calibration of `u` and
+  `fold` are still owed by the lead; no numbers are recorded here. lavapipe timings measure
+  the shader on the CPU and are not a calibration.
 
 ### K2a (#387): DSK runtime in the Program drive
 

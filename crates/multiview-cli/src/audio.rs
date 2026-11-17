@@ -216,6 +216,15 @@ pub struct AudioControlHandle {
     declared_tracks: std::collections::HashMap<String, (usize, Option<String>, Option<String>)>,
     /// Shared stable-index source list read by the bake consumer each tick.
     live_track_inputs: Option<Arc<multiview_framestore::SwapCell<Arc<Vec<String>>>>>,
+    /// `media_player` source id -> player id (ADR-M012): the player's audio is
+    /// on the bus once, under the player id; a selection, route or track naming
+    /// the source resolves to that channel. Live: the command drain publishes
+    /// each alias add/repoint/remove at the frame boundary that rebinds its
+    /// video; readers take one wait-free load.
+    aliases: SharedMap<String>,
+    /// Set when `aliases` changed; the bake consumer re-applies the routing
+    /// gains (a route may name an alias) at its next `apply_pending`.
+    aliases_dirty: Arc<AtomicBool>,
     /// Test-only interleaving point inside [`Self::request_routing`], after the
     /// channel snapshot and before the gain table is published.
     #[cfg(test)]
@@ -306,6 +315,8 @@ impl AudioControlHandle {
             sample_rate: AudioFormat::CANONICAL_RATE,
             declared_tracks: std::collections::HashMap::new(),
             live_track_inputs: None,
+            aliases: shared_map(std::collections::HashMap::new()),
+            aliases_dirty: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             routing_gap_hook: Arc::default(),
         }
@@ -337,6 +348,64 @@ impl AudioControlHandle {
             next
         });
         self
+    }
+
+    /// Resolve `media_player` source ids to their player's bus channel.
+    #[must_use]
+    pub fn with_aliases(self, aliases: std::collections::HashMap<String, String>) -> Self {
+        self.aliases.store(Arc::new(aliases));
+        self
+    }
+
+    /// Publish a live `media_player` alias change (ADR-M012): `Some(player)`
+    /// binds or repoints `alias` onto that player's channel, `None` unbinds it
+    /// (a removal or a kind change away from `media_player`). One bounded RCU
+    /// of a map holding at most the declared aliases; never blocks on the bus,
+    /// which picks it up at its next item (selection) and `apply_pending`
+    /// (routing gains). Called by the command drain at the frame boundary
+    /// that rebinds the alias's video, so audio and video move together.
+    pub fn set_alias(&self, alias: &str, player: Option<&str>) {
+        if self.aliases.load().get(alias).map(String::as_str) == player {
+            return;
+        }
+        self.aliases.rcu(|current| {
+            let mut next = current.as_ref().clone();
+            match player {
+                Some(player) => {
+                    next.insert(alias.to_owned(), player.to_owned());
+                }
+                None => {
+                    next.remove(alias);
+                }
+            }
+            next
+        });
+        self.aliases_dirty.store(true, Ordering::Release);
+    }
+
+    /// The live alias map (one wait-free load).
+    #[must_use]
+    pub fn aliases(&self) -> Arc<std::collections::HashMap<String, String>> {
+        self.aliases.load()
+    }
+
+    /// The bus channel id `id` names: a `media_player` source resolves to its
+    /// player; anything else is itself.
+    #[must_use]
+    pub fn channel_id(&self, id: &str) -> String {
+        self.aliases
+            .load()
+            .get(id)
+            .map_or_else(|| id.to_owned(), Clone::clone)
+    }
+
+    /// Routing gains for `ids` under `routing`, with live alias resolution.
+    fn gains_for<'a>(
+        &self,
+        ids: impl Iterator<Item = &'a str>,
+        routing: Option<&multiview_config::AudioRouting>,
+    ) -> Vec<(String, f64)> {
+        crate::pipeline::program_bus_gains_aliased(ids, routing, &self.aliases.load())
     }
 
     /// Publish the audio-route consumers through `set` on every live routing
@@ -505,10 +574,13 @@ impl AudioControlHandle {
             return AudioRoutingApplyResult::Restart;
         }
         let known = self.known.load();
+        let aliases = self.aliases.load();
+        // A route naming a `media_player` alias is live on its player's channel.
+        let is_known = |id: &str| known.contains_key(id) || aliases.contains_key(id);
         if routing
             .routes
             .iter()
-            .any(|r| r.contributes_to_program() && !known.contains_key(&r.input_id))
+            .any(|r| r.contributes_to_program() && !is_known(&r.input_id))
         {
             return AudioRoutingApplyResult::Restart;
         }
@@ -534,7 +606,7 @@ impl AudioControlHandle {
                         .as_deref()
                         .and_then(|name| self.declared_tracks.get(name))
                         == Some(&(index, route.language.clone(), route.title.clone()))
-                        && known.contains_key(&route.input_id)
+                        && is_known(&route.input_id)
                 });
         // Review H3 publication protocol: publish the routing document BEFORE
         // taking the channel snapshot. A live join inserts its channel under the
@@ -549,8 +621,7 @@ impl AudioControlHandle {
             .channels
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let gains =
-            crate::pipeline::program_bus_gains(channels.keys().map(String::as_str), Some(routing));
+        let gains = self.gains_for(channels.keys().map(String::as_str), Some(routing));
         drop(channels);
         #[cfg(test)]
         self.run_routing_gap_hook();
@@ -560,7 +631,7 @@ impl AudioControlHandle {
             let mut inputs = live.load().as_ref().clone();
             for (name, source) in &requested {
                 if let Some(&(slot, _, _)) = self.declared_tracks.get(*name) {
-                    if known.contains_key(*source) {
+                    if is_known(source) {
                         if let Some(input) = inputs.get_mut(slot) {
                             (*source).clone_into(input);
                         }
@@ -625,7 +696,7 @@ impl AudioControlHandle {
             .load()
             .filter(|routing| !routing.routes.is_empty())
             .and_then(|routing| {
-                crate::pipeline::program_bus_gains(std::iter::once(id), Some(&routing))
+                self.gains_for(std::iter::once(id), Some(&routing))
                     .first()
                     .map(|(_, gain)| *gain)
             })
@@ -760,7 +831,22 @@ impl AudioControlHandle {
                 applied += 1;
             }
         }
-        if let Some(gains) = self.pending_gains.swap(None) {
+        let mut gains = self.pending_gains.swap(None);
+        // A live alias change moves which channel a route naming the alias
+        // gains: recompute the table from the latest routing (bake consumer,
+        // off the output clock; at most once per published change).
+        if self.aliases_dirty.swap(false, Ordering::AcqRel) {
+            if let Some(routing) = self.routing.load().filter(|r| !r.routes.is_empty()) {
+                let channels = self
+                    .channels
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                gains = Some(Arc::new(
+                    self.gains_for(channels.keys().map(String::as_str), Some(&routing)),
+                ));
+            }
+        }
+        if let Some(gains) = gains {
             let channels = self
                 .channels
                 .read()
@@ -795,6 +881,10 @@ impl AudioControlHandle {
         tick: u64,
         remaining_ticks: u64,
     ) {
+        let outgoing = outgoing.map(|id| self.channel_id(id));
+        let outgoing = outgoing.as_deref();
+        let incoming = self.channel_id(incoming);
+        let incoming = incoming.as_str();
         let key = (outgoing.map(str::to_owned), incoming.to_owned(), flight);
         {
             let mut active = self
@@ -818,7 +908,7 @@ impl AudioControlHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let routing = self.routing.load();
         let gain_of = |id: &str| {
-            crate::pipeline::program_bus_gains(std::iter::once(id), routing.as_deref())
+            self.gains_for(std::iter::once(id), routing.as_deref())
                 .first()
                 .map_or(0.0, |(_, gain)| *gain)
         };
@@ -841,6 +931,8 @@ impl AudioControlHandle {
         bus: &mut multiview_audio::program::ProgramBus,
         selected: Option<&str>,
     ) {
+        let selected = selected.map(|id| self.channel_id(id));
+        let selected = selected.as_deref();
         *self
             .crossfade
             .lock()
@@ -851,7 +943,7 @@ impl AudioControlHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let routing = self.routing.load();
         let selected_gain = selected.map_or(0.0, |id| {
-            crate::pipeline::program_bus_gains(std::iter::once(id), routing.as_deref())
+            self.gains_for(std::iter::once(id), routing.as_deref())
                 .first()
                 .map_or(0.0, |(_, gain)| *gain)
         });
@@ -988,6 +1080,122 @@ mod route_seam_tests {
         handle.select_program_source(&mut bus, Some("b"));
         assert_eq!(bus.program_gain(pa), Some(0.0));
         assert_eq!(bus.program_gain(pb), Some(1.0));
+    }
+
+    fn two_players() -> (
+        ProgramBus,
+        AudioControlHandle,
+        multiview_audio::RoutePoint,
+        multiview_audio::RoutePoint,
+    ) {
+        let (a, b) = (new_store(), new_store());
+        let mut bus = ProgramBus::new(canonical_format(), Rational::new(30_000, 1_001));
+        let pa = bus.add_source("vt-1", Arc::clone(&a), 1.0);
+        let pb = bus.add_source("vt-2", Arc::clone(&b), 1.0);
+        let handle = AudioControlHandle::from_sources(
+            [("vt-1".into(), a), ("vt-2".into(), b)]
+                .into_iter()
+                .collect(),
+            [("vt-1".into(), pa), ("vt-2".into(), pb)]
+                .into_iter()
+                .collect(),
+        )
+        .with_startup(None, ["vt-1".to_owned(), "vt-2".to_owned()]);
+        (bus, handle, pa, pb)
+    }
+
+    /// Issue #474 review A1/C2: a live-added, repointed, reused and removed
+    /// `media_player` alias moves Program audio with its video.
+    #[test]
+    fn live_alias_changes_move_program_audio_with_the_video() {
+        let (mut bus, handle, pa, pb) = two_players();
+        // Live add vt-a -> vt-1, then select it on Program: vt-1 is audible.
+        handle.set_alias("vt-a", Some("vt-1"));
+        assert_eq!(handle.channel_id("vt-a"), "vt-1");
+        handle.apply_pending(&mut bus);
+        handle.select_program_source(&mut bus, Some("vt-a"));
+        assert_eq!(bus.program_gain(pa), Some(1.0));
+        assert_eq!(bus.program_gain(pb), Some(0.0));
+        // Repoint vt-a -> vt-2: the same selection now carries vt-2, never A.
+        handle.set_alias("vt-a", Some("vt-2"));
+        handle.apply_pending(&mut bus);
+        handle.select_program_source(&mut bus, Some("vt-a"));
+        assert_eq!(bus.program_gain(pa), Some(0.0), "A's audio is gone");
+        assert_eq!(bus.program_gain(pb), Some(1.0));
+        // A dissolve between two aliases ramps the two player channels.
+        handle.set_alias("vt-b", Some("vt-1"));
+        handle.crossfade_program_source(&mut bus, Some("vt-a"), "vt-b", 0, 0, 10);
+        assert_eq!(bus.program_gain(pa), Some(1.0), "incoming vt-b = vt-1");
+        assert_eq!(bus.program_gain(pb), Some(0.0), "outgoing vt-a = vt-2");
+        // Removal / kind change: the id names nothing on the bus any more.
+        handle.set_alias("vt-a", None);
+        assert_eq!(handle.channel_id("vt-a"), "vt-a");
+        handle.select_program_source(&mut bus, Some("vt-a"));
+        assert_eq!(bus.program_gain(pa), Some(0.0));
+        assert_eq!(bus.program_gain(pb), Some(0.0));
+        // Reuse of the id onto vt-1 binds again.
+        handle.set_alias("vt-a", Some("vt-1"));
+        handle.select_program_source(&mut bus, Some("vt-a"));
+        assert_eq!(bus.program_gain(pa), Some(1.0));
+    }
+
+    /// Issue #474 review C3: a route naming an alias gains the player's
+    /// channel (live apply accepted), and the player is never mixed twice.
+    #[test]
+    fn routing_through_an_alias_gains_the_player_channel_once() {
+        let (mut bus, handle, pa, pb) = two_players();
+        let routing: multiview_config::AudioRouting = serde_json::from_value(serde_json::json!({
+            "sample_rate_hz": 48000,
+            "routes": [
+                {"input_id": "vt-a", "channels": {"kind": "stereo"}, "include_in_program_bus": true, "gain_db": -6.0}
+            ]
+        }))
+        .unwrap();
+        // Before the alias exists the route names an unknown input: restart.
+        assert_eq!(
+            handle.request_routing(&routing),
+            multiview_control::AudioRoutingApplyResult::Restart
+        );
+        handle.set_alias("vt-a", Some("vt-1"));
+        assert_eq!(
+            handle.request_routing(&routing),
+            multiview_control::AudioRoutingApplyResult::Live
+        );
+        handle.apply_pending(&mut bus);
+        // The bus stores gains as f32: compare at f32 precision.
+        let want = 10f64.powf(-6.0 / 20.0);
+        assert!((bus.program_gain(pa).unwrap() - want).abs() < 1e-6);
+        assert_eq!(bus.program_gain(pb), Some(0.0));
+        // The alias-keyed output feed gain is the route's.
+        assert!((f64::from(handle.output_route_gain("vt-a")) - want).abs() < 1e-6);
+        // Repointing the alias re-gains: the route follows it to vt-2.
+        handle.set_alias("vt-a", Some("vt-2"));
+        handle.apply_pending(&mut bus);
+        assert!((bus.program_gain(pb).unwrap() - want).abs() < 1e-6);
+        assert_eq!(bus.program_gain(pa), Some(0.0));
+        // Startup gains: a player routed via two aliases still gets ONE gain.
+        let twice: multiview_config::AudioRouting = serde_json::from_value(serde_json::json!({
+            "sample_rate_hz": 48000,
+            "routes": [
+                {"input_id": "vt-a", "channels": {"kind": "stereo"}, "include_in_program_bus": true, "gain_db": -6.0},
+                {"input_id": "vt-b", "channels": {"kind": "stereo"}, "include_in_program_bus": true, "gain_db": 0.0}
+            ]
+        }))
+        .unwrap();
+        let aliases: std::collections::HashMap<String, String> = [
+            ("vt-a".into(), "vt-1".into()),
+            ("vt-b".into(), "vt-1".into()),
+        ]
+        .into_iter()
+        .collect();
+        let gains = crate::pipeline::program_bus_gains_aliased(
+            ["vt-1", "vt-2"].into_iter(),
+            Some(&twice),
+            &aliases,
+        );
+        assert_eq!(gains.len(), 2, "one entry per channel");
+        assert!((gains[0].1 - want).abs() < 1e-9, "{gains:?}");
+        assert_eq!(gains[1], ("vt-2".to_owned(), 0.0));
     }
 
     #[test]

@@ -1,8 +1,10 @@
-//! Keyers K1 (ADR-0113): until the GPU key path lands (after #395), a frame
-//! with a keyed or scene-grouped tile is a typed `GpuLimit` on the GPU and
-//! `RunBackend` composes it on the CPU reference — byte-identical to the CPU
-//! oracle, never drawn without its key. Requires a GPU adapter (a software
-//! one such as lavapipe is enough); skips with a note when there is none.
+//! Keyers K1 (ADR-0113): the GPU draws keyed and grouped tiles itself
+//! (`tests/keyers_gpu.rs`), but a keyed frame it cannot hold — tiles plus key
+//! sources past the 64-layer tile array — is still a typed `GpuLimit`, and
+//! `RunBackend` composes it on the persistent CPU reference: byte-identical
+//! to the CPU oracle, never drawn without its key. Requires a GPU adapter (a
+//! software one such as lavapipe is enough); skips with a note when there is
+//! none.
 #![cfg(feature = "wgpu")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -25,8 +27,20 @@ fn color() -> ColorInfo {
     }
 }
 
+/// `n` copies of `tile`, each keyed by `key` (a separate source takes its own
+/// layer, so `n` tiles need `2n` layers).
+fn many<'a>(tile: &Tile<'a>, n: u32) -> Vec<Tile<'a>> {
+    (0..n)
+        .map(|i| {
+            let mut t = tile.clone();
+            t.dst_x = (i % 4) * 4;
+            t
+        })
+        .collect()
+}
+
 #[test]
-fn a_keyed_frame_is_composed_on_the_cpu_until_the_gpu_key_path_lands() {
+fn a_keyed_frame_past_the_gpu_layer_limit_is_composed_on_the_cpu() {
     let gpu = match GpuCompositor::new(None) {
         Ok(gpu) => gpu,
         Err(Error::NoAdapter(reason) | Error::DeviceRequest(reason)) => {
@@ -37,10 +51,13 @@ fn a_keyed_frame_is_composed_on_the_cpu_until_the_gpu_key_path_lands() {
     };
     let bg = Nv12Image::solid(16, 8, 90, 128, 128, color()).unwrap();
     let fill = Nv12Image::solid(8, 8, 200, 100, 150, color()).unwrap();
-    let tiles = [
-        Tile::placed(&bg, 0, 0, 1.0),
-        Tile::placed(&fill, 4, 0, 1.0).with_key(TileKey::luma(0.1, 2.0)),
-    ];
+    let key = Nv12Image::solid(4, 4, 180, 128, 128, color()).unwrap();
+    // 1 + 40 keyed tiles with a key source each need 81 > 64 layers.
+    let mut tiles = vec![Tile::placed(&bg, 0, 0, 1.0)];
+    tiles.extend(many(
+        &Tile::placed(&fill, 4, 0, 1.0).with_key(TileKey::luma(0.1, 2.0).with_source(&key)),
+        40,
+    ));
     let black = LinearRgba::opaque(0.0, 0.0, 0.0);
     let refused = gpu.composite(16, 8, CanvasColor::default(), black, &tiles);
     assert!(matches!(refused, Err(Error::GpuLimit(_))), "{refused:?}");
@@ -60,18 +77,21 @@ fn a_keyed_frame_is_composed_on_the_cpu_until_the_gpu_key_path_lands() {
     // Repeated keyed and grouped frames reuse the persistent fallback's LUTs
     // and band/scene scratch: no growth after warmup (review I1/A1).
     let m = SceneMerge::Mix { p: 0.5 };
-    let grouped = [
-        Tile::placed(&bg, 0, 0, 1.0).in_group(TileGroup::Scene {
-            member: SceneMember::Both,
-            merge: m,
-        }),
-        Tile::placed(&fill, 4, 0, 1.0)
-            .with_key(TileKey::luma(0.1, 2.0))
+    let mut grouped = vec![Tile::placed(&bg, 0, 0, 1.0).in_group(TileGroup::Scene {
+        member: SceneMember::Both,
+        merge: m,
+    })];
+    grouped.extend(many(
+        &Tile::placed(&fill, 4, 0, 1.0)
+            .with_key(TileKey::luma(0.1, 2.0).with_source(&key))
             .in_group(TileGroup::Scene {
                 member: SceneMember::In,
                 merge: m,
             }),
-    ];
+        40,
+    ));
+    let refused = gpu.composite(16, 8, CanvasColor::default(), black, &grouped);
+    assert!(matches!(refused, Err(Error::GpuLimit(_))), "{refused:?}");
     drop(
         backend
             .composite(16, 8, CanvasColor::default(), black, &grouped)

@@ -558,3 +558,29 @@ fn base_doc_with(extra: serde_json::Value) -> serde_json::Value {
     }
     doc
 }
+
+/// Issue #474 / ADR-M012: source and player ids share the frame-store
+/// namespace; a source may reuse a player id only as that player's binding.
+#[test]
+fn validate_media_player_source_id_clash_rules() {
+    let with = |sources: serde_json::Value| -> MultiviewConfig {
+        serde_json::from_value(base_doc_with(serde_json::json!({
+            "media_players": [{ "id": "vt-1" }, { "id": "vt-2" }],
+            "sources": sources
+        })))
+        .unwrap()
+    };
+    with(serde_json::json!([{ "id": "vt-1", "kind": "media_player", "player": "vt-1" }]))
+        .validate()
+        .expect("a source may share its own player's id");
+    with(serde_json::json!([{ "id": "vt-a", "kind": "media_player", "player": "vt-1" }]))
+        .validate()
+        .expect("a distinct alias id is fine");
+    let err = with(serde_json::json!([{ "id": "vt-2", "kind": "media_player", "player": "vt-1" }]))
+        .validate()
+        .expect_err("an alias must not take ANOTHER player's id");
+    assert!(err.to_string().contains("vt-2"), "{err}");
+    with(serde_json::json!([{ "id": "vt-1", "kind": "bars" }]))
+        .validate()
+        .expect_err("a non-player source must not take a player's id");
+}

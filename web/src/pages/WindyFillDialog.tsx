@@ -44,7 +44,7 @@ import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { CheckCircle2, Loader2, XCircle } from 'lucide-react';
 
-import type { ArtifactRef, LoadThen, MediaPlayer } from '../api/media-playersQueries';
+import type { ArtifactRef, LoadFailureCode, LoadThen, MediaPlayer } from '../api/media-playersQueries';
 import { useLoadMediaPlayerArtifact, useMediaPlayerLoadOperation } from '../api/media-playersQueries';
 import { newIdempotencyKey, OperationApiError } from '../api/operations';
 import {
@@ -646,6 +646,51 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
         return t`Superseded`;
       default:
         return state ?? t`Unknown`;
+    }
+  };
+
+  /**
+   * Operator labels for the typed load failure reason (issue #474). An
+   * unrecognised code still renders its raw name rather than disappearing.
+   */
+  const loadFailureLabel = (reason: LoadFailureCode | null | undefined): string => {
+    switch (reason) {
+      case 'wrong_cadence':
+        return t`Clip frame rate does not match the canvas`;
+      case 'vfr':
+        return t`Clip is variable frame rate`;
+      case 'no_cadence':
+        return t`Clip declares no frame rate`;
+      case 'alpha':
+        return t`Clip carries an alpha plane`;
+      case 'not_found':
+        return t`Clip not found`;
+      case 'invalid_data':
+        return t`Clip could not be parsed`;
+      case 'timeout':
+        return t`Clip open timed out`;
+      case 'no_video_stream':
+        return t`Clip has no video stream`;
+      case 'unknown_length':
+        return t`Clip length is unknown`;
+      case 'invalid_window':
+        return t`Clip playout window is invalid`;
+      case 'decoder_open':
+        return t`Video decoder could not be opened`;
+      case 'no_frames':
+        return t`No decodable frame`;
+      case 'audio_unavailable':
+        return t`Player audio rail unavailable`;
+      case 'journal_failed':
+        return t`Player journal refused the load`;
+      case 'reference_missing':
+        return t`Load has no durable identity`;
+      case 'other':
+      case null:
+      case undefined:
+        return t`Load failed`;
+      default:
+        return String(reason);
     }
   };
 
@@ -1256,6 +1301,14 @@ export function WindyFillDialog({ player, onOpenChange }: WindyFillDialogProps):
                   {loadOp.isError ? (
                     <p role="alert" className="mt-1 text-destructive">
                       {errorText(loadOp.error)}
+                    </p>
+                  ) : null}
+                  {loadOp.data?.state === 'failed' ? (
+                    <p role="alert" className="mt-1 text-destructive" data-testid="load-failure-reason">
+                      {loadFailureLabel(loadOp.data.reason)}
+                      {loadOp.data.detail !== undefined && loadOp.data.detail !== null
+                        ? ` — ${loadOp.data.detail}`
+                        : ''}
                     </p>
                   ) : null}
                   {loadOp.data?.native !== undefined && loadOp.data.native !== null ? (
