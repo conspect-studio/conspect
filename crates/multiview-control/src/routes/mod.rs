@@ -1634,6 +1634,17 @@ pub fn api_router() -> Router<AppState> {
             get(web_capture::capabilities),
         )
         .route("/media/captures", post(web_capture::create))
+        // Windy Premium account (issue #470): admin-only, write-only secret.
+        .route(
+            "/integrations/windy",
+            get(web_capture::windy_account)
+                .put(web_capture::set_windy_account)
+                .delete(web_capture::clear_windy_account),
+        )
+        .route(
+            "/integrations/windy/verify",
+            post(web_capture::verify_windy_account),
+        )
         .route("/media/captures/{id}", get(web_capture::get))
         .route(
             "/media/captures/{id}/artifact",

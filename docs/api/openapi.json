@@ -5372,6 +5372,192 @@
         }
       }
     },
+    "/api/v1/integrations/windy": {
+      "get": {
+        "tags": [
+          "integrations"
+        ],
+        "operationId": "get_windy_account",
+        "responses": {
+          "200": {
+            "description": "Secret-free Windy account status (credential is write-only).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WindyAccountView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Admin role and an unscoped key are required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Account store not configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "integrations"
+        ],
+        "operationId": "set_windy_account",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WindyAccountBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Stored encrypted; Premium resets until the next passing login check.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WindyAccountView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Admin role and an unscoped key are required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Account store not configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid email or password.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "integrations"
+        ],
+        "operationId": "clear_windy_account",
+        "responses": {
+          "200": {
+            "description": "Credential removed; Premium disabled.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WindyAccountView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Admin role and an unscoped key are required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Account store not configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/integrations/windy/verify": {
+      "post": {
+        "tags": [
+          "integrations"
+        ],
+        "operationId": "verify_windy_account",
+        "responses": {
+          "200": {
+            "description": "Bounded login check ran; `result` is premium, rejected (wrong email/password), not_premium or unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WindyVerifyResult"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Admin role and an unscoped key are required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "No account set, store not configured, or a check is already running.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/iptv": {
       "get": {
         "tags": [
@@ -16321,7 +16507,7 @@
       },
       "CaptureBody": {
         "type": "object",
-        "description": "One authorized, bounded public Windy view. Premium needs a configured secret resolver.",
+        "description": "One authorized, bounded Windy view. Premium needs a verified Windy account.",
         "required": [
           "fill_id",
           "view",
@@ -29228,6 +29414,94 @@
           "today"
         ]
       },
+      "WindyAccountBody": {
+        "type": "object",
+        "description": "Write-only Windy account input; never echoed, logged or audited.",
+        "required": [
+          "email",
+          "password"
+        ],
+        "properties": {
+          "email": {
+            "type": "string",
+            "description": "Windy account email."
+          },
+          "password": {
+            "type": "string",
+            "description": "Windy account password."
+          }
+        },
+        "additionalProperties": false
+      },
+      "WindyAccountView": {
+        "type": "object",
+        "description": "Secret-free Windy account status. The email and password are write-only.",
+        "required": [
+          "set",
+          "premium_available",
+          "verifying"
+        ],
+        "properties": {
+          "last_verified_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "RFC 3339 time of the last login check of the current credential."
+          },
+          "premium_available": {
+            "type": "boolean",
+            "description": "Premium capture is enabled (the current credential passed its check)."
+          },
+          "result": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WindyVerdict",
+                "description": "Verdict of the last login check of the current credential."
+              }
+            ]
+          },
+          "set": {
+            "type": "boolean",
+            "description": "A credential is stored (encrypted at rest)."
+          },
+          "verifying": {
+            "type": "boolean",
+            "description": "A login check is running."
+          }
+        }
+      },
+      "WindyVerdict": {
+        "type": "string",
+        "description": "Last Windy Premium login-check verdict.",
+        "enum": [
+          "premium",
+          "rejected",
+          "not_premium",
+          "unavailable"
+        ]
+      },
+      "WindyVerifyResult": {
+        "type": "object",
+        "description": "Result of `POST /integrations/windy/verify`.",
+        "required": [
+          "result",
+          "account"
+        ],
+        "properties": {
+          "account": {
+            "$ref": "#/components/schemas/WindyAccountView",
+            "description": "Status after the check."
+          },
+          "result": {
+            "$ref": "#/components/schemas/WindyVerdict",
+            "description": "This check's verdict."
+          }
+        }
+      },
       "WipePatternDoc": {
         "type": "string",
         "description": "`OpenAPI` mirror of [`multiview_core::switcher::WipePattern`] (ADR-0112 §3).",
@@ -29401,6 +29675,10 @@
     {
       "name": "audit",
       "description": "Read-only change audit log (who/what/when)"
+    },
+    {
+      "name": "integrations",
+      "description": "Third-party integrations: the Windy Premium capture account (admin only; credential write-only, encrypted at rest; login check)"
     },
     {
       "name": "account",

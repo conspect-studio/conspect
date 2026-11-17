@@ -18586,8 +18586,10 @@ fn player_runtime_body(
                                             frame_index = index.saturating_add(1);
                                             match player.on_decoded(index) {
                                                 PlayerAction::Publish { at } => {
-                                                    if let Ok(image) = clip.scaler.convert(
-                                                        &decoded.frame,
+                                                    if let Ok(image) = tile_image_with_alpha(
+                                                        &mut clip.scaler,
+                                                        &mut clip.alpha,
+                                                        &decoded,
                                                         plan.canvas_color.output_tag(),
                                                     ) {
                                                         last = Arc::new(image);
@@ -18692,8 +18694,10 @@ fn player_runtime_body(
                                         frame_index = index.saturating_add(1);
                                         match player.on_decoded(index) {
                                             PlayerAction::Publish { at } => {
-                                                if let Ok(image) = clip.scaler.convert(
-                                                    &decoded.frame,
+                                                if let Ok(image) = tile_image_with_alpha(
+                                                    &mut clip.scaler,
+                                                    &mut clip.alpha,
+                                                    &decoded,
                                                     plan.canvas_color.output_tag(),
                                                 ) {
                                                     last = Arc::new(image);
@@ -18811,8 +18815,10 @@ fn player_runtime_body(
                                                 frame_index = frame_index.saturating_add(1);
                                                 match player.on_decoded(index) {
                                                     PlayerAction::Publish { at } => {
-                                                        if let Ok(image) = clip.scaler.convert(
-                                                            &decoded.frame,
+                                                        if let Ok(image) = tile_image_with_alpha(
+                                                            &mut clip.scaler,
+                                                            &mut clip.alpha,
+                                                            &decoded,
                                                             plan.canvas_color.output_tag(),
                                                         ) {
                                                             last = Arc::new(image);
@@ -20790,6 +20796,9 @@ fn open_and_stream(
 /// Media-player NV12+A: attaches a decoded asset's straight alpha plane (#391).
 #[path = "pipeline_alpha.rs"]
 mod media_alpha;
+pub(crate) use media_alpha::{
+    open_named as open_named_decoder, tile_image_with_alpha, vp9_alpha_decoder, MediaAlpha,
+};
 
 /// Convert a source frame index to a libav `AV_TIME_BASE` (microsecond) seek
 /// target at the given `cadence`, using exact integer rationals — never float
@@ -31532,6 +31541,150 @@ loop_default = true
         }
         out.truncate(want);
         out
+    }
+
+    /// Encode a canvas-sized (64x48), 25 fps, 10-frame white clip whose alpha
+    /// is four 16-px bands `[0, 85, 170, 255]` with the local `ffmpeg` CLI, or
+    /// `false` (SKIP) when the encoder is unavailable.
+    fn alpha_band_clip(path: &std::path::Path, codec: &[&str]) -> bool {
+        let source = "color=c=white:s=64x48:r=25:d=0.4,format=rgba,\
+                      geq=r=255:g=255:b=255:a='if(lt(X,16),0,if(lt(X,32),85,if(lt(X,48),170,255)))'";
+        std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg(source)
+            .args(codec)
+            .arg(path)
+            .status()
+            .is_ok_and(|s| s.success())
+            && path.exists()
+    }
+
+    /// K6 (#391), end to end on the production load path: opener (alpha
+    /// gate, decoder selection, primed NV12+A) → runtime ingest decode →
+    /// `TileStore` publish. Every picture the worker publishes after the
+    /// commit, primed and decoded alike, carries the asset's straight alpha.
+    #[allow(clippy::print_stdout, clippy::indexing_slicing)] // SKIP notes; fixed-size planes.
+    fn runtime_alpha_case(file: &str, encoder: &str, codec: &[&str], tolerance: u8) {
+        let _budget = crate::player::budget_test_guard();
+        let encoders = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-encoders"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        if !encoders.split_whitespace().any(|w| w == encoder) {
+            println!("SKIP: ffmpeg encoder `{encoder}` not available for {file}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(file);
+        if !alpha_band_clip(&path, codec) {
+            println!("SKIP: ffmpeg could not encode {file}");
+            return;
+        }
+        // WebM declares no frame count, so the clip's length is declared as a
+        // library asset would (the "no guessed length" rule, design 4.2).
+        let mut spec = ClipSpec::new(&path, LoadThen::Cue);
+        spec.out_point = Some(10);
+        let (rig, rx) = start_with_clip(spec);
+        rig.handle.mailbox.submit(TransportVerb::Play);
+        let period = MediaTime::from_tick(1, rig.cadence).as_nanos();
+        let mut now = 1_000_000_000_i64;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut distinct: Vec<*const Nv12Image> = Vec::new();
+        let mut committed = false;
+        while distinct.len() < 6 {
+            assert!(
+                Instant::now() < deadline,
+                "hang deadline: {} alpha pictures",
+                distinct.len()
+            );
+            now += period;
+            rig.clock.set(now);
+            while let Ok((_, _, image)) = rx.recv_timeout(Duration::from_millis(5)) {
+                let Some(alpha) = image.alpha_plane() else {
+                    assert!(
+                        !committed,
+                        "{file}: an opaque picture after the alpha commit"
+                    );
+                    continue; // NA heartbeat before the commit.
+                };
+                committed = true;
+                for row in [1_usize, 24, 46] {
+                    for (band, want) in [0_u8, 85, 170, 255].into_iter().enumerate() {
+                        let got = alpha[row * 64 + band * 16 + 8];
+                        assert!(
+                            got.abs_diff(want) <= tolerance,
+                            "{file}: alpha ({row}, band {band}) = {got}, want {want}"
+                        );
+                    }
+                }
+                let ptr = Arc::as_ptr(&image);
+                if !distinct.contains(&ptr) {
+                    distinct.push(ptr);
+                }
+            }
+        }
+        assert!(rig.runtime.status.load().fault.is_none());
+        assert!(rig.shutdown().is_none());
+    }
+
+    #[test]
+    fn runtime_qtrle_alpha_asset_publishes_exact_alpha_on_every_frame() {
+        runtime_alpha_case(
+            "alpha.mov",
+            "qtrle",
+            &["-c:v", "qtrle", "-pix_fmt", "argb"],
+            0,
+        );
+    }
+
+    #[test]
+    fn runtime_prores_4444_alpha_asset_publishes_its_alpha() {
+        runtime_alpha_case(
+            "alpha_prores.mov",
+            "prores_ks",
+            &[
+                "-c:v",
+                "prores_ks",
+                "-profile:v",
+                "4444",
+                "-pix_fmt",
+                "yuva444p10le",
+            ],
+            1,
+        );
+    }
+
+    /// ADR-0112 §5 on the runtime path: the opener must select `libvpx-vp9`
+    /// (libav's native `vp9` drops the alpha side stream and would publish an
+    /// opaque picture, failing this test).
+    #[test]
+    fn runtime_vp9_alpha_asset_selects_libvpx_and_publishes_its_alpha() {
+        if ffmpeg_next::decoder::find_by_name("libvpx-vp9").is_none() {
+            println!("SKIP: libav has no libvpx-vp9 decoder");
+            return;
+        }
+        runtime_alpha_case(
+            "alpha_vp9.webm",
+            "libvpx-vp9",
+            &[
+                "-c:v",
+                "libvpx-vp9",
+                "-pix_fmt",
+                "yuva420p",
+                "-lossless",
+                "1",
+            ],
+            2,
+        );
     }
 
     fn start_with_clip(spec: ClipSpec) -> (Rig, Observed) {

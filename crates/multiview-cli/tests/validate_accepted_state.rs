@@ -131,7 +131,7 @@ fn validate(path: &Path) -> (i32, String) {
 #[tokio::test]
 async fn validate_passes_a_bootable_accepted_state() {
     let dir = tempfile::tempdir().unwrap();
-    let path = install(dir.path()).await;
+    let path = Box::pin(install(dir.path())).await;
     let (code, text) = validate(&path);
     assert_eq!(code, 0, "{text}");
     assert!(text.contains("OK   start: accepted state"), "{text}");
@@ -144,7 +144,7 @@ async fn validate_passes_a_bootable_accepted_state() {
 #[tokio::test]
 async fn validate_passes_a_six_cell_accepted_state_with_a_switcher() {
     let dir = tempfile::tempdir().unwrap();
-    let path = install(dir.path()).await;
+    let path = Box::pin(install(dir.path())).await;
     make_six_cell(&path);
     let (code, text) = validate(&path);
     assert_eq!(
@@ -159,7 +159,7 @@ async fn validate_passes_a_six_cell_accepted_state_with_a_switcher() {
 #[tokio::test]
 async fn validate_fails_a_non_bootable_accepted_state_with_the_start_up_reason() {
     let dir = tempfile::tempdir().unwrap();
-    let path = install(dir.path()).await;
+    let path = Box::pin(install(dir.path())).await;
     let desired = path.parent().unwrap().join(".multiview/desired.json");
     let mut document: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&desired).unwrap()).unwrap();
