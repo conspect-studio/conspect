@@ -1,0 +1,112 @@
+# Live source add/edit on a switcher run (issue #464, R3)
+
+Status: accepted (lane livesrc, 14 Nov 2026). Invariants #1 and #10.
+
+## Problem
+
+On a run that declares a first-slice M/E (`[switcher]`), every live source
+upsert of a decoded kind (and every synthetic kind, since a demand-managed run
+catalogues all kinds) reached the live-source hub, which asked
+`IngestSpawner::invalidate_live_edit`. `LiveIngestSpawner` answered `true` for
+**every** id when `clear_on_remove` (switcher run) and a demand manager were
+present. That removed the catalogue entry and the demand pins and logged
+`switcher source edit requires restart`. So:
+
+- a **new** source id was never catalogued: `POST /sources/{id}/start` answered
+  `409 ... applies on restart`, while the create had answered
+  `X-Multiview-Apply: live` (mda001, 15 Nov 08:31 AEDT, `youtube-germnay`);
+- an edit of any source silently dropped it from the running engine.
+
+## Why the fence existed
+
+`git log -S invalidate_live_edit`: c062f3f7 (PR 224) added it; f60d96d2 dropped
+it in the production-line convergence; 3dcc363d restored it after review
+(openai/gpt-6-sol on de03eab4, HIGH): *the demand-catalogue live-edit path
+reuses the same `TileStore` and only schedules an asynchronous restart, so an
+opted-in M/E could keep resolving the old source's pixels until the replacement
+publishes (or indefinitely on restart failure).* The finding is about **edits**
+(stale media of the previous definition). A new id has no previous definition
+and no stale pixels; refusing it was over-broad.
+
+## Rule
+
+1. **Add (id not catalogued).** The hub catalogues it exactly as on a
+   non-switcher demand run: catalogue entry with the drain's store, standing
+   pins, restart request. The demand worker starts it off the clock. Its store
+   is also published into a live bus-store map (below), so the M/E can prime
+   and take it. Nothing on air is touched.
+2. **Edit of a media-changing field.**
+   - **On a bus**: the control plane refuses it **before the durable commit**
+     with `409` naming every switcher consumer (Program / Preview of the M/E,
+     fill / key of a downstream keyer). Nothing is stored, nothing is
+     enqueued. The operator takes the source off the bus first. Make-before-
+     break into the same store was rejected: the M/E would air the old
+     definition until the new one publishes, the exact PR 224 finding.
+   - **Not on a bus**: applied live. After the hub's teardown has stopped and
+     awaited the old producer (bounded), the spawner advances the source's
+     lifecycle (fencing any detached writer), clears the store (no stale
+     pixels can be primed or taken), then re-catalogues the new definition into
+     the same store and requests a restart. The tile shows the slate until the
+     new definition publishes, never the old media.
+   - Policy/guide-only edits keep the existing no-restart path.
+3. **Race.** A take onto the source between the control-plane check and the
+   hub's retire is possible. The store is then cleared under it: Program shows
+   the honest no-signal slate of a `starting` source until the new media
+   arrives. It never shows stale media and is never silent (source status).
+4. **Start agrees with the engine.** A source the engine adopted live (its
+   upsert landed) but the hub has not catalogued yet is waited for, bounded
+   (2 s, off the engine, on the control task), then started. Only a source the
+   engine really does not run gets `409 ... applies on restart`.
+5. **Remove** is unchanged: retire pixels, drop pins, fence.
+
+## The M/E sees the drive's store set
+
+The switcher tick driver's prime map and the PVW monitor map were fixed at run
+start, so a live-added source could never be primed, taken or monitored. The
+drive now carries a `stores_generation` counter bumped only by
+`insert_store`/`remove_store` (the drain's live add/remove). The frame hook
+compares it once per tick; only when it changed does it copy the drive's store
+map into the driver (`sync_live_stores`). That copy is bounded by the drive's
+store count and paced by operator adds. The driver and the PVW monitor look
+there first, then at the boot map. No shared cell is read on the clock.
+
+Review #477 rejected a first version that loaded a hub-written `SwapCell` on
+the clock: `SwapCell::load` is lock-free, not wait-free, and a retired map
+could be dropped on the clock thread.
+
+## In-flight starts of a retired definition
+
+A demand start captures its catalogue entry before it spawns. The edit fence
+advances the lifecycle and withdraws the old entry in one critical section
+under the lifecycle lock. The demand rail spawner holds the catalogue
+directly: it is built before the demand manager exists, so it must not depend
+on the manager handle. A start mints its lifecycle under the same lock, and
+only if its definition is still the catalogued one with the same store. So a
+start of definition A that resumes after the edit fails instead of publishing
+A into the reused store, even when B never starts. Removal is covered the same
+way.
+
+## Shed removals
+
+A removal whose hub teardown is shed (`Full`) moves its id from the drain's
+hub-known set (`applied_media`) into a pending set. The drain retries it one per
+tick until the hub takes it, so the catalogue entry, the pins and the producer
+always go. Only an ACCEPTED re-add of the same id cancels it; a shed re-add
+does not. A new id is admitted only while hub-known plus pending stays under
+`MAX_ADMITTED_SOURCES`, so this state is bounded however long the queue stays
+full. Over the cap, an add is held like a shed submit (re-apply retries).
+
+## Invariants
+
+- **#1.** No new work on the output clock beyond one integer compare per tick
+  and, on a store-set change only, a bounded map copy (above). All
+  spawn, teardown, clear and catalogue work stays on the hub worker and the
+  demand worker.
+- **#10.** No new queue. The hub queue (32) and the command bus stay bounded and
+  shed; the Start wait is a bounded poll on the control task, never the engine.
+- Evidence: `live_source_switcher_` lib tests (add catalogues, edit retires,
+  on-bus refusal, in-flight start of a retired definition), the shed-teardown
+  retry test, and the chaos test `switcher_live_source_chaos` (20 adds
+  under a command and M/E flood on a deterministic clock: contiguous ticks,
+  tick-derived PTS, zero repeats, live-added sources taken to Program and
+  monitored on PVW mid-flood, every added source ready).

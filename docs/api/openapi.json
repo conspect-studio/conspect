@@ -11277,6 +11277,16 @@
               }
             }
           },
+          "409": {
+            "description": "On a switcher run: a media edit of a source on a bus (Program, Preview, or a downstream keyer's fill/key) is refused before it is stored; the detail names every such consumer. Take it off the bus first; policy-only edits apply live (issue #464).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "412": {
             "description": "If-Match precondition failed.",
             "content": {
