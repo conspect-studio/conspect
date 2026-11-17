@@ -2349,6 +2349,13 @@ pub struct CommandDrain {
     /// old producer stops and the alias is catalogued without a re-apply.
     /// Counted against the source cap; a removal or kind change drops it.
     pending_binds: std::collections::BTreeMap<String, PendingBind>,
+    /// The store of each `media_player` alias the hub last ACCEPTED (review
+    /// ship-1111 round 3), separate from the desired drive binding: a
+    /// removal withdraws exactly what the hub holds, never a store that was
+    /// only on the drive (a repoint still pending). Moved into
+    /// `pending_unbinds` on removal; replaced only by an accepted binding.
+    hub_aliases:
+        std::collections::BTreeMap<String, Arc<multiview_framestore::TileStore<Nv12Image>>>,
     /// The media-player channels the run booted (ADR-M012). `None` on a run
     /// that does not say (tests, the software path): a player then counts as
     /// booted when the drive holds its store.
@@ -2453,6 +2460,7 @@ impl CommandDrain {
             pending_teardowns: std::collections::BTreeSet::new(),
             pending_unbinds: std::collections::BTreeMap::new(),
             pending_binds: std::collections::BTreeMap::new(),
+            hub_aliases: std::collections::BTreeMap::new(),
             booted_players: None,
             source_cap: multiview_config::MAX_ADMITTED_SOURCES,
             live_overlays: None,
@@ -3394,16 +3402,15 @@ impl CommandDrain {
         if was_alias {
             // Drop only this id's map entry: the player keeps its own entry
             // (and store) under the player id.
-            let store = drive.store(id).cloned();
             drive.remove_store(id);
             self.publish_alias(id, None);
             // A shed alias binding is moot: the producer upsert's own hub
             // request tears down whatever runs under the id first.
             self.pending_binds.remove(id);
             // The producer's own hub request re-catalogues the id; a shed one
-            // must not leave the alias catalogued, so withdraw it explicitly
-            // (store-guarded: it never touches the producer's entry).
-            self.unbind_alias_off_clock(id, store);
+            // must not leave the alias catalogued, so withdraw what the hub
+            // holds (store-guarded: it never touches the producer's entry).
+            self.unbind_accepted_alias(id);
         }
         true
     }
@@ -3521,8 +3528,10 @@ impl CommandDrain {
             self.applied_media.insert(id.clone(), bind.source);
             self.unapplied.remove(&id);
             self.pending_teardowns.remove(&id);
+            // The hub replaced whatever it held under the id with this store.
             self.pending_unbinds.remove(&id);
             self.pending_binds.remove(&id);
+            self.hub_aliases.insert(id, bind.store);
         } else {
             self.unapplied.insert(id.clone());
             self.pending_binds.insert(id, bind);
@@ -3639,6 +3648,18 @@ impl CommandDrain {
         }
     }
 
+    /// A removed alias: withdraw the binding the hub last ACCEPTED (never the
+    /// drive's, which may be a repoint the hub never saw). With none accepted
+    /// the hub holds nothing for it. A pending unbind of an earlier accepted
+    /// binding is never overwritten by one the hub never applied: it only
+    /// changes when a later binding was accepted (which cancelled it).
+    fn unbind_accepted_alias(&mut self, id: &str) {
+        let Some(store) = self.hub_aliases.remove(id) else {
+            return;
+        };
+        self.unbind_alias_off_clock(id, Some(store));
+    }
+
     /// Resubmit ONE shed alias unbind (non-blocking `try_send`).
     fn retry_pending_unbind(&mut self) {
         let Some((id, store)) = self
@@ -3720,13 +3741,12 @@ impl CommandDrain {
             // ADR-M012: an alias owns no producer, so nothing is torn down. A
             // source sharing its player's id leaves the player channel itself
             // registered (transport still addresses it).
-            let store = drive.store(id).cloned();
             if !self.config.media_players.iter().any(|p| p.id == id) {
                 drive.remove_store(id);
             }
             self.publish_alias(id, None);
             self.drop_pending_bind(id);
-            self.unbind_alias_off_clock(id, store);
+            self.unbind_accepted_alias(id);
             self.config.sources.retain(|s| s.id != id);
             self.applied_media.remove(id);
             self.unapplied.remove(id);

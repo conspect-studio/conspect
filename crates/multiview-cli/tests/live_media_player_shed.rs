@@ -361,3 +361,82 @@ fn an_alias_of_a_player_without_a_channel_stays_refused_across_reapply_and_repoi
     assert!(wait(|| r.alias("ghost").is_some_and(|(_, u)| u.is_some())));
     r.hub.shutdown();
 }
+
+/// What the hub holds for `id`: its catalogue entry's store and preview entry.
+fn hub_state(r: &Rig, id: &str) -> (Option<Store>, Option<Store>) {
+    (
+        r.alias(id).map(|(store, _)| store),
+        r.preview.load().get(id).cloned(),
+    )
+}
+
+/// Round 3, sequence A: accepted x->vt-1; under a full queue repoint x->vt-9
+/// (the hub never sees it) and remove x. Recovery must withdraw what the hub
+/// actually holds (vt-1's binding), and the id must stop counting.
+#[test]
+fn removing_an_alias_whose_repoint_was_shed_withdraws_the_accepted_binding() {
+    const CAP: usize = 3;
+    let mut r = rig(Some(&["vt-1", "vt-9"]), Some(CAP));
+    let base = r.drain.admitted_sources();
+    r.upsert(serde_json::json!({"id": "x", "kind": "media_player", "player": "vt-1"}));
+    r.settle();
+    let (catalogued, preview) = hub_state(&r, "x");
+    assert!(catalogued.is_some_and(|s| Arc::ptr_eq(&s, &r.player)));
+    assert!(preview.is_some_and(|s| Arc::ptr_eq(&s, &r.player)));
+
+    r.fault.full();
+    r.upsert(serde_json::json!({"id": "x", "kind": "media_player", "player": "vt-9"}));
+    r.remove("x");
+    assert!(
+        r.drain.admitted_sources() <= base + 1,
+        "x counts once while pending"
+    );
+    r.fault.clear();
+    r.tick(CAP * 4);
+    r.settle();
+    let (catalogued, preview) = hub_state(&r, "x");
+    assert!(
+        catalogued.is_none() && preview.is_none(),
+        "the hub's catalogue entry, pins and preview of x are withdrawn: \
+         catalogued {}, preview {}",
+        catalogued.is_some(),
+        preview.is_some()
+    );
+    assert_eq!(r.drain.admitted_sources(), base, "x no longer counts");
+    r.hub.shutdown();
+}
+
+/// Round 3, sequence B: accepted x->vt-1; under a full queue remove x,
+/// re-add x->vt-9 (never applied) and remove x again. The pending cleanup
+/// must still target vt-1's accepted binding, never be overwritten by vt-9's.
+#[test]
+fn a_shed_readd_never_overwrites_the_pending_unbind_of_the_accepted_alias() {
+    const CAP: usize = 3;
+    let mut r = rig(Some(&["vt-1", "vt-9"]), Some(CAP));
+    let base = r.drain.admitted_sources();
+    r.upsert(serde_json::json!({"id": "x", "kind": "media_player", "player": "vt-1"}));
+    r.settle();
+    assert!(hub_state(&r, "x").0.is_some());
+
+    r.fault.full();
+    r.remove("x");
+    r.upsert(serde_json::json!({"id": "x", "kind": "media_player", "player": "vt-9"}));
+    r.remove("x");
+    assert!(
+        r.drain.admitted_sources() <= base + 1,
+        "x counts once while pending"
+    );
+    r.fault.clear();
+    r.tick(CAP * 4);
+    r.settle();
+    let (catalogued, preview) = hub_state(&r, "x");
+    assert!(
+        catalogued.is_none() && preview.is_none(),
+        "the hub's catalogue entry, pins and preview of x are withdrawn: \
+         catalogued {}, preview {}",
+        catalogued.is_some(),
+        preview.is_some()
+    );
+    assert_eq!(r.drain.admitted_sources(), base, "x no longer counts");
+    r.hub.shutdown();
+}
