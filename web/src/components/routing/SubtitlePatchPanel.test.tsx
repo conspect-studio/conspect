@@ -66,6 +66,10 @@ const patchBody = {
   outputs: [
     {
       output: 'out-1',
+      // The unified `GET /patch` output shape (E3 + patch-f): the server always
+      // reports the video/audio readback alongside the subtitle slots.
+      video: [],
+      audio: [],
       subtitle: [
         { slot: 0, format: 'webvtt', language: 'en', name: null, live: true, source: { source: 'cam-1' } },
         { slot: 1, format: 'webvtt', language: 'es', name: null, live: false, source: null },

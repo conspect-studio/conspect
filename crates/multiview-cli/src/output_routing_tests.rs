@@ -166,6 +166,7 @@ fn router(
         preview_selection: None,
         halved: Arc::new(AtomicBool::new(false)),
         sizing: None,
+        source_sizing: None,
     };
     let aux = wiring();
     let mirror = AuxWiring {
@@ -178,6 +179,7 @@ fn router(
         preview_selection: None,
         halved: Arc::new(AtomicBool::new(false)),
         sizing: None,
+        source_sizing: None,
     };
     let (r, h) = OutputRouter::new(
         RouterConfig {
@@ -381,6 +383,45 @@ impl WindowDelivery for Rec {
 
 const TICK_NS: i128 = 200_000_000;
 
+/// How long one harness tick waits, at most, for the router's encode
+/// threads to finish what they were handed (#461).
+const SETTLE_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The harness's stand-in for the tick period (#461, #369, #408, #413, #432,
+/// #444, #446). The harness drives the router by tick count, as fast as it
+/// can, while every live video worker and private audio bus encodes on its
+/// own thread in wall time. In the product a worker has a whole tick period
+/// (40 ms at 25 fps, 200 ms at this harness's 5 fps) to encode; a fixed
+/// 2-3 ms harness sleep gave it ~1% of that, so on a loaded host a healthy
+/// worker fell several ticks behind and the dispatcher refused its move
+/// (`EncoderNotReady`) or failed its stage: the test measured the host, not
+/// the router.
+///
+/// Wait until every worker has processed every item it accepted, bounded by
+/// `bound` of wall time. A worker that makes no progress within the bound
+/// (a test's deliberately wedged or blocked encoder) is marked stuck at its
+/// count and never waited on again until it moves, so a wedge costs one
+/// bound per test, not one per tick. Waits only on worker threads, never on
+/// the router: the router's own non-blocking contract is unchanged and still
+/// timed by the tests.
+fn settle_workers(r: &OutputRouter, bound: std::time::Duration) {
+    let workers = r.worker_progress();
+    let waiting = |p: &crate::rendition_workers::WorkerProgress| {
+        p.behind() && p.stuck_at.load(Ordering::Acquire) != p.done.load(Ordering::Acquire) + 1
+    };
+    let deadline = Instant::now() + bound;
+    while workers.iter().any(|p| waiting(p)) {
+        if Instant::now() >= deadline {
+            for p in workers.iter().filter(|p| waiting(p)) {
+                p.stuck_at
+                    .store(p.done.load(Ordering::Acquire) + 1, Ordering::Release);
+            }
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+}
+
 fn pts(t: u64) -> MediaTime {
     MediaTime::from_nanos(i64::try_from(t).unwrap() * 200_000_000)
 }
@@ -405,6 +446,8 @@ struct Harness {
     /// The clock's aux send gate and sent-tick counter.
     aux_active: Arc<AtomicBool>,
     aux_sent: Arc<AtomicU64>,
+    /// Per-tick wall-clock bound of [`settle_workers`].
+    settle: std::time::Duration,
 }
 
 fn harness(outputs: usize, max: usize, open: Option<OpenFn>) -> Harness {
@@ -475,6 +518,7 @@ fn harness_full(
             preview_selection: None,
             halved: Arc::new(AtomicBool::new(false)),
             sizing: None,
+            source_sizing: None,
         },
         Box::new(move |settings, _bus| open(settings)),
         reformat,
@@ -499,6 +543,7 @@ fn harness_full(
         clean: Vec::new(),
         aux_active,
         aux_sent,
+        settle: SETTLE_BOUND,
     }
 }
 
@@ -583,6 +628,7 @@ impl Harness {
         self.max_router = self.max_router.max(started.elapsed());
         // A live worker encodes within the tick period.
         std::thread::sleep(std::time::Duration::from_millis(2));
+        settle_workers(&self.r, self.settle);
     }
     fn windows_of(&self, o: usize) -> Vec<&Vec<(i64, bool)>> {
         self.rec
@@ -1787,6 +1833,7 @@ fn a_dying_live_encoder_falls_back(block: bool, bound: u64) {
     }
     assert!(applied, "the take applied before the encoder died");
     assert_eq!(x.d.binding_video_key(1), Some(1));
+    x.settle = std::time::Duration::ZERO;
     kill.store(true, Ordering::SeqCst);
     if !block {
         // Tick once so the worker gets a frame, then wait (wall clock, not
@@ -2134,6 +2181,8 @@ struct AudioHarness {
     /// The longest whole consumer step (router tick, routed-audio feed and
     /// program-audio dispatch; the simulated encode sleep excluded).
     step_max: std::time::Duration,
+    /// Per-tick wall-clock bound of [`settle_workers`].
+    settle: std::time::Duration,
     store: Arc<TileStore<Nv12Image>>,
     base_force: Arc<AtomicU64>,
     tap: crate::routing_audio::AudioTapCell,
@@ -2172,6 +2221,7 @@ fn audio_harness(outputs: usize, cadence: Rational, open: OpenFn) -> AudioHarnes
             preview_selection: None,
             halved: Arc::new(AtomicBool::new(false)),
             sizing: None,
+            source_sizing: None,
         },
         open,
     )
@@ -2229,6 +2279,7 @@ fn audio_harness(outputs: usize, cadence: Rational, open: OpenFn) -> AudioHarnes
         bars_live: true,
         feed_max: std::time::Duration::ZERO,
         step_max: std::time::Duration::ZERO,
+        settle: SETTLE_BOUND,
         store,
         base_force,
         tap,
@@ -2325,6 +2376,7 @@ impl AudioHarness {
         self.step_max = self.step_max.max(step.elapsed());
         // The private encode threads run within the tick period.
         std::thread::sleep(std::time::Duration::from_millis(3));
+        settle_workers(&self.r, self.settle);
     }
 
     /// Tick from `from` until the outcome of `op` arrives (other outcomes
@@ -2813,7 +2865,8 @@ fn stalled_or_crashing_worker(panic_worker: bool) {
     let t = x.run(t, 2);
     assert_eq!(x.h.snapshot().audio_buses_live, 1);
     assert!(x.d.binding_audio_key(1).is_some(), "on the private bus");
-    // Now the worker wedges (or panics) at its next job.
+    // Now the worker wedges (or panics) at its next job: never wait on it.
+    x.settle = std::time::Duration::ZERO;
     wedged.store(true, Ordering::Release);
     let mut failed_at = None;
     let depth = u64::try_from(crate::routing_audio::PRIVATE_AUDIO_QUEUE).unwrap();
@@ -3583,6 +3636,8 @@ fn a_blocked_clean_encoder_degrades_then_falls_back_and_program_is_unaffected() 
         x.tick(t);
         t += 1;
     }
+    // The worker is wedged on purpose from here: never wait on it (#461).
+    x.settle = std::time::Duration::ZERO;
     block.store(true, Ordering::SeqCst);
     let wedged_at = t;
     let mut degraded_at = None;
@@ -3665,6 +3720,8 @@ fn a_blocked_source_encoder_degrades_then_falls_back() {
         x.tick(t);
         t += 1;
     }
+    // The worker is wedged on purpose from here: never wait on it (#461).
+    x.settle = std::time::Duration::ZERO;
     block.store(true, Ordering::SeqCst);
     let wedged_at = t;
     let mut degraded_at = None;
@@ -3718,6 +3775,8 @@ fn a_transient_offer_stall_within_the_gap_fill_horizon_never_degrades() {
         x.tick(t);
         t += 1;
     }
+    // The worker is wedged on purpose from here: never wait on it (#461).
+    x.settle = std::time::Duration::ZERO;
     block.store(true, Ordering::SeqCst);
     // A short stall (6 ticks, as when this test was written against the old
     // 8-tick gap-fill bound): well under the degraded bound.
@@ -3945,6 +4004,8 @@ fn a_healthy_sibling_key_never_hides_a_starved_key_on_the_same_bus() {
         x.tick(t);
         t += 1;
     }
+    // The worker is wedged on purpose from here: never wait on it (#461).
+    x.settle = std::time::Duration::ZERO;
     block.store(true, Ordering::SeqCst);
     let wedged_at = t;
     let mut degraded_at = None;
@@ -3995,6 +4056,8 @@ fn a_consumer_gap_on_a_full_clean_queue_never_fails_the_key() {
         t += 1;
     }
     // Fill the worker's queue (and its in-flight slot).
+    // The worker is wedged on purpose from here: never wait on it (#461).
+    x.settle = std::time::Duration::ZERO;
     block.store(true, Ordering::SeqCst);
     for _ in 0..6 {
         x.tick(t);
@@ -4546,6 +4609,7 @@ fn reformat_harness(outputs: usize, max: usize, mode: OpenMode) -> ReformatHarne
             preview_selection: None,
             halved: Arc::clone(&halved),
             sizing: None,
+            source_sizing: None,
         },
         Box::new(move |_, bus| {
             take_log.lock().unwrap().push((bus.clone(), None));
@@ -4612,6 +4676,7 @@ impl ReformatHarness {
             .on_tick(t, pts(t), &mut self.d, &mut self.rec)
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
+        settle_workers(&self.r, SETTLE_BOUND);
     }
     fn reformat(&self, op: &str, output: usize) {
         self.h
@@ -8179,6 +8244,48 @@ fn a_rejected_set_never_switches_a_staying_members_private_bus_audio() {
             "no bars sample ever reached the bus on air (block at {start})"
         );
     }
+}
+
+/// #469 (a): a source routed to an output as a bare feed is published for
+/// the decoders (at the canvas: no output format) from the take until its
+/// feed closes after the linger, and the Program-only router publishes none.
+#[test]
+fn a_direct_source_route_publishes_source_sizing_until_it_closes() {
+    let mut x = harness(2, 6, None);
+    let sizing = crate::display_size::source_sizing_slot();
+    x.r.aux.source_sizing = Some(Arc::clone(&sizing));
+    for t in 0..3 {
+        x.tick(t);
+    }
+    assert!(sizing.load().is_empty(), "nothing routed");
+    x.h.try_take(take("a", 1, src())).unwrap();
+    let mut now = 3;
+    let mut applied = false;
+    while !applied {
+        x.tick(now);
+        applied = x
+            .outcomes
+            .try_iter()
+            .any(|o| o.outcome == TakeResult::Applied);
+        now += 1;
+        assert!(now < 3 + OPEN_DEADLINE_TICKS, "applied within the deadline");
+    }
+    assert_eq!(
+        *sizing.load(),
+        vec![(Arc::<str>::from("cam"), (u32::MAX, u32::MAX))],
+        "the routed source sizes at the canvas"
+    );
+    let published = sizing.load();
+    x.tick(now);
+    assert!(
+        Arc::ptr_eq(&published, &sizing.load()),
+        "no republish without a feed change"
+    );
+    x.h.try_take(take("b", 1, PictureBus::Program)).unwrap();
+    for t in now + 1..now + 40 + LINGER_TICKS + 2 {
+        x.tick(t);
+    }
+    assert!(sizing.load().is_empty(), "un-routed: no sizing left");
 }
 
 /// #308 review C1: snapshot publication (on the bake consumer, every tick
