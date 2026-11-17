@@ -24,6 +24,7 @@ fn video(ts: u32, keyframe: bool) -> EgressSample {
         rtp_timestamp: ts,
         keyframe,
         data: vec![0x00, 0x00, 0x00, 0x01, if keyframe { 0x65 } else { 0x61 }],
+        cast: None,
     }
 }
 
@@ -33,6 +34,7 @@ fn audio(ts: u32) -> EgressSample {
         rtp_timestamp: ts,
         keyframe: false,
         data: vec![0xFC, 0xAB],
+        cast: None,
     }
 }
 

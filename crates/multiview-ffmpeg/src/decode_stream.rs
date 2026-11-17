@@ -644,6 +644,45 @@ impl StreamAudioDecoder {
         Self::new(parameters.as_parameters().clone(), time_base)
     }
 
+    /// An AAC (LC) decoder from its `AudioSpecificConfig` (the config bytes
+    /// an opened AAC encoder reports), at `sample_rate` with `channels`.
+    ///
+    /// # Errors
+    /// [`FfmpegError::CodecNotFound`] / [`FfmpegError::OpenDecoder`].
+    #[allow(unsafe_code)]
+    pub fn from_aac_config(
+        asc: &[u8],
+        sample_rate: u32,
+        channels: u16,
+        time_base: Rational,
+    ) -> Result<Self> {
+        crate::decode::ensure_initialized()?;
+        let codec = ffmpeg::decoder::find(ffmpeg::codec::Id::AAC)
+            .ok_or(FfmpegError::CodecNotFound("aac"))?;
+        let mut ctx = ffmpeg::codec::context::Context::new_with_codec(codec);
+        let len = i32::try_from(asc.len()).map_err(|_| FfmpegError::FrameMismatch("aac config"))?;
+        // SAFETY: `ctx` owns a freshly-allocated `AVCodecContext` that has no
+        // extradata yet. We allocate `len + AV_INPUT_BUFFER_PADDING_SIZE`
+        // zeroed bytes with libav's allocator (the context frees them with
+        // `av_free` on drop), copy `asc` into it and set the size; nothing
+        // else aliases the pointer.
+        unsafe {
+            let raw = ctx.as_mut_ptr();
+            let padded = asc.len() + ffmpeg::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize;
+            let buf = ffmpeg::ffi::av_mallocz(padded).cast::<u8>();
+            if buf.is_null() {
+                return Err(FfmpegError::FrameMismatch("aac config allocation"));
+            }
+            std::ptr::copy_nonoverlapping(asc.as_ptr(), buf, asc.len());
+            (*raw).extradata = buf;
+            (*raw).extradata_size = len;
+            (*raw).sample_rate = i32::try_from(sample_rate).unwrap_or(48_000);
+            (*raw).ch_layout.nb_channels = i32::from(channels);
+        }
+        let decoder = ctx.decoder().audio().map_err(FfmpegError::OpenDecoder)?;
+        Ok(Self { decoder, time_base })
+    }
+
     /// Decode one coded packet and return every frame it releases as
     /// interleaved `f32` (planar-`f32` decoders only, such as libav `aac`).
     ///

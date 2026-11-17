@@ -420,6 +420,10 @@ where
             slot,
         )));
     }
+    #[cfg(feature = "ffmpeg")]
+    if let Some(rung) = crate::cast_output::installed_cast_webrtc() {
+        state = state.with_cast_webrtc(rung);
+    }
     // The network front door's live counters (ADR-0107 slice 3,
     // `GET /api/v1/metrics/frontdoor`); absent when `[network]` is not
     // configured this run (404, not an error).

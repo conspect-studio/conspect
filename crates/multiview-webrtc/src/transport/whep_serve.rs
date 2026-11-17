@@ -49,11 +49,29 @@ const RECV_BUFFER: usize = 2048;
 /// run GC, and pump TURN when otherwise idle.
 const DRIVER_TICK: Duration = Duration::from_millis(10);
 
+/// A cast viewer's gate (ADR-0114 slice 5), implemented by the control
+/// plane's attachment: whether a sample of window `window` may be written
+/// to this viewer (not fenced, and that window passed its identity gate),
+/// and the fence a dead session raises. Lock-free and bounded.
+pub trait ViewerGate: Send + Sync {
+    /// See the trait docs.
+    fn may_write(&self, window: u64) -> bool;
+    /// Whether the viewer is fenced (its session is ended at once).
+    fn is_fenced(&self) -> bool;
+    /// Fence the viewer (its session ended).
+    fn fence(&self);
+}
+
 /// One admitted WHEP viewer session plus its per-session SPS/PPS cache.
 pub(crate) struct ViewerSession {
     id: SessionId,
     output_id: String,
     session: Session,
+    /// A cast viewer's gate (`None`: a `webrtc` output viewer).
+    gate: Option<std::sync::Arc<dyn ViewerGate>>,
+    /// PLI/FIR received from this viewer: counted, never forwarded (no rung
+    /// may request a keyframe from the shared encoder, ADR-0114 decision 6).
+    keyframe_requests: u64,
     /// Whether the video keyframe seam has been sent to this viewer yet — a late
     /// joiner only decodes from the first IDR, so delta AUs before the first
     /// keyframe are dropped for this viewer (the standard remuxer late-join gate).
@@ -221,6 +239,32 @@ impl WhepServeHandle {
         offer: &str,
         want_audio: bool,
     ) -> Result<WhepNegotiated> {
+        self.negotiate_gated(output_id, offer, want_audio, None)
+    }
+
+    /// [`Self::negotiate`] for a cast viewer (ADR-0114 slice 5): the session
+    /// is built with the cast send buffers, and every sample is written to it
+    /// only when `gate` allows its window; a fenced gate ends the session at
+    /// the next driver tick.
+    ///
+    /// # Errors
+    /// As [`Self::negotiate`].
+    pub fn negotiate_cast(
+        &self,
+        output_id: &str,
+        offer: &str,
+        gate: std::sync::Arc<dyn ViewerGate>,
+    ) -> Result<WhepNegotiated> {
+        self.negotiate_gated(output_id, offer, true, Some(gate))
+    }
+
+    fn negotiate_gated(
+        &self,
+        output_id: &str,
+        offer: &str,
+        want_audio: bool,
+        gate: Option<std::sync::Arc<dyn ViewerGate>>,
+    ) -> Result<WhepNegotiated> {
         // The output must be a configured `webrtc` output.
         let registration = {
             let outputs = self
@@ -250,7 +294,12 @@ impl WhepServeHandle {
 
         let now = Instant::now();
         let audio = want_audio && offer_has_audio(offer);
-        let mut session = Session::new(&SessionConfig::serve(), now);
+        let config = if gate.is_some() {
+            SessionConfig::cast()
+        } else {
+            SessionConfig::serve()
+        };
+        let mut session = Session::new(&config, now);
         // Gather host + advertised candidates (IPv6-first), skipping the
         // unspecified bind addr (never a valid ICE candidate).
         let mut gathered = 0usize;
@@ -309,6 +358,8 @@ impl WhepServeHandle {
             id: session_id.clone(),
             output_id: output_id.to_owned(),
             session,
+            gate,
+            keyframe_requests: 0,
             saw_keyframe: false,
             was_connected: false,
         };
@@ -351,6 +402,14 @@ impl WhepServeHandle {
     }
 
     /// The number of live viewers on `output_id` (telemetry / tests).
+    /// Remove output `output_id`'s registration (the cast rung's last viewer
+    /// left); its viewers are ended by the driver as their feed is gone.
+    pub fn unregister_output(&self, output_id: &str) {
+        if let Ok(mut outputs) = self.inner.outputs.lock() {
+            outputs.remove(output_id);
+        }
+    }
+
     #[must_use]
     pub fn live_viewer_count(&self, output_id: &str) -> usize {
         self.inner
@@ -523,6 +582,14 @@ impl WhepServeEndpoint {
     pub(crate) fn tick(viewers: &mut [ViewerSession], shared: &WhepShared, now: Instant) {
         Self::pump_egress(viewers, now, shared);
         for v in viewers.iter_mut() {
+            // A fenced cast viewer: its transport is closed abruptly (DTLS
+            // close), never drained (decision 5.4).
+            if v.gate.as_ref().is_some_and(|g| g.is_fenced()) {
+                v.session.disconnect();
+            }
+            if v.session.take_keyframe_request() {
+                v.keyframe_requests = v.keyframe_requests.saturating_add(1);
+            }
             let _ = v.session.handle_timeout(now);
             v.was_connected |= v.session.is_connected();
         }
@@ -551,6 +618,19 @@ impl WhepServeEndpoint {
                     if !v.session.is_connected() {
                         continue;
                     }
+                    // A cast viewer is written only samples of windows its
+                    // gate passed (ADR-0114 decision 5.4: the gate is at the
+                    // driver's write to a viewer's session).
+                    let wallclock = match (&v.gate, sample.cast) {
+                        (Some(gate), Some(stamp)) => {
+                            if !gate.may_write(stamp.window) {
+                                continue;
+                            }
+                            stamp.wallclock.unwrap_or(now)
+                        }
+                        (Some(_), None) => continue,
+                        (None, _) => now,
+                    };
                     match sample.media {
                         EgressMedia::Video => {
                             if sample.keyframe {
@@ -560,17 +640,20 @@ impl WhepServeEndpoint {
                                 // Late joiner before its first IDR: skip delta AUs.
                                 continue;
                             }
-                            let _ = v.session.write_video_sample(
+                            let _ = v.session.write_sample_at(
+                                crate::transport::MediaKind::Video,
                                 &sample.data,
-                                sample.keyframe,
                                 sample.rtp_timestamp,
+                                wallclock,
                                 now,
                             );
                         }
                         EgressMedia::Audio => {
-                            let _ = v.session.write_audio_sample(
+                            let _ = v.session.write_sample_at(
+                                crate::transport::MediaKind::Audio,
                                 &sample.data,
                                 sample.rtp_timestamp,
+                                wallclock,
                                 now,
                             );
                         }
@@ -648,6 +731,9 @@ impl WhepServeEndpoint {
         viewers.retain_mut(|v| {
             if v.session.is_alive() {
                 return true;
+            }
+            if let Some(gate) = &v.gate {
+                gate.fence();
             }
             if let Ok(mut by_output) = shared.viewers_by_output.lock() {
                 if let Some(ids) = by_output.get_mut(&v.output_id) {

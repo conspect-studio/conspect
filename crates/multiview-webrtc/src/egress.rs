@@ -109,6 +109,21 @@ pub struct EgressSample {
     pub keyframe: bool,
     /// The coded payload (an H.264 access unit or one Opus frame).
     pub data: Vec<u8>,
+    /// The cast rung only (ADR-0114 slice 5): the window sequence number this
+    /// sample belongs to (a viewer is written only windows its gate passed)
+    /// and the RTCP wallclock of its engine media time (the epoch's wall time,
+    /// as a monotonic instant). `None` on every other output.
+    pub cast: Option<CastStamp>,
+}
+
+/// The cast rung's per-sample stamp (see [`EgressSample::cast`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CastStamp {
+    /// The window sequence number (from 1).
+    pub window: u64,
+    /// The wall time of the sample's engine media time, mapped onto the
+    /// monotonic clock (the RTCP sender-report wallclock of both streams).
+    pub wallclock: Option<Instant>,
 }
 
 /// Shared bounded ring backing an [`EgressSink`]/[`EgressFeed`] pair.
@@ -352,6 +367,7 @@ mod tests {
             rtp_timestamp: ts,
             keyframe,
             data: vec![0x65, 0xAB],
+            cast: None,
         }
     }
 
@@ -448,6 +464,7 @@ mod tests {
             rtp_timestamp: 0,
             keyframe,
             data: vec![0; len],
+            cast: None,
         }
     }
 
@@ -474,7 +491,10 @@ mod tests {
         let (sink, feed) = egress_feed();
         let t0 = Instant::now();
         let _ = sink.push_at(sized(EgressMedia::Audio, false, 10), t0);
-        let _ = sink.push_at(sized(EgressMedia::Audio, false, 10), t0 + Duration::from_secs(1));
+        let _ = sink.push_at(
+            sized(EgressMedia::Audio, false, 10),
+            t0 + Duration::from_secs(1),
+        );
         assert_eq!(feed.len(), 2);
         let _ = sink.push_at(
             sized(EgressMedia::Audio, false, 10),
@@ -537,14 +557,22 @@ mod tests {
         let t = Instant::now();
         let _ = sink.push_at(sized(EgressMedia::Video, true, 10), t);
         let _ = sink.push_at(sized(EgressMedia::Video, false, 10), t);
-        let _ = sink.push_at(sized(EgressMedia::Video, true, 10), t + Duration::from_secs(1));
-        let _ = sink.push_at(sized(EgressMedia::Video, false, 10), t + Duration::from_secs(1));
+        let _ = sink.push_at(
+            sized(EgressMedia::Video, true, 10),
+            t + Duration::from_secs(1),
+        );
+        let _ = sink.push_at(
+            sized(EgressMedia::Video, false, 10),
+            t + Duration::from_secs(1),
+        );
         // At 2.001 s the first GOP is too old; the second stays whole.
         let _ = sink.push_at(
             sized(EgressMedia::Video, false, 10),
             t + MAX_EGRESS_AGE + Duration::from_millis(1),
         );
-        let got: Vec<bool> = std::iter::from_fn(|| feed.pop()).map(|s| s.keyframe).collect();
+        let got: Vec<bool> = std::iter::from_fn(|| feed.pop())
+            .map(|s| s.keyframe)
+            .collect();
         assert_eq!(got, [true, false, false]);
     }
 

@@ -910,6 +910,7 @@ async fn serve_control_plane(
             rtc_lane,
             ice_tcp_lane,
         );
+        multiview_cli::cast_output::install_cast_webrtc(unified.cast_webrtc);
         (unified.whep, unified.whip, unified.whep_output)
     };
     #[cfg(not(feature = "webrtc-native"))]
@@ -1226,6 +1227,7 @@ async fn run_pipeline_until_ctrl_c(
             pipeline.output_routing(),
         ));
         multiview_cli::cast_output::install_cast_outputs(Some(pipeline.cast_outputs()));
+        multiview_cli::cast_output::install_cast_windows(Some(pipeline.window_subscriptions()));
         multiview_cli::output_routing_control::install_program_metrics(Some(
             pipeline.program_metrics(),
         ));

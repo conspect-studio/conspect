@@ -37,7 +37,7 @@ pub use unified::{
     Egress, InboundDatagram, InboundFrame, SharedInbound, SharedTcp, TcpSend, UnifiedBuilder,
     UnifiedEndpoint,
 };
-pub use whep_serve::{WhepNegotiated, WhepServeEndpoint, WhepServeHandle};
+pub use whep_serve::{ViewerGate, WhepNegotiated, WhepServeEndpoint, WhepServeHandle};
 pub use whip_endpoint::{WhipEndpoint, WhipHandle, WhipNegotiated};
 pub use whip_push::{
     PushBackoff, PushLane, WhipPushAnswer, WhipPushClient, WhipPushOffer, WhipPushSpec,
@@ -171,7 +171,16 @@ pub struct SessionConfig {
     /// contract, never str0m's sample API (ADR-T014 §4). WHEP **egress** leaves
     /// it `false` and writes samples via [`Session::write_video_sample`].
     pub rtp_mode: bool,
+    /// str0m's per-session send buffers `(video packets, audio packets)`,
+    /// set explicitly (ADR-0114 decision 6: about 1.2 MiB per viewer at one
+    /// MTU a packet). `None`: the library's own defaults.
+    pub send_buffers: Option<(usize, usize)>,
 }
+
+/// The cast `WebRTC` rung's per-viewer send buffers (ADR-0114 decision 6):
+/// str0m 0.16.2's defaults, set explicitly so a library update cannot raise
+/// them silently.
+pub const CAST_SEND_BUFFERS: (usize, usize) = (1000, 50);
 
 impl Default for SessionConfig {
     fn default() -> Self {
@@ -180,6 +189,7 @@ impl Default for SessionConfig {
             enable_vp8: true,
             enable_opus: true,
             rtp_mode: false,
+            send_buffers: None,
         }
     }
 }
@@ -196,6 +206,7 @@ impl SessionConfig {
             enable_vp8: false,
             enable_opus: true,
             rtp_mode: true,
+            send_buffers: None,
         }
     }
 
@@ -213,6 +224,17 @@ impl SessionConfig {
             enable_vp8: false,
             enable_opus: true,
             rtp_mode: false,
+            send_buffers: None,
+        }
+    }
+
+    /// A cast `WebRTC` viewer (ADR-0114 slice 5): as [`Self::serve`], with
+    /// the send buffers set explicitly to [`CAST_SEND_BUFFERS`].
+    #[must_use]
+    pub fn cast() -> Self {
+        Self {
+            send_buffers: Some(CAST_SEND_BUFFERS),
+            ..Self::serve()
         }
     }
 
@@ -227,6 +249,7 @@ impl SessionConfig {
             enable_vp8: false,
             enable_opus: true,
             rtp_mode: false,
+            send_buffers: None,
         }
     }
 }
@@ -370,6 +393,11 @@ impl Session {
             builder
                 .codec_config()
                 .add_h264(96.into(), Some(97.into()), true, 0x0042_e01f);
+        }
+        if let Some((video, audio)) = config.send_buffers {
+            builder = builder
+                .set_send_buffer_video(video)
+                .set_send_buffer_audio(audio);
         }
         let rtc = builder.build(now);
         Self {
@@ -785,6 +813,31 @@ impl Session {
         self.write_sample(MediaKind::Audio, data, u64::from(rtp_timestamp), now)
     }
 
+    /// Write one sample of `kind` with the RTCP wallclock `wallclock` (the
+    /// moment this sample's media time stands for, ADR-0114 decision 2:
+    /// "the epoch's wall time of the sample's `E` for both streams"), instead
+    /// of the time of writing. str0m requires it not to lie in the future of
+    /// `now`; a later one is clamped to `now`.
+    ///
+    /// # Errors
+    /// As [`Self::write_video_sample`].
+    pub fn write_sample_at(
+        &mut self,
+        kind: MediaKind,
+        data: &[u8],
+        rtp_timestamp: u32,
+        wallclock: Instant,
+        now: Instant,
+    ) -> Result<()> {
+        self.write_sample_with(
+            kind,
+            data,
+            u64::from(rtp_timestamp),
+            wallclock.min(now),
+            now,
+        )
+    }
+
     /// Common write path for both media kinds: resolve the mid + negotiated PT,
     /// re-stamp the RTP time on the kind's clock, hand the access unit to str0m's
     /// sample-mode writer, and drive one packetization pass.
@@ -793,6 +846,17 @@ impl Session {
         kind: MediaKind,
         data: &[u8],
         rtp_timestamp: u64,
+        now: Instant,
+    ) -> Result<()> {
+        self.write_sample_with(kind, data, rtp_timestamp, now, now)
+    }
+
+    fn write_sample_with(
+        &mut self,
+        kind: MediaKind,
+        data: &[u8],
+        rtp_timestamp: u64,
+        wallclock: Instant,
         now: Instant,
     ) -> Result<()> {
         let mid = self
@@ -816,7 +880,7 @@ impl Session {
             .writer(mid)
             .ok_or_else(|| WebRtcError::Transport("no writer for mid".to_owned()))?;
         writer
-            .write(pt, now, rtp_time, data.to_vec())
+            .write(pt, wallclock, rtp_time, data.to_vec())
             .map_err(|e| WebRtcError::Transport(format!("write: {e}")))?;
         // Drive so str0m packetizes the sample into outbound SRTP now.
         self.drive(now);

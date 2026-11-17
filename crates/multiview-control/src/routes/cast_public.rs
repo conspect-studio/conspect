@@ -47,6 +47,7 @@ const RECEIVER_CSS: &str = include_str!("../cast_receiver/receiver.css");
 
 const MEDIA_METHODS: HeaderValue = HeaderValue::from_static("GET, HEAD, OPTIONS");
 const REPORT_METHODS: HeaderValue = HeaderValue::from_static("POST, OPTIONS");
+const WHEP_METHODS: HeaderValue = HeaderValue::from_static("POST, DELETE, OPTIONS");
 const ALLOW_HEADERS: HeaderValue = HeaderValue::from_static("Range, Content-Type, Accept-Encoding");
 const EXPOSE_HEADERS: HeaderValue = HeaderValue::from_static("Content-Length, Content-Range");
 const MAX_AGE: HeaderValue = HeaderValue::from_static("86400");
@@ -64,7 +65,10 @@ pub fn public_router() -> Router<AppState> {
         .route("/cast/receiver/receiver.css", get(receiver_css))
         .route(
             "/cast/{token}/{file}",
-            get(media).options(preflight).post(report),
+            get(media)
+                .options(preflight)
+                .post(report)
+                .delete(whep_delete),
         )
         // Anything else under `/cast/` is the same 404 (never the SPA
         // fallback's index page, never a different body).
@@ -131,8 +135,15 @@ async fn preflight(
     if !admitted {
         return with_cors(not_found(), headers.get(header::ORIGIN));
     }
-    let post = path.is_ok_and(|Path((_, file))| file == "report" || file == "ladder");
-    let methods = if post { REPORT_METHODS } else { MEDIA_METHODS };
+    let file = path
+        .as_ref()
+        .map(|Path((_, file))| file.clone())
+        .unwrap_or_default();
+    let methods = match file.as_str() {
+        "report" | "ladder" => REPORT_METHODS,
+        "whep" => WHEP_METHODS,
+        _ => MEDIA_METHODS,
+    };
     let mut response = StatusCode::NO_CONTENT.into_response();
     let out = response.headers_mut();
     out.insert(header::ALLOW, methods.clone());
@@ -271,6 +282,9 @@ async fn take_report(
     };
     if file == "ladder" {
         return take_ladder(state, &token, body).await;
+    }
+    if file == "whep" {
+        return take_whep(state, &token, &admitted, body).await;
     }
     if file != "report" {
         return not_found();
@@ -420,6 +434,9 @@ struct Offered {
 fn served_now(state: &AppState, config_id: &str) -> Vec<&'static str> {
     let mut served = vec!["hls"];
     let labelled = crate::cast_streams::reauth::labels(state, config_id).is_some();
+    if labelled && state.cast_webrtc.available(config_id) {
+        served.insert(0, "webrtc");
+    }
     if labelled && state.moq.available() {
         served.insert(0, "moq");
     }
@@ -461,6 +478,15 @@ fn attach_best(
                     then: rest,
                 };
             }
+        }
+        // WebRTC is admitted by its own `POST …/whep` (the offer is the
+        // receiver's), so the answer only names it (decision 3).
+        if candidate == "webrtc" {
+            return Offered {
+                rung: "webrtc",
+                attach: serde_json::json!({ "rung": "webrtc", "whep": "whep" }),
+                then: rest,
+            };
         }
         candidate = if rest.is_empty() {
             "hls"
@@ -521,6 +547,124 @@ fn attach_moq(
         "audio": lease.audio,
         "expires_in_ms": lease.expires_in_ms,
     }))
+}
+
+/// The SDP offer cap of `POST /cast/<token>/whep` (as `routes/whep_output.rs`).
+const MAX_WHEP_OFFER_BYTES: usize = 64 * 1024;
+
+/// `POST /cast/<token>/whep` (ADR-0114 decision 3): the WebRTC rung. The
+/// shared check (done by the caller), then the per-token ladder rate (an
+/// offer costs the same as a ladder call), the body (at most 64 KiB of SDP),
+/// the shared check again (the body was awaited), the clearance of the
+/// present state, the engine's negotiation and the registration with the
+/// token at the same generation. Every failure after the token check is the
+/// same `503` (the receiver steps down), never a hint about the feed.
+async fn take_whep(
+    state: &AppState,
+    token: &str,
+    admitted: &crate::cast_streams::Admitted,
+    body: Body,
+) -> Response {
+    match state.cast_streams.admit_ladder(&admitted.stream_id) {
+        Ok(()) => {}
+        Err(LadderError::TooSoon) => return too_many(),
+        Err(LadderError::Unknown) => return not_found(),
+    }
+    let read = axum::body::to_bytes(body, MAX_WHEP_OFFER_BYTES).await;
+    if !readmitted(state, token, admitted) {
+        return not_found();
+    }
+    let Ok(bytes) = read else {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    };
+    let Ok(offer) = std::str::from_utf8(&bytes) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let enabled = state.cast_streams.ladder().iter().any(|r| r == "webrtc");
+    if !enabled || !state.cast_webrtc.available(&admitted.config_id) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let Some((labels, clearance)) =
+        crate::cast_streams::reauth::clearance_now(state, &admitted.config_id)
+    else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let attachment = std::sync::Arc::new(crate::cast_streams::identity::CastAttachment::new(
+        &admitted.stream_id,
+        &admitted.config_id,
+        "webrtc",
+        labels,
+        clearance,
+    ));
+    let answer = match state.cast_webrtc.negotiate(
+        &admitted.config_id,
+        offer,
+        std::sync::Arc::clone(&attachment),
+    ) {
+        Ok(answer) => answer,
+        Err(crate::cast_webrtc::CastWhepReject::Offer) => {
+            return StatusCode::BAD_REQUEST.into_response()
+        }
+        Err(crate::cast_webrtc::CastWhepReject::Unavailable) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    };
+    if !state.cast_streams.attach(&attachment, admitted.generation) {
+        attachment.fence();
+        return not_found();
+    }
+    let same_generation = crate::cast_streams::reauth::admit(state, token)
+        .is_some_and(|again| again.generation == admitted.generation);
+    let same_labels = crate::cast_streams::reauth::clearance_now(state, &admitted.config_id)
+        .is_some_and(|(_, now)| now == *attachment.clearance());
+    if !(same_generation && same_labels) {
+        attachment.fence();
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let mut response = (StatusCode::CREATED, answer.sdp).into_response();
+    let h = response.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/sdp"),
+    );
+    if let Ok(location) = HeaderValue::from_str(&format!("whep?session={}", answer.session_id)) {
+        h.insert(header::LOCATION, location);
+    }
+    if let Ok(id) = HeaderValue::from_str(&answer.session_id) {
+        h.insert("x-session-id", id);
+    }
+    response
+}
+
+/// `DELETE /cast/<token>/whep` (ADR-0114 decision 3): end this token's
+/// WebRTC attachments (all of them; a token has at most two). Same `404` as
+/// any dead token; `204` otherwise.
+async fn whep_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    path: Result<Path<(String, String)>, PathRejection>,
+) -> Response {
+    let origin = headers.get(header::ORIGIN).cloned();
+    let response = no_store(match path {
+        Ok(Path((token, file))) if file == "whep" => {
+            match crate::cast_streams::reauth::admit(&state, &token) {
+                Some(admitted) => {
+                    for attachment in state
+                        .cast_streams
+                        .attachments(&admitted.stream_id)
+                        .into_iter()
+                        .filter(|a| a.rung == "webrtc")
+                    {
+                        attachment.fence();
+                    }
+                    StatusCode::NO_CONTENT.into_response()
+                }
+                None => not_found(),
+            }
+        }
+        _ => not_found(),
+    });
+    with_cors(response, origin.as_ref())
 }
 
 async fn receiver_redirect() -> Response {
