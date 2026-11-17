@@ -778,6 +778,41 @@ async fn in_n_is_refused_with_422_for_fill_and_key() {
     }
 }
 
+/// #307 merge review MR-01: a fill or key spelled like an engine store key
+/// (`layout:<id>`, `bus:<name>`) is a 422 on the plan and the command even
+/// when a configured source carries that literal id, so a keyer can never
+/// bind an adopted stored layout's store by name collision.
+#[tokio::test]
+async fn a_reserved_store_key_is_refused_as_fill_or_key_even_when_configured() {
+    let doc = DOC.replacen(
+        "[[sources]]\nid = \"secret\"",
+        "[[sources]]\nid = \"layout:wall\"\nkind = \"bars\"\n[[sources]]\nid = \"secret\"",
+        1,
+    );
+    assert!(
+        doc.contains("layout:wall"),
+        "fixture carries the colliding id"
+    );
+    let (_dir, path) = temp_boot(&doc);
+    let rig = rig(&path);
+    for extra in [
+        json!({"keyer":"dsk1","fill":"layout:wall"}),
+        json!({"keyer":"dsk1","fill":"gfx","key":"bus:program"}),
+    ] {
+        let verb = body("keyer_set", extra);
+        let (status, kind) = kind_of(command(&rig, ADMIN, "reserved", &verb).await).await;
+        assert_eq!(
+            (status, kind.as_str()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "keyer-source-not-a-source"
+            )
+        );
+        let (status, _) = kind_of(plan(&rig, ADMIN, &verb).await).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+}
+
 /// The merge with the transition API (#429): `transition` belongs to
 /// `set_transition` only, so a keyer verb carrying one is a 422 on both the
 /// plan and the command, and nothing is enqueued.

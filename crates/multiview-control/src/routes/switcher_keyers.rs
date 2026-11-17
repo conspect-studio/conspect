@@ -217,6 +217,19 @@ fn shape(kind: &str, fields: &KeyerFields, other_refs: bool) -> Result<String, B
         )));
     }
     for source in fields.sources() {
+        if multiview_config::switcher::KEYER_RESERVED_PREFIXES
+            .iter()
+            .any(|p| source.starts_with(p))
+        {
+            return Err(Box::new(typed(
+                422,
+                "keyer-source-not-a-source",
+                format!(
+                    "{source:?} uses a reserved prefix (layout:/bus:); keyer fill and key \
+                     name configured sources only (#307)"
+                ),
+            )));
+        }
         if source.starts_with(INPUT_REF_PREFIX) {
             return Err(Box::new(typed(
                 422,

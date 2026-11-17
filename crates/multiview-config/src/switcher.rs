@@ -21,6 +21,12 @@ use crate::error::ConfigError;
 pub const MAX_MIXER_INPUTS: u16 = 64;
 /// Prefix of the engine's mixer-input reference spelling (`in:<n>`).
 pub const INPUT_REF_PREFIX: &str = "in:";
+/// Engine-reserved store-key prefixes a keyer fill or key may never name
+/// (#307): a stored layout adopted as an M/E source is keyed `layout:<id>`
+/// and a bus store `bus:<name>` in the same store map a keyer resolves its
+/// fill and key from, so a configured source spelled that way could bind
+/// the layout's picture without the layout's authorization closure.
+pub const KEYER_RESERVED_PREFIXES: [&str; 2] = ["layout:", "bus:"];
 /// Maximum operator label length, in characters.
 pub const MAX_MIXER_INPUT_LABEL: usize = 64;
 
@@ -386,6 +392,11 @@ impl DownstreamKeyerConfig {
             if id.starts_with(INPUT_REF_PREFIX) {
                 return err(format!(
                     "{role} {id:?} names a mixer input; keyer fill and key name sources only"
+                ));
+            }
+            if KEYER_RESERVED_PREFIXES.iter().any(|p| id.starts_with(p)) {
+                return err(format!(
+                    "{role} {id:?} uses a reserved prefix (layout:/bus:); keyer fill and key name configured sources only"
                 ));
             }
             if !sources.contains(&id) {
@@ -1051,6 +1062,24 @@ number = 3
         let mut program = dsk("dsk1", 1);
         program.program = "other".into();
         keyer_refused(vec![program], "undeclared program");
+    }
+
+    /// #307 merge review MR-01: a fill or key spelled like an engine store
+    /// key (`layout:<id>`, `bus:<name>`) is refused even when a configured
+    /// source carries that literal id, so a keyer can never bind an adopted
+    /// layout's store by name collision.
+    #[test]
+    fn a_fill_or_key_never_names_a_reserved_store_key() {
+        for (fill, key) in [("layout:wall", None), ("bars", Some("bus:program"))] {
+            let mut keyer = dsk("dsk1", 1);
+            keyer.fill = fill.into();
+            keyer.key = key.map(Into::into);
+            let error = keyer
+                .validate_definition(&["bars", "layout:wall", "bus:program"], CANVAS.0, CANVAS.1)
+                .expect_err("reserved prefix must be refused")
+                .to_string();
+            assert!(error.contains("reserved prefix"), "{error}");
+        }
     }
 
     #[test]
