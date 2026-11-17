@@ -450,6 +450,7 @@ pub fn admit(
         let flags = KeyerFlags {
             tie: def.tie,
             pending: (def.on_at_start && def.family == KeyerFamily::Dsk).then_some(Pending {
+                defs_version: None,
                 action: PendingAction::Cut,
                 deadline: None,
                 boot: true,
@@ -612,6 +613,24 @@ pub struct Pending {
     pub deadline: Option<u64>,
     /// The op-less `on_at_start` intent (an operator command supersedes it).
     pub boot: bool,
+    /// The keyer definitions version a bound command was authorized against
+    /// (review round 2 K3-BOUND-1): when the definitions move while it is
+    /// held, it is refused (`keyer-definitions-changed`), never applied to
+    /// a re-pointed fill. `None` for an unbound (DSK) command.
+    pub defs_version: Option<u64>,
+}
+
+impl Pending {
+    /// An operator command held for a fresh fill and key, refused at
+    /// +[`TAKE_PRIME_DEADLINE_TICKS`] and bound to `defs_version`.
+    fn held(action: PendingAction, tick: Tick, defs_version: Option<u64>) -> Self {
+        Self {
+            action,
+            deadline: Some(tick.index.saturating_add(TAKE_PRIME_DEADLINE_TICKS)),
+            boot: false,
+            defs_version,
+        }
+    }
 }
 
 /// The `Copy` state of one keyer; staged per tick for reject atomicity.
@@ -1313,6 +1332,12 @@ impl KeyerRuntime {
 
     /// Complete ramps whose terminal tick is now and resolve held commands
     /// (fresh: apply; deadline: refuse). Runs before the mailbox drain.
+    ///
+    /// A held command bound to a definitions version that moved is refused
+    /// `keyer-definitions-changed` (review round 2 K3-BOUND-1). A held USK
+    /// cut that would land while a background transition is in flight is
+    /// refused `keyer-in-transition`, the admission rule (review round 2
+    /// MEDIA-2: never an abrupt overlay mid-transition; not deferred).
     pub(crate) fn tick_pending(&mut self, tick: Tick, sink: &mut OpSink<'_>) {
         for (index, entry) in self.slots.iter_mut().enumerate() {
             let Some(slot) = entry.as_mut() else {
@@ -1339,7 +1364,22 @@ impl KeyerRuntime {
             let Some(pending) = slot.flags.pending else {
                 continue;
             };
-            if live_now(&slot.def, tick) {
+            let refusal = if pending.defs_version.is_some_and(|v| v != self.def_version) {
+                Some(REFUSE_KEYER_DEFINITION_CHANGED)
+            } else if slot.def.family == KeyerFamily::Usk
+                && self.in_transition
+                && live_now(&slot.def, tick)
+            {
+                Some(REFUSE_KEYER_IN_TRANSITION)
+            } else {
+                None
+            };
+            if let Some(reason) = refusal {
+                slot.flags.pending = None;
+                if let Some(op) = slot.pending_op.take() {
+                    sink.refused(op, reason);
+                }
+            } else if live_now(&slot.def, tick) {
                 slot.flags.pending = None;
                 // A held command that lands takes the keyer out of a tied
                 // transition: the operator's verb wins.
@@ -1382,10 +1422,14 @@ impl KeyerRuntime {
 
     /// Apply one keyer verb at this tick. Never touches the background
     /// machine or the held background take (ADR-0113 §6).
+    ///
+    /// `defs_version`: the definitions version a bound command was
+    /// authorized against; a command held for a fresh fill keeps it.
     pub(crate) fn command(
         &mut self,
         keyer: u8,
         action: KeyerAction,
+        defs_version: Option<u64>,
         operation_id: String,
         tick: Tick,
         sink: &mut OpSink<'_>,
@@ -1455,11 +1499,8 @@ impl KeyerRuntime {
                     // On air or mid-ramp, the keyer already holds a pair.
                     slot.flags.on_air = true;
                 } else {
-                    slot.flags.pending = Some(Pending {
-                        action: PendingAction::Cut,
-                        deadline: Some(tick.index.saturating_add(TAKE_PRIME_DEADLINE_TICKS)),
-                        boot: false,
-                    });
+                    slot.flags.pending =
+                        Some(Pending::held(PendingAction::Cut, tick, defs_version));
                     slot.pending_op = Some(operation_id);
                     return;
                 }
@@ -1487,11 +1528,8 @@ impl KeyerRuntime {
                 }
                 let rate = rate.unwrap_or(slot.def.rate);
                 if on && !live_now(&slot.def, tick) {
-                    slot.flags.pending = Some(Pending {
-                        action: PendingAction::Auto(rate),
-                        deadline: Some(tick.index.saturating_add(TAKE_PRIME_DEADLINE_TICKS)),
-                        boot: false,
-                    });
+                    slot.flags.pending =
+                        Some(Pending::held(PendingAction::Auto(rate), tick, defs_version));
                     slot.pending_op = Some(operation_id);
                     return;
                 }

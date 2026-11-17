@@ -778,3 +778,194 @@ fn arm_is_refused_while_a_take_is_held_and_the_held_take_keeps_its_set() {
     assert!(on_air(&handle, 1), "usk1 went on");
     assert!(!on_air(&handle, 2), "usk2 never toggled");
 }
+
+/// A take bound to the arm set and definitions the caller was authorized
+/// against (as the control plane builds it).
+fn bound(
+    handle: &multiview_engine::switcher_control::SwitcherControl,
+    verb: SwitcherVerb,
+) -> SwitcherVerb {
+    SwitcherVerb::Bound(Box::new(multiview_engine::switcher_control::BoundVerb {
+        verb,
+        arm_version: Some(handle.snapshot().unwrap().arm_version),
+        defs_version: Some(handle.keyer_definitions().unwrap().version),
+    }))
+}
+
+/// Re-point USK 1 to `fill` (a `keyer_set`, built off the clock).
+fn repoint_usk1(
+    handle: &multiview_engine::switcher_control::SwitcherControl,
+    fill: &str,
+    allow_on_air: bool,
+) -> SwitcherVerb {
+    let def = handle
+        .resolve_usk(&usk("usk1", fill, 1, Some(FLY)), "me1", "main")
+        .unwrap();
+    let slot = u8::try_from(usk_slot(1).unwrap()).unwrap();
+    handle.keyer_set_verb(
+        &handle.keyer_definitions().unwrap(),
+        slot,
+        def,
+        allow_on_air,
+    )
+}
+
+/// Review round 2 (MEDIA-3 / AUTHZ-3 / K3-BOUND-1): a bound CUT or AUTO
+/// held by the fresh gate keeps the versions it was authorized against. A
+/// `keyer_set` re-pointing the armed, off-air USK while it is held (legal:
+/// the keyer is not engaged) makes the held take refuse
+/// `keyer-definitions-changed` when it would apply; it never puts the new
+/// fill on Program.
+#[test]
+fn a_held_take_is_refused_when_an_armed_key_is_redefined_while_held() {
+    use multiview_engine::keyer::REFUSE_KEYER_DEFINITION_CHANGED;
+    for take in [SwitcherVerb::Cut, SwitcherVerb::Auto(rate(4))] {
+        let rig = rig();
+        let (handle, mut hook, mut drive) = build(&rig, &[usk("usk1", "cold", 1, Some(FLY))]);
+        let mut outcomes = handle.outcomes();
+        handle
+            .try_send(cmd(
+                "set",
+                transition(serde_json::json!({"kind": "mix", "rate": 4})),
+            ))
+            .unwrap();
+        handle.try_send(cmd("arm", arm(false, &[1]))).unwrap();
+        fresh(&rig, 0);
+        step(&mut hook, &mut drive, 0);
+        handle
+            .try_send(cmd("take", bound(&handle, take.clone())))
+            .unwrap();
+        fresh(&rig, 1);
+        step(&mut hook, &mut drive, 1);
+        assert!(!on_air(&handle, 1), "held: usk1's fill is cold");
+        // Another caller re-points the off-air key to a live fill.
+        handle
+            .try_send(cmd("repoint", repoint_usk1(&handle, "gfx", false)))
+            .unwrap();
+        fresh(&rig, 2);
+        step(&mut hook, &mut drive, 2);
+        let got = drain(&mut outcomes).0;
+        assert!(
+            got.iter()
+                .any(|o| o.operation_id == "repoint" && o.completed),
+            "{got:?}"
+        );
+        for k in 3..12 {
+            fresh(&rig, k);
+            step(&mut hook, &mut drive, k);
+        }
+        let got = drain(&mut outcomes).0;
+        let outcome = got.iter().find(|o| o.operation_id == "take").unwrap();
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some(REFUSE_KEYER_DEFINITION_CHANGED),
+            "{take:?}: {got:?}"
+        );
+        assert_eq!(outcome.tick, 3);
+        assert!(!on_air(&handle, 1), "{take:?}: the new fill never went on");
+    }
+}
+
+/// Review round 2 (K3-BOUND-1): a USK `keyer_cut` held for a fresh fill
+/// keeps the definitions version it was authorized against: a `keyer_set`
+/// (`on_air = "allow"`) replacing the held keyer's definition makes the
+/// held cut refuse `keyer-definitions-changed`, never land on the new fill.
+#[test]
+fn a_held_usk_keyer_cut_is_refused_when_its_keyer_is_redefined() {
+    use multiview_engine::keyer::REFUSE_KEYER_DEFINITION_CHANGED;
+    let rig = rig();
+    let (handle, mut hook, mut drive) = build(&rig, &[usk("usk1", "cold", 1, Some(FLY))]);
+    let mut outcomes = handle.outcomes();
+    let slot = u8::try_from(usk_slot(1).unwrap()).unwrap();
+    fresh(&rig, 0);
+    step(&mut hook, &mut drive, 0);
+    handle
+        .try_send(cmd(
+            "kcut",
+            bound(
+                &handle,
+                SwitcherVerb::KeyerCut {
+                    keyer: slot,
+                    on: true,
+                },
+            ),
+        ))
+        .unwrap();
+    fresh(&rig, 1);
+    step(&mut hook, &mut drive, 1);
+    assert!(!on_air(&handle, 1), "held: the fill is cold");
+    handle
+        .try_send(cmd("repoint", repoint_usk1(&handle, "gfx", true)))
+        .unwrap();
+    fresh(&rig, 2);
+    step(&mut hook, &mut drive, 2);
+    for k in 3..8 {
+        fresh(&rig, k);
+        step(&mut hook, &mut drive, k);
+    }
+    let got = drain(&mut outcomes).0;
+    assert!(
+        got.iter()
+            .any(|o| o.operation_id == "repoint" && o.completed),
+        "{got:?}"
+    );
+    let kcut = got.iter().find(|o| o.operation_id == "kcut").unwrap();
+    assert_eq!(
+        kcut.error.as_deref(),
+        Some(REFUSE_KEYER_DEFINITION_CHANGED),
+        "{got:?}"
+    );
+    assert_eq!(kcut.tick, 3);
+    assert!(!on_air(&handle, 1));
+}
+
+/// Review round 2 (MEDIA-2): a held USK `keyer_cut` whose fill becomes
+/// fresh while a background AUTO is in flight is refused
+/// `keyer-in-transition` (the admission rule, applied when it would land),
+/// never an abrupt overlay mid-transition.
+#[test]
+fn a_held_usk_keyer_cut_never_lands_during_a_background_auto() {
+    let rig = rig();
+    let (handle, mut hook, mut drive) = build(&rig, &[usk("usk1", "cold", 1, Some(FLY))]);
+    let mut outcomes = handle.outcomes();
+    let slot = u8::try_from(usk_slot(1).unwrap()).unwrap();
+    handle
+        .try_send(cmd(
+            "set",
+            transition(serde_json::json!({"kind": "mix", "rate": 8})),
+        ))
+        .unwrap();
+    handle
+        .try_send(cmd(
+            "kcut",
+            SwitcherVerb::KeyerCut {
+                keyer: slot,
+                on: true,
+            },
+        ))
+        .unwrap();
+    fresh(&rig, 0);
+    step(&mut hook, &mut drive, 0);
+    assert!(!on_air(&handle, 1), "held: the fill is cold");
+    handle
+        .try_send(cmd("bg", SwitcherVerb::Auto(rate(8))))
+        .unwrap();
+    fresh(&rig, 1);
+    step(&mut hook, &mut drive, 1);
+    assert!(handle.snapshot().unwrap().in_flight);
+    // The fill comes up mid-AUTO.
+    for k in 2..6 {
+        fresh(&rig, k);
+        rig.publish("cold", LUMA_FILL, k);
+        step(&mut hook, &mut drive, k);
+        assert!(!on_air(&handle, 1), "tick {k}: no overlay mid-transition");
+    }
+    let got = drain(&mut outcomes).0;
+    let kcut = got.iter().find(|o| o.operation_id == "kcut").unwrap();
+    assert_eq!(
+        kcut.error.as_deref(),
+        Some(REFUSE_KEYER_IN_TRANSITION),
+        "{got:?}"
+    );
+    assert_eq!(kcut.tick, 2);
+}

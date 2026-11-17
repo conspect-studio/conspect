@@ -242,6 +242,26 @@ pub const SET_SWITCHER_GRACE_TICKS: u64 = 16;
 pub const REFUSE_SET_ARMED: &str =
     "engine-busy: a salvo is already armed on this M/E; retry when it settled";
 
+/// The arm-set and keyer-definitions versions a [`SwitcherVerb::Bound`]
+/// verb was authorized against (`None`: not bound on that axis). `Copy`, so
+/// holding it costs nothing on the clock.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Bound {
+    arm_version: Option<u64>,
+    defs_version: Option<u64>,
+}
+
+/// The single held take (a CUT/AUTO/punch/patch waiting for a fresh frame).
+/// Review round 2 (MEDIA-3, AUTHZ-3, K3-BOUND-1): it keeps the versions it
+/// was authorized against and is refused, never retargeted, when either
+/// moved before it lands.
+#[derive(Debug)]
+struct HeldTake {
+    command: SwitcherCommand,
+    deadline: u64,
+    bound: Bound,
+}
+
 /// The armed mixer half of a set (one slot, separate from the held take).
 #[derive(Debug)]
 struct ArmedSet {
@@ -413,6 +433,7 @@ impl SwitcherControl {
             primed_stores: None,
             live_stores: HashMap::new(),
             pending_take: None,
+            drain_bound: Bound::default(),
             armed: None,
             last_tick: 0,
             staged_success: Vec::with_capacity(MAX_COMMANDS_PER_TICK),
@@ -688,7 +709,10 @@ pub struct SwitcherTickDriver {
     /// taken and monitored. Consulted before the boot map: a source removed
     /// and re-added live has a NEW store here. No shared state is read.
     live_stores: HashMap<String, Arc<TileStore<Nv12Image>>>,
-    pending_take: Option<(SwitcherCommand, u64)>,
+    pending_take: Option<HeldTake>,
+    /// The versions the command being drained was bound to (review round
+    /// 2 K3-BOUND-1): a take held by the fresh gate keeps them.
+    drain_bound: Bound,
     /// The armed mixer half of an atomic set (#308), if any.
     armed: Option<ArmedSet>,
     last_tick: u64,
@@ -950,10 +974,11 @@ impl SwitcherTickDriver {
             }
             Some(false) => {
                 if !held {
-                    self.pending_take = Some((
-                        command.clone(),
-                        tick.index.saturating_add(TAKE_PRIME_DEADLINE_TICKS),
-                    ));
+                    self.pending_take = Some(HeldTake {
+                        command: command.clone(),
+                        deadline: tick.index.saturating_add(TAKE_PRIME_DEADLINE_TICKS),
+                        bound: self.drain_bound,
+                    });
                 }
                 Ok(false)
             }
@@ -1203,9 +1228,9 @@ impl SwitcherTickDriver {
         if self
             .pending_take
             .as_ref()
-            .is_some_and(|(_, deadline)| tick.index >= *deadline)
+            .is_some_and(|held| tick.index >= held.deadline)
         {
-            if let Some((command, _)) = self.pending_take.take() {
+            if let Some(HeldTake { command, .. }) = self.pending_take.take() {
                 self.publish_outcome(
                     command.operation_id,
                     tick.index,
@@ -1268,6 +1293,8 @@ impl SwitcherTickDriver {
         // Keyers: stage the Copy flags a rejected frame restores, then finish
         // ramps and resolve held keyer commands (ADR-0113 §6).
         self.keyers.begin_tick();
+        // Review round 2 (MEDIA-2): a held USK cut never lands mid-transition.
+        self.keyers.set_in_transition(self.machine.is_in_flight());
         self.keyers.tick_pending(
             tick,
             &mut OpSink {
@@ -1310,8 +1337,20 @@ impl SwitcherTickDriver {
             // is at its end value). An aborted AUTO cancelled them above.
             self.keyers.complete_tied(tick);
         }
-        if let Some((command, deadline)) = self.pending_take.take() {
-            if let SwitcherVerb::Patch(set) = &command.verb {
+        if let Some(HeldTake {
+            command,
+            deadline,
+            bound,
+        }) = self.pending_take.take()
+        {
+            if let Some(reason) = self.bound_refusal(bound) {
+                // Review round 2 (K3-BOUND-1): the arm set or a keyer
+                // definition moved while the take was held (a `keyer_set`
+                // re-pointing an armed, off-air USK is legal meanwhile): the
+                // take is refused, never applied to keys it was not
+                // authorized for.
+                self.publish_outcome(command.operation_id, tick.index, false, Some(reason.into()));
+            } else if let SwitcherVerb::Patch(set) = &command.verb {
                 // A held patch re-validates against the live table: nothing
                 // else could change it while it held the only slot.
                 match self.gate_patch(&command, set, tick, true) {
@@ -1322,7 +1361,13 @@ impl SwitcherTickDriver {
                         false,
                         Some(REFUSE_NO_FRESH_FRAME.into()),
                     ),
-                    Ok(false) => self.pending_take = Some((command, deadline)),
+                    Ok(false) => {
+                        self.pending_take = Some(HeldTake {
+                            command,
+                            deadline,
+                            bound,
+                        });
+                    }
                     Err(err) => {
                         self.publish_outcome(command.operation_id, tick.index, false, Some(err));
                     }
@@ -1347,7 +1392,11 @@ impl SwitcherTickDriver {
                     Some(REFUSE_NO_FRESH_FRAME.into()),
                 );
             } else {
-                self.pending_take = Some((command, deadline));
+                self.pending_take = Some(HeldTake {
+                    command,
+                    deadline,
+                    bound,
+                });
             }
         }
         if projection.completed {
@@ -1362,6 +1411,7 @@ impl SwitcherTickDriver {
             };
             // Review AUTHZ-1/-2: a bound verb is applied only against the
             // arm set and keyer definitions it was authorized for.
+            self.drain_bound = Bound::default();
             let command = match command.verb {
                 SwitcherVerb::Bound(bound) => {
                     let BoundVerb {
@@ -1369,10 +1419,12 @@ impl SwitcherTickDriver {
                         arm_version,
                         defs_version,
                     } = *bound;
-                    let refusal = if arm_version.is_some_and(|v| v != self.arm_version) {
-                        Some(REFUSE_ARM_CHANGED)
-                    } else if defs_version.is_some_and(|v| v != self.keyers.def_version()) {
-                        Some(crate::keyer::REFUSE_KEYER_DEFINITION_CHANGED)
+                    let versions = Bound {
+                        arm_version,
+                        defs_version,
+                    };
+                    let refusal = if let Some(reason) = self.bound_refusal(versions) {
+                        Some(reason)
                     } else if matches!(verb, SwitcherVerb::Bound(_)) {
                         Some("invalid: a bound verb cannot be nested")
                     } else {
@@ -1387,6 +1439,8 @@ impl SwitcherTickDriver {
                         );
                         continue;
                     }
+                    // Kept by a take or keyer cut this drain holds.
+                    self.drain_bound = versions;
                     SwitcherCommand {
                         operation_id: command.operation_id,
                         scene_version: command.scene_version,
@@ -1501,6 +1555,7 @@ impl SwitcherTickDriver {
                 self.keyers.command(
                     keyer,
                     action,
+                    self.drain_bound.defs_version,
                     command.operation_id,
                     tick,
                     &mut OpSink {
@@ -1819,13 +1874,29 @@ impl SwitcherTickDriver {
         match self.take_fresh(&command.verb, tick) {
             Some(true) => self.apply_take(&command.verb, scenes, tick).map(Some),
             Some(false) => {
-                self.pending_take = Some((
-                    command.clone(),
-                    tick.index.saturating_add(TAKE_PRIME_DEADLINE_TICKS),
-                ));
+                self.pending_take = Some(HeldTake {
+                    command: command.clone(),
+                    deadline: tick.index.saturating_add(TAKE_PRIME_DEADLINE_TICKS),
+                    bound: self.drain_bound,
+                });
                 Ok(None)
             }
             None => Err("switcher source prime provider is unavailable".into()),
+        }
+    }
+
+    /// The typed refusal of a verb bound to versions that moved (review
+    /// AUTHZ-1/-2; round 2 K3-BOUND-1 for a held one): two integer compares.
+    fn bound_refusal(&self, bound: Bound) -> Option<&'static str> {
+        if bound.arm_version.is_some_and(|v| v != self.arm_version) {
+            Some(REFUSE_ARM_CHANGED)
+        } else if bound
+            .defs_version
+            .is_some_and(|v| v != self.keyers.def_version())
+        {
+            Some(crate::keyer::REFUSE_KEYER_DEFINITION_CHANGED)
+        } else {
+            None
         }
     }
 
