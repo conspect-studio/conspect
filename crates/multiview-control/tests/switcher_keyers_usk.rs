@@ -878,3 +878,76 @@ async fn usk_keyer_cut_is_authorized_on_its_sources_and_bound_to_its_definition(
     );
     assert!(!on_air(&rig, 2));
 }
+
+/// Review round 2 (IDEMP-1): a CUT/AUTO retry with the same
+/// `Idempotency-Key` answers its original 202 and operation id even after
+/// another operator armed a key the caller may not control: the implicit
+/// armed set is authorized (and bound) only for a NEW admission. The
+/// request-level checks still run first: a principal without the M/E is
+/// 403 on the same key path.
+#[tokio::test]
+async fn a_take_replay_answers_its_first_202_after_an_inaccessible_key_is_armed() {
+    let (_dir, path) = temp_boot(DOC);
+    let mut rig = build(&path, DOC);
+    let mut outcomes = rig.handle.outcomes();
+    let bg = body("arm", json!({ "background": true }));
+    assert_eq!(
+        command(&rig, ADMIN, "arm-bg", &bg).await.status(),
+        StatusCode::ACCEPTED
+    );
+    tick(&mut rig.driver, 1);
+    assert!(outcomes.try_recv().unwrap().event.completed);
+    let mut next = 2;
+    for (verb, key) in [
+        (body("cut", json!({})), "take-replay-cut"),
+        (
+            body("auto", json!({ "duration_frames": 4 })),
+            "take-replay-auto",
+        ),
+    ] {
+        let first = command(&rig, NO_USK1, key, &verb).await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED, "{verb}");
+        let op = body_json(first).await["operation_id"].clone();
+        // Let the take (an AUTO runs 4 ticks) settle before re-arming.
+        for _ in 0..6 {
+            tick(&mut rig.driver, next);
+            next += 1;
+        }
+        assert!(!rig.handle.snapshot().unwrap().in_flight);
+        // Another operator arms usk1, which NO_USK1 may not control.
+        let arm = body("arm", json!({ "background": true, "keys": ["usk1"] }));
+        assert_eq!(
+            command(&rig, ADMIN, &format!("{key}-arm"), &arm)
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        tick(&mut rig.driver, next);
+        next += 1;
+        // A new take is refused on the armed key...
+        assert_eq!(
+            command(&rig, NO_USK1, &format!("{key}-new"), &verb)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        // ...but the retry answers its original 202.
+        let replay = command(&rig, NO_USK1, key, &verb).await;
+        assert_eq!(replay.status(), StatusCode::ACCEPTED, "{verb}");
+        assert_eq!(body_json(replay).await["operation_id"], op);
+        // Request-level authorization still precedes the replay.
+        assert_eq!(
+            command(&rig, NO_ME, key, &verb).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            command(&rig, ADMIN, &format!("{key}-rearm"), &bg)
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        tick(&mut rig.driver, next);
+        next += 1;
+        while outcomes.try_recv().is_ok() {}
+    }
+}

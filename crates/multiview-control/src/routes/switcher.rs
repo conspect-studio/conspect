@@ -637,13 +637,6 @@ pub(crate) async fn submit_switcher(
         Err(response) => return Ok(*response),
     };
     let handle = engine(&state)?;
-    // Review AUTHZ-1: a take toggles the armed keys; it is authorized on
-    // them and bound to the arm set and definitions it was authorized for.
-    let bound = if matches!(kind.as_str(), "cut" | "auto") {
-        super::switcher_keyers::authorize_armed(&principal, &req.me, handle)?
-    } else {
-        None
-    };
     if req.action == "auto" && !handle.supports_auto() {
         return Err(ControlError::Validation(
             "AUTO requires a same-epoch preview compositor and admitted transition budget".into(),
@@ -655,6 +648,32 @@ pub(crate) async fn submit_switcher(
     };
     authorize_target(&principal, target.as_ref())?;
     let verb = verb(&req, &kind, target.as_ref(), transition)?;
+    // P3R2-C: authorization of every EXPLICIT request field and static
+    // validation are done; an EXISTING reservation is a replay and answers
+    // its original 202 before the transient admission checks (buses, an
+    // active take, the scene), which describe the engine now rather than the
+    // request. `peek` never reserves; a fresh key still passes every check
+    // below before `reserve`. The key is scoped per principal and path, so
+    // this never answers another principal's operation.
+    if let Some(op) = idem
+        .0
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+        .and_then(|key| state.idempotency.peek(key))
+    {
+        return Ok(accepted(&op, kind));
+    }
+    // Review AUTHZ-1: a NEW take toggles the armed keys; it is authorized
+    // on them and bound to the arm set and definitions it was authorized
+    // for. Review round 2 IDEMP-1: the armed set is engine state, not part
+    // of the request, so a replay (above) is not re-authorized against a set
+    // another operator armed since; the original op already carries the
+    // versions it was bound to.
+    let bound = if matches!(kind.as_str(), "cut" | "auto") {
+        super::switcher_keyers::authorize_armed(&principal, &req.me, handle)?
+    } else {
+        None
+    };
     let verb = match bound {
         Some((arm_version, defs_version)) => {
             SwitcherVerb::Bound(Box::new(multiview_engine::switcher_control::BoundVerb {
@@ -665,19 +684,6 @@ pub(crate) async fn submit_switcher(
         }
         None => verb,
     };
-    // P3R2-C: authorization and static validation are done; an EXISTING
-    // reservation is a replay and answers its original 202 before the
-    // transient admission checks (buses, an active take, the scene), which
-    // describe the engine now rather than the request. `peek` never reserves;
-    // a fresh key still passes every check below before `reserve`.
-    if let Some(op) = idem
-        .0
-        .as_deref()
-        .filter(|key| !key.trim().is_empty())
-        .and_then(|key| state.idempotency.peek(key))
-    {
-        return Ok(accepted(&op, kind));
-    }
     validate_buses(handle, &req, target.as_ref())?;
     let scene_version = handle
         .scene_version()
