@@ -482,7 +482,7 @@ keyers.
   band, because a DIP merge colours pixels no tile covers. Frames with no grouped tile keep the
   covered-span path unchanged.
 - **Deviation: WIPE merge and the GPU key path are not in K1.** `SceneMerge::Wipe` lands with K3 on
-  top of lane `transitions`' mask. The WGSL key path (`key_params`, binding 6) is not merged before
+  top of lane `transitions`' mask (**resolved in K3** on the CPU oracle, see "K3 as built"). The WGSL key path (`key_params`, binding 6) is not merged before
   #395. Until it is, `GpuCompositor` refuses a frame with a keyed or grouped tile with a typed
   `GpuLimit`, and `RunBackend` routes a keyed or grouped frame (an allocation-free scan, before
   any GPU work) to a **persistent** CPU reference owned by the GPU compositor, whose LUT cache and
@@ -594,7 +594,9 @@ keyers.
     WIPE behaves like a CUT at the transition end: `tie_envelope()` returns `{going_on: 0,
     going_off: 1}`, the keyer keeps its state through the flight and flips on the terminal tick
     (`keyers_dsk::a_tied_dsk_on_a_wipe_cuts_at_the_terminal_tick`). The exact WIPE envelope is K3
-    (#388).
+    (#388). **Resolved in K3:** the per-pixel envelope replaced this deviation, and the test
+    became `a_tied_dsk_on_a_wipe_follows_the_mask_and_flips_on_the_terminal_tick` (see "K3 as
+    built").
   - **Gate.** A CUT or AUTO is also gated on the fill and key of every tied keyer it would put on
     (`take_fresh`). For a new take that is every tied keyer that is off and not in its own AUTO.
     A CUT during a background AUTO completes that flight, so it waits only for the surviving
@@ -894,6 +896,7 @@ keyers.
   - The routing handle and the router get the switcher's `CleanDskGate`.
 - **Deviations and choices.**
   - **`arm` is not built.** It needs USKs (K3, #388). USK `keyer_set` fields arrive with K3.
+    (**Built in K3**, see "K3 as built".)
   - **z is fixed after definition.** The design is silent on re-ordering. Changing z would
     re-order draws mid-flight, so a `keyer_set` with a different z on an existing keyer is 422.
   - **No delete.** The design defines no verb that removes a keyer. A DSK is removed by
@@ -978,3 +981,127 @@ keyers.
 - **Concern.** The GET/events parity test drives the driver without the frame hook, so its
   `tally` is the background roles only. Keyer tally resolution is covered by the lib unit
   test on a constructed snapshot.
+
+### K3 (#388): upstream keyers, the arm set and key-changing transitions
+
+Built on K4 (`feat/keyers-k4`, PR #476). CPU oracle first: keyed and grouped frames already take
+the CPU fallback on a GPU backend (K1), and so does a complemented wipe mask (below).
+
+- **Compositor.**
+  - `SceneMerge::Wipe { mask }`: `lerp(out, in, m(x, y))` per canvas pixel with lane
+    `transitions`' `WipeMask` (no border band). `SceneMerge::apply` now takes the canvas pixel
+    and size; `merge_scenes` derives each accumulator pixel's canvas row from the band geometry.
+    A mask not valid for the canvas merges as the outgoing scene (never a poisoned pixel).
+  - `WipeMask::complement` / `complemented()`: coverage `1 − m(x, y)`, endpoints included. It is
+    the tied DSK's going-off envelope. `composite.wgsl` does not read it, so
+    `needs_cpu_keyer_path` (and `FrameJob::needs_cpu_keyer_path`) routes a frame with a
+    complemented mask to the CPU reference. **Owed to the WGSL key path (#386 branch):**
+    `SceneMerge::Wipe` in the merge register and the complement lane.
+- **Config.** `[[switcher.mix_effects.keyers]]` is `UpstreamKeyerConfig` (`deny_unknown_fields`):
+  the DSK fields minus `program`, `rate`, `tie` and `on_at_start`. `validate_keyers` (run by the
+  boot preflight `validate`) checks at most 4 per M/E, unique id and z per M/E, the DSK
+  per-field rules (through `as_definition`, labelled "upstream keyer"), and charges
+  `USK_FOLD (2) × dst/canvas + u × sources/canvas` to the **shared** `switcher.keyer_budget`.
+  The default budget is unchanged (3.0): one full-canvas keyer of either family.
+- **Runtime.** `KeyerRuntime` has `MAX_KEYERS = 6` fixed slots: DSKs at `0..2`, USKs at `2..6`
+  (USK key index `k` is slot `2 + k − 1`, the declared order). Draw order is every USK in
+  ascending z, then every DSK in ascending z. `KeyerDef::family`; a USK's object id is
+  `<me>/<id>`. `SwitcherState` keeps key states in a fixed `[bool; 4]` and the armed set in an
+  `Arc<ArmedSet>`, so the per-tick staging clone stays allocation-free; the driver mirrors the
+  runtime's USK on-air states into the machine at commit (a loss or a key cut can differ from
+  its toggle).
+- **`arm`.** `SwitcherVerb::Arm(Arc<ArmedSet>)` (built off the clock) goes through
+  `SwitcherState::arm_shared` (empty, duplicate, out-of-range and in-flight refused, fixed-array
+  scan). A key that is not a defined USK is refused `unknown-keyer`. The runtime caches the set
+  as a `Copy` `NextTake`; a rejected frame restores it with the machine.
+- **Transitions.** Armed USKs reuse the tied-DSK flight bookkeeping (`flight: Some(direction)`,
+  fixed at the AUTO start, `complete_tied` on the terminal tick or CUT, `cancel_tied` on an
+  abort, punch or reject), so **an aborted AUTO (ADR-0104 §2) restores key state** and a USK that
+  never went on releases its pair. During an AUTO an armed USK is drawn whole (weight 1) with
+  `DrawRole::In` / `Out`; every USK below the highest changing one is `Both`; the rest stay
+  `Top`. The drive turns a key-changing frame into scene groups: the Program cell is `Out` (or
+  `Both` when the background does not change or the incoming frame is not fresh), the incoming
+  background is one `In` tile at opacity 1, the WIPE border band is `Both`, and the merge is MIX
+  `p`, DIP `dip_weights` in the fill colour (linear, decoded once per colour) or WIPE `m(x, y)`.
+  A frame without a changing key keeps the single-accumulator path.
+- **Key-only transitions** (background not armed): no incoming picture, no DIP colour, a DIP
+  merges as a MIX and its keys follow `p` (`MixOverlay::envelope(false)`), the background never
+  swaps, `CompositedFrame::mix` is `None` (Program audio does not crossfade), PVW is not Program-
+  tallied, the SW2-02 terminal abort and the "same source on both buses" refusal do not apply.
+- **Tied DSK on a WIPE** (replaces the K2a deviation): `TieEnvelope::wipe` carries the mask;
+  the keyer is drawn through `m(x, y)` going on and its complement going off, at weight 1 while
+  that side is visible at all (so the tally never names an invisible keyer), and flips on the
+  terminal tick.
+- **Fresh gate.** A CUT or AUTO waits for every armed USK going on (and every tied DSK, as
+  before), then is refused at +50 ticks; a key-only take needs no fresh background; going off is
+  never gated.
+- **Verbs on a USK.** `keyer_cut` flips it outside a background transition
+  (`REFUSE_KEYER_IN_TRANSITION` during one); `keyer_auto` and `keyer_tie` are refused
+  (`REFUSE_KEYER_USK_VERB`).
+- **Tally.** A USK participant is Program-tallied only while its side is visible (not at MIX
+  `p = 0` going on, nor before a DIP's switch point); armed USKs going on are in `preview`.
+- **Clean.** USKs are part of the M/E scene, so they never take the Clean / DSK exclusion: the
+  gate's "defined" bit and the tick backstop count DSKs only (`any_dsk`).
+- **CLI boot.** `admit_keyers` resolves the M/E's USKs after the DSKs; the `keyer` demand set
+  seeds their fills and keys labelled `me1/<id>`.
+- **API.**
+  - `arm {background, keys}` on the existing plan/command routes: `Idempotency-Key`, 202 +
+    `operation_id`, outcome on `switcher.operation`. Authorization exactly as K4: `Write` role
+    on plan and command, `Control` on the M/E, `Program` scope, `Control` on every armed keyer
+    object id (`me1/<key>`, the list bounded at 5 before it is walked), then `Read` on every
+    armed key's fill and key, all before any existence answer (an unseen key is 403, a visible
+    undefined one 404). 422 for an empty, duplicate or over-long set; 409 `in-flight` during a
+    transition.
+  - `keyer_set` / `keyer_cut` take `family = "usk"` (object id `<me>/<keyer>`). A USK
+    `keyer_set` merges onto the definition, validates with the USK rules, admits its cost
+    against the shared budget, never reserves the Clean gate, refuses `rate`/`on_at_start`
+    (422 `keyer-usk`) and persists into `switcher.mix_effects[].keyers` after `applied`.
+  - `GET /api/v1/switcher/{me}`: `keyers[]` lists USK rows (`family = "usk"`, `armed`), and
+    `armed {background, keys}` lists the readable armed keys; rows, armed keys and
+    `switcher.keyer` events are filtered by keyer object id and redacted alike (tested).
+  - OpenAPI regenerated with `cargo run -p xtask -- gen-openapi` (`cargo xtask` has no alias in
+    this checkout); AsyncAPI is unchanged (`switcher.keyer` already carries the object id).
+- **Deviations and choices.**
+  - **Request field `family`.** The design note's `keyer` names a DSK; K3 adds an optional
+    `family` (`dsk` default) rather than inferring the family from the id, so a USK and a DSK
+    may share an id and every request names the object it authorizes.
+  - **USK `keyer_cut`** is allowed outside a transition (design note §8), refused during one.
+  - **A key-only CUT/AUTO** uses the existing `cut` / `auto` verbs after an `arm` without the
+    background; there is no separate key-transition verb.
+  - **WIPE envelope weight.** A tied DSK on a WIPE carries weight 1 (0 at the invisible end) and
+    the mask; the scalar envelope is a visibility flag, the pixels come from the mask.
+  - **GPU:** the WGSL path for `SceneMerge::Wipe` and the complement is owed to the #386 branch.
+- **Tests.**
+  - `multiview-compositor` `tests/keyers_wipe_merge.rs` (5): frames 0, mid, end of a WIPE with a
+    key going on against `lerp(scene_out, scene_in, m)` with each scene composed separately and
+    an independently written-out reveal; a key-only WIPE; a soft circle merge equal on the
+    oracle and 1-4 threads; the complement is `1 − m` and a foreign mask keeps the outgoing
+    scene; a tile through a complemented mask, routed to the CPU.
+  - `multiview-config`: unit tests (3: limits, uniqueness, shared budget, round trip, DSK-only
+    fields refused) and `tests/switcher_keyers.rs` (the preflight accepts USKs; budget shared).
+  - `multiview-engine` `tests/keyers_usk.rs` (10): arm validation; CUT with fly and an unarmed
+    key staying; MIX, DIP and WIPE frames 0, mid, end with a key going on, against
+    `merge(scene_out, scene_in)` composed separately; a key going off; key-only MIX, DIP (as
+    MIX) and WIPE; an unarmed USK below (`both`) and above (`top`) an armed one; an AUTO aborted
+    on a stale incoming source restores key state; the fresh gate (+50, 0 lost ticks, going off
+    never gated); USK verb refusals; USKs below DSKs. `tests/keyers_dsk.rs`: the WIPE tie test.
+  - `tests/keyers_usk_chaos.rs` (2, invariants #1/#10): 1 500 ticks with armed-key sources
+    stalling and one vanishing during AUTOs under an `arm`/AUTO/CUT flood: contiguous ticks,
+    PTS from the tick counter, 0 repeats, one outcome per op, keys dropped at the trigger;
+    6 000 ticks of key-changing MIX, DIP, WIPE-with-border and key-only AUTOs: the drive's
+    scratch, slate and DIP-fill odometers and the definition builds never move after warm-up.
+  - `multiview-control` `tests/switcher_keyers_usk.rs` (5): the `arm` BOLA matrix on plan and
+    command (M/E, program, keyer object, sources, viewer; 403 before 404; no key burned); shape
+    and `in-flight`; 202 + outcome + replay and the armed set in GET; USK `keyer_set` /
+    `keyer_cut` and persistence to the M/E; GET/events parity and redaction for scoped
+    principals.
+- **Concerns.**
+  - **No counting allocator** (as K2a: the workspace forbids `unsafe_code`); the gate is the
+    pooled odometers plus fixed arrays. `arm` allocates only off the clock (the `Arc` set) and
+    its refusals use the existing per-command outcome path.
+  - **Cost of a key-changing frame:** two extra full-band accumulators and a merge per pixel on
+    the CPU while a USK changes; the default budget (one full-canvas keyer) bounds it until the
+    mda001 run.
+  - **GPU:** a key-changing or WIPE-tied frame is composed on the CPU fallback until the WGSL
+    key path lands.
+
