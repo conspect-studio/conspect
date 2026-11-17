@@ -993,7 +993,7 @@
     info('LOAD accepted: stream', parsed.tag, mine ? '(retry ' + retryCount + ')' : '', 'title:', current.title);
     if (!mine) {
       // One GET of master.m3u8: learns the H.264 profile/level for the decode message and ends at once on a dead token.
-      var loadUs = window.performance && performance.now ? (performance.timeOrigin || 0) * 1000 + performance.now() * 1000 : null;
+      var loadUs = ladder('monoUs');      // the probe's one receiver clock (null without probe.js)
       ladder('stop');
       probe(function (status, text) {
         if (gone(status)) { endCast(status); return; }

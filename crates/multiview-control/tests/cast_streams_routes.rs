@@ -3725,3 +3725,131 @@ async fn the_ladder_runs_the_shared_token_check() {
         StatusCode::NOT_FOUND
     );
 }
+
+/// A POST to `/cast/<token>/<file>` whose body is held until `release`.
+fn held_public_post(
+    path: &str,
+    body: Vec<u8>,
+    polled: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) -> Request<Body> {
+    let stream = async_stream::stream! {
+        let _ = polled.send(());
+        let _ = release.await;
+        yield Ok::<_, std::io::Error>(body);
+    };
+    public("POST", path)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// ADR-0114 5.1, the request in flight: a report or ladder call whose body is
+/// still arriving when the token is revoked, or when the engine falls back
+/// to a feed its owner may not read, answers the generic 404 whatever the
+/// body (valid, malformed, oversized), and stores nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_body_in_flight_across_a_revoke_or_fallback_is_the_generic_404() {
+    let mut big = probe_body();
+    big["pad"] = serde_json::json!("x".repeat(2100));
+    let bodies: Vec<(&str, Vec<u8>)> = vec![
+        ("report", serde_json::to_vec(&serde_json::json!({"v": 1, "state": "playing", "transport": {"first_frame_ms": 1, "latency_method": "unavailable"}})).unwrap()),
+        ("ladder", serde_json::to_vec(&probe_body()).unwrap()),
+        ("ladder", b"[not json".to_vec()),
+        ("ladder", serde_json::to_vec(&big).unwrap()),
+        ("report", b"[not json".to_vec()),
+        ("report", big.to_string().into_bytes()),
+    ];
+    for (revoke, (file, body)) in [true, false]
+        .into_iter()
+        .flat_map(|r| bodies.clone().into_iter().map(move |b| (r, b)))
+    {
+        let rig = rig();
+        let (status, doc) = create(&rig, SCOPED, serde_json::json!({"output": "output-0"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{doc}");
+        let (token, id) = (token_of(&doc), doc["id"].as_str().unwrap().to_owned());
+        let (_, unknown_file) = fetch(&rig, &format!("/cast/{token}/nope-0.m4s")).await;
+        let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let request = held_public_post(
+            &format!("/cast/{token}/{file}"),
+            body,
+            polled_tx,
+            release_rx,
+        );
+        let router = rig.router.clone();
+        let call = tokio::spawn(async move { send(&router, request).await });
+        polled_rx.await.unwrap();
+        if revoke {
+            let r = send(
+                &rig.router,
+                delete(&format!("/api/v1/cast/streams/{id}"), SCOPED),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        } else {
+            rig.routing
+                .live
+                .lock()
+                .unwrap()
+                .outputs
+                .get_mut("cast-1")
+                .unwrap()
+                .bus = "source:secret-cam".to_owned();
+        }
+        release_tx.send(()).unwrap();
+        let response = call.await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{file} revoke={revoke}"
+        );
+        assert_eq!(
+            body_bytes(response).await,
+            unknown_file,
+            "{file} revoke={revoke}: the generic body"
+        );
+        assert_eq!(rig.state.cast_streams.servable_on("cast-1"), 0);
+    }
+}
+
+/// The preflight of a token route runs the shared check too: a dead token
+/// gets the generic 404, a live one the 204 with the methods.
+#[tokio::test]
+async fn the_preflight_runs_the_shared_token_check() {
+    let rig = rig();
+    let (_, doc) = create(&rig, OPERATOR_TOKEN, serde_json::json!({})).await;
+    let (token, id) = (token_of(&doc), doc["id"].as_str().unwrap().to_owned());
+    let preflight = |t: String, file: &'static str| {
+        public("OPTIONS", &format!("/cast/{t}/{file}"))
+            .header(header::ORIGIN, "https://cast.conspect.studio")
+            .body(Body::empty())
+            .unwrap()
+    };
+    for file in ["ladder", "report", "master.m3u8"] {
+        assert_eq!(
+            send(&rig.router, preflight(token.clone(), file))
+                .await
+                .status(),
+            StatusCode::NO_CONTENT,
+            "{file}"
+        );
+        let r = send(&rig.router, preflight("C".repeat(43), file)).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND, "{file}");
+        assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            r.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://cast.conspect.studio"
+        );
+    }
+    send(
+        &rig.router,
+        delete(&format!("/api/v1/cast/streams/{id}"), OPERATOR_TOKEN),
+    )
+    .await;
+    assert_eq!(
+        send(&rig.router, preflight(token, "ladder")).await.status(),
+        StatusCode::NOT_FOUND,
+        "revoked"
+    );
+}

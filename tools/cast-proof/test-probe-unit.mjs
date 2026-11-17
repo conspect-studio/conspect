@@ -109,9 +109,10 @@ function feed(lat, fromUs, toUs, everyUs, latencyMs, c = clock) {
 {
   const lat = new P.Latency('frame');
   lat.reset(0);
-  feed(lat, 3_000_000, 4_000_000, 33_000, 500);
-  lat.reset(4_000_000);   // the epoch stepped: samples discarded, the warm-up restarts
-  check('an epoch step discards the samples and restarts the warm-up', lat.values.length === 0 && lat.startUs === 7_000_000);
+  const w = feed(lat, 3_000_000, 9_000_000, 33_000, 500);
+  check('a window was reported before the step', w.length === 1 && lat.last !== null);
+  lat.reset(9_000_000);   // the epoch stepped: samples discarded, the warm-up restarts
+  check('an epoch step discards the samples, the last figure and restarts the warm-up', lat.values.length === 0 && lat.startUs === 12_000_000 && lat.last === null);
 }
 check('rVFC present: method frame', P.methodFor(true, true) === 'frame');
 check('no requestVideoFrameCallback: method playhead', P.methodFor(false, true) === 'playhead');
@@ -150,6 +151,19 @@ check('an unavailable method never measures', new P.Latency('unavailable').locke
   call.onload();
   const tr = Q.transport();
   check('engine clock null: method unavailable and no latency figure', tr.rung === 'hls' && tr.latency_method === 'unavailable' && tr.latency_ms === null && tr.clock_error_ms === null, JSON.stringify(tr));
+  // A usable clock, but the player gives no date-time mapping for any frame: still unavailable, no figure.
+  const xhrs2 = xhrs.length;
+  t = 2000;
+  Q.start({ base: 'https://e.example/cast/TOKEN/', master, video: () => video, playerManager: { getShakaPlayer: () => ({ getPlayheadTimeAsDate: () => null }) }, storage: null, env: { navigator: { userAgent: 'x' } } });
+  const c2 = xhrs[xhrs2];
+  c2.status = 200;
+  const t0 = c2.body.clock.t0;
+  c2.responseText = JSON.stringify({ v: 1, clock: { source: 'epoch', epoch_generation: 1, media_us: 1, wall_unix_us: 1, t1_unix_us: t0 + 1000, t2_unix_us: t0 + 1100 }, attach: { rung: 'hls' }, then: [], srt: null });
+  t = 2002; c2.onload();
+  await new Promise((r) => setTimeout(r, 350));   // the playhead sampler runs (no rVFC): frames without a mapping
+  video.currentTime = 1; await new Promise((r) => setTimeout(r, 250));
+  const tr2 = Q.transport();
+  check('a usable clock but no frame mapping: method unavailable, no figure', tr2.clock_error_ms !== null && tr2.latency_method === 'unavailable' && tr2.latency_ms === null, JSON.stringify(tr2));
   Q.stop();
   check('stop() ends the load', Q.transport() === null);
 }
@@ -158,7 +172,7 @@ check('an unavailable method never measures', new P.Latency('unavailable').locke
 {
   check('presented = total - dropped', P.presentedFrames({ totalVideoFrames: 100, droppedVideoFrames: 30 }) === 70 && P.presentedFrames(null) === null);
   let nowMs = 0; const ticks = [];
-  const W = load({ Date: { now: () => nowMs } });
+  const W = load({ performance: { timeOrigin: 0, now: () => nowMs } });
   const timers = { setInterval: (fn) => { ticks.push(fn); return 1; } };
   const video = { paused: false, readyState: 4, q: { totalVideoFrames: 0, droppedVideoFrames: 0 }, getVideoPlaybackQuality() { return this.q; } };
   const changes = [];
@@ -178,10 +192,32 @@ check('an unavailable method never measures', new P.Latency('unavailable').locke
   check('a lower value starts a new count and is not progress', wd.stalled() && changes[2] === true, JSON.stringify(changes));
   step(250, 4, 0);
   check('progress on the new count clears it', !wd.stalled() && changes[3] === false);
+  // Buffer starvation (readyState drops) while playing is a stall.
+  video.readyState = 1;
+  for (let i = 0; i < 9; i++) step(250, 4, 0);
+  check('buffer starvation (readyState < 2, not paused) is a stall', wd.stalled());
+  // Pausing clears it and never stalls.
   video.paused = true;
+  step(250, 4, 0);
+  check('pausing clears a stall', !wd.stalled() && changes[changes.length - 1] === false);
   for (let i = 0; i < 12; i++) step(250, 4, 0);
   check('a paused element is never stalled', !wd.stalled());
   wd.stop();
+  // Before the first presented frame of a load the watchdog does not fire (the first-frame deadline applies).
+  const v2 = { paused: false, readyState: 1, q: { totalVideoFrames: 0, droppedVideoFrames: 0 }, getVideoPlaybackQuality() { return this.q; } };
+  const t2 = []; const c2 = [];
+  const w2 = new W.FrameWatchdog(() => v2, (x) => c2.push(x), null, { setInterval: (fn) => { t2.push(fn); return 2; } });
+  for (let i = 0; i < 20; i++) { nowMs += 250; t2[0](); }
+  check('no stall before the first frame of the load', !w2.stalled() && c2.length === 0);
+  w2.stop();
+}
+
+// ---- one receiver clock, also without performance.timeOrigin (old Chrome)
+{
+  const Old = load({ performance: { timing: { navigationStart: 1.7e12 }, now: () => 5000 } });
+  check('without timeOrigin the clock uses navigationStart', Old.monoUs() === (1.7e12 + 5000) * 1000 && Old.originMs() === 1.7e12);
+  const None = load({});
+  check('without performance.now there is no receiver clock', None.monoUs() === null);
 }
 
 // ---- capabilities parsing and failure memory

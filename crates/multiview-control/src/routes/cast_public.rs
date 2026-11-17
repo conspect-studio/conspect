@@ -119,9 +119,18 @@ fn with_cors(mut response: Response, origin: Option<&HeaderValue>) -> Response {
 }
 
 async fn preflight(
+    State(state): State<AppState>,
     headers: HeaderMap,
     path: Result<Path<(String, String)>, PathRejection>,
 ) -> Response {
+    // The shared token check (ADR-0114 5.1) on every token route, the
+    // preflight included: a dead token gets the generic 404, never a 204.
+    let admitted = path
+        .as_ref()
+        .is_ok_and(|Path((token, _))| crate::cast_streams::reauth::admit(&state, token).is_some());
+    if !admitted {
+        return with_cors(not_found(), headers.get(header::ORIGIN));
+    }
     let post = path.is_ok_and(|Path((_, file))| file == "report" || file == "ladder");
     let methods = if post { REPORT_METHODS } else { MEDIA_METHODS };
     let mut response = StatusCode::NO_CONTENT.into_response();
@@ -257,10 +266,9 @@ async fn take_report(
     let Ok(Path((token, file))) = path else {
         return not_found();
     };
-    let admitted = crate::cast_streams::reauth::admit(state, &token);
-    if admitted.is_none() {
+    let Some(admitted) = crate::cast_streams::reauth::admit(state, &token) else {
         return not_found();
-    }
+    };
     if file == "ladder" {
         return take_ladder(state, &token, body).await;
     }
@@ -268,9 +276,14 @@ async fn take_report(
         return not_found();
     }
     let limit = crate::cast_streams::MAX_REPORT_BYTES;
-    let bytes: Bytes = match axum::body::to_bytes(body, limit).await {
-        Ok(bytes) => bytes,
-        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    let read = axum::body::to_bytes(body, limit).await;
+    // The body was awaited: admit again before any answer that depends on it
+    // (a revoke, an expiry or a fallback may have landed meanwhile).
+    if !readmitted(state, &token, &admitted) {
+        return not_found();
+    }
+    let Ok(bytes) = read else {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
     let value: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(value @ serde_json::Value::Object(_)) => value,
@@ -281,6 +294,14 @@ async fn take_report(
         Err(ReportError::TooSoon) => too_many(),
         Err(ReportError::Unknown) => not_found(),
     }
+}
+
+/// The shared check again after an `.await`: the same stream, on the same
+/// output, still admitted.
+fn readmitted(state: &AppState, token: &str, before: &crate::cast_streams::Admitted) -> bool {
+    crate::cast_streams::reauth::admit(state, token).is_some_and(|again| {
+        again.stream_id == before.stream_id && again.config_id == before.config_id
+    })
 }
 
 /// Microseconds since the Unix epoch on the system wall clock.
@@ -314,22 +335,21 @@ async fn take_ladder(state: &AppState, token: &str, body: Body) -> Response {
         Err(LadderError::TooSoon) => return too_many(),
         Err(LadderError::Unknown) => return not_found(),
     }
-    let bytes: Bytes = match axum::body::to_bytes(body, MAX_LADDER_BYTES).await {
-        Ok(bytes) => bytes,
-        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    let read = axum::body::to_bytes(body, MAX_LADDER_BYTES).await;
+    // The body was awaited: admit again (a revoke, an expiry or a take may
+    // have landed meanwhile) BEFORE any answer that depends on the body, and
+    // answer only for the same stream on the same output.
+    if !readmitted(state, token, &admitted) {
+        return not_found();
+    }
+    let again = admitted;
+    let Ok(bytes) = read else {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
     let request: LadderRequest = match parse_request(&bytes, state.cast_streams.now_ms()) {
         Ok(request) => request,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    // The body was awaited: admit again (a revoke or a take may have landed
-    // meanwhile) and answer only for the same stream on the same output.
-    let Some(again) = crate::cast_streams::reauth::admit(state, token) else {
-        return not_found();
-    };
-    if again.stream_id != admitted.stream_id || again.config_id != admitted.config_id {
-        return not_found();
-    }
     let clock = state
         .cast_engine
         .as_ref()

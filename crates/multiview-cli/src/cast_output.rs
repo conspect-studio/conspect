@@ -725,7 +725,8 @@ pub fn clock_pair(
     epoch: &multiview_output::SharedEpoch,
     wall_now_unix_ns: i64,
 ) -> Option<multiview_control::cast_engine::CastClock> {
-    let (map, generation) = epoch.get_with_generation()?;
+    // The lock-free mirror: a client-driven read never takes the cell's lock.
+    let (map, generation) = epoch.snapshot()?;
     if !map.rate.is_valid() {
         return None;
     }

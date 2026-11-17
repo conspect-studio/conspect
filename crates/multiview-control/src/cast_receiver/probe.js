@@ -45,15 +45,30 @@
     try { console.info.apply(console, a); } catch (e) { /* console missing */ }
   }
 
-  /** Monotonic wall-like clock in microseconds (timeOrigin + now), or null without performance.now. */
+  /** The origin (ms since the Unix epoch) of performance.now(): timeOrigin, else navigationStart, else 0. */
+  function originMs(perf) {
+    perf = perf || root.performance;
+    if (!perf) { return 0; }
+    return typeof perf.timeOrigin === 'number' ? perf.timeOrigin : (perf.timing && perf.timing.navigationStart) || 0;
+  }
+  P.originMs = originMs;
+
+  /**
+   * Monotonic wall-like clock in microseconds (origin + performance.now()), or null without performance.now. Every
+   * receiver time (LOAD, ladder t0/t3, presented frames) is on this one clock.
+   */
   function monoUs(perf) {
     perf = perf || root.performance;
     if (!perf || typeof perf.now !== 'function') { return null; }
-    var origin = typeof perf.timeOrigin === 'number' ? perf.timeOrigin :
-      (perf.timing && perf.timing.navigationStart) || 0;
-    return (origin + perf.now()) * 1000;
+    return (originMs(perf) + perf.now()) * 1000;
   }
   P.monoUs = monoUs;
+
+  /** Milliseconds on a monotonic clock for deadlines (performance.now, else Date.now). */
+  function monoMs() {
+    var perf = root.performance;
+    return perf && typeof perf.now === 'function' ? perf.now() : Date.now();
+  }
 
   // ---------------------------------------------------------------- clock offset (pure)
 
@@ -106,12 +121,13 @@
   function Latency(method) {
     this.method = method;
     this.locked = method === 'unavailable';
+    this.mapped = null;    // null: no frame yet; false: the last frame had no date-time mapping
     this.reset();
-    this.last = null;
   }
   /** A new measurement start (first frame, an epoch step): the warm-up and the window restart. */
   Latency.prototype.reset = function (firstFrameUs) {
     this.startUs = typeof firstFrameUs === 'number' ? firstFrameUs + WARMUP_MS * 1000 : null;
+    this.last = null;      // a figure of the old measurement (an old epoch generation) is never reported
     this.windowStartUs = null;
     this.values = [];
     this.invalid = 0;
@@ -121,6 +137,7 @@
    * ({offset_us, error_us} or null). Returns the finished window's stats when this sample closed one.
    */
   Latency.prototype.sample = function (presentUs, frameWallUs, clock) {
+    this.mapped = typeof frameWallUs === 'number' && isFinite(frameWallUs);
     if (this.locked || this.startUs === null || presentUs < this.startUs) { return null; }
     if (this.windowStartUs === null) { this.windowStartUs = presentUs; }
     if (clock && typeof frameWallUs === 'number' && isFinite(frameWallUs)) {
@@ -175,13 +192,15 @@
     this.counter = video && typeof video.requestVideoFrameCallback === 'function' ? 'rvfc' :
       (video && typeof video.getVideoPlaybackQuality === 'function' ? 'quality' : null);
     this.isStalled = false;
-    this.lastFrameAt = Date.now();
+    this.lastFrameAt = monoMs();
     this.lastCount = -1;
     this.stopped = false;
     var handle = null;
+    this.seenFrame = false;
     function frame(nowMs, md) {
       if (self.stopped) { return; }
-      self.lastFrameAt = Date.now();
+      self.seenFrame = true;
+      self.lastFrameAt = monoMs();
       if (self.isStalled) { self.isStalled = false; onChange(false); }
       if (onFrame) { try { onFrame(nowMs, md); } catch (e) { /* never break the loop */ } }
       arm();
@@ -204,13 +223,20 @@
         else if (n !== null && n > self.lastCount) {
           var first = self.lastCount < 0;
           self.lastCount = n;
-          if (!first) { self.lastFrameAt = Date.now(); if (self.isStalled) { self.isStalled = false; onChange(false); } }
+          if (!first || n > 0) { self.seenFrame = true; self.lastFrameAt = monoMs(); if (self.isStalled) { self.isStalled = false; onChange(false); } }
         }
       }
       if (self.counter === 'rvfc' && v && (!handle || handle.v !== v)) { arm(); }   // CAF replaced the element
-      var playing = v && !v.paused && v.readyState >= 2;
-      if (!playing) { self.lastFrameAt = Date.now(); return; }
-      if (!self.isStalled && Date.now() - self.lastFrameAt >= STALL_MS) { self.isStalled = true; onChange(true); }
+      // Paused or ended is not a stall (and clears one); an element that wants to play and presents nothing for
+      // 2 s is, whatever its readyState: buffer starvation is exactly what the watchdog is for. Before the first
+      // frame of the load the attempt's first-frame deadline applies, not this.
+      var wanted = v && !v.paused && !v.ended;
+      if (!wanted || !self.seenFrame) {
+        self.lastFrameAt = monoMs();
+        if (self.isStalled) { self.isStalled = false; onChange(false); }
+        return;
+      }
+      if (!self.isStalled && monoMs() - self.lastFrameAt >= STALL_MS) { self.isStalled = true; onChange(true); }
     }, QUALITY_EVERY_MS);
   }
   /** Presented frames of a VideoPlaybackQuality: totalVideoFrames - droppedVideoFrames, or null. */
@@ -379,7 +405,8 @@
           var stepped = r.clock.add(t0, c.t1_unix_us, c.t2_unix_us, t3, c.epoch_generation);
           if (stepped) {
             info('engine epoch stepped: latency samples discarded');
-            r.latency.reset(r.firstFrameUs);
+            // The warm-up restarts now (not from the first frame, which is long past).
+            if (r.firstFrameUs !== null) { r.latency.reset(t3); }
           }
         } else if (c === null) {
           r.clock.reset();
@@ -445,8 +472,7 @@
       r.stalled = stalled;
       info(stalled ? 'no frame presented for 2 s: stalled' : 'frames presented again');
     }, hasRvfc ? function (now, md) {
-      var perf = root.performance;
-      var origin = typeof perf.timeOrigin === 'number' ? perf.timeOrigin : 0;
+      var origin = originMs();
       var shown = md && typeof md.expectedDisplayTime === 'number' ? md.expectedDisplayTime : now;
       onPresented(r, (origin + shown) * 1000, md ? md.mediaTime : NaN);
     } : null);
@@ -496,7 +522,9 @@
   P.transport = function () {
     if (!run) { return null; }
     var clock = run.clock.usable();
-    var method = clock ? run.latency.method : 'unavailable';
+    // Unavailable without a usable clock, and while the player gives no date-time mapping for the frames
+    // (wallUsForMediaTime null): a method is reported only when a figure can be produced, never a guess.
+    var method = clock && run.latency.mapped !== false ? run.latency.method : 'unavailable';
     return {
       rung: run.rung,
       first_frame_ms: run.firstFrameMs,

@@ -1762,18 +1762,19 @@ fn h_a_wedged_cast_sink_with_tracks_and_hostile_captions_costs_the_clock_nothing
     drop(release_tx);
 }
 
-/// One HTTP/1.1 request on a fresh connection; the status code (0 when the
-/// connection failed). Plain std I/O: the flood threads are not tokio.
-fn http_status(
+/// One HTTP/1.1 request on a fresh connection: the status code (0 when the
+/// connection failed) and the response body. Plain std I/O: the flood
+/// threads are not tokio.
+fn http_call(
     addr: std::net::SocketAddr,
     method: &str,
     path: &str,
     auth: Option<&str>,
     body: &str,
-) -> u16 {
+) -> (u16, String) {
     use std::io::{Read as _, Write as _};
     let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)) else {
-        return 0;
+        return (0, String::new());
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let auth = auth.map_or_else(String::new, |token| {
@@ -1784,18 +1785,16 @@ fn http_status(
         body.len()
     );
     if stream.write_all(request.as_bytes()).is_err() {
-        return 0;
+        return (0, String::new());
     }
-    let mut head = [0_u8; 12];
-    if stream.read_exact(&mut head).is_err() {
-        return 0;
-    }
-    let mut rest = Vec::new();
-    let _ = stream.read_to_end(&mut rest);
-    std::str::from_utf8(&head[9..12])
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
+    let mut answer = Vec::new();
+    let _ = stream.read_to_end(&mut answer);
+    let answer = String::from_utf8_lossy(&answer).into_owned();
+    let status = answer.get(9..12).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let body = answer
+        .split_once("\r\n\r\n")
+        .map_or_else(String::new, |(_, b)| b.to_owned());
+    (status, body)
 }
 
 /// The body of a `201` create answer: the token path.
@@ -1886,9 +1885,16 @@ fn serve_control(
 struct LadderFlood {
     /// Status code -> count, over every flood call.
     statuses: std::collections::BTreeMap<u16, u64>,
-    /// The clock pair of the first answered probe (`media_us`), when the
-    /// run had an epoch.
+    /// `200` answers.
     answered: u64,
+    /// `200` answers that carried a clock pair (`clock` not null).
+    clocked: u64,
+    /// `404` answers to the LIVE token (must stay 0: the flood never kills it).
+    live_404: u64,
+    /// Epoch publishes the writer made during the flood.
+    epoch_writes: u64,
+    /// Cast video segments published when the flood began and ended.
+    segments: (u64, u64),
 }
 
 /// (l) R3 chaos test, invariants #1 and #10 (ADR-0114 slice 2): a flood of
@@ -1915,6 +1921,30 @@ fn l_a_ladder_flood_costs_the_clock_zero_ticks_and_the_hls_output_zero_packets()
                 let path = create_stream(addr, "op.op-secret");
                 let token = path.split('/').nth(2).unwrap().to_owned();
                 let stop = Arc::new(AtomicBool::new(false));
+                // The sampler's role, at 50 Hz instead of ~1 Hz (a step every
+                // 10th publish): the cell the cast packager reads and the
+                // ladder's clock pair reads is written throughout the flood.
+                let writer = {
+                    let (stop, epoch) = (Arc::clone(&stop), ctl.cast.epoch.clone());
+                    std::thread::spawn(move || {
+                        let mut writes = 0_u64;
+                        while !stop.load(Ordering::Acquire) {
+                            let map = multiview_core::wallclock::WallClockRef::new(
+                                1_794_705_000_000_000_000 + i64::try_from(writes).unwrap(),
+                                0,
+                                multiview_core::time::Rational::new(1_000_000_000, 1),
+                            );
+                            if writes % 10 == 9 {
+                                epoch.set_stepped(map);
+                            } else {
+                                epoch.set(map);
+                            }
+                            writes += 1;
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        writes
+                    })
+                };
                 let bodies = [
                 "{\"v\":1,\"receiver\":{\"kind\":\"web\"},\"caps\":{\"wt\":false,\"mse\":true,\"rvfc\":true,\"frames\":\"rvfc\"},\"clock\":{\"t0\":1}}".to_owned(),
                 "{\"v\":1,\"clock\":{\"t0\":1}}".to_owned(),
@@ -1922,73 +1952,116 @@ fn l_a_ladder_flood_costs_the_clock_zero_ticks_and_the_hls_output_zero_packets()
                 format!("{{\"v\":1,\"pad\":\"{}\"}}", "x".repeat(4000)),
                 "[not json".to_owned(),
             ];
+                let segments_before = ctl.cast.gate.status().video_segments;
                 let flooders: Vec<_> = (0..8)
                     .map(|i| {
                         let (stop, token, bodies) =
                             (Arc::clone(&stop), token.clone(), bodies.clone());
                         std::thread::spawn(move || {
-                            let mut statuses = std::collections::BTreeMap::<u16, u64>::new();
+                            let mut flood = LadderFlood::default();
                             let mut n = i;
                             while !stop.load(Ordering::Acquire) {
                                 n += 1;
-                                let target = if n % 7 == 0 {
-                                    "C".repeat(43)
-                                } else {
-                                    token.clone()
-                                };
-                                let status = http_status(
+                                let live = n % 7 != 0;
+                                let target = if live { token.clone() } else { "C".repeat(43) };
+                                let (status, body) = http_call(
                                     addr,
                                     "POST",
                                     &format!("/cast/{target}/ladder"),
                                     None,
                                     &bodies[n % bodies.len()],
                                 );
-                                *statuses.entry(status).or_insert(0) += 1;
+                                *flood.statuses.entry(status).or_insert(0) += 1;
+                                if status == 200 {
+                                    flood.answered += 1;
+                                    let doc: serde_json::Value =
+                                        serde_json::from_str(&body).unwrap_or_default();
+                                    if doc["clock"]["media_us"].is_i64() {
+                                        flood.clocked += 1;
+                                    }
+                                }
+                                if status == 404 && live {
+                                    flood.live_404 += 1;
+                                }
                             }
-                            statuses
+                            flood
                         })
                     })
                     .collect();
-                let progress = ctl.sample_progress(CHAOS_TICKS);
+                let progress = ctl.sample_progress(CHAOS_TICKS - 10);
+                let segments_after = ctl.cast.gate.status().video_segments;
+                let status = ctl.cast.gate.status();
                 stop.store(true, Ordering::Release);
                 let mut flood = LadderFlood::default();
                 for flooder in flooders {
-                    for (status, count) in flooder.join().unwrap() {
+                    let one = flooder.join().unwrap();
+                    for (status, count) in one.statuses {
                         *flood.statuses.entry(status).or_insert(0) += count;
                     }
+                    flood.answered += one.answered;
+                    flood.clocked += one.clocked;
+                    flood.live_404 += one.live_404;
                 }
-                flood.answered = flood.statuses.get(&200).copied().unwrap_or(0);
+                flood.epoch_writes = writer.join().unwrap();
+                flood.segments = (segments_before, segments_after);
                 let mut seen = record.lock().unwrap();
                 seen.0.progress = progress;
-                seen.0.status = Some(ctl.cast.gate.status());
+                seen.0.status = Some(status);
                 seen.1 = flood;
                 runtime.shutdown_background();
             },
         )
     });
     let (seen, flood) = std::mem::take(&mut *seen.lock().unwrap());
+    let detail = format!(
+        "statuses {:?}, answered {}, clocked {}, live 404 {}, epoch writes {}, segments {:?}, gate {:?}",
+        flood.statuses,
+        flood.answered,
+        flood.clocked,
+        flood.live_404,
+        flood.epoch_writes,
+        flood.segments,
+        seen.status
+    );
     assert_unaffected(&control, &run, &seen);
     let total: u64 = flood.statuses.values().sum();
-    assert!(total >= 200, "the flood ran: {:?}", flood.statuses);
+    assert!(total >= 200, "the flood ran: {detail}");
+    assert!(flood.answered >= 1, "some calls were answered: {detail}");
+    assert_eq!(
+        flood.clocked, flood.answered,
+        "every answer carried the clock pair of the live epoch: {detail}"
+    );
     assert!(
-        flood.answered >= 1,
-        "some calls were answered: {:?}",
-        flood.statuses
+        flood.epoch_writes >= 100,
+        "the epoch was written throughout: {detail}"
+    );
+    assert_eq!(
+        flood.live_404, 0,
+        "the live token stayed admitted: {detail}"
     );
     assert!(
         flood.statuses.get(&429).copied().unwrap_or(0) > flood.answered,
-        "the per-token rate refused most of the flood: {:?}",
-        flood.statuses
+        "the per-token rate refused most of the flood: {detail}"
     );
     assert!(
         flood.statuses.get(&404).copied().unwrap_or(0) > 0,
-        "unknown tokens: {:?}",
-        flood.statuses
+        "unknown tokens: {detail}"
     );
-    let status = seen.status.unwrap();
     assert!(
-        status.active,
-        "the cast was live during the flood: {status:?}"
+        flood.statuses.get(&400).copied().unwrap_or(0)
+            + flood.statuses.get(&413).copied().unwrap_or(0)
+            > 0
+            || flood.answered > 0,
+        "{detail}"
+    );
+    // The cast packager (which reads the same epoch cell) kept publishing.
+    assert!(
+        seen.status.as_ref().is_some_and(|s| s.active),
+        "the cast was live during the flood: {detail}"
+    );
+    assert!(
+        flood.segments.1 >= flood.segments.0 + 2,
+        "the cast packager published during the flood: {detail}"
     );
     assert!(run.cast_packets > 0, "the cast sink received packets");
 }
