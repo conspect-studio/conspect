@@ -115,6 +115,17 @@ pub enum ProbeError {
         /// `vps_max_layers_minus1 + 1` from the stream's VPS.
         layers: u8,
     },
+    /// The clip is HEVC whose decoder configuration exceeds the bounded
+    /// extradata read, so its layer count (and with it HEVC alpha) cannot be
+    /// checked. Refused rather than risk playing an alpha clip opaque
+    /// (review K6-SAFETY-1).
+    #[error(
+        "clip is HEVC with an oversized decoder configuration; its layers \
+         (HEVC alpha) cannot be checked. Transcode to ProRes 4444, QuickTime \
+         Animation (qtrle), VP9 alpha (WebM), a PNG sequence, or a single-layer \
+         HEVC/H.264 clip"
+    )]
+    HevcUncheckable,
     /// The container has no video stream.
     #[error("container has no video stream")]
     NoVideo,
@@ -204,11 +215,18 @@ pub(super) enum PixelAlpha {
 /// * [`ProbeError::HevcAlpha`] when an HEVC stream declares more than one
 ///   layer: HEVC alpha is an auxiliary layer libav decodes opaque, and the
 ///   base layer's pixel format does not reveal it.
+/// * [`ProbeError::HevcUncheckable`] when `hevc_uncheckable`: an HEVC stream
+///   whose decoder configuration exceeded the bounded read, so its layers
+///   cannot be checked.
 pub(super) fn validate_alpha(
     pix_fmt: &str,
     alpha: PixelAlpha,
     hevc_layers: Option<u8>,
+    hevc_uncheckable: bool,
 ) -> Result<bool, ProbeError> {
+    if hevc_uncheckable {
+        return Err(ProbeError::HevcUncheckable);
+    }
     if let Some(layers) = hevc_layers.filter(|layers| *layers > 1) {
         return Err(ProbeError::HevcAlpha { layers });
     }
@@ -407,15 +425,15 @@ mod tests {
     fn supported_alpha_is_accepted_and_unsupported_alpha_is_refused() {
         // K6 (#391): alpha the NV12+A decode carries is accepted and reported.
         assert_eq!(
-            validate_alpha("yuva444p10le", PixelAlpha::Supported, None),
+            validate_alpha("yuva444p10le", PixelAlpha::Supported, None, false),
             Ok(true)
         );
         assert_eq!(
-            validate_alpha("yuv420p", PixelAlpha::Opaque, None),
+            validate_alpha("yuv420p", PixelAlpha::Opaque, None, false),
             Ok(false)
         );
         // Alpha the layout map cannot carry is refused, with a remediation.
-        let error = validate_alpha("pal8", PixelAlpha::Unsupported, None)
+        let error = validate_alpha("pal8", PixelAlpha::Unsupported, None, false)
             .expect_err("unmappable alpha is refused");
         assert_eq!(
             error,
@@ -481,15 +499,21 @@ mod tests {
         // HEVC alpha's auxiliary layer decodes opaque (ADR-0058 §3): a
         // multi-layer HEVC stream is refused even though its base-layer
         // pixel format is opaque.
-        let error = validate_alpha("yuv420p", PixelAlpha::Opaque, Some(2))
+        let error = validate_alpha("yuv420p", PixelAlpha::Opaque, Some(2), false)
             .expect_err("multi-layer HEVC is refused");
         assert_eq!(error, ProbeError::HevcAlpha { layers: 2 });
         let message = error.to_string();
         assert!(message.contains("HEVC alpha decodes opaque"), "{message}");
         assert!(message.contains("ProRes 4444"), "{message}");
+        // Review K6-SAFETY-1: oversized HEVC extradata (dropped by the
+        // bounded read) cannot be checked for layers: refused, not opaque.
+        let error = validate_alpha("yuv420p", PixelAlpha::Opaque, None, true)
+            .expect_err("uncheckable HEVC is refused");
+        assert_eq!(error, ProbeError::HevcUncheckable);
+        assert!(error.to_string().contains("cannot be checked"), "{error}");
         // Ordinary single-layer HEVC plays.
         assert_eq!(
-            validate_alpha("yuv420p", PixelAlpha::Opaque, Some(1)),
+            validate_alpha("yuv420p", PixelAlpha::Opaque, Some(1), false),
             Ok(false)
         );
     }

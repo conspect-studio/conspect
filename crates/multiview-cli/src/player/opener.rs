@@ -665,8 +665,13 @@ fn open_one(
     if stop.load(Ordering::Acquire) || coordinator.is_superseded(generation) {
         return Err(OpenAbort::Abandoned);
     }
-    let has_alpha = validate_alpha(&facts.pix_fmt, facts.alpha, facts.hevc_layers)
-        .map_err(|error| failed(probe_reason(&error), error))?;
+    let has_alpha = validate_alpha(
+        &facts.pix_fmt,
+        facts.alpha,
+        facts.hevc_layers,
+        facts.hevc_uncheckable,
+    )
+    .map_err(|error| failed(probe_reason(&error), error))?;
     let cadence = validate_cadence(
         config.canvas_cadence,
         facts.avg_frame_rate,
@@ -962,6 +967,8 @@ struct VideoFacts {
     has_audio: bool,
     alpha: PixelAlpha,
     hevc_layers: Option<u8>,
+    /// HEVC whose extradata exceeded the bounded read (layers unknowable).
+    hevc_uncheckable: bool,
     pix_fmt: String,
 }
 
@@ -1007,12 +1014,17 @@ fn probe_facts(demuxer: &Demuxer) -> Result<VideoFacts, OpenAbort> {
     };
     // HEVC alpha rides an auxiliary layer the base-layer pixel format does not
     // reveal (and libav decodes opaque, ADR-0058 §3): read the VPS layer count.
-    let hevc_layers = (parameters.id() == ffmpeg::codec::Id::HEVC)
-        .then(|| {
-            let facts = multiview_ffmpeg::video_stream_facts(&parameters);
-            hevc_vps_max_layers(&facts.extradata)
-        })
-        .flatten();
+    // Review K6-SAFETY-1: oversized extradata is dropped by the bounded read
+    // (never truncated); the layers are then unknowable and the load refused.
+    let (hevc_layers, hevc_uncheckable) = if parameters.id() == ffmpeg::codec::Id::HEVC {
+        let facts = multiview_ffmpeg::video_stream_facts(&parameters);
+        (
+            hevc_vps_max_layers(&facts.extradata),
+            facts.extradata_oversize,
+        )
+    } else {
+        (None, false)
+    };
     Ok(VideoFacts {
         stream_index,
         parameters,
@@ -1026,6 +1038,7 @@ fn probe_facts(demuxer: &Demuxer) -> Result<VideoFacts, OpenAbort> {
         has_audio,
         alpha,
         hevc_layers,
+        hevc_uncheckable,
         pix_fmt,
     })
 }
@@ -1145,7 +1158,9 @@ fn probe_reason(error: &ProbeError) -> LoadFailureReason {
         ProbeError::Cadence { .. } => LoadFailureReason::WrongCadence,
         ProbeError::NoCadence => LoadFailureReason::NoCadence,
         ProbeError::Vfr { .. } => LoadFailureReason::Vfr,
-        ProbeError::Alpha { .. } | ProbeError::HevcAlpha { .. } => LoadFailureReason::Alpha,
+        ProbeError::Alpha { .. } | ProbeError::HevcAlpha { .. } | ProbeError::HevcUncheckable => {
+            LoadFailureReason::Alpha
+        }
         ProbeError::NoVideo => LoadFailureReason::NoVideoStream,
         ProbeError::UnknownLength => LoadFailureReason::UnknownLength,
         ProbeError::Window(_) => LoadFailureReason::InvalidWindow,
