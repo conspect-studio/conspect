@@ -290,3 +290,91 @@ async fn live_alias_moves_audio_with_video_and_a_kind_change_never_shares_the_pl
     );
     hub.shutdown();
 }
+
+/// Merge review (#474 x #477): a producer -> `media_player` alias transition
+/// while the hub queue is FULL keeps the replaced producer's teardown pending
+/// and retries it until the producer stops (never left to run teardown), and
+/// new aliases are admitted only under the live source cap, counting an id
+/// that is both an alias and a pending teardown once.
+#[test]
+fn a_shed_producer_to_alias_teardown_is_retried_and_aliases_respect_the_cap() {
+    let config = config();
+    let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+    let (sender, rx) = command_bus(16);
+    let registry = stop_registry();
+    let hub = LiveSourceHub::start(Arc::clone(&registry), shared_stores(HashMap::new()));
+    let fault = multiview_cli::live_sources::SubmitFault::default();
+    let (mut drive, player) = drive(&config);
+    let boot = multiview_cli::control::CommandDrain::new(rx, config.clone(), publisher)
+        .with_live_sources(hub.handle().with_fault(fault.clone()));
+    let cap = boot.applied_sources() + 2;
+    let mut drain = boot.with_source_cap(cap);
+    let submit = |drain: &mut multiview_cli::control::CommandDrain,
+                  drive: &mut CompositorDrive<Nv12Image>,
+                  source: Box<multiview_config::Source>| {
+        sender
+            .try_submit(Command::UpsertSource {
+                op: OperationId::new(),
+                source,
+            })
+            .unwrap();
+        drain.apply(drive);
+    };
+    let running = |id: &str| registry.lock().unwrap().get(id).cloned();
+    let wait = |mut f: Box<dyn FnMut() -> bool>| {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < end {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        f()
+    };
+
+    // A hub-known bars producer under `p`.
+    submit(
+        &mut drain,
+        &mut drive,
+        Box::new(serde_json::from_value(serde_json::json!({"id": "p", "kind": "bars"})).unwrap()),
+    );
+    assert!(
+        wait(Box::new(|| running("p").is_some())),
+        "producer running"
+    );
+    let producer = running("p").unwrap();
+
+    // The queue fills; `p` becomes an alias of vt-1. Its teardown is shed.
+    fault.full();
+    submit(&mut drain, &mut drive, alias("p", "vt-1"));
+    assert!(
+        Arc::ptr_eq(drive.store("p").unwrap(), &player),
+        "alias bound"
+    );
+    assert_eq!(drain.pending_teardowns(), 1, "the shed teardown is kept");
+    assert!(!producer.stop_requested(), "still pending while full");
+
+    // Cap: `p` (alias + pending teardown) counts once, so one more alias fits
+    // and the next is held.
+    submit(&mut drain, &mut drive, alias("q", "vt-1"));
+    assert!(drive.store("q").is_some(), "q admitted under the cap");
+    submit(&mut drain, &mut drive, alias("r", "vt-1"));
+    assert!(drive.store("r").is_none(), "r held at the cap");
+    assert_eq!(drain.applied_sources(), cap);
+
+    // The queue recovers: the retried teardown stops the old producer.
+    fault.clear();
+    drain.apply(&mut drive);
+    assert_eq!(drain.pending_teardowns(), 0, "teardown reached the hub");
+    assert!(
+        wait(Box::new(
+            || producer.stop_requested() && running("p").is_none()
+        )),
+        "the replaced producer stopped"
+    );
+    assert!(
+        Arc::ptr_eq(drive.store("p").unwrap(), &player),
+        "alias kept"
+    );
+    hub.shutdown();
+}

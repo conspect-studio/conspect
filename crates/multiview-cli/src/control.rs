@@ -3375,12 +3375,13 @@ impl CommandDrain {
             s.id == id && !matches!(s.kind, multiview_config::SourceKind::MediaPlayer { .. })
         });
         let is_player_id = self.config.media_players.iter().any(|p| p.id == id);
+        // A NEW id is admitted under the same live source cap as a producer
+        // (review #477): an alias holds a drive binding and an audio alias.
+        if self.over_source_cap(&id) {
+            return;
+        }
         if replaced_producer && !is_player_id {
-            if let Some(seam) = &self.live_sources {
-                if seam.request_teardown(&id) != crate::live_sources::HubSubmit::Accepted {
-                    tracing::warn!(source = %id, "previous producer teardown shed; it stops at run teardown");
-                }
-            }
+            self.teardown_replaced_producer(&id);
         }
         // A repoint (alias A -> B) replaces this id's entry with B's store; the
         // previous player's own entry is never touched.
@@ -3415,6 +3416,39 @@ impl CommandDrain {
         }
         self.applied_media.insert(id.clone(), source.clone());
         self.unapplied.remove(&id);
+    }
+
+    /// Stop the producer a `media_player` alias replaces under `id`, through
+    /// the same bounded bookkeeping as [`Self::remove_source`] (review #477):
+    /// a shed (`Full`) teardown of a hub-known producer is kept in
+    /// `pending_teardowns` and retried one per tick, never dropped. While
+    /// the retry is pending the id is both an alias and a pending teardown;
+    /// [`Self::over_source_cap`] counts it once.
+    fn teardown_replaced_producer(&mut self, id: &str) {
+        let Some(seam) = self.live_sources.clone() else {
+            return;
+        };
+        match seam.request_teardown(id) {
+            crate::live_sources::HubSubmit::Accepted => {
+                self.pending_teardowns.remove(id);
+            }
+            crate::live_sources::HubSubmit::Full => {
+                tracing::warn!(
+                    source = %id,
+                    "live-source hub queue full; the replaced producer's teardown is \
+                     retried each tick"
+                );
+                if self.applied_media.contains_key(id) {
+                    self.pending_teardowns.insert(id.to_owned());
+                }
+            }
+            crate::live_sources::HubSubmit::Gone => {
+                tracing::warn!(
+                    source = %id,
+                    "live-source hub gone; the replaced producer stops at run teardown"
+                );
+            }
+        }
     }
 
     /// An upsert that changes only presentation or standing policy
@@ -3581,7 +3615,14 @@ impl CommandDrain {
     /// Held like a shed submit: re-apply once the hub has caught up.
     fn over_source_cap(&mut self, id: &str) -> bool {
         let known = self.applied_media.contains_key(id) || self.pending_teardowns.contains(id);
-        if known || self.applied_media.len() + self.pending_teardowns.len() < self.source_cap {
+        // Distinct ids: a `media_player` alias whose replaced producer's
+        // teardown is still pending is one id, counted once.
+        let pending_only = self
+            .pending_teardowns
+            .iter()
+            .filter(|p| !self.applied_media.contains_key(p.as_str()))
+            .count();
+        if known || self.applied_media.len() + pending_only < self.source_cap {
             return false;
         }
         tracing::warn!(
