@@ -5372,6 +5372,192 @@
         }
       }
     },
+    "/api/v1/integrations/windy": {
+      "get": {
+        "tags": [
+          "integrations"
+        ],
+        "operationId": "get_windy_account",
+        "responses": {
+          "200": {
+            "description": "Secret-free Windy account status (credential is write-only).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WindyAccountView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Admin role and an unscoped key are required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Account store not configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "integrations"
+        ],
+        "operationId": "set_windy_account",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WindyAccountBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Stored encrypted; Premium resets until the next passing login check.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WindyAccountView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Admin role and an unscoped key are required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Account store not configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid email or password.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "integrations"
+        ],
+        "operationId": "clear_windy_account",
+        "responses": {
+          "200": {
+            "description": "Credential removed; Premium disabled.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WindyAccountView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Admin role and an unscoped key are required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Account store not configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/integrations/windy/verify": {
+      "post": {
+        "tags": [
+          "integrations"
+        ],
+        "operationId": "verify_windy_account",
+        "responses": {
+          "200": {
+            "description": "Bounded login check ran; `result` is premium, rejected (wrong email/password), not_premium or unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WindyVerifyResult"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Admin role and an unscoped key are required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "No account set, store not configured, or a check is already running.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/iptv": {
       "get": {
         "tags": [
@@ -12642,7 +12828,7 @@
             }
           },
           "409": {
-            "description": "`capacity` (keyer budget, generic for scoped callers; or a fifth stored layout as an M/E source, or a source it shows cannot be leased), `layout-changed` (the stored layout was edited or deleted while this request was in flight; retry), `on-air-protected` (a fill/key change of a keyer on air without `on_air = \"allow\"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyers-unavailable`; nothing is enqueued and every lease and key taken is released.",
+            "description": "`capacity` (keyer budget, generic for scoped callers; or a fifth stored layout as an M/E source, or a source it shows cannot be leased), `layout-changed` (the stored layout was edited or deleted while this request was in flight; retry), `on-air-protected` (a fill/key change of a keyer on air without `on_air = \"allow\"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyer-in-transition`, `in-flight` (`arm` during a transition), `keyers-unavailable`; nothing is enqueued and every lease and key taken is released.",
             "content": {
               "application/json": {
                 "schema": {
@@ -12693,7 +12879,7 @@
         },
         "responses": {
           "200": {
-            "description": "`SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`).",
+            "description": "`SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set`/`arm` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`, `keyer-in-transition` (a USK `keyer_cut` during a transition), `in-flight` (`arm` during a transition)).",
             "content": {
               "application/json": {
                 "schema": {
@@ -12703,7 +12889,7 @@
             }
           },
           "403": {
-            "description": "Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source (checked before any existence answer); a keyer verb also needs the command role (Operator), so a Viewer or ReadOnly key cannot plan one.",
+            "description": "Not authorized for the M/E, the Program scope, the keyer object id (`<program>/<id>` for a DSK, `<me>/<id>` for a USK; for `arm` every armed key) or a named fill/key source (for `arm` the fill and key of every armed key) (checked before any existence answer); a keyer verb also needs the command role (Operator), so a Viewer or ReadOnly key cannot plan one.",
             "content": {
               "application/json": {
                 "schema": {
@@ -15260,6 +15446,27 @@
         },
         "additionalProperties": false
       },
+      "ArmedView": {
+        "type": "object",
+        "description": "The next-transition set (`arm`, K3) as the caller may see it.",
+        "required": [
+          "background",
+          "keys"
+        ],
+        "properties": {
+          "background": {
+            "type": "boolean",
+            "description": "The background moves with the next transition."
+          },
+          "keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Armed upstream keyer ids the caller may read (keyer object id\n`<me>/<id>`); unreadable ones are dropped."
+          }
+        }
+      },
       "ArtifactRef": {
         "type": "object",
         "description": "Exact immutable completed capture selector; no path or owner override.",
@@ -16295,7 +16502,7 @@
       },
       "CaptureBody": {
         "type": "object",
-        "description": "One authorized, bounded public Windy view. Premium needs a configured secret resolver.",
+        "description": "One authorized, bounded Windy view. Premium needs a verified Windy account.",
         "required": [
           "fill_id",
           "view",
@@ -19427,10 +19634,25 @@
           }
         }
       },
+      "KeyerFamilyWire": {
+        "type": "string",
+        "description": "Which keyer family a request names (K3). Absent: `dsk` (K4 requests are\nunchanged).",
+        "enum": [
+          "dsk",
+          "usk"
+        ]
+      },
       "KeyerFields": {
         "type": "object",
         "description": "The keyer fields of a switcher request (flattened into it). Every field\nis optional; which ones a verb takes is checked by shape.",
         "properties": {
+          "background": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`arm` (K3): whether the background moves with the next transition."
+          },
           "clip": {
             "type": [
               "number",
@@ -19444,7 +19666,18 @@
               "string",
               "null"
             ],
-            "description": "`keyer_set`: chroma reference colour `#RRGGBB` (`type = chroma`\nonly); `\"\"` clears it."
+            "description": "`keyer_set`: chroma reference colour `#RRGGBB` (`type = chroma`\nonly); `\"\"` clears it. Downstream keyers only (`keyer-usk` on a USK)."
+          },
+          "family": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyerFamilyWire",
+                "description": "Keyer verbs: `dsk` (default) or `usk` (K3). A USK's object id is\n`<me>/<keyer>`; it takes `keyer_cut` (outside a transition) and\n`keyer_set`, and changes on air through `arm` + CUT/AUTO."
+              }
+            ]
           },
           "fill": {
             "type": [
@@ -19488,6 +19721,16 @@
               "null"
             ],
             "description": "Keyer id within the program (`dsk1`); the object id is\n`<program>/<keyer>`. Required by every keyer verb."
+          },
+          "keys": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "`arm` (K3): the upstream keyer ids (of this M/E) that toggle with the\nnext transition, at most 4, distinct."
           },
           "loss": {
             "type": [
@@ -19563,7 +19806,7 @@
               "string",
               "null"
             ],
-            "description": "`keyer_set`: `linear`, `luma` or `chroma` (K7; needs `color`, refuses\na `key` source)."
+            "description": "`keyer_set`: `linear`, `luma` or `chroma` (K7; needs `color`, refuses\na `key` source; downstream keyers only, a USK refuses it as\n`usk-chroma`)."
           },
           "z": {
             "type": [
@@ -19639,6 +19882,7 @@
         "required": [
           "id",
           "family",
+          "armed",
           "fill",
           "type",
           "on_air",
@@ -19649,9 +19893,13 @@
           "pending"
         ],
         "properties": {
+          "armed": {
+            "type": "boolean",
+            "description": "USK: armed to toggle with the next transition (K3); always `false`\nfor a DSK (its next-transition flag is `tie`)."
+          },
           "family": {
             "type": "string",
-            "description": "`dsk` (USKs arrive with K3)."
+            "description": "`dsk` or `usk` (K3)."
           },
           "fill": {
             "type": "string",
@@ -19666,7 +19914,7 @@
           },
           "id": {
             "type": "string",
-            "description": "Keyer id within the program."
+            "description": "Keyer id within the program (DSK) or the M/E (USK)."
           },
           "key": {
             "type": [
@@ -27055,7 +27303,7 @@
         "allOf": [
           {
             "$ref": "#/components/schemas/KeyerFields",
-            "description": "Downstream keyer fields (ADR-0113 §8, K4): `keyer` names the keyer\n(object id `<program>/<keyer>`); `on`, `tie` and the `keyer_set`\ndefinition fields. Fill and key name sources only (`in:<n>` is 422)."
+            "description": "Keyer fields (ADR-0113 §8, K4/K3): `keyer` names the keyer (object id\n`<program>/<keyer>`, or `<me>/<keyer>` with `family = \"usk\"`); `on`,\n`tie` and the `keyer_set` definition fields; `arm` takes `background`\nand `keys` (upstream keyer ids). Fill and key name sources only\n(`in:<n>` is 422)."
           },
           {
             "type": "object",
@@ -27067,7 +27315,7 @@
             "properties": {
               "action": {
                 "type": "string",
-                "description": "Action to classify on `/plan`, one of `select_program`, `select_preview`,\n`cut`, `auto`, `set_transition`, `keyer_cut`, `keyer_auto`, `keyer_tie`,\n`keyer_set`; the action is part of the same validated request."
+                "description": "Action to classify on `/plan`, one of `select_program`, `select_preview`,\n`cut`, `auto`, `set_transition`, `keyer_cut`, `keyer_auto`, `keyer_tie`,\n`keyer_set`, `arm`; the action is part of the same validated request."
               },
               "duration_frames": {
                 "type": [
@@ -27142,9 +27390,14 @@
           "in_flight",
           "keyers",
           "tally",
+          "armed",
           "transition"
         ],
         "properties": {
+          "armed": {
+            "$ref": "#/components/schemas/ArmedView",
+            "description": "The next-transition set (`arm`, K3): the background flag and the\narmed upstream keyer ids the caller may read."
+          },
           "in_flight": {
             "type": "boolean",
             "description": "Active AUTO status."
@@ -28983,6 +29236,94 @@
           "today"
         ]
       },
+      "WindyAccountBody": {
+        "type": "object",
+        "description": "Write-only Windy account input; never echoed, logged or audited.",
+        "required": [
+          "email",
+          "password"
+        ],
+        "properties": {
+          "email": {
+            "type": "string",
+            "description": "Windy account email."
+          },
+          "password": {
+            "type": "string",
+            "description": "Windy account password."
+          }
+        },
+        "additionalProperties": false
+      },
+      "WindyAccountView": {
+        "type": "object",
+        "description": "Secret-free Windy account status. The email and password are write-only.",
+        "required": [
+          "set",
+          "premium_available",
+          "verifying"
+        ],
+        "properties": {
+          "last_verified_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "RFC 3339 time of the last login check of the current credential."
+          },
+          "premium_available": {
+            "type": "boolean",
+            "description": "Premium capture is enabled (the current credential passed its check)."
+          },
+          "result": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WindyVerdict",
+                "description": "Verdict of the last login check of the current credential."
+              }
+            ]
+          },
+          "set": {
+            "type": "boolean",
+            "description": "A credential is stored (encrypted at rest)."
+          },
+          "verifying": {
+            "type": "boolean",
+            "description": "A login check is running."
+          }
+        }
+      },
+      "WindyVerdict": {
+        "type": "string",
+        "description": "Last Windy Premium login-check verdict.",
+        "enum": [
+          "premium",
+          "rejected",
+          "not_premium",
+          "unavailable"
+        ]
+      },
+      "WindyVerifyResult": {
+        "type": "object",
+        "description": "Result of `POST /integrations/windy/verify`.",
+        "required": [
+          "result",
+          "account"
+        ],
+        "properties": {
+          "account": {
+            "$ref": "#/components/schemas/WindyAccountView",
+            "description": "Status after the check."
+          },
+          "result": {
+            "$ref": "#/components/schemas/WindyVerdict",
+            "description": "This check's verdict."
+          }
+        }
+      },
       "WipePatternDoc": {
         "type": "string",
         "description": "`OpenAPI` mirror of [`multiview_core::switcher::WipePattern`] (ADR-0112 §3).",
@@ -29156,6 +29497,10 @@
     {
       "name": "audit",
       "description": "Read-only change audit log (who/what/when)"
+    },
+    {
+      "name": "integrations",
+      "description": "Third-party integrations: the Windy Premium capture account (admin only; credential write-only, encrypted at rest; login check)"
     },
     {
       "name": "account",

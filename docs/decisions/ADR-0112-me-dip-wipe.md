@@ -143,8 +143,9 @@ rendered transition reaches HLS/SRT/MoQ with no routing change.
      frame is fully incoming. At most three full-canvas tiles above the cell
      (outgoing cell, incoming, clip); the scratch pool is sized once for them.
      Tile order (after ADR-0113): layout cells, then the transition tiles,
-     then the stinger clip, then the downstream keyers, because the clip is
-     part of the M/E transition and a DSK sits over the M/E output; tied
+     then the upstream keyers, then the stinger clip, then the downstream
+     keyers. The clip is part of the M/E transition, so it rolls over the
+     whole M/E scene, USKs included. A DSK sits over the M/E output; tied
      DSKs ride the stinger's mix window (MIX envelope), hold their state
      through pre-roll, and land on `swap_at` with the take.
    - **Swap and end.** The take completes (Program/Preview swap, outcome

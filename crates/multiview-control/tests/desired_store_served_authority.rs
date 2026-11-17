@@ -374,7 +374,7 @@ async fn create(router: &Router, family: &Family, body: &Value) -> String {
 /// 412 and GET returns the committed body and tag, for every store-served family.
 #[tokio::test]
 async fn failed_store_write_after_commit_never_authorizes_a_stale_tag() {
-    let (_dir, _path, router, fail) = faultable().await;
+    let (_dir, _path, router, fail) = Box::pin(faultable()).await;
     member_device(&router).await;
     for family in families() {
         let old = create(&router, &family, &family.create).await;
@@ -449,7 +449,7 @@ async fn failed_store_write_after_commit_never_authorizes_a_stale_tag() {
 /// serves the identical tag.
 #[tokio::test]
 async fn recreated_identity_never_reuses_a_tag_and_keeps_it_across_restart() {
-    let (_dir, path, router, _fail) = faultable().await;
+    let (_dir, path, router, _fail) = Box::pin(faultable()).await;
     member_device(&router).await;
     for family in families() {
         let first = create(&router, &family, &family.create).await;
@@ -524,7 +524,7 @@ fn post_idem(path: &str, token: &str, key: Option<&str>) -> axum::http::Request<
 /// never updated.
 #[tokio::test]
 async fn export_and_promote_after_a_failed_store_write_carry_the_committed_body() {
-    let (_dir, path, router, fail) = faultable().await;
+    let (_dir, path, router, fail) = Box::pin(faultable()).await;
     let family = &families()[0]; // overlays — a store-served family (R3-01).
 
     // Create normally, then commit an edit whose store projection write fails.
