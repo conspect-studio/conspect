@@ -531,6 +531,65 @@ struct AuxState {
     /// tick (cleared, never shrunk): bounded by the active layout feeds.
     #[cfg(feature = "overlay")]
     pending: Vec<PendingBake>,
+    /// Per registered M/E layout key: the source ids its body binds, for
+    /// the tally (a source inside `layout:<id>` on PGM/PVW is on PGM/PVW).
+    /// Rebuilt only when the M/E set changes (a body change replaces the
+    /// set), never per tick.
+    #[cfg(feature = "overlay")]
+    me_bound: MeBound,
+}
+
+/// Per M/E layout key, the source ids its body binds.
+#[cfg(feature = "overlay")]
+type MeBound = Vec<(Arc<str>, std::collections::HashSet<String>)>;
+
+/// The aux bakes' tally (M1): a source is on Program when the consumer's
+/// snapshot names it OR names an M/E layout source whose body binds it;
+/// on Preview likewise for the PVW selection. No allocation: set lookups
+/// over at most [`multiview_engine::switcher_layouts::MAX_ME_LAYOUT_SOURCES`]
+/// keys.
+#[cfg(feature = "overlay")]
+struct MeTally<'a> {
+    signals: &'a crate::aux_overlays::AuxOverlaySignals,
+    preview: Option<&'a str>,
+    me: &'a [(Arc<str>, std::collections::HashSet<String>)],
+}
+
+#[cfg(feature = "overlay")]
+impl crate::aux_overlays::TallyLookup for MeTally<'_> {
+    fn is_program(&self, id: &str) -> bool {
+        self.signals.program.contains(id)
+            || self
+                .me
+                .iter()
+                .any(|(key, bound)| self.signals.program.contains(&**key) && bound.contains(id))
+    }
+
+    fn is_preview(&self, id: &str) -> bool {
+        self.preview == Some(id)
+            || self
+                .me
+                .iter()
+                .any(|(key, bound)| self.preview == Some(&**key) && bound.contains(id))
+    }
+}
+
+/// The wanted set (M2): the M/E layout `keys` first (so the snapshot says
+/// which layout is on Program), then each bake's bound sources (at most
+/// [`crate::aux_overlays::MAX_BAKED_CELLS`] per bake), deduplicated before
+/// the [`crate::aux_overlays::MAX_WANTED_SOURCES`] cap.
+#[cfg(feature = "overlay")]
+fn wanted_set<'a, B>(
+    keys: impl Iterator<Item = &'a str>,
+    bakes: impl Iterator<Item = B>,
+) -> std::collections::HashSet<String>
+where
+    B: Iterator<Item = &'a str>,
+{
+    crate::aux_overlays::collect_wanted(
+        keys.chain(bakes.flat_map(|b| b.take(crate::aux_overlays::MAX_BAKED_CELLS))),
+        crate::aux_overlays::MAX_WANTED_SOURCES,
+    )
 }
 
 /// One M/E layout source's compose state (#307): its canvas and, in
@@ -683,14 +742,20 @@ impl AuxState {
         let preview = inputs.preview_selection.as_ref().and_then(|s| s.load());
         let preview = preview.as_deref();
         let signals = signals.as_ref();
+        let tally = MeTally {
+            signals,
+            preview,
+            me: &self.me_bound,
+        };
+        let tally = &tally;
         let run = |item: &mut PendingBake| {
-            item.out = Some(item.bake.bake(
+            item.out = Some(item.bake.bake_with_tally(
                 &item.picture,
                 tick.pts,
                 item.canvas.cell_states(),
                 item.canvas.cell_frames(),
                 signals,
-                preview,
+                tally,
             ));
         };
         if let Some((first, rest)) = self.pending.split_first_mut() {
@@ -757,7 +822,11 @@ impl AuxState {
             // routed layouts (config caps routed layouts at the same bound)
             // plus at most MAX_ME_LAYOUT_SOURCES M/E layout sources, of at
             // most MAX_BAKED_CELLS cells each (larger layouts get no bake),
-            // and at most MAX_WANTED_SOURCES ids in total.
+            // plus the M/E layout keys while anything bakes (the tally of a
+            // source inside a layout on Program), deduplicated, capped at
+            // MAX_WANTED_SOURCES.
+            let wanted = self.per_feed.values().any(|f| f.bake.is_some())
+                || self.per_me_layout.values().any(|m| m.bake.is_some());
             let routed = self
                 .per_feed
                 .values()
@@ -768,17 +837,18 @@ impl AuxState {
                 .values()
                 .filter_map(|m| m.bake.as_ref())
                 .take(multiview_engine::switcher_layouts::MAX_ME_LAYOUT_SOURCES);
-            let sources: std::collections::HashSet<String> = routed
-                .chain(me)
-                .flat_map(|bake| {
-                    bake.bound_sources()
-                        .take(crate::aux_overlays::MAX_BAKED_CELLS)
-                })
-                .take(crate::aux_overlays::MAX_WANTED_SOURCES)
-                .map(str::to_owned)
-                .collect();
-            let wanted = self.per_feed.values().any(|f| f.bake.is_some())
-                || self.per_me_layout.values().any(|m| m.bake.is_some());
+            let keys = self
+                .me_bound
+                .iter()
+                .filter(|_| wanted)
+                .map(|(key, _)| &**key)
+                .take(multiview_engine::switcher_layouts::MAX_ME_LAYOUT_SOURCES);
+            let sources = wanted_set(
+                keys,
+                routed
+                    .chain(me)
+                    .map(crate::aux_overlays::LayoutOverlayBake::bound_sources),
+            );
             overlays.wanted_sources.store(Arc::new(sources));
             overlays.wanted.store(wanted, Ordering::Relaxed);
         }
@@ -802,16 +872,29 @@ impl AuxState {
             .as_ref()
             .is_none_or(|seen| !Arc::ptr_eq(seen, &set));
         if changed {
-            // A key that left the set with a bake changes `wanted`.
-            #[cfg(feature = "overlay")]
-            {
-                self.bakes_changed |= self.per_me_layout.iter().any(|(key, state)| {
-                    state.bake.is_some() && !set.iter().any(|entry| entry.key == *key)
-                });
-            }
             self.per_me_layout
                 .retain(|key, _| set.iter().any(|entry| entry.key == *key));
             self.me_seen = Some(Arc::clone(&set));
+            // The tally's per-key bound sources (and the keys in `wanted`);
+            // a set change (a key added or dropped, with or without a
+            // bake) recomputes `wanted` once.
+            #[cfg(feature = "overlay")]
+            {
+                self.me_bound = set
+                    .iter()
+                    .map(|entry| {
+                        let bound = entry
+                            .body
+                            .layout
+                            .cells
+                            .iter()
+                            .filter_map(|c| c.source.clone())
+                            .collect();
+                        (Arc::clone(&entry.key), bound)
+                    })
+                    .collect();
+                self.bakes_changed = true;
+            }
         }
         for entry in set.iter() {
             let layout_state = self
@@ -2291,12 +2374,16 @@ codec = "h264"
         let (tx, handle, overlays) = spawn_me_baking(&set, stores);
         tx.offer(tick(0));
         assert!(wait_for(
-            || store.sequence() == 1 && overlays.wanted_sources.load().len() == 9
+            || store.sequence() == 1 && overlays.wanted_sources.load().len() == 10
         ));
         let wanted = overlays.wanted_sources.load();
         for i in 0..9 {
             assert!(wanted.contains(&format!("s{i}")), "s{i} is wanted");
         }
+        assert!(
+            wanted.contains("layout:news"),
+            "the M/E key is wanted (its Program tally)"
+        );
         assert!(overlays.wanted.load(Ordering::Relaxed));
         // Unregistered: nothing bakes, nothing is wanted.
         set.store(Arc::new(Vec::new()));
@@ -2305,6 +2392,141 @@ codec = "h264"
             && !overlays.wanted.load(Ordering::Relaxed)));
         assert_eq!(store.sequence(), 1, "a removed key is not fed");
         assert!(!handle.failed.load(Ordering::Acquire));
+    }
+
+    /// Bake `body` once at t=0 with the aux thread's tally over `me` and
+    /// return each tile's tally by source id.
+    #[cfg(feature = "overlay")]
+    fn tallies(
+        body: &Arc<crate::aux_layout::RoutedLayout>,
+        program: &[&str],
+        preview: Option<&str>,
+        me: &MeBound,
+    ) -> HashMap<String, crate::overlays::TileTally> {
+        use crate::aux_overlays::tests as fx;
+        let (stores, _keep) = fx::stores(&[], 1920, 1080);
+        let mut canvas =
+            crate::aux_layout::LayoutCanvas::new(Arc::clone(body), fx::spec(1920, 1080)).unwrap();
+        let inputs = crate::aux_overlays::AuxOverlayInputs {
+            signals: crate::aux_overlays::signals_slot(),
+            wanted: Arc::new(AtomicBool::new(false)),
+            wanted_sources: crate::aux_overlays::wanted_sources(),
+            labels: fx::labels(),
+            watermark: None,
+            wall_clock: crate::wallclock::WallClockSource::system(),
+            canvas_color: CanvasColor::default(),
+            source_probes: Arc::default(),
+        };
+        let mut bake = crate::aux_overlays::LayoutOverlayBake::new(body, &inputs).unwrap();
+        let pts = MediaTime::from_nanos(0);
+        let picture = canvas.compose(&stores, pts).unwrap();
+        let signals = crate::aux_overlays::AuxOverlaySignals {
+            program: program.iter().map(|s| (*s).to_owned()).collect(),
+            ..Default::default()
+        };
+        let tally = MeTally {
+            signals: &signals,
+            preview,
+            me,
+        };
+        let _ = bake.bake_with_tally(
+            &picture,
+            pts,
+            canvas.cell_states(),
+            canvas.cell_frames(),
+            &signals,
+            &tally,
+        );
+        bake.last_dynamics()
+            .iter()
+            .map(|(id, d)| (id.clone(), d.tally))
+            .collect()
+    }
+
+    /// M/E key `layout:wall` binding `sources`.
+    #[cfg(feature = "overlay")]
+    fn wall_binding(sources: &[&str]) -> MeBound {
+        vec![(
+            Arc::from("layout:wall"),
+            sources.iter().map(|s| (*s).to_owned()).collect(),
+        )]
+    }
+
+    /// Review M1: a source inside an M/E layout source on PGM is on Program
+    /// (red), on PVW on Preview (green), in every bake — a routed layout or
+    /// another M/E layout showing it too; a direct selection still works and
+    /// a source the layout does not bind stays off.
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn a_source_inside_a_layout_on_a_bus_carries_that_bus_tally() {
+        use crate::overlays::TileTally;
+        let body = crate::aux_overlays::tests::newsone(
+            multiview_config::LayoutOverlays::default(),
+            1920,
+            1080,
+        );
+        // `layout:wall` binds s0 and s1 (this bake is another layout showing them).
+        let me = wall_binding(&["s0", "s1"]);
+        let on_pgm = tallies(&body, &["layout:wall"], None, &me);
+        assert_eq!(on_pgm["s0"], TileTally::Program);
+        assert_eq!(on_pgm["s1"], TileTally::Program);
+        assert_eq!(on_pgm["s2"], TileTally::Off, "not bound by the layout");
+        let on_pvw = tallies(&body, &[], Some("layout:wall"), &me);
+        assert_eq!(on_pvw["s0"], TileTally::Preview);
+        assert_eq!(on_pvw["s2"], TileTally::Off);
+        // Program wins over Preview for the same source.
+        let both = tallies(&body, &["layout:wall"], Some("s0"), &me);
+        assert_eq!(both["s0"], TileTally::Program);
+        // Direct selections, unchanged.
+        let direct = tallies(&body, &["s3"], Some("s4"), &me);
+        assert_eq!(direct["s3"], TileTally::Program);
+        assert_eq!(direct["s4"], TileTally::Preview);
+        assert_eq!(direct["s0"], TileTally::Off, "the layout is on no bus");
+    }
+
+    /// Review M2: the wanted set fits every routed and M/E bake at full
+    /// cells plus the M/E keys, and duplicates never consume the cap.
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn the_wanted_set_fits_routed_and_me_bakes_and_dedupes_before_the_cap() {
+        use crate::aux_overlays::{MAX_BAKED_CELLS, MAX_WANTED_SOURCES};
+        use multiview_engine::switcher_layouts::MAX_ME_LAYOUT_SOURCES;
+        let bakes = MAX_PARALLEL_BAKES + MAX_ME_LAYOUT_SOURCES;
+        let ids: Vec<Vec<String>> = (0..bakes)
+            .map(|b| (0..MAX_BAKED_CELLS).map(|c| format!("b{b}c{c}")).collect())
+            .collect();
+        let keys: Vec<String> = (0..MAX_ME_LAYOUT_SOURCES)
+            .map(|i| format!("layout:l{i}"))
+            .collect();
+        let set = wanted_set(
+            keys.iter().map(String::as_str),
+            ids.iter().map(|b| b.iter().map(String::as_str)),
+        );
+        assert_eq!(set.len(), bakes * MAX_BAKED_CELLS + MAX_ME_LAYOUT_SOURCES);
+        assert_eq!(set.len(), MAX_WANTED_SOURCES, "the bound is exact");
+        assert!(keys.iter().all(|k| set.contains(k)));
+        assert!(ids.iter().flatten().all(|id| set.contains(id)));
+        // Every bake binding the same source first: duplicates do not
+        // consume the cap, so the distinct ids after them still fit.
+        let dup: Vec<Vec<String>> = (0..bakes)
+            .map(|b| {
+                std::iter::repeat_n("shared".to_owned(), MAX_BAKED_CELLS / 2)
+                    .chain((0..MAX_BAKED_CELLS / 2).map(|c| format!("b{b}c{c}")))
+                    .collect()
+            })
+            .collect();
+        let set = wanted_set(
+            std::iter::empty(),
+            dup.iter().map(|b| b.iter().map(String::as_str)),
+        );
+        assert_eq!(set.len(), 1 + bakes * MAX_BAKED_CELLS / 2);
+        // A bake beyond the per-bake cell bound is truncated per bake.
+        let big: Vec<String> = (0..MAX_BAKED_CELLS * 2).map(|c| format!("x{c}")).collect();
+        let set = wanted_set(
+            std::iter::empty(),
+            std::iter::once(big.iter().map(String::as_str)),
+        );
+        assert_eq!(set.len(), MAX_BAKED_CELLS);
     }
 
     /// Cost (no timing assert): two 1+8 `NewsOne` layouts at 1920x1080 with

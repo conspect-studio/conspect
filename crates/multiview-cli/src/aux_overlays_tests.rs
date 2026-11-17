@@ -766,7 +766,8 @@ fn a_layout_over_the_cell_budget_composes_but_does_not_bake() {
     let mut bake = LayoutOverlayBake::new(&at, &inputs()).expect("64 cells: a bake");
     // An edit growing it past the budget drops the bake.
     assert!(!bake.rebuild(&over, &labels()));
-    const { assert!(MAX_WANTED_SOURCES == 8 * 64) };
+    // (8 routed + 4 M/E layout bakes) x 64 cells + the 4 M/E layout keys.
+    const { assert!(MAX_WANTED_SOURCES == (8 + 4) * 64 + 4) };
 }
 
 /// AR2-1: a source bound by two cells is observed once per tick (the
