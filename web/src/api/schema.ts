@@ -2322,9 +2322,10 @@ export interface paths {
         put?: never;
         /**
          * Plan 1..64 crosspoints: mixer inputs (path, on-air flag, refusals), the
-         *     slots of one output (§12.4 path P1/P2/P3 and cost), or an atomic set
-         *     over many destinations (#308: every member planned, `can_take` only when
-         *     all can and the set's new encoders fit the caller's caps); no change.
+         *     slots of one output (§12.4 path P0/P1/P2/P3, cost and the first
+         *     passthrough miss), or an atomic set over many destinations (#308: every
+         *     member planned, `can_take` only when all can and the set's new encoders
+         *     fit the caller's caps); no change.
          */
         post: operations["plan_patch"];
         delete?: never;
@@ -6092,6 +6093,145 @@ export interface components {
             segment_uri?: string | null;
         };
         /**
+         * @description Admission cost (ADR-0113 §9). Scoped callers see only their own delta;
+         *     the totals go to unscoped readers only (ADR-0108 decision 8).
+         */
+        KeyerCost: {
+            /**
+             * Format: double
+             * @description The keyer budget (unscoped readers only).
+             */
+            budget?: number | null;
+            /**
+             * Format: double
+             * @description The change's cost delta in canvas folds (new cost − old cost).
+             */
+            delta: number;
+            /** @description Whether it fits the remaining budget. */
+            fits: boolean;
+            /**
+             * @description Every keyer holding a reservation, by object id (unscoped readers
+             *     only).
+             */
+            holders?: string[] | null;
+            /**
+             * Format: double
+             * @description Reserved total after the change (unscoped readers only).
+             */
+            reserved?: number | null;
+        };
+        /**
+         * @description The keyer fields of a switcher request (flattened into it). Every field
+         *     is optional; which ones a verb takes is checked by shape.
+         */
+        KeyerFields: {
+            /**
+             * Format: float
+             * @description `keyer_set`: luma clip, `[0, 1]`.
+             */
+            clip?: number | null;
+            /** @description `keyer_set`: fill source id (a source; `in:<n>` is refused). */
+            fill?: string | null;
+            /** @description `keyer_set`: destination rectangle in canvas pixels. */
+            fly?: Record<string, never> | null;
+            /**
+             * Format: float
+             * @description `keyer_set`: luma gain, finite and `>= 0`.
+             */
+            gain?: number | null;
+            /** @description `keyer_set`: invert the matte. */
+            invert?: boolean | null;
+            /**
+             * @description `keyer_set`: key source id; JSON `null` keeps it, `""` clears it (a
+             *     self key).
+             */
+            key?: string | null;
+            /**
+             * @description Keyer id within the program (`dsk1`); the object id is
+             *     `<program>/<keyer>`. Required by every keyer verb.
+             */
+            keyer?: string | null;
+            /** @description `keyer_set`: `drop_to_off_air` or `hold_last_good`. */
+            loss?: string | null;
+            /** @description `keyer_set`: `stale`, `reconnecting` or `no_signal`. */
+            loss_trigger?: string | null;
+            /** @description `keyer_set`: mask in fill-source pixels. */
+            mask?: Record<string, never> | null;
+            /** @description `keyer_set`: admitted source envelope `{w, h}`. */
+            max_source?: Record<string, never> | null;
+            /** @description `keyer_cut` / `keyer_auto`: the target state. */
+            on?: boolean | null;
+            on_air?: null | components["schemas"]["KeyerOnAir"];
+            /** @description `keyer_set`: go on at boot through the fresh gate. */
+            on_at_start?: boolean | null;
+            /**
+             * Format: int32
+             * @description `keyer_set`: AUTO rate in frames, 1..=300.
+             */
+            rate?: number | null;
+            /** @description `keyer_tie`: tied to the next background take. */
+            tie?: boolean | null;
+            /** @description `keyer_set`: `linear` or `luma` (`chroma` is refused until K7). */
+            type?: string | null;
+            /**
+             * Format: int32
+             * @description `keyer_set` defining a new keyer: its z among DSKs.
+             */
+            z?: number | null;
+        };
+        /**
+         * @description `on_air` guard of `keyer_set`.
+         * @enum {string}
+         */
+        KeyerOnAir: "protect" | "allow";
+        /** @description The plan answer of a keyer verb. */
+        KeyerPlan: {
+            /** @description Whether the command can be taken now. */
+            can_take: boolean;
+            /** @description `class1`: every keyer verb lands at one tick. */
+            class: string;
+            cost?: null | components["schemas"]["KeyerCost"];
+            /** @description The keyer object id. */
+            keyer: string;
+            /** @description Whether the keyer is on air now. */
+            on_air: boolean;
+            refusal?: null | components["schemas"]["PatchRefusal"];
+        };
+        /** @description One `keyers[]` row of `GET /api/v1/switcher/{me}` (design note §8). */
+        KeyerRow: {
+            /** @description `dsk` (USKs arrive with K3). */
+            family: string;
+            /** @description Fill source id, or `"redacted"`. */
+            fill: string;
+            /** @description Destination rectangle, `null` = full canvas. */
+            fly?: Record<string, never> | null;
+            /** @description Keyer id within the program. */
+            id: string;
+            /** @description Key source id, `"redacted"`, or `null` (self key). */
+            key?: string | null;
+            /** @description `drop_to_off_air` or `hold_last_good`. */
+            loss: string;
+            /** @description Mask in fill-source pixels. */
+            mask?: Record<string, never> | null;
+            /** @description On air. */
+            on_air: boolean;
+            /** @description An operator command is held waiting for fresh sources. */
+            pending: boolean;
+            /** @description `{start_tick, rate, to_on}` while ramping; clients compute the weight. */
+            ramp?: Record<string, never> | null;
+            /**
+             * Format: int32
+             * @description AUTO rate in frames.
+             */
+            rate: number;
+            /** @description Drawing a frozen pair past its loss trigger. */
+            stale: boolean;
+            /** @description Tied to the next background take. */
+            tie: boolean;
+            /** @description `linear` or `luma`. */
+            type: string;
+        };
+        /**
          * @description `OpenAPI` mirror of [`multiview_licence::LadderState`] (the seven conditions).
          *
          *     Serde-equivalent: a unit enum rendered `snake_case`.
@@ -7338,6 +7478,50 @@ export interface components {
             target: components["schemas"]["TallyTargetDoc"];
         };
         /**
+         * @description Passthrough (P0) counters of the run (#344 D2b): keys open (no encoder
+         *     session each) and cumulative AU / repeat / drift-drop / stall / slate /
+         *     bridge counts.
+         */
+        PassthroughTotals: {
+            /**
+             * Format: int64
+             * @description Source access units passed through.
+             */
+            aus: number;
+            /**
+             * Format: int64
+             * @description Moves onto an on-demand picture bridge.
+             */
+            bridges: number;
+            /**
+             * Format: int64
+             * @description Bridges that found no encoder session (stayed on the slate).
+             */
+            bridges_refused: number;
+            /**
+             * Format: int64
+             * @description Access units dropped by drift corrections.
+             */
+            drift_drops: number;
+            /** @description Passthrough keys open. */
+            keys: number;
+            /**
+             * Format: int64
+             * @description Repeat (skip) access units emitted by drift corrections.
+             */
+            repeats: number;
+            /**
+             * Format: int64
+             * @description Ticks emitted from a format slate.
+             */
+            slate_ticks: number;
+            /**
+             * Format: int64
+             * @description Runs ended by a stall.
+             */
+            stalls: number;
+        };
+        /**
          * @description `POST /patch/take` 202 answer. The outcome arrives as `switcher.operation`
          *     (mixer inputs), `route.output` (one output) or, for a set of two or more
          *     destinations, `patch.take` (#308).
@@ -7550,7 +7734,13 @@ export interface components {
             /** @description Whether the destination input is on Program now (mixer inputs). */
             on_air: boolean;
             /**
-             * @description The path this crosspoint takes: `mixer-input`, `P1`, `P2`, `P3`
+             * @description For an output video slot fed by a source that is not P0: the first
+             *     passthrough miss (#344 D2b), e.g. `passthrough-not-supported-on-medium`
+             *     or `not-enough-history`. Never names a source.
+             */
+            passthrough?: string | null;
+            /**
+             * @description The path this crosspoint takes: `mixer-input`, `P0`, `P1`, `P2`, `P3`
              *     (§12.4), `follow` (an audio slot riding the video take) or
              *     `subtitle` (a subtitle slot's route-table re-point).
              */
@@ -8307,6 +8497,7 @@ export interface components {
             encoder_sessions?: string | null;
             /** @description Video encoders running. */
             encoders: number;
+            passthrough?: null | components["schemas"]["PassthroughTotals"];
         };
         /** @description A crosspoint plan, or an output plan when `target.kind` is `output`. */
         RoutingPlanRequestDoc: components["schemas"]["RouteTakeRequest"] | components["schemas"]["OutputRouteRequest"];
@@ -9259,20 +9450,23 @@ export interface components {
              */
             scene_version: number;
         };
+        /** @description A `SwitcherPlan` for a background verb, or a `KeyerPlan` for `keyer_cut`, `keyer_auto`, `keyer_tie` and `keyer_set`. */
+        SwitcherPlanResponseDoc: components["schemas"]["SwitcherPlan"] | components["schemas"]["KeyerPlan"];
         /**
          * @description One source-select, take or output-binding request. References are checked
          *     independently; absent references never authorize implicitly.
          */
-        SwitcherRequest: {
+        SwitcherRequest: components["schemas"]["KeyerFields"] & {
             /**
              * @description Action to classify on `/plan`, one of `select_program`, `select_preview`,
-             *     `cut`, `auto`, `set_transition`; the action is part of the same
-             *     validated request.
+             *     `cut`, `auto`, `set_transition`, `keyer_cut`, `keyer_auto`, `keyer_tie`,
+             *     `keyer_set`; the action is part of the same validated request.
              */
             action: string;
             /**
              * Format: int32
              * @description AUTO duration at the output's exact cadence; no floating milliseconds.
+             *     For `keyer_auto`, an optional rate override in 1..=300 frames.
              */
             duration_frames?: number | null;
             /**
@@ -9297,10 +9491,17 @@ export interface components {
         SwitcherStateResponse: {
             /** @description Active AUTO status. */
             in_flight: boolean;
+            /**
+             * @description Downstream keyer rows the caller may read (keyer object id), with
+             *     unreadable source ids `"redacted"`; changes only on state changes.
+             */
+            keyers: components["schemas"]["KeyerRow"][];
             /** @description Actual PVW source id. */
             preview_source: string;
             /** @description Actual PGM source id. */
             program_source: string;
+            /** @description Engine tally resolved to source ids; unreadable ids are dropped. */
+            tally: components["schemas"]["TallyView"];
             /**
              * Format: int64
              * @description Applied output tick.
@@ -9438,6 +9639,13 @@ export interface components {
             kind: "element";
             /** @description Element name. */
             name: string;
+        };
+        /** @description The engine tally resolved to source ids (unreadable ids dropped). */
+        TallyView: {
+            /** @description Sources on Preview and keys going on next. */
+            preview: string[];
+            /** @description Sources contributing to Program. */
+            program: string[];
         };
         /**
          * @description `OpenAPI` mirror of [`multiview_core::stream::TcSourceKind`].
@@ -16876,7 +17084,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description `{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, live, source: {source}|{bus}|{layout}|{redacted:true}|null, path: P1|P2|P3|null, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ], subtitle: [ { slot, format, language, name, live, source: {source}|{redacted:true}|null } ] } ] }`. Subtitle slots come from the engine's live route table when the running engine samples that slot (`live: true`), else (no run, the run ended, the output not in this run, or a slot beyond the run's table) from the accepted config (`live: false`), per slot. Video slot 0 comes from the engine's live readback (`live: true`); `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. With no readback (no running engine, routing unavailable, or the output not in this run) `live` is false and `source` and `path` are null: the live state is unknown, never reported as Program. Audio slot 0's `source` is the output's accepted audio feed (`"follow"` by default, else `"program"`, `"none"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{"redacted": true}`. */
+            /** @description `{ mixer: [ { me, inputs: [ { number, label, video: {source}|{redacted:true}|null, on_program, on_preview } ], inputs_version, tick } ], outputs: [ { output, format: {width,height,fit,…}|null, video: [ { slot: 0, live, source: {source}|{bus}|{layout}|{redacted:true}|null, path: P0|P1|P2|P3|null, passthrough: {state, reason}|null, pending: {source, held_ticks}|null, degraded } ], audio: [ { slot, track, language, source } ], subtitle: [ { slot, format, language, name, live, source: {source}|{redacted:true}|null } ] } ] }`. Subtitle slots come from the engine's live route table when the running engine samples that slot (`live: true`), else (no run, the run ended, the output not in this run, or a slot beyond the run's table) from the accepted config (`live: false`), per slot. Video slot 0 comes from the engine's live readback (`live: true`); `path` is P1 whenever an encoded bus (Program at the output's format, or a live key of its own) carries it. `path` is P0 while the output passes its source's compressed video through (#344: 0 decode, 0 encode); `passthrough` is that output's passthrough state (`metering`, `moving`, `passthrough`, `slate`, `bridging`, `returning`, `unavailable`, …) and its reason (a match-rule miss, a bridge reason, or `bridging on slate: no encoder session`), null when the output has no passthrough candidate; a reason never names a source. With no readback (no running engine, routing unavailable, or the output not in this run) `live` is false and `source` and `path` are null: the live state is unknown, never reported as Program. Audio slot 0's `source` is the output's accepted audio feed (`"follow"` by default, else `"program"`, `"none"`, `{source}` or `{tracks}`), projected and redacted exactly as `GET /routing`; audio slots i > 0 are `{track}`, fixed by config. A mixer the caller cannot read (M/E object + Program scope) is omitted, an output it does not pass the output axis for is omitted, and a feed it cannot read (a source, or a track whose route input it cannot read) is `{"redacted": true}`. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -19293,6 +19501,15 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description On a switcher run: a media edit of a source on a bus (Program, Preview, or a downstream keyer's fill/key) is refused before it is stored; the detail names every such consumer. Take it off the bus first; policy-only edits apply live (issue #464). */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
             /** @description If-Match precondition failed. */
             412: {
                 headers: {
@@ -20154,8 +20371,12 @@ export interface operations {
     submit_switcher: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Required; a replay answers the first 202. */
+                "Idempotency-Key": string;
+            };
             path: {
+                /** @description The verb; must equal `action`. */
                 kind: string;
             };
             cookie?: never;
@@ -20166,6 +20387,7 @@ export interface operations {
             };
         };
         responses: {
+            /** @description Queued; the outcome arrives as `switcher.operation` at the engine tick. Keyer verbs also emit `switcher.keyer` on a committed state change. */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -20174,6 +20396,7 @@ export interface operations {
                     "application/json": components["schemas"]["SwitcherAccepted"];
                 };
             };
+            /** @description Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source; the key is not burned. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -20182,6 +20405,16 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description `unknown-keyer`. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `capacity` (keyer budget; generic for scoped callers), `on-air-protected` (a fill/key change of a keyer on air without `on_air = "allow"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyers-unavailable`; nothing is enqueued and every lease taken is released. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -20198,6 +20431,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description `engine-busy` (the 64-slot mailbox is full; key and leases released) or `idempotency-capacity`. */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -20221,15 +20455,26 @@ export interface operations {
             };
         };
         responses: {
+            /** @description `SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`). */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["SwitcherPlan"];
+                    "application/json": components["schemas"]["SwitcherPlanResponseDoc"];
                 };
             };
+            /** @description Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source (checked before any existence answer); a keyer verb also needs the command role (Operator), so a Viewer or ReadOnly key cannot plan one. */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `unknown-keyer` (a keyer the caller may read is not defined). */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -20245,6 +20490,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description Invalid verb fields; `keyer-source-not-a-source` (a fill or key naming a mixer input `in:<n>`); `keyer-rate`. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -20266,6 +20512,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
+            /** @description Engine-owned state. `keyers[]` lists only the downstream keyer rows whose object id (`<program>/<keyer>`) the caller may read, with unreadable fill/key source ids replaced by `"redacted"`; `tally` drops unreadable ids (ADR-0113 §8). */
             200: {
                 headers: {
                     [name: string]: unknown;
