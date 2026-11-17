@@ -25,8 +25,19 @@ fn valid_header(value: &str) -> bool {
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Credential {
-    Bearer { token: String },
-    GlobalKey { email: String, key: String },
+    Bearer {
+        token: String,
+    },
+    GlobalKey {
+        email: String,
+        key: String,
+    },
+    /// Site login (e.g. the Windy Premium account). Resolved only for a trusted
+    /// producer's private stdin; never echoed by any API.
+    Password {
+        username: String,
+        password: String,
+    },
 }
 impl fmt::Debug for Credential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -64,6 +75,42 @@ impl SecretRef {
     }
 }
 
+/// Read an exactly-32-byte master key from an owner-private regular file
+/// (no symlink, no group/other bits, inode unchanged across open). Errors
+/// never carry key material or the path.
+/// # Errors
+/// Missing, loose, non-regular, swapped or wrongly sized key file.
+#[cfg(unix)]
+pub fn read_master_key_file(path: &Path) -> std::io::Result<Zeroizing<[u8; 32]>> {
+    use std::io::{Error, ErrorKind, Read};
+    use std::os::unix::fs::MetadataExt;
+    let before = fs::symlink_metadata(path)?;
+    if !before.is_file() || before.file_type().is_symlink() || before.mode() & 0o077 != 0 {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "master-key file must be a private regular file",
+        ));
+    }
+    // A swap to a symlink/other file after the check changes dev/ino below.
+    let mut file = fs::File::open(path)?;
+    let opened = file.metadata()?;
+    if opened.dev() != before.dev() || opened.ino() != before.ino() || opened.mode() & 0o077 != 0 {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "master-key file changed during open",
+        ));
+    }
+    let mut key = Zeroizing::new([0u8; 32]);
+    file.read_exact(key.as_mut())?;
+    let mut trailing = [0u8; 1];
+    if file.read(&mut trailing)? != 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "master key must contain exactly 32 bytes",
+        ));
+    }
+    Ok(key)
+}
 pub struct Vault {
     root: PathBuf,
     key: Zeroizing<[u8; 32]>,
@@ -108,6 +155,13 @@ impl Vault {
                     && email.len() <= 320
                     && valid_header(key)
                     && key.len() <= 8192
+            }
+            Credential::Password { username, password } => {
+                valid_header(username)
+                    && username.len() <= 256
+                    && !password.is_empty()
+                    && !password.contains('\0')
+                    && password.len() <= 1024
             }
         };
         if !valid {
@@ -362,6 +416,62 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+    #[test]
+    fn password_credential_roundtrips_encrypted_and_bounded() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let vault = Vault::open(dir.path(), [7; 32]).unwrap();
+        let secret = Credential::Password {
+            username: "ops@example.com".into(),
+            password: "pw-not-on-disk".into(),
+        };
+        let reference = vault.store("system", &secret).unwrap();
+        let bytes = fs::read(vault.path(&reference).unwrap()).unwrap();
+        assert!(!bytes.windows(14).any(|w| w == b"pw-not-on-disk"));
+        assert!(!bytes.windows(15).any(|w| w == b"ops@example.com"));
+        match &vault.resolve("system", &reference).unwrap() {
+            Credential::Password { username, password } => {
+                assert_eq!(username, "ops@example.com");
+                assert_eq!(password, "pw-not-on-disk");
+            }
+            _ => panic!("wrong credential kind"),
+        }
+        for (username, password) in [("", "x"), ("a@b", ""), ("bad\nname", "x"), ("a@b", "nul\0")] {
+            let bad = Credential::Password {
+                username: username.into(),
+                password: password.into(),
+            };
+            assert!(matches!(
+                vault.store("system", &bad),
+                Err(VaultError::Invalid)
+            ));
+        }
+        let long = Credential::Password {
+            username: "a@b".into(),
+            password: "p".repeat(1025),
+        };
+        assert!(vault.store("system", &long).is_err());
+    }
+    #[test]
+    fn master_key_file_must_be_private_and_exact() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        fs::write(&path, [9u8; 32]).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_master_key_file(&path).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(*read_master_key_file(&path).unwrap(), [9u8; 32]);
+        fs::write(&path, [9u8; 33]).unwrap();
+        assert!(read_master_key_file(&path).is_err());
+        fs::write(&path, [9u8; 31]).unwrap();
+        assert!(read_master_key_file(&path).is_err());
+        let link = dir.path().join("link");
+        fs::write(&path, [9u8; 32]).unwrap();
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(read_master_key_file(&link).is_err());
     }
     #[test]
     fn rejects_traversal_and_public_directory() {

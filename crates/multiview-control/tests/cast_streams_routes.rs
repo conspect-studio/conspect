@@ -4110,4 +4110,24 @@ mod moq_rung {
         assert_eq!(body["attach"]["rung"], "hls", "{body}");
         assert!(fake.admitted.lock().unwrap().is_empty());
     }
+
+    /// Lens 2 (PR 516): an engine fallback the control plane has not seen
+    /// yet is labelled in the engine range; a new attachment is never
+    /// cleared for it. The ladder then offers HLS, where every request runs
+    /// the barrier.
+    #[tokio::test]
+    async fn an_engine_minted_label_is_never_cleared_for_a_new_attachment() {
+        use multiview_control::cast_streams::identity::engine_minted;
+        let (rig, fake) = moq_rig(16);
+        let (_, token) = scoped_stream(&rig).await;
+        rig.cast.labels["cast-1"].record(
+            &Component::Audio,
+            5,
+            engine_minted(identity(&Component::Audio, "src:secret-cam")),
+        );
+        let (status, body, _) = ladder(&rig, &token, &probe_body()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["attach"], serde_json::json!({"rung": "hls"}), "{body}");
+        assert!(fake.admitted.lock().unwrap().is_empty());
+    }
 }

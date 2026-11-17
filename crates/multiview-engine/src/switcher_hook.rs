@@ -1,8 +1,8 @@
 //! Owned frame hook for a first-slice one-cell Program scene. No shared mutex
 //! crosses between the frame boundary and completion callbacks.
 use crate::clock::Tick;
-use crate::drive::{CompositedFrame, CompositorDrive, MixOverlay, TransitionStyle};
-use crate::keyer::{KeyerDraw, MAX_DSK};
+use crate::drive::{CompositedFrame, CompositorDrive, TransitionStyle};
+use crate::keyer::{KeyerDraw, MAX_KEYERS};
 use crate::runtime::FrameControl;
 use crate::switcher_control::SwitcherTickDriver;
 use crate::switcher_layouts::LayoutSources;
@@ -63,7 +63,7 @@ pub struct SwitcherFrameHook<C> {
     /// by the driver, swapped into the drive, so the previous tick's `Arc`s
     /// come back here and drop on the next resolve. No per-tick allocation:
     /// boxed once at construction to keep the hook small.
-    keyer_buf: Box<[Option<KeyerDraw>; MAX_DSK]>,
+    keyer_buf: Box<[Option<KeyerDraw>; MAX_KEYERS]>,
 }
 
 /// The compositor's mask shape for a switcher wipe pattern.
@@ -105,7 +105,7 @@ impl<C> SwitcherFrameHook<C> {
             last_bus: [None, None],
             fps_num: 0,
             fps_den: 0,
-            keyer_buf: Box::new([const { None }; MAX_DSK]),
+            keyer_buf: Box::new([const { None }; MAX_KEYERS]),
         }
     }
 
@@ -277,6 +277,9 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
             },
             _ => TransitionStyle::Mix,
         };
+        // K3: a key-only transition (background not armed) draws no
+        // incoming picture; the keys merge at the transition weight.
+        drive.set_transition_background(self.driver.next_take().background);
         if mix.is_some() && drive.transition_style() != style {
             if let Err(error) = drive.set_transition_style(style) {
                 failure = Some(error.to_string());
@@ -322,7 +325,8 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         // tied keyers follow the same envelope the transition tiles use (MIX
         // opacity, DIP weights), then one buffer swap into the drive (the
         // previous tick's `Arc`s come back and drop on the next resolve).
-        let envelope = drive.mix_overlay().map(MixOverlay::tie_envelope);
+        let background = drive.transition_background();
+        let envelope = drive.mix_overlay().map(|mix| mix.envelope(background));
         let incoming_drawn = drive.transition_incoming_drawn(tick.pts);
         self.driver
             .resolve_keyers(tick, envelope, incoming_drawn, &mut self.keyer_buf);

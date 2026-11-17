@@ -31,6 +31,7 @@
 
 use crate::blend::{LinearRgba, PremulRgba};
 use crate::error::Result;
+use crate::mask::WipeMask;
 use crate::pipeline::Nv12Image;
 use crate::range;
 
@@ -195,8 +196,8 @@ pub enum SceneMember {
 }
 
 /// How the outgoing and incoming scene accumulators are merged, per pixel, in
-/// premultiplied linear light (ADR-0113 §2). Wipe arrives with slice K3 on
-/// top of lane `transitions`' mask.
+/// premultiplied linear light (ADR-0113 §2). Wipe (slice K3) uses lane
+/// `transitions`' [`WipeMask`] at each canvas pixel.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum SceneMerge {
@@ -215,14 +216,37 @@ pub enum SceneMerge {
         /// Colour-to-incoming weight in `[0, 1]` (0 until the switch point).
         i: f32,
     },
+    /// `lerp(out, in, m(x, y))` with the WIPE mask of lane `transitions` at
+    /// canvas pixel `(x, y)` (ADR-0113 §3.2, slice K3). A mask that is not
+    /// valid for the canvas ([`WipeMask::is_valid_for`]) reads 0 everywhere:
+    /// the outgoing scene, never a poisoned pixel.
+    Wipe {
+        /// The incoming picture's mask at this step (no border band).
+        mask: WipeMask,
+    },
 }
 
 impl SceneMerge {
-    /// Merge one pixel's two scene accumulators.
+    /// Merge one pixel's two scene accumulators at canvas pixel `px` of a
+    /// `canvas_wh` canvas (only a WIPE depends on the position).
     #[must_use]
-    pub fn apply(self, out: PremulRgba, inc: PremulRgba) -> PremulRgba {
+    pub fn apply(
+        self,
+        out: PremulRgba,
+        inc: PremulRgba,
+        px: (u32, u32),
+        canvas_wh: (u32, u32),
+    ) -> PremulRgba {
         match self {
             Self::Mix { p } => lerp(out, inc, unit(p)),
+            Self::Wipe { mask } => {
+                let m = if mask.is_valid_for(canvas_wh.0, canvas_wh.1) {
+                    unit(mask.coverage(px.0, px.1))
+                } else {
+                    0.0
+                };
+                lerp(out, inc, m)
+            }
             Self::Dip { colour, d, i } => {
                 let colour = LinearRgba { a: 1.0, ..colour }.premultiplied();
                 lerp(lerp(out, colour, unit(d)), inc, unit(i))
@@ -490,7 +514,7 @@ mod tests {
             a: 1.0,
         };
         for p in [0.0, 0.3, 0.5, 1.0] {
-            let m = SceneMerge::Mix { p }.apply(x, x);
+            let m = SceneMerge::Mix { p }.apply(x, x, (0, 0), (1, 1));
             assert!((m.r - x.r).abs() < 1e-6 && (m.a - 1.0).abs() < 1e-6);
         }
     }

@@ -2745,12 +2745,23 @@ impl RenditionDispatcher {
             .get(key)
             .is_none_or(|a| a.failed || a.retired)
     }
-    /// The index of the next window not dispatched yet (`None`: finished).
-    /// Windows are dispatched in ascending index, so every window offered
-    /// from now on has at least this index (ADR-0114 decision 5.4: the cast
-    /// labels' "labelled through" mark).
-    pub(crate) fn next_window_index(&self) -> Option<i128> {
-        self.next_window
+    /// The first window output `output_index`'s binding has NOT offered to
+    /// its delivery yet: the head of its pending queue (a window held behind
+    /// an incomplete dynamic stage or a group decision), else the next
+    /// window to dispatch. Every window below it was offered (or dropped)
+    /// and every move outcome it produced is already queued (ADR-0114
+    /// decision 5.4: the cast labels' per-output "labelled through" mark).
+    pub(crate) fn undelivered_window(&self, output_index: usize) -> Option<i128> {
+        let pending = self
+            .bindings
+            .iter()
+            .find(|b| b.output_index == output_index)
+            .and_then(|b| b.pending.front().map(|e| e.index));
+        match (pending, self.next_window) {
+            (Some(p), Some(n)) => Some(p.min(n)),
+            (Some(p), None) => Some(p),
+            (None, n) => n,
+        }
     }
     pub(crate) fn video_key_count(&self) -> usize {
         self.video.len()
@@ -4861,6 +4872,45 @@ mod tests {
             key: Some(key),
             from_dts: g
         }));
+    }
+
+    #[test]
+    fn a_binding_held_behind_a_stalled_stage_reports_its_own_undelivered_window() {
+        // ADR-0114 decision 5.4 (PR 516 review, lens 1): the cast labels'
+        // "labelled through" mark is per binding. Output 1 waits behind a
+        // stalled dynamic audio stage while the base windows keep closing:
+        // its first undelivered window stays at the held one, below the
+        // global dispatch index, until that window is offered.
+        let now = Instant::now();
+        let mut d =
+            RenditionDispatcher::new(aac_cfg(vec![binding(0, 0, 1), binding(1, 0, 1)])).unwrap();
+        let mut sink = FakeDelivery::new(2);
+        let (key, key_gen) = d.add_audio_key().unwrap();
+        d.dispatch_dynamic_audio(
+            key,
+            key_gen,
+            vec![tagged(0, 2)],
+            Some(mark(tick_ns(1))),
+            false,
+            now,
+            &mut sink,
+        )
+        .unwrap();
+        d.rebind_audio(1, Some(key), 1024, None).unwrap();
+        for i in 0..4_i64 {
+            d.dispatch(ve25(i), now, &mut sink).unwrap();
+            d.dispatch(audio_event(i, 1), now, &mut sink).unwrap();
+        }
+        let delivered = |o: usize| sink.windows.iter().filter(|w| w.0 == o).count();
+        assert_eq!(delivered(0), 4);
+        let held = d.undelivered_window(1).unwrap();
+        let global = d.undelivered_window(0).unwrap();
+        assert!(held < global, "held {held}, global {global}");
+        assert_eq!(
+            usize::try_from(held).unwrap(),
+            delivered(1),
+            "the mark is exactly the first window output 1 has not been offered"
+        );
     }
 
     #[test]

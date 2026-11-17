@@ -1191,6 +1191,25 @@ const RELATIVE_SHED_SLACK: u64 = FPS;
 /// (every tick emitted, contiguous HLS video PTS, the control's HLS audio
 /// count, the clock's cadence while the fault is in place) is unchanged.
 fn assert_unaffected_relative(control: &(Run, ChaosSeen), run: &Run, seen: &ChaosSeen) {
+    let (control_run, control_seen) = control;
+    assert!(
+        control_run.hls_audio_packets > 0,
+        "the run carries program audio"
+    );
+    assert_eq!(
+        relative_violations(control, run, seen),
+        Vec::<String>::new(),
+        "{:?} (control run {:?})",
+        run.lines,
+        isolation_violations(control_run, CHAOS_TICKS, None, &control_seen.progress, 6)
+    );
+}
+
+/// The predicate of [`assert_unaffected_relative`]: the control run's own
+/// violations (shed excepted) and the chaos run's, with the shed count
+/// bounded relative to the control run. Empty when isolated. One predicate,
+/// so the negative control can prove THIS check sees a shared stall.
+fn relative_violations(control: &(Run, ChaosSeen), run: &Run, seen: &ChaosSeen) -> Vec<String> {
     let (control, control_seen) = control;
     let not_shed = |violations: Vec<String>| -> Vec<String> {
         violations
@@ -1198,39 +1217,30 @@ fn assert_unaffected_relative(control: &(Run, ChaosSeen), run: &Run, seen: &Chao
             .filter(|v| !v.starts_with("the hot queue shed"))
             .collect()
     };
-    assert_eq!(
-        not_shed(isolation_violations(
-            control,
-            CHAOS_TICKS,
-            None,
-            &control_seen.progress,
-            6
-        )),
-        Vec::<String>::new(),
-        "the control run"
-    );
-    assert!(
-        control.hls_audio_packets > 0,
-        "the run carries program audio"
-    );
-    assert_eq!(
-        not_shed(isolation_violations(
-            run,
-            CHAOS_TICKS,
-            Some(control.hls_audio_packets),
-            &seen.progress,
-            6
-        )),
-        Vec::<String>::new(),
-        "{:?}",
-        run.lines
-    );
-    assert!(
-        run.dropped <= control.dropped + RELATIVE_SHED_SLACK,
-        "the chaos run shed {} frame(s), the control run {}",
-        run.dropped,
-        control.dropped
-    );
+    let mut all: Vec<String> = not_shed(isolation_violations(
+        control,
+        CHAOS_TICKS,
+        None,
+        &control_seen.progress,
+        6,
+    ))
+    .into_iter()
+    .map(|v| format!("control: {v}"))
+    .collect();
+    all.extend(not_shed(isolation_violations(
+        run,
+        CHAOS_TICKS,
+        Some(control.hls_audio_packets),
+        &seen.progress,
+        6,
+    )));
+    if run.dropped > control.dropped + RELATIVE_SHED_SLACK {
+        all.push(format!(
+            "the chaos run shed {} frame(s), the control run {}",
+            run.dropped, control.dropped
+        ));
+    }
+    all
 }
 
 /// (e) R3 chaos test, invariants #1 and #10: a cast sink whose disk write
@@ -2336,9 +2346,26 @@ mod moq_rung {
         });
     }
 
+    /// The negative control of [`m_stalled_cast_moq_viewers_cost_the_clock_zero_ticks_and_the_hls_output_zero_packets`]:
+    /// the same relative predicate fails for a 1.2 s stall of the SHARED
+    /// consumer (PR 516 review, lens 3: one predicate for both).
+    #[test]
+    fn n_a_shared_stall_fails_the_relative_isolation_predicate() {
+        let control = chaos_run("cast_nm0", Setup::LIVE, None, None);
+        let setup = Setup {
+            consumer_stall: Some((CHAOS_AT + FPS, SHARED_STALL)),
+            keep_fatal: true,
+            ..Setup::LIVE
+        };
+        let (run, seen) = chaos_run("cast_nm1", setup, None, None);
+        let violations = relative_violations(&control, &run, &seen);
+        assert!(!violations.is_empty(), "a shared stall must be detected");
+    }
+
     /// R3 chaos, invariants #1 and #10 (ADR-0114 decision 6, "Long-run and
     /// stalled-consumer proof", engine rows): cast `MoQ` attachments that never
-    /// read (stalled), and one whose transport is wedged, on the real
+    /// read (stalled), one whose transport closer panics and one whose closer
+    /// wedges, fenced while the clock runs, on the real
     /// pipeline, cost the clock zero ticks and the HLS binding zero packets
     /// against the control run; the registry's subscription cap holds and
     /// the next attachment is refused; retained bytes stay within the
@@ -2398,7 +2425,28 @@ mod moq_rung {
                             )
                             .is_err()
                     };
+                    // A panicking attachment (its transport closer panics)
+                    // and a wedged one (its closer blocks until the run
+                    // ends), fenced while the clock runs: the fence is an
+                    // atomic; the closer runs on the fencing thread, never
+                    // on the data plane.
+                    let (panicking, wedged) = (&stalled[0].0, &stalled[1].0);
+                    panicking.set_closer(Box::new(|| panic!("a broken transport")));
+                    let release = Arc::new(AtomicBool::new(false));
+                    let held = Arc::clone(&release);
+                    wedged.set_closer(Box::new(move || {
+                        while !held.load(Ordering::Acquire) {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }));
+                    panicking.fence();
+                    let fencer = {
+                        let wedged = Arc::clone(wedged);
+                        std::thread::spawn(move || wedged.fence())
+                    };
                     let progress = ctl.sample_progress(CHAOS_TICKS - 20);
+                    release.store(true, Ordering::Release);
+                    fencer.join().unwrap();
                     let mut caps = cap_record.lock().unwrap();
                     *caps = (
                         stalled.len(),

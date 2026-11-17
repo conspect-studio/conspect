@@ -4336,8 +4336,10 @@ impl Pipeline {
             subtitle_end,
             consumer: ConsumerRouting {
                 router: Box::new(router),
-                cast_labels: crate::cast_output::CastLabeller::new(&self.cast_outputs.load()),
-                declared_track_names: self.discrete_track_names.clone(),
+                cast_labels: crate::cast_output::CastLabeller::new(
+                    &self.cast_outputs.load(),
+                    &self.discrete_track_names,
+                ),
                 base_force,
                 inband_sets: self.output_inband_sets.clone(),
                 base_formats: self.rendition_formats.clone(),
@@ -4546,11 +4548,17 @@ impl Pipeline {
         }
         // ADR-0113 §4: a defined keyer keeps its fill and key warm, leased to
         // the keyer object id (listed in `GET /api/v1/sources/status`).
-        if !self.switcher_keyers.is_empty() {
+        // K3: the M/E's upstream keyers keep theirs warm the same way.
+        let usk_items = self
+            .switcher_me
+            .as_ref()
+            .map(crate::switcher_runtime::usk_demand_items)
+            .unwrap_or_default();
+        if !self.switcher_keyers.is_empty() || !usk_items.is_empty() {
             let keyers = manager.consumer_set(multiview_engine::ConsumerClass::Keyer, Rails::VIDEO);
-            keyers.seed(crate::switcher_runtime::keyer_demand_items(
-                &self.switcher_keyers,
-            ));
+            let mut items = crate::switcher_runtime::keyer_demand_items(&self.switcher_keyers);
+            items.extend(usk_items);
+            keyers.seed(items);
             self.keyer_demand = Some(keyers);
         }
         // K4: a run with an M/E can define its first DSK at run time
@@ -8526,8 +8534,7 @@ struct ConsumerRouting {
     router: Box<crate::output_routing::OutputRouter>,
     /// The cast outputs' content labeller (ADR-0114 decision 5.4).
     cast_labels: crate::cast_output::CastLabeller,
-    /// The declared discrete tracks' names, in track order.
-    declared_track_names: Vec<String>,
+
     /// Per base video key: its worker's forced-IDR request cell.
     base_force: Vec<Arc<AtomicU64>>,
     /// Per output: [`BindingConfig::inband_parameter_changes_ok`].
@@ -9271,7 +9278,6 @@ fn consumer_main<D: WindowDelivery>(
     let ConsumerRouting {
         mut router,
         mut cast_labels,
-        declared_track_names,
         base_force,
         inband_sets,
         base_formats,
@@ -9622,13 +9628,13 @@ fn consumer_main<D: WindowDelivery>(
             })?;
         // ADR-0114 decision 5.4: label what every cast output carries now,
         // after this tick's takes and every move outcome of the windows
-        // offered so far (two fingerprint compares per cast output; no
+        // offered so far (two fingerprint hashes per cast output; no
         // allocation unless something changed).
         cast_labels.label(
             &router,
             item.tick_index,
-            dispatcher.next_window_index(),
-            &|name| routed_track_input(track_inputs, &declared_track_names, name),
+            &|output| dispatcher.undelivered_window(output),
+            &track_inputs.load(),
         );
         // Every output tick hands any admitted-but-undelivered tail to its
         // transport, so a quiet encoder cannot strand an admitted window behind a
@@ -15584,16 +15590,6 @@ fn declared_discrete_tracks(
         })
         .take(usize::from(u16::MAX))
         .collect()
-}
-
-/// The live route input of the declared track `name` (`None`: unknown).
-fn routed_track_input(
-    live: &multiview_framestore::SwapCell<Arc<Vec<String>>>,
-    names: &[String],
-    name: &str,
-) -> Option<String> {
-    let at = names.iter().position(|n| n == name)?;
-    live.load().get(at).cloned()
 }
 
 /// The [`multiview_output::AudioSelection`] for one configured output: absent

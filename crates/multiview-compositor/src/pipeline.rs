@@ -1556,7 +1556,7 @@ fn composite_band_reference(
             for tile in tiles {
                 if tile.group == TileGroup::Top {
                     if let Some((o, i, merge)) = seg.take() {
-                        acc = merge.apply(o, i);
+                        acc = merge.apply(o, i, (px, py), canvas_wh);
                     }
                 }
                 let src = match tile_dst_offset(tile, px, py) {
@@ -1596,7 +1596,7 @@ fn composite_band_reference(
                 }
             }
             if let Some((o, i, merge)) = seg {
-                acc = merge.apply(o, i);
+                acc = merge.apply(o, i, (px, py), canvas_wh);
             }
             let straight = PremulRgba {
                 r: acc.r,
@@ -1785,6 +1785,7 @@ fn fold_tiles<'s>(
             TileGroup::Top => {
                 if let Some(merge) = seg.take() {
                     merge_scenes(
+                        geom,
                         acc,
                         covered,
                         bg_premul,
@@ -1841,6 +1842,7 @@ fn fold_tiles<'s>(
     }
     if let Some(merge) = seg {
         merge_scenes(
+            geom,
             acc,
             covered,
             bg_premul,
@@ -1963,8 +1965,12 @@ fn grow_scene(buf: &mut Vec<PremulRgba>, span_pixels: usize, counter: &AtomicU64
 }
 
 /// Close a scene segment: write `merge(out, in)` for every pixel of the span
-/// into the main accumulator and mark it covered (ADR-0113 §2).
+/// into the main accumulator and mark it covered (ADR-0113 §2). A WIPE
+/// merge reads its mask at each pixel's canvas position (K3).
+#[allow(clippy::too_many_arguments)]
+// reason: the band geometry, both scene accumulators and the main one.
 fn merge_scenes(
+    geom: &BandGeom,
     acc: &mut [PremulRgba],
     covered: &mut Coverage,
     bg_premul: PremulRgba,
@@ -1973,11 +1979,17 @@ fn merge_scenes(
     span_pixels: usize,
     merge: SceneMerge,
 ) {
+    let w = geom.w.max(1);
+    let row0 = u64::from(geom.py_start).saturating_add(u64::try_from(geom.span_start).unwrap_or(0));
     for idx in 0..span_pixels {
         let o = scene_out.get(idx).copied().unwrap_or(bg_premul);
         let i = scene_in.get(idx).copied().unwrap_or(bg_premul);
+        // Canvas position of this accumulator pixel (bands split rows only).
+        let px = u32::try_from(idx % w).unwrap_or(u32::MAX);
+        let py = u32::try_from(row0.saturating_add(u64::try_from(idx / w).unwrap_or(0)))
+            .unwrap_or(u32::MAX);
         if let Some(slot) = acc.get_mut(idx) {
-            *slot = merge.apply(o, i);
+            *slot = merge.apply(o, i, (px, py), geom.canvas_wh);
         }
         covered.mark(idx);
     }

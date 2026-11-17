@@ -814,17 +814,27 @@ impl RegistryFeedFactory {
         // 2. Authorize every resolved axis before any demand or peer slot: the
         //    requested scope, the effective output, and every typed dependency
         //    (source object, output, program, mix/effect).
-        let dependencies = binding
-            .dependencies
-            .iter()
-            .map(typed_dependency)
-            .collect::<Vec<_>>();
-        metadata::authorize_dependencies(principal, &dependencies)?;
-        let sources = binding
-            .source_dependencies()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        metadata::authorize_binding(principal, scope, &binding.output_id, &sources)?;
+        // A desk lease authorizes the principal against the binding's resolved
+        // axes. A cast lease does not: its authority is the token's (ADR-0114
+        // decision 5.1, "no rung has a credential of its own"). The shared
+        // token check authorized the owner for the output's live closure, and
+        // every window is then judged against what that token is cleared for
+        // (`gate`). The binding's static axes are named by config id and the
+        // run's boot dependencies, which an owner's API-scoped grants never
+        // name, so applying them here would refuse every scoped owner.
+        if gate.is_none() {
+            let dependencies = binding
+                .dependencies
+                .iter()
+                .map(typed_dependency)
+                .collect::<Vec<_>>();
+            metadata::authorize_dependencies(principal, &dependencies)?;
+            let sources = binding
+                .source_dependencies()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            metadata::authorize_binding(principal, scope, &binding.output_id, &sources)?;
+        }
         // The transport's own cancellation identity, obtained from the fence and
         // installed in the registry BEFORE any window can be published to this
         // peer. An already-cancelled fence fails here: no demand, no peer slot.
@@ -1281,7 +1291,8 @@ struct WorkerState {
 pub(crate) struct CastWindowGate {
     attachment: Arc<CastAttachment>,
     video: Rational,
-    audio: Vec<(StreamKind, Component, Rational)>,
+    /// `(stream, component, time base, samples per packet)`.
+    audio: Vec<(StreamKind, Component, Rational, i64)>,
     cadence: Rational,
     scratch: Vec<(usize, u64)>,
     components: Vec<Component>,
@@ -1301,7 +1312,7 @@ impl CastWindowGate {
         binding: &EffectiveBinding,
         video: Rational,
     ) -> Self {
-        let audio: Vec<(StreamKind, Component, Rational)> = binding
+        let audio: Vec<(StreamKind, Component, Rational, i64)> = binding
             .audio
             .iter()
             .map(|a| {
@@ -1309,11 +1320,19 @@ impl CastWindowGate {
                     StreamKind::AudioTrack(_) => Component::Track(a.track.clone()),
                     _ => Component::Audio,
                 };
-                (a.kind, component, a.time_base)
+                // One coded frame: AAC 1024 samples, Opus at most 20 ms. The
+                // larger bound is used for an unknown codec (a frame never
+                // spans more ticks than this covers).
+                let samples = if a.codec.starts_with("mp4a") {
+                    1024
+                } else {
+                    i64::from(a.sample_rate.max(1)) / 50
+                };
+                (a.kind, component, a.time_base, samples.max(1))
             })
             .collect();
         let mut components = vec![Component::Video];
-        components.extend(audio.iter().map(|(_, c, _)| c.clone()));
+        components.extend(audio.iter().map(|(_, c, _, _)| c.clone()));
         Self {
             attachment,
             video,
@@ -1343,21 +1362,35 @@ impl CastWindowGate {
     pub(crate) fn judge(&mut self, packets: &[EncodedPacket]) -> GateVerdict {
         self.scratch.clear();
         for packet in packets {
-            let (component, base) = match packet.kind() {
-                StreamKind::Video => (0, self.video),
+            // An audio packet codes `span` samples from its PTS: it carries
+            // content of every tick from the one of its first sample to the
+            // one of its last (an AAC frame straddles tick boundaries), so
+            // both are judged (PR 516 review, lens 1).
+            let (component, base, span) = match packet.kind() {
+                StreamKind::Video => (0, self.video, 1),
                 kind => {
-                    let Some(at) = self.audio.iter().position(|(k, _, _)| *k == kind) else {
+                    let Some(at) = self.audio.iter().position(|(k, _, _, _)| *k == kind) else {
                         self.attachment.fence();
                         return GateVerdict::Refuse;
                     };
-                    (at + 1, self.audio.get(at).map_or(self.video, |a| a.2))
+                    let (base, span) = self.audio.get(at).map_or((self.video, 1), |a| (a.2, a.3));
+                    (at + 1, base, span)
                 }
             };
-            let Some(tick) = packet.pts().and_then(|pts| self.tick_of(pts, base)) else {
+            let ticks = packet.pts().and_then(|pts| {
+                Some((
+                    self.tick_of(pts, base)?,
+                    self.tick_of(pts.checked_add(span - 1)?, base)?,
+                ))
+            });
+            let Some((first, last)) = ticks else {
                 self.attachment.fence();
                 return GateVerdict::Refuse;
             };
-            self.scratch.push((component, tick));
+            self.scratch.push((component, first));
+            if last != first {
+                self.scratch.push((component, last));
+            }
         }
         let components = &self.components;
         let refs = self
@@ -3289,6 +3322,56 @@ mod tests {
                 .producer_mut()
                 .offer_complete(0, GENERATION, &window(2), SPAN, Instant::now());
             assert!(recv_within(&mut windows, Duration::from_millis(500)).is_some());
+        }
+
+        /// PR 516 review, lens 1: an AAC packet whose first sample is in a
+        /// cleared tick and whose last is in the tick of a change is refused.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_straddling_audio_packet_is_judged_on_its_last_sample() {
+            let mut c = cast(10_000);
+            c.labels
+                .record(&Component::Audio, 3, engine_minted(audio_id("src:secret")));
+            let mut audio = Packet::copy(&[0x21, 0x10, 0x05]);
+            // 3 * 1920 - 100: starts in tick 2, its 1024 samples end in tick 3.
+            audio.set_pts(Some(3 * 1920 - 100));
+            audio.set_dts(Some(3 * 1920 - 100));
+            c.registry.producer_mut().offer_complete(
+                0,
+                GENERATION,
+                &[idr(2), EncodedPacket::from_audio_packet(audio)],
+                SPAN,
+                Instant::now(),
+            );
+            assert_eq!(c.delivered(Duration::from_millis(300)), Vec::<u64>::new());
+            assert!(c.attachment.is_fenced());
+        }
+
+        /// PR 516 review, lens 2: the cast lease's authority is the token's;
+        /// an owner scoped to its API output id (never the config id or the
+        /// run's boot axes) is admitted on the real factory.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_scoped_owner_attaches_by_its_token() {
+            let c = cast(1);
+            let scoped = operator(Some(vec!["a".into()]), Some(vec!["output-0".into()]));
+            let (sink, _w) = Fence::channel(4);
+            assert!(c
+                .registry
+                .factory
+                .attach_cast(
+                    &scoped,
+                    &WhepScope::Output("out-cast".into()),
+                    sink.clone(),
+                    Arc::clone(&c.attachment)
+                )
+                .is_ok());
+            // The desk path keeps its own checks for the same principal.
+            let (desk, _w) = Fence::channel(4);
+            assert!(matches!(
+                c.registry
+                    .factory
+                    .attach(&scoped, &WhepScope::Output("out-cast".into()), desk),
+                Err(MoqReject::Forbidden)
+            ));
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

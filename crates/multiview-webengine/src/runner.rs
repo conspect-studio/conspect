@@ -452,6 +452,166 @@ pub fn is_commit_uncertain(error: &io::Error) -> bool {
         .is_some_and(|inner| inner.downcast_ref::<CommitUncertain>().is_some())
 }
 
+/// Spawn the embedded browser host for `capture` with a Rust-owned private
+/// profile/home/temp/cwd and feed it the request (including any resolved
+/// credential) over stdin only — never argv or environment. The returned
+/// directory guard must outlive every child, which `run_producer` reaps.
+fn run_host(
+    tools: &Tools,
+    capture: &Capture,
+    verify: bool,
+    pending: &mut impl Write,
+    control: Control<'_>,
+    observer: &mut dyn FnMut(ResourceSample),
+) -> io::Result<(tempfile::TempDir, ProducerRun<LineTail>)> {
+    // Declared before the guard: dropped after every child has been reaped.
+    let private = tempfile::Builder::new().prefix("conspect-web-").tempdir()?;
+    let mut dirs = std::fs::DirBuilder::new();
+    dirs.mode(0o700);
+    let (profile, home, temp, cwd) = (
+        private.path().join("profile"),
+        private.path().join("home"),
+        private.path().join("tmp"),
+        private.path().join("cwd"),
+    );
+    for dir in [&profile, &home, &temp, &cwd] {
+        dirs.create(dir)?;
+    }
+    let source = capture.windy.as_ref().map_or_else(
+        || serde_json::json!({"kind":"html","document":capture.document}),
+        |view| serde_json::json!({"kind":"windy","view":view}),
+    );
+    // May carry a resolved credential: it only ever goes to the child's stdin.
+    let request = serde_json::to_vec(&serde_json::json!({
+        "browser":tools.browser, "ffmpeg":tools.ffmpeg, "profile":profile,
+        "width":capture.width,"height":capture.height,"fps":capture.fps,"frames":capture.frames,
+        "source": source,
+        "background": capture.background,
+        "gl": tools.gl,
+        "capture": capture.effective_capture(),
+        "timing": capture.capture.timing, "frame_ms": capture.capture.frame_ms,
+        "end_hold_ms": capture.capture.end_hold_ms, "max_steps": capture.capture.max_steps,
+        "output_cadence": capture.output_cadence,
+        "verify": verify,
+    }))?;
+    let mut command = Command::new(&tools.node);
+    command
+        .args([
+            "-e",
+            &HOST
+                .replace("/*WINDY_TEMPLATE*/", include_str!("template_windy.cjs"))
+                .replace("/*MOV_COLOR*/", include_str!("mov_color.cjs"))
+                .replace("/*STEP_PLAN*/", include_str!("step_plan.cjs")),
+        ])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("TMPDIR", &temp)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .current_dir(&cwd);
+    let run = run_producer(
+        command,
+        request,
+        LineTail::default(),
+        pending,
+        control,
+        observer,
+    )?;
+    Ok((private, run))
+}
+
+/// Outcome of a bounded Windy Premium login check ([`verify_premium`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PremiumVerdict {
+    /// Logged in and `settings_subscription` names Premium.
+    Premium,
+    /// The site refused the email/password.
+    Rejected,
+    /// Logged in, but the account carries no Premium subscription.
+    NotPremium,
+    /// The check could not complete (network, page change, deadline, tools).
+    Unavailable,
+}
+impl PremiumVerdict {
+    /// Stable wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Premium => "premium",
+            Self::Rejected => "rejected",
+            Self::NotPremium => "not_premium",
+            Self::Unavailable => "unavailable",
+        }
+    }
+    /// Map the host's final status line (never content-bearing) to a verdict.
+    fn from_status(exit_ok: bool, line: Option<&[u8]>) -> Self {
+        let line = line.unwrap_or_default();
+        if exit_ok {
+            let marker: Option<serde_json::Value> = serde_json::from_slice(line).ok();
+            let ok = marker.as_ref().is_some_and(|m| {
+                m.get("event").and_then(serde_json::Value::as_str) == Some("premium_verify")
+                    && m.get("premium").and_then(serde_json::Value::as_bool) == Some(true)
+            });
+            return if ok { Self::Premium } else { Self::Unavailable };
+        }
+        match line {
+            b"Windy login rejected" => Self::Rejected,
+            b"Windy account has no Premium" => Self::NotPremium,
+            _ => Self::Unavailable,
+        }
+    }
+}
+
+/// Bounded login check: open Windy in a private throwaway profile, log in with
+/// `credentials` (stdin only) and read `localStorage.settings_subscription`.
+/// Produces no artifact. Call on a management blocking worker.
+/// # Errors
+/// Invalid tools/request, cancellation, or a process/pipe failure; a page or
+/// site failure is the [`PremiumVerdict::Unavailable`] verdict instead.
+pub fn verify_premium(
+    tools: &Tools,
+    credentials: crate::capture::WindyCredentials,
+    control: Control<'_>,
+) -> io::Result<PremiumVerdict> {
+    let capture = Capture {
+        width: 1280,
+        height: 720,
+        fps: 1,
+        frames: 2,
+        document: String::new(),
+        background: crate::capture::Background::Opaque,
+        windy: Some(crate::capture::WindyView {
+            // The radar page reliably renders the login control (spike-proven).
+            lat: -33.87,
+            lon: 151.21,
+            zoom: 7,
+            overlay: "radar".into(),
+            terms_accepted: true,
+            require_premium: true,
+            credentials: Some(credentials),
+        }),
+        capture: crate::capture::CaptureOptions {
+            mode: Some(crate::capture::CaptureMode::Realtime),
+            ..crate::capture::CaptureOptions::default()
+        },
+        // A login check produces no artifact: nothing to conform.
+        output_cadence: None,
+    };
+    capture.validate()?;
+    tools.validate()?;
+    control.check()?;
+    let mut sink = io::sink();
+    let (private, run) = run_host(tools, &capture, true, &mut sink, control, &mut |_| {})?;
+    drop(private);
+    control.check()?;
+    let line = run.sink.finish();
+    Ok(PremiumVerdict::from_status(
+        run.exit.success() && !run.wrote,
+        line.as_deref(),
+    ))
+}
+
 /// Run one bounded capture and commit only successful producer output.
 ///
 /// `allow` authorizes the trusted producer identity before any process starts.
@@ -534,58 +694,7 @@ pub fn run_capture_observed(
     control.check()?;
     let mut pending = store.begin(provenance, maximum_bytes, allow)?;
     reserved(pending.id())?;
-    // Declared before the guard: dropped after every child has been reaped.
-    let private = tempfile::Builder::new().prefix("conspect-web-").tempdir()?;
-    let mut dirs = std::fs::DirBuilder::new();
-    dirs.mode(0o700);
-    let (profile, home, temp, cwd) = (
-        private.path().join("profile"),
-        private.path().join("home"),
-        private.path().join("tmp"),
-        private.path().join("cwd"),
-    );
-    for dir in [&profile, &home, &temp, &cwd] {
-        dirs.create(dir)?;
-    }
-    let source = capture.windy.as_ref().map_or_else(
-        || serde_json::json!({"kind":"html","document":capture.document}),
-        |view| serde_json::json!({"kind":"windy","view":view}),
-    );
-    let request = serde_json::to_vec(&serde_json::json!({
-        "browser":tools.browser, "ffmpeg":tools.ffmpeg, "profile":profile,
-        "width":capture.width,"height":capture.height,"fps":capture.fps,"frames":capture.frames,
-        "source": source,
-        "background": capture.background,
-        "gl": tools.gl,
-        "capture": capture.effective_capture(),
-        "timing": capture.capture.timing, "frame_ms": capture.capture.frame_ms,
-        "end_hold_ms": capture.capture.end_hold_ms, "max_steps": capture.capture.max_steps,
-        "output_cadence": capture.output_cadence,
-    }))?;
-    let mut command = Command::new(&tools.node);
-    command
-        .args([
-            "-e",
-            &HOST
-                .replace("/*WINDY_TEMPLATE*/", include_str!("template_windy.cjs"))
-                .replace("/*MOV_COLOR*/", include_str!("mov_color.cjs"))
-                .replace("/*STEP_PLAN*/", include_str!("step_plan.cjs")),
-        ])
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", &home)
-        .env("TMPDIR", &temp)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("XDG_CACHE_HOME", home.join(".cache"))
-        .current_dir(&cwd);
-    let run = run_producer(
-        command,
-        request,
-        LineTail::default(),
-        &mut pending,
-        control,
-        observer,
-    )?;
+    let (private, run) = run_host(tools, capture, false, &mut pending, control, observer)?;
     drop(private);
     let (wrote, tail, exit) = (run.wrote, run.sink, run.exit);
     if !exit.success() {
@@ -641,4 +750,32 @@ fn completion_valid(capture: &crate::capture::Capture, marker: &serde_json::Valu
         && conform_ok
         && (capture.background != crate::capture::Background::Transparent
             || marker.get("alpha").and_then(serde_json::Value::as_bool) == Some(true))
+}
+
+#[cfg(test)]
+mod verdict_tests {
+    use super::PremiumVerdict as V;
+    #[test]
+    fn status_lines_map_to_typed_verdicts() {
+        let ok = br#"{"event":"premium_verify","premium":true}"#;
+        assert_eq!(V::from_status(true, Some(ok)), V::Premium);
+        assert_eq!(V::from_status(true, None), V::Unavailable);
+        assert_eq!(
+            V::from_status(true, Some(b"{\"event\":\"capture_complete\"}")),
+            V::Unavailable
+        );
+        assert_eq!(V::from_status(false, Some(ok)), V::Unavailable);
+        assert_eq!(
+            V::from_status(false, Some(b"Windy login rejected")),
+            V::Rejected
+        );
+        assert_eq!(
+            V::from_status(false, Some(b"Windy account has no Premium")),
+            V::NotPremium
+        );
+        assert_eq!(
+            V::from_status(false, Some(b"capture failed")),
+            V::Unavailable
+        );
+    }
 }
