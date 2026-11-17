@@ -1025,49 +1025,92 @@ fn a_flapping_source_never_gets_a_take_while_not_fresh() {
     );
 }
 
-/// A live encoder whose `finish()` takes 3 s (test 6).
-struct SlowFinish(FakeEnc);
+/// A live encoder whose `finish()` blocks until the test releases it (test
+/// 6). `entered` / `exited` record where the close is, so the test proves
+/// causally that the router kept ticking while `finish()` was still running
+/// (#501): a router that waited on the close could not tick until `finish()`
+/// returned, and `finish()` returns only when the test releases it or, as a
+/// hang guard, after [`SLOW_FINISH_GUARD`].
+struct SlowFinish {
+    inner: FakeEnc,
+    entered: Arc<AtomicBool>,
+    exited: Arc<AtomicBool>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+/// How long a [`SlowFinish`] close waits for its release before it returns
+/// anyway, so a regression fails the test instead of hanging it.
+const SLOW_FINISH_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl VideoEncodeWorker for SlowFinish {
     fn encode(&mut self, item: BakedTick) -> Result<Vec<EncodedPacket>, PipelineError> {
-        self.0.encode(item)
+        self.inner.encode(item)
     }
     fn reorder_bound(&self) -> ReorderBound {
         ReorderBound::NoReorder
     }
     fn finish(&mut self) -> Result<Vec<EncodedPacket>, PipelineError> {
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        self.entered.store(true, Ordering::SeqCst);
+        let _ = self
+            .release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv_timeout(SLOW_FINISH_GUARD);
+        self.exited.store(true, Ordering::SeqCst);
         Ok(Vec::new())
     }
     fn force_keyframe(&mut self) {
-        self.0.force_keyframe();
+        self.inner.force_keyframe();
     }
 }
 
 impl LiveEncoder for SlowFinish {
     fn start_at(&mut self, t0: u64) {
-        self.0.start_at(t0);
+        self.inner.start_at(t0);
     }
     fn time_base(&self) -> Rational {
-        self.0.time_base()
+        self.inner.time_base()
     }
     fn move_gate(&self) -> MoveGate {
-        self.0.move_gate()
+        self.inner.move_gate()
     }
 }
 
-/// Test 6: closing an encoder whose finish takes 3 s never blocks the
-/// consumer. Bound: every router call around and after the close < 50 ms, and
-/// the close lands on its linger tick.
+/// Test 6: closing an encoder whose finish never returns on its own never
+/// blocks the consumer (#501). Proven by causality, not by a wall-clock bound
+/// on a router call (which measured host preemption on a loaded runner): the
+/// close lands on its linger tick, `finish()` is entered, and the router then
+/// runs [`SLOW_FINISH_TICKS`] more ticks (Program cadence intact) while
+/// `finish()` is provably still inside, held by the test. Only then is the
+/// close released, and the reaper (not the router) takes it.
 #[test]
 fn a_slow_close_never_blocks_the_consumer() {
+    /// Ticks the router must run while the close is held: 3 s at 5 fps,
+    /// the span of the old 3 s `finish()`.
+    const SLOW_FINISH_TICKS: u64 = 16;
     let encoded = Arc::new(AtomicUsize::new(0));
-    let enc = Arc::clone(&encoded);
+    let entered = Arc::new(AtomicBool::new(false));
+    let exited = Arc::new(AtomicBool::new(false));
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let gate = Arc::new(std::sync::Mutex::new(Some(gate)));
+    let (enc, ent, ext) = (
+        Arc::clone(&encoded),
+        Arc::clone(&entered),
+        Arc::clone(&exited),
+    );
     let open: OpenFn = Box::new(move |_| {
-        let e: Box<dyn LiveEncoder> = Box::new(SlowFinish(FakeEnc {
-            forced: false,
-            encoded: Arc::clone(&enc),
-        }));
+        let Some(rx) = gate.lock().unwrap().take() else {
+            return Err("one slow encoder per test".to_owned());
+        };
+        let e: Box<dyn LiveEncoder> = Box::new(SlowFinish {
+            inner: FakeEnc {
+                forced: false,
+                encoded: Arc::clone(&enc),
+            },
+            entered: Arc::clone(&ent),
+            exited: Arc::clone(&ext),
+            release: std::sync::Mutex::new(rx),
+        });
         Ok(e)
     });
     let mut x = harness(2, 6, Some(open));
@@ -1085,24 +1128,38 @@ fn a_slow_close_never_blocks_the_consumer() {
         t += 1;
         assert!(t < 120, "back on Program");
     }
-    // Run to the linger close and well past it; measure from before the close.
-    x.max_router = std::time::Duration::ZERO;
+    // Run to the linger close.
     let close_by = t + LINGER_TICKS + 2;
     while x.h.snapshot().dynamic_encoders_live > 0 {
         x.tick(t);
         t += 1;
         assert!(t <= close_by, "closed at its linger tick");
     }
-    let closed = Instant::now();
-    while closed.elapsed() < std::time::Duration::from_millis(3200) {
+    // The closing worker reaches `finish()` on its own thread; keep ticking
+    // until it does (a bound on the worker, not on the router).
+    let reached = Instant::now() + SETTLE_BOUND;
+    while !entered.load(Ordering::SeqCst) {
+        assert!(Instant::now() < reached, "the close reached finish()");
+        x.tick(t);
+        t += 1;
+    }
+    // The router ticks on while the close is held inside `finish()`.
+    for _ in 0..SLOW_FINISH_TICKS {
         x.tick(t);
         t += 1;
     }
     assert!(
-        x.max_router < std::time::Duration::from_millis(50),
-        "router tick during a 3 s finish: {:?}",
-        x.max_router
+        !exited.load(Ordering::SeqCst),
+        "the router ran {SLOW_FINISH_TICKS} ticks only after finish() returned: it waited on the close"
     );
+    release.send(()).unwrap();
+    let done = Instant::now() + SETTLE_BOUND;
+    while !exited.load(Ordering::SeqCst) {
+        assert!(Instant::now() < done, "the released close finishes");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    x.tick(t);
+    t += 1;
     assert_eq!(
         x.windows_of(0).len(),
         usize::try_from(t - 1).unwrap(),
