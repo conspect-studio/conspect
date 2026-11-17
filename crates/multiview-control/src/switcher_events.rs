@@ -92,3 +92,34 @@ pub async fn sweep_switcher_leases(
         }
     }
 }
+
+/// How often the stored-layout M/E source registry is swept (#307).
+pub const ME_LAYOUT_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Drop stored layouts registered as M/E sources that the M/E has not
+/// referenced (Program, Preview or a patched input, from the engine's own
+/// snapshot and readback) for [`crate::me_layouts::ME_LAYOUT_LINGER`]. Holds
+/// the registry weakly: the task ends when the control state is dropped.
+/// Control-plane only; never touches the output clock.
+pub async fn sweep_me_layouts(
+    control: SwitcherControl,
+    registry: std::sync::Weak<crate::me_layouts::MeLayoutRegistry>,
+    interval: Duration,
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+        let Some(registry) = registry.upgrade() else {
+            break;
+        };
+        let dropped = registry.sweep(
+            |id| crate::me_layouts::me_references(&control, id),
+            Instant::now(),
+        );
+        if dropped > 0 {
+            tracing::debug!(
+                dropped,
+                "switcher: released unreferenced M/E layout sources"
+            );
+        }
+    }
+}

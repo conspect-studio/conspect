@@ -36,9 +36,10 @@ reports `applied`):
 id = "usk1"                            # unique within the M/E; object id "me1/usk1"
 fill = "cam-3"                         # a source id (mixer inputs "in:<n>" are refused)
 key = "cam-3-matte"                    # optional; absent = self key
-type = "luma"                          # luma | linear | (chroma, slice K7)
-clip = 0.10                            # luma: [0,1] on post-range-expand Y
-gain = 4.0                             # luma: >= 0
+type = "luma"                          # luma | linear | chroma (slice K7)
+clip = 0.10                            # luma: [0,1] on post-range-expand Y; chroma: [0,1] on the distance
+gain = 4.0                             # luma, chroma: >= 0
+# color = "#00b140"                    # chroma only, required: the reference (fill's own R'G'B' codes)
 invert = false
 mask = { x = 0, y = 0, w = 1920, h = 1080 }   # fill-source pixels; optional
 fly = { x = 1280, y = 60, w = 576, h = 324 }  # canvas pixels, even, >= 16; optional = full canvas
@@ -58,8 +59,10 @@ on_at_start = false                    # the station bug: goes on at boot throug
 z = 1
 ```
 
-`premultiplied = true` and `type = "chroma"` are refused at validation with typed messages
-until their slices land. The `KeyType::DvePip { rect }` descriptor deserializes as
+`premultiplied = true` is refused at validation with a typed message until its slice lands.
+`type = "chroma"` (K7) needs `color` and keys the fill itself: a chroma key with a `key`
+source is refused (`chroma-key-source`), as is `color` on another type (§14 K7). The
+`KeyType::DvePip { rect }` descriptor deserializes as
 `type = "linear"` with `fly = rect`.
 
 Runtime state, per keyer, in the switcher tick driver: a fixed array allocated at attach (at most
@@ -95,10 +98,16 @@ matte      = linear, no key source : 1
              linear, key source    : clamp(Y_key_norm, 0, 1)
              luma                  : invert?(clamp((Y_norm − clip) × gain, 0, 1)),
                                      Y of the key source, else of the fill
+             chroma (K7)           : invert?(clamp((|rgb_tile − ref_tile| − clip) × gain, 0, 1)),
+                                     rgb_tile = the fill's linear RGB in its own gamut (after
+                                     step 3, before the step-4 primaries convert, ADR-C007 §3),
+                                     ref_tile = `color` quantized to the fill's (Y, Cb, Cr)
+                                     codes and decoded like a pixel, once per frame
 ```
 
 Y is post-range-expand code-value Y (step 1 of the pipeline), so steps 2–5 are unchanged and the
-alpha is premultiplied once (#8). Both kernels sample fill and key independently from the same
+alpha is premultiplied once (#8). The chroma distance reads the step-3 value both kernels already
+compute and only feeds alpha, so the step order is unchanged too. Both kernels sample fill and key independently from the same
 integer destination offset `(ddx, ddy)`:
 
 ```text
@@ -158,6 +167,11 @@ refilled in place like `key_params`); the shader rounds the texel to its integer
 it up at `table_base + code`. This is exact by construction: a huge or infinite gain makes the
 matte a step at the clip, and a shader evaluation of `(y − clip) × gain` could flip whole
 pixels on float fuzz (review MEDIA-1).
+
+A chroma matte depends on RGB, so it has no table: the shader computes it from the fill's
+step-3 linear RGB, the reference in `KeyParams.chroma` (converted on the CPU once per frame) and
+an edge the CPU reduces to finite numbers (`chroma_edge`: always 0, always 1, a step at the clip
+for an infinite gain, or the finite ramp), so no NaN or infinity reaches the shader (§14 K7).
 
 Nothing is borrowed from the fill's `TileParams`, so fill and key can differ in size and range.
 Layer count: at most 1 Program cell + 3 transition tiles + 6 keyers × 2 (fill, key) = 16 ≤ 64.
@@ -462,7 +476,7 @@ data plane). K5 is R2.
 | K4 (#389) | Control API: verbs, plan with scoped visibility, BOLA row filtering and redaction, persistence after `applied`, OpenAPI/AsyncAPI | K2 (K3 for `arm`) |
 | K5 (#390) | Desk: keyer strip, DSK controls, keyer panel, key tally on the wall | K4 |
 | K6 (#391) | Alpha media: media-player decode of ProRes 4444, qtrle, PNG/TGA and VP9 alpha into NV12+A; NDI alpha; the SW-11 import gate | K2 |
-| K7 (#392) | Chroma key (ADR-C007 domain) | K1 |
+| K7 (#392) | Chroma key (ADR-C007 domain); built, §14 | K1 |
 
 The backlog rows SW-9 (#35) and SW-10 (#36) are superseded by K1 and K2–K3. They predate the
 as-built drive and assume a render-plan resolver that was not built.
@@ -492,7 +506,7 @@ keyers.
   band, because a DIP merge colours pixels no tile covers. Frames with no grouped tile keep the
   covered-span path unchanged.
 - **Deviation: WIPE merge is not in K1.** `SceneMerge::Wipe` lands with K3 on top of lane
-  `transitions`' mask. The GPU key path was first held back until #395 (the bounded GPU
+  `transitions`' mask (**resolved in K3**, on the CPU oracle and the GPU; see "K3 as built"). The GPU key path was first held back until #395 (the bounded GPU
   readback, PR #424). Until it landed, `GpuCompositor` refused a keyed or grouped frame with a
   typed `GpuLimit`, and `RunBackend` composed it on the persistent CPU fallback. That
   deviation is closed; see "K1 GPU key path as built" below. A genuine GPU failure, and a
@@ -526,13 +540,24 @@ keyers.
   is `true` for the wgpu compositor, so `OffClockGpu` no longer routes a keyed frame to the CPU
   before GPU work. The simulated chaos GPU keeps the CPU route, so the engine's slow-fallback
   epoch tests are unchanged.
-- **Parameters (§3.3).** `KeyParams` (80 bytes) is binding 6, one entry per tile, parallel to
+- **Parameters (§3.3).** `KeyParams` (96 bytes since K7; 80 as K1 built it) is binding 6, one entry per tile, parallel to
   `tiles`. It holds:
   - `head`: key layer, key w and h, and the flags (kind, invert, has-source, has-mask,
     has-table, and the 2-bit group).
   - `table`: the base of the tile's matte table in `mattes`.
   - `mask`: a `vec4<u32>` in fill-source pixels.
-  - `merge`: kind, p or d, and i, plus the DIP colour.
+  - `merge`: kind, p or d, and i, plus the DIP colour. K3 adds kind ≥ 2, a WIPE merge:
+    `2 + shape + 8·reverse + 16·complement`, then softness, extent and radius, with the origin
+    and expand in the DIP-colour lanes (K3 itself added no struct growth).
+  - `chroma` (K7): a chroma key's reference in tile-gamut linear RGB; a chroma key reuses
+    `table` for its packed reference codes, edge mode, clip and gain (see K7 below).
+
+  The lanes are disjoint by owner, so a chroma key in a WIPE group packs both: the key owns
+  `head[0..3]`, `head[3]` bits 0-5, `table`, `mask` and `chroma`; the scene group owns `head[3]`
+  bits 8-9, `merge` and `dip_colour` (`KeyParams::with_group`); a tile's own wipe mask and its
+  complement live in `TileParams` spare lanes (`prim2.w`), untouched by both. The struct is
+  96 bytes in Rust and WGSL; the `uniforms` unit test `rust_and_wgsl_blocks_share_one_layout`
+  checks every member offset and the size of `KeyParams` and `TileParams` against naga's layout.
 
   `mattes` is binding 7: one 256-entry `f32` table per signal-keyed tile (see §3.3). Both
   buffers are allocated once at `MAX_TILES` entries (tables) and refilled in place, like the
@@ -553,14 +578,19 @@ keyers.
     step of a huge gain cannot diverge from the CPU, and the shader never clamps a NaN.
   - A NaN tile opacity reads as 0, as on the CPU.
 - **Scene groups.** Two extra `vec4` registers (outgoing and incoming) hold the open segment.
-  It merges (MIX, DIP) at the next `Top` tile or the end of the list, and the last grouped
+  It merges (MIX, DIP, and since K3 WIPE `m(px, py)`) at the next `Top` tile or the end of the list, and the last grouped
   tile's merge wins. A grouped tile that covers nothing still opens its segment and sets its
   merge, matching the CPU oracle.
+- **Wipe masks (K3).** Tile and merge masks share one `mask_coverage` (mirrors
+  `WipeMask::coverage`), which honours the complement (`1 − m`): a tile mask carries it in the
+  spare `TileParams::prim2.w` lane (still 160 bytes), a merge in its kind code. Endpoints and a
+  mask of another canvas are encoded exactly on the CPU side (a pinned coverage, or a MIX at 0),
+  as the oracle reads them. Nothing K3 builds is refused.
 - **Still refused (typed `GpuLimit`, then the CPU fallback).**
   - Tiles plus key sources past the 64-layer tile array. §3.3's worst case is 16 layers.
   - A fill or key larger than the device's `max_texture_dimension_2d`.
 - **Tests.**
-  - `tests/keyers_gpu.rs` (`wgpu`, 5 tests) compares GPU and CPU oracle output (SSIM ≥ 0.98,
+  - `tests/keyers_gpu.rs` (`wgpu`, 6 tests since K3) compares GPU and CPU oracle output (SSIM ≥ 0.98,
     PSNR ≥ 40 dB on Y and UV) across 18 frames, plus the MEDIA-1 frames below. The cases cover:
     - a luma self key, and a luma key with a key source of another size and range (up- and
       downscaled tile);
@@ -579,6 +609,11 @@ keyers.
     composites, and that the layer-limit refusal falls back to the oracle.
   - On lavapipe (llvmpipe, Vulkan) the minima were SSIM 0.99998 and PSNR 60.9 dB, with a
     maximum |ΔY| of 2 codes.
+  - K3 (`k3_wipe_merges_and_complemented_masks_match_the_cpu_oracle`): WIPE merges and tiles
+    through a mask, each plain and complemented, for all five shapes, reverse, hard and soft
+    edges, both endpoints, a border-expanded mask and a foreign-canvas mask (88 frames); the
+    fixtures must differ from a MIX / the uncomplemented tile, and neither falls back on the GPU
+    backend. On lavapipe the minima were SSIM 0.99999 and PSNR 61.05 dB, |ΔY| ≤ 2.
   - GPU-free `KeyParams` packing unit tests run in `cargo test` without an adapter, including
     a check that the matte table equals `key::luma_matte` for all 256 codes over NaN, negative
     and infinite gains and NaN, ±∞ and subnormal clips, in both ranges.
@@ -591,7 +626,8 @@ keyers.
 
 - **Config.** `[[switcher.downstream_keyers]]` and `switcher.keyer_budget` are typed fields of
   `SwitcherConfig` (named fields win over `flatten`, so they leave `extra`; other future keys still
-  round-trip there). `DownstreamKeyerConfig` is `deny_unknown_fields`. `type = "chroma"` and
+  round-trip there). `DownstreamKeyerConfig` is `deny_unknown_fields`. (K7 lifted the chroma refusal below; see
+  K7.) `type = "chroma"` and
   `premultiplied = true` parse only so validation can refuse them by name. `validate_keyers` runs
   from the document validation, where the canvas is known. It checks: at most 2 DSKs; unique ids
   and z; a declared program; fill and key are declared sources, `in:` refused; rate in 1..=300;
@@ -671,7 +707,9 @@ keyers.
     WIPE behaves like a CUT at the transition end: `tie_envelope()` returns `{going_on: 0,
     going_off: 1}`, the keyer keeps its state through the flight and flips on the terminal tick
     (`keyers_dsk::a_tied_dsk_on_a_wipe_cuts_at_the_terminal_tick`). The exact WIPE envelope is K3
-    (#388).
+    (#388). **Resolved in K3:** the per-pixel envelope replaced this deviation, and the test
+    became `a_tied_dsk_on_a_wipe_follows_the_mask_and_flips_on_the_terminal_tick` (see "K3 as
+    built").
   - **Gate.** A CUT or AUTO is also gated on the fill and key of every tied keyer it would put on
     (`take_fresh`). For a new take that is every tied keyer that is off and not in its own AUTO.
     A CUT during a background AUTO completes that flight, so it waits only for the surviving
@@ -837,7 +875,7 @@ keyers.
     defaults.
   - **Validation.** The merged entry is checked with the config's own per-definition rules
     (`DownstreamKeyerConfig::validate_definition`, the same checks boot validation runs: source
-    exists, `chroma`/`premultiplied` refused by name, geometry, `max_source`, mask). The
+    exists, `premultiplied` refused by name (`chroma` too until K7), geometry, `max_source`, mask). The
     cross-keyer rules are then checked against the live set: unique z, at most 2 DSKs (409
     `capacity`), and the budget.
   - **Resolve.** The definition is resolved off the clock (`SwitcherControl::resolve_keyer`,
@@ -971,6 +1009,7 @@ keyers.
   - The routing handle and the router get the switcher's `CleanDskGate`.
 - **Deviations and choices.**
   - **`arm` is not built.** It needs USKs (K3, #388). USK `keyer_set` fields arrive with K3.
+    (**Built in K3**, see "K3 as built".)
   - **z is fixed after definition.** The design is silent on re-ordering. Changing z would
     re-order draws mid-flight, so a `keyer_set` with a different z on an existing keyer is 422.
   - **No delete.** The design defines no verb that removes a keyer. A DSK is removed by
@@ -1055,6 +1094,310 @@ keyers.
 - **Concern.** The GET/events parity test drives the driver without the frame hook, so its
   `tally` is the background roles only. Keyer tally resolution is covered by the lib unit
   test on a constructed snapshot.
+
+### K3 (#388): upstream keyers, the arm set and key-changing transitions
+
+Built on K4 (`feat/keyers-k4`, PR #476), then merged with main after the K4 merge and the
+WGSL key path (#386 part 2, PR #502). CPU oracle first; the GPU draws every K3 frame since the
+merge (see "K1 GPU key path as built", wipe masks).
+
+- **Compositor.**
+  - `SceneMerge::Wipe { mask }`: `lerp(out, in, m(x, y))` per canvas pixel with lane
+    `transitions`' `WipeMask` (no border band). `SceneMerge::apply` now takes the canvas pixel
+    and size; `merge_scenes` derives each accumulator pixel's canvas row from the band geometry.
+    A mask not valid for the canvas merges as the outgoing scene (never a poisoned pixel).
+  - `WipeMask::complement` / `complemented()`: coverage `1 − m(x, y)`, endpoints included. It is
+    the tied DSK's going-off envelope. The GPU draws both (merge kind ≥ 2 in `KeyParams`, the
+    complement in `TileParams::prim2.w`; `KeyParams::build` now takes the canvas size; the
+    group lanes are disjoint from K7's chroma lanes, see "K1 GPU key path as built"). Main
+    removed `key::needs_cpu_keyer_path`; `FrameJob::needs_cpu_keyer_path` (for a composer
+    without a key path, the simulated chaos GPU) also counts a complemented mask.
+- **Config.** `[[switcher.mix_effects.keyers]]` is `UpstreamKeyerConfig` (`deny_unknown_fields`):
+  the DSK fields minus `program`, `rate`, `tie` and `on_at_start`. `validate_keyers` (run by the
+  boot preflight `validate`) checks at most 4 per M/E, unique id and z per M/E, the DSK
+  per-field rules (through `as_definition`, labelled "upstream keyer"), and charges
+  `USK_FOLD (2) × dst/canvas + u × sources/canvas` to the **shared** `switcher.keyer_budget`.
+  The default budget is unchanged (3.0): one full-canvas keyer of either family.
+- **Runtime.** `KeyerRuntime` has `MAX_KEYERS = 6` fixed slots: DSKs at `0..2`, USKs at `2..6`
+  (USK key index `k` is slot `2 + k − 1`, the declared order). Draw order is every USK in
+  ascending z, then every DSK in ascending z. `KeyerDef::family`; a USK's object id is
+  `<me>/<id>`. `SwitcherState` keeps key states in a fixed `[bool; 4]` and the armed set in an
+  `Arc<ArmedSet>`, so the per-tick staging clone stays allocation-free; the driver mirrors the
+  runtime's USK on-air states into the machine at commit (a loss or a key cut can differ from
+  its toggle).
+- **`arm`.** `SwitcherVerb::Arm(Arc<ArmedSet>)` (built off the clock) goes through
+  `SwitcherState::arm_shared` (empty, duplicate, out-of-range and in-flight refused, fixed-array
+  scan). A key that is not a defined USK is refused `unknown-keyer`. While a take is held by the
+  fresh gate, `arm` is refused `take-held` (`REFUSE_ARM_TAKE_HELD`, review K3-INV-1), so a held
+  CUT lands with the set it was admitted with. Each applied `arm` bumps `arm_version`
+  (snapshot field; restored by a reject). The runtime caches the set
+  as a `Copy` `NextTake`; a rejected frame restores it with the machine.
+- **Transitions.** Armed USKs reuse the tied-DSK flight bookkeeping (`flight: Some(direction)`,
+  fixed at the AUTO start, `complete_tied` on the terminal tick or CUT, `cancel_tied` on an
+  abort, punch or reject), so **an aborted AUTO (ADR-0104 §2) restores key state** and a USK that
+  never went on releases its pair. During an AUTO an armed USK is drawn whole (weight 1) with
+  `DrawRole::In` / `Out`; every USK below the highest changing one is `Both`; the rest stay
+  `Top`. The drive turns a key-changing frame into scene groups: the Program cell is `Out` (or
+  `Both` when the background does not change or the incoming frame is not fresh), the incoming
+  background is one `In` tile at opacity 1, the WIPE border band is `Both`, and the merge is MIX
+  `p`, DIP `dip_weights` in the fill colour (linear, decoded once per colour) or WIPE `m(x, y)`.
+  A frame without a changing key keeps the single-accumulator path.
+- **Key-only transitions** (background not armed): no incoming picture, no DIP colour, a DIP
+  merges as a MIX and its keys follow `p` (`MixOverlay::envelope(false)`), the background never
+  swaps, `CompositedFrame::mix` is `None` (Program audio does not crossfade), PVW is not Program-
+  tallied, the SW2-02 terminal abort and the "same source on both buses" refusal do not apply.
+- **Tied DSK on a WIPE** (replaces the K2a deviation): `TieEnvelope::wipe` carries the mask;
+  the keyer is drawn through `m(x, y)` going on and its complement going off, at weight 1 while
+  that side is visible at all (so the tally never names an invisible keyer), and flips on the
+  terminal tick.
+- **Fresh gate.** A CUT or AUTO waits for every armed USK going on (and every tied DSK, as
+  before), then is refused at +50 ticks; a key-only take needs no fresh background; going off is
+  never gated.
+- **Verbs on a USK.** `keyer_cut` flips it outside a background transition
+  (`REFUSE_KEYER_IN_TRANSITION` during one); `keyer_auto` and `keyer_tie` are refused
+  (`REFUSE_KEYER_USK_VERB`).
+- **Tally.** A USK participant is Program-tallied only while its side is visible (not at MIX
+  `p = 0` going on, nor before a DIP's switch point); armed USKs going on are in `preview`.
+- **Clean.** USKs are part of the M/E scene, so they never take the Clean / DSK exclusion: the
+  gate's "defined" bit and the tick backstop count DSKs only (`any_dsk`).
+- **CLI boot.** `admit_keyers` resolves the M/E's USKs after the DSKs; the `keyer` demand set
+  seeds their fills and keys labelled `me1/<id>`.
+- **API.**
+  - `arm {background, keys}` on the existing plan/command routes: `Idempotency-Key`, 202 +
+    `operation_id`, outcome on `switcher.operation`. Authorization exactly as K4: `Write` role
+    on plan and command, `Control` on the M/E, `Program` scope, `Control` on every armed keyer
+    object id (`me1/<key>`, the list bounded at 5 before it is walked), then `Read` on every
+    armed key's fill and key, all before any existence answer (an unseen key is 403, a visible
+    undefined one 404). 422 for an empty, duplicate or over-long set; 409 `in-flight` during a
+    transition.
+  - **CUT and AUTO toggle the armed keys (review AUTHZ-1).** Plan and command authorize
+    `Control` on every currently armed USK object and `Read` on its fill and key
+    (`switcher_keyers::authorize_armed`). The command carries the committed `arm_version` and
+    definitions version it was authorized against (`SwitcherVerb::Bound`, boxed off the clock);
+    the tick refuses it `arm-changed` / `keyer-definitions-changed` if either moved, so a take
+    never toggles a key its caller was not authorized for. Consequence: an `arm` and a CUT sent
+    in the same tick refuse the CUT; arm, see it applied, then take.
+  - **Held verbs keep their binding (review round 2 MEDIA-3 / AUTHZ-3 / K3-BOUND-1).** A bound
+    take held by the fresh gate keeps its `(arm_version, defs_version)` in the held-take slot
+    (`HeldTake`, `Copy` versions, no allocation) and is rechecked before it is applied: if the
+    definitions moved while it was held (a `keyer_set` re-pointing an armed, off-air USK is
+    legal then, since an off-air keyer is not protected), it is refused
+    `keyer-definitions-changed`, never retargeted onto the new fill. A held USK `keyer_cut`
+    keeps the definitions version in its per-keyer `Pending` (`Option<u64>`) and is refused the
+    same way when a `keyer_set` (`on_air = "allow"`) replaced its definition. Chosen over
+    refusing `keyer_set` on a referenced keyer: one integer compare on the held path, no new
+    cross-verb rule, and the refusal lands on the operation whose authorization went stale.
+  - **A held USK cut never lands mid-transition (review round 2 MEDIA-2).** When a held USK
+    `keyer_cut` becomes fresh while a background transition is in flight it is refused
+    `keyer-in-transition` (the admission rule, applied at resolution), not deferred: deferring
+    would land an abrupt key at an arbitrary later tick the operator never chose.
+  - **A take replay is not re-authorized on the armed set (review round 2 IDEMP-1).** CUT/AUTO
+    command runs every request-level check (role, M/E, Program scope, explicit sources and the
+    resolved target, static validation) first, then answers an existing principal/path-scoped
+    `Idempotency-Key` reservation with its original 202 and `operation_id`, and only then, for a
+    new admission, authorizes the currently armed USKs and binds the versions. The armed set is
+    engine state, not part of the request: the original operation already carries the versions
+    it was authorized against, so another operator's later `arm` does not turn the retry into a
+    403.
+  - **Key-only takes with identical buses (review MEDIA-1).** `same-source` (PGM == PVW) is
+    refused only when the armed set moves the background.
+  - **USK `keyer_cut` (review AUTHZ-2)** also needs `Read` on the keyer's resolved fill and key
+    and is bound to the definitions version (refused `keyer-definitions-changed` if a
+    `keyer_set` re-pointed it meanwhile). DSK `keyer_cut`/`keyer_auto`/`keyer_tie` keep K4's
+    rule (sources are checked when named; the K4 design does not require Read on a DSK's
+    current fill to drive it, tested in `switcher_keyers`).
+  - `keyer_set` / `keyer_cut` take `family = "usk"` (object id `<me>/<keyer>`). A USK
+    `keyer_set` merges onto the definition, validates with the USK rules, admits its cost
+    against the shared budget, never reserves the Clean gate, refuses `rate`/`on_at_start`
+    (422 `keyer-usk`) and persists into `switcher.mix_effects[].keyers` after `applied`.
+  - `GET /api/v1/switcher/{me}`: `keyers[]` lists USK rows (`family = "usk"`, `armed`), and
+    `armed {background, keys}` lists the readable armed keys; rows, armed keys and
+    `switcher.keyer` events are filtered by keyer object id and redacted alike (tested).
+  - OpenAPI regenerated with `cargo run -p xtask -- gen-openapi` (`cargo xtask` has no alias in
+    this checkout); AsyncAPI is unchanged (`switcher.keyer` already carries the object id).
+- **Deviations and choices.**
+  - **Request field `family`.** The design note's `keyer` names a DSK; K3 adds an optional
+    `family` (`dsk` default) rather than inferring the family from the id, so a USK and a DSK
+    may share an id and every request names the object it authorizes.
+  - **USK `keyer_cut`** is allowed outside a transition (design note §8), refused during one.
+  - **A key-only CUT/AUTO** uses the existing `cut` / `auto` verbs after an `arm` without the
+    background; there is no separate key-transition verb.
+  - **WIPE envelope weight.** A tied DSK on a WIPE carries weight 1 (0 at the invisible end) and
+    the mask; the scalar envelope is a visibility flag, the pixels come from the mask.
+- **Tests.**
+  - `multiview-compositor` `tests/keyers_gpu.rs` K3 test (above) and `tests/keyers_wipe_merge.rs` (5): frames 0, mid, end of a WIPE with a
+    key going on against `lerp(scene_out, scene_in, m)` with each scene composed separately and
+    an independently written-out reveal; a key-only WIPE; a soft circle merge equal on the
+    oracle and 1-4 threads; the complement is `1 − m` and a foreign mask keeps the outgoing
+    scene; a tile through a complemented mask.
+  - `multiview-config`: unit tests (3: limits, uniqueness, shared budget, round trip, DSK-only
+    fields refused) and `tests/switcher_keyers.rs` (the preflight accepts USKs; budget shared).
+  - `multiview-engine` `tests/keyers_usk.rs` (10): arm validation; CUT with fly and an unarmed
+    key staying; MIX, DIP and WIPE frames 0, mid, end with a key going on, against
+    `merge(scene_out, scene_in)` composed separately; a key going off; key-only MIX, DIP (as
+    MIX) and WIPE; an unarmed USK below (`both`) and above (`top`) an armed one; an AUTO aborted
+    on a stale incoming source restores key state; the fresh gate (+50, 0 lost ticks, going off
+    never gated); USK verb refusals; USKs below DSKs. `tests/keyers_dsk.rs`: the WIPE tie test.
+  - `tests/keyers_usk_chaos.rs` (4, invariants #1/#10; restructured after review K3-INV-2):
+    a clock-driven run (manual time source, sources published by tick index) where each
+    cycle's armed keys stall and vanish DURING a 40-tick key-changing AUTO, the losses counted
+    against the committed snapshot's `in_flight` (≥ 6 in flight over 8 cycles), with
+    contiguous ticks, PTS from the counter and 0 repeats; a bounded `arm`/AUTO/CUT flood from 8
+    tasks whose accepted ids equal the terminal outcomes exactly (sends = accepted + busy,
+    zero lag with a per-tick reader); a stalled reader that sees exactly the 256-entry ring
+    plus a counted lag; and 6 000 ticks of key-changing MIX, DIP, WIPE-with-border and key-only
+    AUTOs where the drive's scratch, slate and DIP-fill odometers and the definition builds
+    never move after warm-up.
+  - `multiview-engine` `tests/keyers_usk.rs` also: `arm` refused while a take is held, the
+    held CUT keeping its set (review K3-INV-1); round 2: a held bound CUT and AUTO refused
+    `keyer-definitions-changed` after the armed off-air USK's fill is re-pointed while held; a
+    held USK `keyer_cut` refused the same way after a `keyer_set` (`allow`); a held unarmed USK
+    `keyer_cut` whose fill becomes fresh mid-AUTO refused `keyer-in-transition`, never drawn.
+  - `multiview-control` `tests/switcher_keyers_usk.rs` (10; round 2 added: a CUT and an AUTO
+    replay answer the original 202 / `operation_id` after another operator armed a key the
+    caller may not control, while a new take is 403 and a principal without the M/E is 403 on
+    the same key; round 1 added: key-only CUT/AUTO
+    with identical buses and the retained background refusal; CUT/AUTO BOLA on the armed keys
+    and their sources; a take bound to a stale arm set refused `arm-changed`; USK `keyer_cut`
+    BOLA on its sources and bound to its definition): the `arm` BOLA matrix on plan and
+    command (M/E, program, keyer object, sources, viewer; 403 before 404; no key burned); shape
+    and `in-flight`; 202 + outcome + replay and the armed set in GET; USK `keyer_set` /
+    `keyer_cut` and persistence to the M/E; GET/events parity and redaction for scoped
+    principals.
+- **Concerns.**
+  - **No counting allocator** (as K2a: the workspace forbids `unsafe_code`); the gate is the
+    pooled odometers plus fixed arrays. `arm` allocates only off the clock (the `Arc` set) and
+    its refusals use the existing per-command outcome path.
+  - **Cost of a key-changing frame:** two extra full-band accumulators and a merge per pixel on
+    the CPU while a USK changes; the default budget (one full-canvas keyer) bounds it until the
+    mda001 run.
+  - **GPU timing:** the WIPE merge adds one mask evaluation per pixel of a key-changing frame;
+    lavapipe proves equality only, and the RTX 4060 figures are still owed with the bench.
+
+### K7 (#392): chroma key
+
+- **Matte (ADR-C007 §3).** `KeyKind::Chroma {reference, clip, gain}`:
+  `m = clamp((d − clip) × gain, 0, 1)`, then optional invert, where `d` is the Euclidean
+  distance in the **fill's own-gamut linear RGB** between the fill pixel and the reference. The
+  reference is the operator's `#RRGGBB`, read as R'G'B' codes (`code / 255`), quantized once
+  per frame per tile onto the fill's own `(Y, Cb, Cr)` code grid (fill matrix and range,
+  `key::chroma_reference_codes`) and decoded through **the same** front half (steps 1-3) as
+  the fill's pixels (`key::chroma_reference_linear`; CPU: once per tile fold, with the LUTs
+  exactly when the pixels use them; GPU: in `KeyParams::build`). A pixel at the reference is matte 0
+  (keyed out); far colours are 1; the edge is monotonic in `d`. Clip/gain on the distance is
+  the luma key's shape, so operators get one mental model; clip and gain share the config
+  fields and bounds (`clip` in [0, 1], `gain` finite and `>= 0`).
+- **Pipeline order.** The CPU front half is split into `tile_yuv_to_tile_linear` (steps 1-3;
+  LUT twin in `LutSet`) and the step-4 primaries convert, which runs on that same value, so a
+  chroma tile's canvas-linear colour is unchanged and the #8 order is untouched; the matte only
+  multiplies into alpha at the single premultiply. The shader reads its existing `lin_tile`
+  (step 3) for the distance.
+- **Exact reference on every path (review K7 MEDIA-1).** A first cut linearized the reference
+  analytically while LUT composites linearized pixels by table, so a fill carrying exactly
+  the reference (full-range grey 128 vs `#808080`) at `clip = 0, gain = 1e9` was keyed out
+  without LUTs but kept whole with them, and the GPU differed from CPU+LUT by 110 codes.
+  Now the reference is a point on the fill's code grid decoded by the identical CPU path, so
+  equal codes give `d = 0` bit-exactly with and without LUTs. The shader packs the
+  reference codes (`KeyParams.table[0]`, `y | cb << 8 | cr << 16`) and short-circuits a
+  pixel with those codes to `d = 0`, so its transcendental EOTF cannot leave a residue either;
+  other pixels use the analytic reference against the shader's own `lin_tile`. A large gain
+  is therefore a sharp key that removes exactly the reference codes (`clip > 0` widens it to
+  nearby codes); off the reference the matte is still a clamp of `(d − clip) × gain`, whose
+  CPU/GPU agreement at a huge gain is bounded by the SSIM/PSNR gate, not bit-exact.
+- **Degenerate parameters are total.** `key::chroma_matte` flushes a subnormal clip or gain to 0
+  (a GPU may flush them) and reads a NaN or negative gain as 0 and a NaN distance as 0. The GPU
+  never sees a NaN or infinity: `uniforms::chroma_edge` reduces `(clip, gain)` to a mode and
+  finite numbers (`KeyParams.table[1..4]`), unit-tested equal to the oracle for every clip and
+  gain class (NaN, ±∞, subnormal, zero, negative, `f32::MAX`) and a range of distances.
+- **GPU.** `KEY_KIND_CHROMA` (3); `KeyParams` grows from 80 to 96 bytes with `chroma: vec4<f32>`
+  (the reference). No matte table, no key-source layer: `TileKey::signal_source` is `None` for
+  a chroma key, so a key source on one is never uploaded or read.
+- **Key source: refused.** Chroma keys the fill's own colour; a separate key has no colour to
+  measure. Config refuses it (`chroma-key-source`); the compositor ignores one if a caller
+  sets it.
+- **Config and API.** `DownstreamKeyerConfig.color` (`#RRGGBB` / `#RGB`,
+  `crate::parse_hex_color`), required by `chroma` (`chroma-color-required`, `chroma-color`)
+  and refused on other types (`chroma-color-without-chroma`). The boot preflight and the K4
+  `validate_definition` run the same checks. `keyer_set` takes `type = "chroma"` and `color`
+  (`""` clears it); GET rows report `type = "chroma"`. OpenAPI regenerated
+  (`cargo xtask gen-openapi`). The off-clock scene key (#415) compares the reference too.
+- **Cost.** Unchanged: a chroma key has no key source (one upload), and the shader adds a
+  distance and a clamp per covered pixel, the same order as the luma table lookup.
+- **Tests.**
+  - `key` unit tests (6): the exact reference is keyed out (and kept when inverted), a far
+    colour is 1, the edge is monotonic and bounded, degenerate parameters are total, a key
+    source is ignored and the mask applies, the reference is quantized to the fill's codes
+    and decoded exactly like a pixel.
+  - `uniforms` unit tests (2): `chroma_edge` equals the oracle for every parameter class; the
+    packing (kind, invert, no table, no source, reference, edge).
+  - `tests/keyers_chroma_cpu.rs` (8): goldens against an independent per-pixel computation
+    (green screen with several references, clip/gain and invert; the reference kernel equal);
+    the studio green keyed out with subject kept and a soft edge; the distance in the tile
+    gamut (a PQ/BT.2020 fill whose canvas-gamut matte would differ); opacity × mask × matte
+    premultiplied once; a key source ignored; degenerate parameters never poison the layers
+    beneath; a proptest that the tile-driven kernel equals the oracle at 1-4 threads, with
+    LUTs on and off and in a scene group; MEDIA-1: a fill carrying exactly the reference
+    (full-range grey, limited grey, a full-range light grey, PQ/BT.2020) keyed out at gain
+    1e9, `f32::MAX` and +∞ with and without LUTs (red before the fix).
+  - `tests/keyers_chroma_gpu.rs` (`wgpu`, 4): GPU vs CPU over 8 frames (soft edge, invert,
+    pure distance, upscaled masked full-range fill at weight 0.7, PQ/BT.2020 downscaled fill,
+    MIX group, NaN/±∞ parameters, step and `f32::MAX` gain); the exact reference keyed out on
+    the GPU; MEDIA-1: reference-code columns keyed out and neighbouring codes (127, 129)
+    kept at gain 1e9, `f32::MAX` and +∞, within |ΔY| ≤ 2 of the CPU with and without LUTs
+    (red before the fix: |ΔY| 110 against CPU+LUT); no CPU fallback and no GPU pool growth
+    over 30 frames. On lavapipe (llvmpipe 19,
+    Vulkan) the minima were SSIM 0.99997 and PSNR 63.3 dB, max |ΔY| 2.
+  - `multiview-config` (3): accept (with mask, invert, `#RGB`, the K4 per-definition check, the
+    same cost as a linear self key), the typed refusals and clip/gain bounds, a TOML round
+    trip. The K2a "chroma is refused" assertion was removed in its own commit.
+  - `multiview-engine` `keyer` unit test: config to `KeyKind::Chroma`, cost unchanged, a
+    missing colour is a typed error.
+  - `multiview-control` `tests/switcher_keyers.rs`: `keyer_set` with chroma is planned,
+    applied at the tick, persisted, re-validated after a TOML round trip and listed by GET;
+    the four bad shapes are 422 with their reasons.
+- **Not done.** Spill suppression (ADR-C007 and ADR-0056 do not ask for it; a chroma key
+  leaves green fringes on edges until a spill slice), an automatic reference picker, a
+  separate key-source chroma key, and USK chroma (see "K3 × K7 merge" below). A dedicated chroma bench
+  figure is not recorded (`keyer_composite_bench` has no chroma case); the RTX 4060
+  calibration is still owed by the lead as for K1.
+
+
+### K3 × #436 merge (stored layout as an M/E source)
+
+- A held take keeps both checks: K3's `Bound` versions (arm set, keyer definitions) and #436's
+  `SelectionGuard`. The guard rides the outer `SwitcherCommand` (`expect`) through the `Bound`
+  unwrap at drain; `guard_violated` exempts `Arm` and `Bound` (a held take holds the inner verb).
+- The current Preview of a CUT/AUTO is engine state like the armed set: its layout authorization
+  and guard run only for a NEW take, after the idempotent replay (review R3-IDEMP-1), from the same
+  snapshot the arm binding reads.
+- A key-only take (background not armed) moves neither bus, so it neither authorizes nor guards
+  Preview (review R3-KEYONLY-1). If an arm change adds the background before the take drains, the
+  bound arm version refuses it (`arm-changed`); it never takes an unguarded Preview.
+### K3 × K7 merge (K3 branch merged with main after PR #507)
+
+- **`KeyParams` (96 bytes).** K3 put the WIPE merge in the existing `merge` / `dip_colour` lanes
+  (kind ≥ 2) and the complemented tile mask in `TileParams::prim2.w`; K7 reused `table` for the
+  chroma reference codes and edge, and added `chroma`. No lane is shared: the textual auto-merge
+  was correct in layout, but it dropped the canvas size from K7's new `KeyParams::with_group`
+  (where K3's WIPE packing now lives) and K7's packing test called the 3-argument `build`;
+  both are fixed. `a_chroma_key_packs_beside_every_scene_merge` checks that a chroma key in
+  every scene group (MIX, DIP, WIPE, a complemented WIPE, a pinned endpoint; each member)
+  keeps its key lanes and the group keeps its merge lanes. `rust_and_wgsl_blocks_share_one_layout`
+  compares the Rust structs with naga's WGSL layout.
+- **GPU.** `keyers_chroma_gpu::a_chroma_key_in_a_wipe_scene_group_matches_the_cpu_oracle_on_the_gpu`
+  (3 frames: a chroma key coming on through a soft circle WIPE; an inverted, masked chroma key
+  going off through a reversed box WIPE beside a PQ/BT.2020 chroma tile; a step-gain chroma
+  key through a complemented mask over a WIPE group). The tile-driven CPU kernel equals the
+  oracle at 1-4 threads with and without LUTs. GPU against CPU on lavapipe (llvmpipe 19,
+  Vulkan): minima SSIM 0.99999 and PSNR 63.6 dB, max |ΔY| 2 (floors SSIM 0.98, PSNR 40 dB).
+- **USK chroma is refused, consistently.** `UpstreamKeyerConfig` has no `color` field
+  (`deny_unknown_fields`, so a TOML `color` on a USK is a parse error), and
+  `UpstreamKeyerConfig::validate_definition` refuses `type = "chroma"` by name (`usk-chroma`)
+  before the shared DSK checks, which would otherwise report a missing colour. `as_definition`
+  sets `color: None`. The boot preflight and the K4 USK `keyer_set` path run the same check;
+  `keyer_set` also refuses `color` on `family = "usk"` as a DSK-only field (`keyer-usk`), so
+  the colour is never silently dropped. Tests: the `multiview-config` USK test and
+  `switcher_keyers_usk::usk_keyer_set_cut_and_persistence`.
 
 ### K5 (#390): desk, and the small API additions it needed
 

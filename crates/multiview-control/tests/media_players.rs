@@ -448,3 +448,83 @@ async fn list_players_is_readable_by_a_viewer() {
         .collect();
     assert_eq!(ids, vec!["vt-1", "vt-2"]);
 }
+
+/// A provider whose every operation ended `failed` on a cadence mismatch.
+struct FailedLoads;
+impl multiview_control::player_load::PlayerLoadProvider for FailedLoads {
+    fn load(
+        &self,
+        _: &str,
+        _: &multiview_control::auth::Principal,
+        _: &str,
+        _: multiview_control::player_load::ArtifactRef,
+        _: multiview_control::player_load::LoadThen,
+        _: multiview_control::web_capture::ArtifactLease,
+    ) -> multiview_control::error::ControlResult<multiview_control::player_load::LoadOperation>
+    {
+        Err(multiview_control::error::ControlError::EngineBusy)
+    }
+    fn operation(
+        &self,
+        _: &str,
+        _: &multiview_control::auth::Principal,
+        operation: u64,
+    ) -> multiview_control::error::ControlResult<multiview_control::player_load::LoadOperation>
+    {
+        Ok(multiview_control::player_load::LoadOperation {
+            operation,
+            state: "failed",
+            native: None,
+            reason: Some(multiview_control::player_load::LoadFailureCode::WrongCadence),
+            detail: Some(
+                "clip frame rate 25/1 does not match the canvas frame rate 30000/1001".into(),
+            ),
+        })
+    }
+}
+
+/// A failed native load reports its typed reason and redacted detail on the
+/// operation route (issue #474), never a bare `failed`.
+#[tokio::test]
+async fn failed_load_operation_reports_typed_reason() {
+    let store = InMemoryMediaPlayerStore::new();
+    store
+        .create(
+            "vt-1",
+            ResourceInput {
+                name: "vt-1".to_owned(),
+                body: json!({ "id": "vt-1", "eof_policy": "hold_last_frame" }),
+            },
+        )
+        .expect("seed media player");
+    let store: Arc<dyn ResourceRepository> = Arc::new(store);
+    let h = harness_with(move |mut state| {
+        state.player_load = Arc::new(FailedLoads);
+        state.with_media_player_store(store)
+    });
+    let resp = send(
+        &h.router,
+        get(
+            "/api/v1/media/players/vt-1/load-operations/7",
+            OPERATOR_TOKEN,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["operation"], 7);
+    assert_eq!(body["state"], "failed");
+    assert_eq!(body["reason"], "wrong_cadence");
+    assert_eq!(
+        body["detail"],
+        "clip frame rate 25/1 does not match the canvas frame rate 30000/1001"
+    );
+    assert!(body["native"].is_null());
+    // Out-of-scope principals never see the operation (BOLA).
+    let resp = send(
+        &h.router,
+        get("/api/v1/media/players/vt-1/load-operations/7", SCOPED_TOKEN),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}

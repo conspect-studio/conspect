@@ -78,6 +78,7 @@ fn command(op: &str, verb: SwitcherVerb) -> SwitcherCommand {
         operation_id: op.to_owned(),
         scene_version: 1,
         verb,
+        expect: None,
     }
 }
 
@@ -366,4 +367,20 @@ fn sustained_repeat_ticks_still_expire_an_armed_set_but_never_an_applying_one() 
     }
     driver.commit_composed_tick(tick(2));
     assert_eq!((held.state(), held.tick()), (ArmState::Committed, 2));
+}
+
+/// #307 PR 2: a member of an armed set is a reference (the frame hook never
+/// removes a layout store an armed salvo will patch), until the set settles.
+#[test]
+fn an_armed_set_member_is_a_source_reference_until_it_settles() {
+    let (handle, mut driver) = with_inputs();
+    run(&mut driver, 1);
+    assert!(!driver.references_source("d"));
+    let (verb, _arm) = armed(&[(4, "d")], false);
+    handle.try_send(command("set", verb)).unwrap();
+    run(&mut driver, 2);
+    assert!(
+        driver.references_source("d"),
+        "an armed set's member must count as referenced"
+    );
 }

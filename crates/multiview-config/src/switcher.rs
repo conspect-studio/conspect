@@ -4,7 +4,9 @@
 //!
 //! Downstream keyers (ADR-0113, `docs/architecture/switcher-keyers.md` §2,
 //! slice K2): `[[switcher.downstream_keyers]]` is typed, validated and
-//! admitted against `switcher.keyer_budget` at definition.
+//! admitted against `switcher.keyer_budget` at definition. Upstream keyers
+//! (slice K3): `[[switcher.mix_effects.keyers]]`, at most four per M/E,
+//! admitted against the same budget.
 //!
 //! Numbered mixer inputs (ADR-0110, `docs/architecture/output-routing.md`
 //! §12.2): an M/E may declare `[[switcher.mix_effects.inputs]]`; PGM/PVW then
@@ -21,6 +23,12 @@ use crate::error::ConfigError;
 pub const MAX_MIXER_INPUTS: u16 = 64;
 /// Prefix of the engine's mixer-input reference spelling (`in:<n>`).
 pub const INPUT_REF_PREFIX: &str = "in:";
+/// Engine-reserved store-key prefixes a keyer fill or key may never name
+/// (#307): a stored layout adopted as an M/E source is keyed `layout:<id>`
+/// and a bus store `bus:<name>` in the same store map a keyer resolves its
+/// fill and key from, so a configured source spelled that way could bind
+/// the layout's picture without the layout's authorization closure.
+pub const KEYER_RESERVED_PREFIXES: [&str; 2] = ["layout:", "bus:"];
 /// Maximum operator label length, in characters.
 pub const MAX_MIXER_INPUT_LABEL: usize = 64;
 
@@ -55,6 +63,11 @@ pub struct MixEffectsConfig {
     /// back by the control plane after the engine applied a selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transition: Option<TransitionDescriptor>,
+    /// Upstream keyers of this M/E (ADR-0113, slice K3), at most
+    /// [`MAX_UPSTREAM_KEYERS`]. Their order is the 1-based key index the
+    /// `arm` verb and the value machine use.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keyers: Vec<UpstreamKeyerConfig>,
 }
 
 /// One numbered mixer input slot `me1.in<N>` and its patched video source.
@@ -94,6 +107,11 @@ pub enum MixerInputVideo {
 
 /// Hard limit on downstream keyers per program (ADR-0113 §9).
 pub const MAX_DOWNSTREAM_KEYERS: usize = 2;
+/// Hard limit on upstream keyers per M/E (ADR-0113 §7).
+pub const MAX_UPSTREAM_KEYERS: usize = 4;
+/// Fold weight of a USK (ADR-0113 §7: two accumulators during a
+/// key-changing transition).
+pub const USK_FOLD: f64 = 2.0;
 /// Smallest fly width and height, in canvas pixels (ADR-0113 §4).
 pub const MIN_KEYER_FLY: u32 = 16;
 /// Largest DSK AUTO rate, in frames (ADR-0113 §5).
@@ -152,8 +170,7 @@ pub struct KeyerSize {
     pub h: u32,
 }
 
-/// How a DSK derives its matte. `chroma` parses so it can be refused by name
-/// (slice K7); it never reaches the runtime.
+/// How a DSK derives its matte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -163,7 +180,9 @@ pub enum KeyerType {
     Linear,
     /// Luma key with `clip` and `gain`.
     Luma,
-    /// Chroma key: refused at validation until slice K7.
+    /// Chroma key (slice K7, ADR-C007 §3) on the fill's own colour: `color`
+    /// is the reference, `clip`/`gain` shape the edge on the linear-RGB
+    /// distance. A key source is refused.
     Chroma,
 }
 
@@ -225,12 +244,18 @@ pub struct DownstreamKeyerConfig {
     /// Matte derivation.
     #[serde(rename = "type", default)]
     pub key_type: KeyerType,
-    /// Luma clip on normalized Y, `[0, 1]`.
+    /// Luma clip on normalized Y, `[0, 1]`. Chroma: the linear-RGB distance
+    /// below which the fill is keyed out fully, `[0, 1]`.
     #[serde(default)]
     pub clip: f32,
-    /// Luma gain, finite and `>= 0`.
+    /// Luma or chroma gain (soft-edge slope), finite and `>= 0`.
     #[serde(default = "default_gain")]
     pub gain: f32,
+    /// Chroma reference colour, `#RRGGBB` / `#RGB` R'G'B' code values of the
+    /// fill's own transfer (e.g. `#00b140`). Required by `type = "chroma"`,
+    /// refused by every other type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
     /// Invert the matte.
     #[serde(default, skip_serializing_if = "is_false")]
     pub invert: bool,
@@ -367,9 +392,30 @@ impl DownstreamKeyerConfig {
             return err(format!("references undeclared program {:?}", self.program));
         }
         if self.key_type == KeyerType::Chroma {
+            if self.key.is_some() {
+                return err(
+                    "type = \"chroma\" keys the fill's own colour; a separate key source is \
+                     refused (chroma-key-source)"
+                        .into(),
+                );
+            }
+            match self.color.as_deref() {
+                None => {
+                    return err(
+                        "type = \"chroma\" needs color = \"#RRGGBB\" (chroma-color-required)"
+                            .into(),
+                    )
+                }
+                Some(c) if crate::parse_hex_color(c).is_none() => {
+                    return err(format!(
+                        "color {c:?} is not a #RGB / #RRGGBB hex color (chroma-color)"
+                    ));
+                }
+                Some(_) => {}
+            }
+        } else if self.color.is_some() {
             return err(
-                "type = \"chroma\" is not supported yet (chroma keys are slice K7); use linear or luma"
-                    .into(),
+                "color applies only to type = \"chroma\" (chroma-color-without-chroma)".into(),
             );
         }
         if self.premultiplied {
@@ -386,6 +432,11 @@ impl DownstreamKeyerConfig {
             if id.starts_with(INPUT_REF_PREFIX) {
                 return err(format!(
                     "{role} {id:?} names a mixer input; keyer fill and key name sources only"
+                ));
+            }
+            if KEYER_RESERVED_PREFIXES.iter().any(|p| id.starts_with(p)) {
+                return err(format!(
+                    "{role} {id:?} uses a reserved prefix (layout:/bus:); keyer fill and key name configured sources only"
                 ));
             }
             if !sources.contains(&id) {
@@ -439,6 +490,163 @@ impl DownstreamKeyerConfig {
             }
         }
         Ok(())
+    }
+}
+
+/// One upstream keyer, `[[switcher.mix_effects.keyers]]` (ADR-0113 §2,
+/// slice K3). It belongs to the M/E scene: it changes state only through
+/// the `arm` set and a background transition (CUT or AUTO), so it has no
+/// rate, tie or boot state of its own. Its object id is `<me>/<id>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamKeyerConfig {
+    /// Unique id within the M/E; the object id is `<me>/<id>`.
+    pub id: String,
+    /// Fill source id (a declared source; mixer inputs are refused).
+    pub fill: String,
+    /// Optional key source id; absent means a self key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Matte derivation.
+    #[serde(rename = "type", default)]
+    pub key_type: KeyerType,
+    /// Luma clip on normalized Y, `[0, 1]`.
+    #[serde(default)]
+    pub clip: f32,
+    /// Luma gain, finite and `>= 0`.
+    #[serde(default = "default_gain")]
+    pub gain: f32,
+    /// Invert the matte.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub invert: bool,
+    /// Mask in fill-source pixels; absent means no mask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<KeyerRect>,
+    /// Destination rectangle in canvas pixels; absent means the full canvas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fly: Option<KeyerRect>,
+    /// Admitted source envelope; absent means the canvas size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_source: Option<KeyerSize>,
+    /// Order among the M/E's USKs (ascending = drawn first), unique.
+    #[serde(default)]
+    pub z: i32,
+    /// Loss policy.
+    #[serde(default)]
+    pub loss: KeyerLossPolicy,
+    /// Loss trigger.
+    #[serde(default)]
+    pub loss_trigger: KeyerLossTrigger,
+    /// Shaped (premultiplied) fills: parsed only to be refused by name.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub premultiplied: bool,
+}
+
+impl UpstreamKeyerConfig {
+    /// The shared per-definition view the field checks and the engine's
+    /// resolution run on: the same fields as a DSK on `program`, with the
+    /// DSK-only ones (`rate`, `tie`, `on_at_start`) at their defaults.
+    #[must_use]
+    pub fn as_definition(&self, program: &str) -> DownstreamKeyerConfig {
+        DownstreamKeyerConfig {
+            id: self.id.clone(),
+            program: program.to_owned(),
+            fill: self.fill.clone(),
+            key: self.key.clone(),
+            key_type: self.key_type,
+            clip: self.clip,
+            gain: self.gain,
+            // A USK has no chroma reference: chroma is a DSK-only type
+            // (K7), refused by `validate_definition` (`usk-chroma`).
+            color: None,
+            invert: self.invert,
+            mask: self.mask,
+            fly: self.fly,
+            max_source: self.max_source,
+            rate: DEFAULT_KEYER_RATE,
+            tie: false,
+            on_at_start: false,
+            z: self.z,
+            loss: self.loss,
+            loss_trigger: self.loss_trigger,
+            premultiplied: self.premultiplied,
+        }
+    }
+
+    /// The USK of a per-definition view (the inverse of
+    /// [`Self::as_definition`]; the DSK-only fields are dropped).
+    #[must_use]
+    pub fn from_definition(def: &DownstreamKeyerConfig) -> Self {
+        Self {
+            id: def.id.clone(),
+            fill: def.fill.clone(),
+            key: def.key.clone(),
+            key_type: def.key_type,
+            clip: def.clip,
+            gain: def.gain,
+            invert: def.invert,
+            mask: def.mask,
+            fly: def.fly,
+            max_source: def.max_source,
+            z: def.z,
+            loss: def.loss,
+            loss_trigger: def.loss_trigger,
+            premultiplied: def.premultiplied,
+        }
+    }
+
+    /// This keyer's admission cost (`fold` = [`USK_FOLD`], ADR-0113 §7).
+    #[must_use]
+    pub fn cost(&self, canvas_w: u32, canvas_h: u32) -> f64 {
+        let fly = self.fly.unwrap_or(KeyerRect {
+            x: 0,
+            y: 0,
+            w: canvas_w,
+            h: canvas_h,
+        });
+        let source = self.max_source.unwrap_or(KeyerSize {
+            w: canvas_w,
+            h: canvas_h,
+        });
+        keyer_cost(
+            USK_FOLD,
+            (fly.w, fly.h),
+            (source.w, source.h),
+            self.key.is_some(),
+            (canvas_w, canvas_h),
+        )
+    }
+
+    /// Validate one definition on its own (the per-field checks a DSK runs:
+    /// sources, `in:` refused, refused-by-name features, geometry, mask).
+    ///
+    /// # Errors
+    /// As [`DownstreamKeyerConfig::validate_definition`], labelled as an
+    /// upstream keyer.
+    pub fn validate_definition(
+        &self,
+        program: &str,
+        sources: &[&str],
+        canvas_w: u32,
+        canvas_h: u32,
+    ) -> Result<(), ConfigError> {
+        if self.key_type == KeyerType::Chroma {
+            // K7 built chroma for DSKs only; a USK has no `color` field, so
+            // it is refused by name rather than as a missing colour.
+            return Err(ConfigError::Validation(format!(
+                "upstream keyer {:?} type = \"chroma\" is not supported on an upstream \
+                 keyer yet (usk-chroma); use a downstream keyer",
+                self.id
+            )));
+        }
+        self.as_definition(program)
+            .validate_definition(sources, canvas_w, canvas_h)
+            .map_err(|e| match e {
+                ConfigError::Validation(msg) => {
+                    ConfigError::Validation(msg.replacen("downstream keyer", "upstream keyer", 1))
+                }
+                other => other,
+            })
     }
 }
 
@@ -627,8 +835,8 @@ impl SwitcherConfig {
     /// `keyer_budget` (ADR-0113 §9, reserved at definition).
     ///
     /// # Errors
-    /// A hard limit, a bad reference, a refused-by-name feature (`chroma`,
-    /// `premultiplied`), a geometry out of bounds or a document over budget.
+    /// A hard limit, a bad reference, a refused-by-name feature
+    /// (`premultiplied`, a chroma key with a key source), a geometry out of bounds or a document over budget.
     pub fn validate_keyers(
         &self,
         sources: &[&str],
@@ -636,8 +844,9 @@ impl SwitcherConfig {
         canvas_w: u32,
         canvas_h: u32,
     ) -> Result<(), ConfigError> {
+        let usk_total = self.validate_upstream_keyers(sources, canvas_w, canvas_h)?;
         if self.downstream_keyers.is_empty() {
-            return Ok(());
+            return self.check_budget(usk_total);
         }
         if self.downstream_keyers.len() > MAX_DOWNSTREAM_KEYERS {
             return Err(ConfigError::Validation(format!(
@@ -671,23 +880,67 @@ impl SwitcherConfig {
                 )));
             }
         }
+        let total: f64 = self
+            .downstream_keyers
+            .iter()
+            .map(|dsk| dsk.cost(canvas_w, canvas_h))
+            .sum();
+        self.check_budget(usk_total + total)
+    }
+
+    /// The summed keyer cost against `keyer_budget` (ADR-0113 §7: USKs and
+    /// DSKs share one budget, reserved at definition).
+    fn check_budget(&self, total: f64) -> Result<(), ConfigError> {
         let budget = self.keyer_budget.unwrap_or(DEFAULT_KEYER_BUDGET);
         if !budget.is_finite() || budget < 0.0 {
             return Err(ConfigError::Validation(format!(
                 "switcher.keyer_budget {budget} must be finite and >= 0"
             )));
         }
-        let total: f64 = self
-            .downstream_keyers
-            .iter()
-            .map(|dsk| dsk.cost(canvas_w, canvas_h))
-            .sum();
         if total > f64::from(budget) + BUDGET_EPSILON {
             return Err(ConfigError::Validation(format!(
-                "downstream keyers cost {total:.3} canvas folds, over switcher.keyer_budget {budget}"
+                "keyers cost {total:.3} canvas folds, over switcher.keyer_budget {budget}"
             )));
         }
         Ok(())
+    }
+
+    /// Validate every M/E's upstream keyers (at most four, unique id and z,
+    /// the per-field checks) and return their summed cost.
+    fn validate_upstream_keyers(
+        &self,
+        sources: &[&str],
+        canvas_w: u32,
+        canvas_h: u32,
+    ) -> Result<f64, ConfigError> {
+        let mut total = 0.0;
+        for me in &self.mix_effects {
+            if me.keyers.len() > MAX_UPSTREAM_KEYERS {
+                return Err(ConfigError::Validation(format!(
+                    "switcher M/E {:?} has more than {MAX_UPSTREAM_KEYERS} upstream keyers",
+                    me.id
+                )));
+            }
+            let mut ids = HashSet::with_capacity(me.keyers.len());
+            let mut zs = HashSet::with_capacity(me.keyers.len());
+            for usk in &me.keyers {
+                usk.validate_definition(&me.program, sources, canvas_w, canvas_h)?;
+                if !ids.insert(usk.id.as_str()) {
+                    return Err(ConfigError::Validation(format!(
+                        "upstream keyer {:?} is declared twice on M/E {:?}",
+                        usk.id, me.id
+                    )));
+                }
+                if !zs.insert(usk.z) {
+                    return Err(ConfigError::Validation(format!(
+                        "upstream keyer {:?} shares z = {} with another keyer on M/E {:?}",
+                        usk.id, usk.z, me.id
+                    )));
+                }
+                total += usk.cost(canvas_w, canvas_h);
+            }
+        }
+        Ok(total)
     }
 
     /// Whether this document defines at least one downstream keyer.
@@ -727,6 +980,7 @@ mod tests {
             program_input: Some(1),
             preview_input: Some(2),
             transition: None,
+            keyers: vec![],
         }
     }
 
@@ -976,6 +1230,7 @@ number = 3
             key_type: KeyerType::Linear,
             clip: 0.0,
             gain: 1.0,
+            color: None,
             invert: false,
             mask: None,
             fly: None,
@@ -1053,14 +1308,99 @@ number = 3
         keyer_refused(vec![program], "undeclared program");
     }
 
+    /// #307 merge review MR-01: a fill or key spelled like an engine store
+    /// key (`layout:<id>`, `bus:<name>`) is refused even when a configured
+    /// source carries that literal id, so a keyer can never bind an adopted
+    /// layout's store by name collision.
     #[test]
-    fn chroma_and_premultiplied_are_refused_by_name() {
-        let mut chroma = dsk("dsk1", 1);
-        chroma.key_type = KeyerType::Chroma;
-        keyer_refused(vec![chroma], "chroma");
+    fn a_fill_or_key_never_names_a_reserved_store_key() {
+        for (fill, key) in [("layout:wall", None), ("bars", Some("bus:program"))] {
+            let mut keyer = dsk("dsk1", 1);
+            keyer.fill = fill.into();
+            keyer.key = key.map(Into::into);
+            let error = keyer
+                .validate_definition(&["bars", "layout:wall", "bus:program"], CANVAS.0, CANVAS.1)
+                .expect_err("reserved prefix must be refused")
+                .to_string();
+            assert!(error.contains("reserved prefix"), "{error}");
+        }
+    }
+
+    #[test]
+    fn premultiplied_is_refused_by_name() {
         let mut shaped = dsk("dsk1", 1);
         shaped.premultiplied = true;
         keyer_refused(vec![shaped], "premultiplied");
+    }
+
+    fn chroma(color: Option<&str>) -> DownstreamKeyerConfig {
+        let mut k = dsk("dsk1", 1);
+        k.key_type = KeyerType::Chroma;
+        k.color = color.map(str::to_owned);
+        k.clip = 0.05;
+        k.gain = 8.0;
+        k
+    }
+
+    #[test]
+    fn a_chroma_key_with_a_reference_colour_is_accepted() {
+        keyers(vec![chroma(Some("#00b140"))], None).unwrap();
+        keyers(vec![chroma(Some("#0f0"))], None).unwrap();
+        let mut masked = chroma(Some("#00FF00"));
+        masked.invert = true;
+        masked.mask = Some(KeyerRect {
+            x: 0,
+            y: 0,
+            w: 960,
+            h: 540,
+        });
+        keyers(vec![masked.clone()], None).unwrap();
+        // The K4 per-definition check is the same rule.
+        masked
+            .validate_definition(SOURCES, CANVAS.0, CANVAS.1)
+            .unwrap();
+        // Same cost as a self linear key (no key source, ADR-0113 §9).
+        assert!(
+            (masked.cost(CANVAS.0, CANVAS.1) - dsk("x", 1).cost(CANVAS.0, CANVAS.1)).abs() < 1e-12
+        );
+    }
+
+    #[test]
+    fn a_chroma_key_is_refused_with_typed_messages() {
+        keyer_refused(vec![chroma(None)], "chroma-color-required");
+        keyer_refused(vec![chroma(Some("green"))], "chroma-color");
+        keyer_refused(vec![chroma(Some("#00b14"))], "chroma-color");
+        let mut sourced = chroma(Some("#00b140"));
+        sourced.key = Some("vt1".into());
+        keyer_refused(vec![sourced], "chroma-key-source");
+        let mut stray = dsk("dsk1", 1);
+        stray.color = Some("#00b140".into());
+        keyer_refused(vec![stray], "chroma-color-without-chroma");
+        for (clip, gain, needle) in [
+            (f32::NAN, 1.0, "clip"),
+            (-0.1, 1.0, "clip"),
+            (1.5, 1.0, "clip"),
+            (0.1, f32::INFINITY, "gain"),
+            (0.1, -1.0, "gain"),
+            (0.1, f32::NAN, "gain"),
+        ] {
+            let mut k = chroma(Some("#00b140"));
+            k.clip = clip;
+            k.gain = gain;
+            keyer_refused(vec![k], needle);
+        }
+    }
+
+    #[test]
+    fn a_chroma_key_round_trips_through_toml() {
+        let doc = "id = \"dsk1\"\nprogram = \"main\"\nfill = \"bars\"\ntype = \"chroma\"\n\
+                   color = \"#00b140\"\nclip = 0.05\ngain = 8.0\n";
+        let k: DownstreamKeyerConfig = toml::from_str(doc).unwrap();
+        assert_eq!(k.key_type, KeyerType::Chroma);
+        assert_eq!(k.color.as_deref(), Some("#00b140"));
+        let back: DownstreamKeyerConfig = toml::from_str(&toml::to_string(&k).unwrap()).unwrap();
+        assert_eq!(back, k);
+        keyers(vec![k], None).unwrap();
     }
 
     #[test]
@@ -1176,5 +1516,130 @@ kept = true
             !out.contains("downstream_keyers") && !out.contains("keyer_budget"),
             "{out}"
         );
+    }
+
+    // ---- Upstream keyers (ADR-0113, K3) ----
+
+    fn usk(id: &str, z: i32) -> UpstreamKeyerConfig {
+        toml::from_str(&format!("id = {id:?}\nfill = \"bars\"\nz = {z}\n")).unwrap()
+    }
+
+    fn usks(list: Vec<UpstreamKeyerConfig>, budget: Option<f32>) -> Result<(), ConfigError> {
+        let mut me = me();
+        me.keyers = list;
+        SwitcherConfig {
+            mix_effects: vec![me],
+            downstream_keyers: vec![],
+            keyer_budget: budget,
+            extra: serde_json::Map::new(),
+        }
+        .validate_keyers(SOURCES, &["main"], CANVAS.0, CANVAS.1)
+    }
+
+    #[test]
+    fn usks_are_typed_bounded_unique_and_validated_like_dsks() {
+        let fly = |id: &str, z: i32| UpstreamKeyerConfig {
+            fly: Some(KeyerRect {
+                x: 0,
+                y: 0,
+                w: 192,
+                h: 108,
+            }),
+            max_source: Some(KeyerSize { w: 192, h: 108 }),
+            ..usk(id, z)
+        };
+        // Four small flying USKs fit the default budget; a fifth is refused.
+        let four: Vec<_> = (1..=4).map(|z| fly(&format!("usk{z}"), z)).collect();
+        usks(four.clone(), None).unwrap();
+        let mut five = four;
+        five.push(fly("usk5", 5));
+        let error = usks(five, Some(100.0)).unwrap_err().to_string();
+        assert!(error.contains("more than 4 upstream keyers"), "{error}");
+        let dup = usks(vec![fly("a", 1), fly("a", 2)], None).unwrap_err();
+        assert!(dup.to_string().contains("declared twice"), "{dup}");
+        let dup_z = usks(vec![fly("a", 1), fly("b", 1)], None).unwrap_err();
+        assert!(dup_z.to_string().contains("shares z"), "{dup_z}");
+        // The per-field checks are the DSK ones, labelled as upstream.
+        let mut input = fly("a", 1);
+        input.fill = "in:1".into();
+        let error = usks(vec![input], None).unwrap_err().to_string();
+        assert!(
+            error.contains("upstream keyer") && error.contains("mixer input"),
+            "{error}"
+        );
+        let mut chroma = fly("a", 1);
+        chroma.key_type = KeyerType::Chroma;
+        let error = usks(vec![chroma], None).unwrap_err().to_string();
+        assert!(
+            error.contains("upstream keyer") && error.contains("usk-chroma"),
+            "{error}"
+        );
+        // A USK has no `color` field (chroma is DSK-only, K7).
+        let doc = "id = \"a\"\nfill = \"bars\"\ntype = \"chroma\"\ncolor = \"#00b140\"\n";
+        assert!(toml::from_str::<UpstreamKeyerConfig>(doc).is_err());
+        let mut odd = fly("a", 1);
+        odd.fly = Some(KeyerRect {
+            x: 1,
+            y: 0,
+            w: 192,
+            h: 108,
+        });
+        assert!(usks(vec![odd], None).is_err());
+    }
+
+    #[test]
+    fn usks_reserve_against_the_shared_budget_at_definition() {
+        // A full-canvas USK costs 2 folds + 1 upload = 3: exactly the default
+        // budget (one full-canvas keyer), so a DSK beside it is refused.
+        usks(vec![usk("usk1", 1)], None).unwrap();
+        assert!((usk("u", 1).cost(CANVAS.0, CANVAS.1) - 3.0).abs() < 1e-9);
+        let mut me = me();
+        me.keyers = vec![usk("usk1", 1)];
+        let both = SwitcherConfig {
+            mix_effects: vec![me],
+            downstream_keyers: vec![dsk("dsk1", 1)],
+            keyer_budget: None,
+            extra: serde_json::Map::new(),
+        }
+        .validate_keyers(SOURCES, &["main"], CANVAS.0, CANVAS.1)
+        .unwrap_err()
+        .to_string();
+        assert!(both.contains("over switcher.keyer_budget"), "{both}");
+        let mut keyed = usk("usk1", 1);
+        keyed.key = Some("vt1".into());
+        assert!(
+            usks(vec![keyed.clone()], None).is_err(),
+            "fill + key is 4 folds"
+        );
+        usks(vec![keyed], Some(4.0)).unwrap();
+    }
+
+    #[test]
+    fn usks_round_trip_and_refuse_dsk_only_fields() {
+        let mut me = me();
+        me.keyers = vec![usk("usk1", 1)];
+        let text = toml::to_string(&me).unwrap();
+        assert!(text.contains("[[keyers]]"), "{text}");
+        let back: MixEffectsConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back, me);
+        for field in [
+            "rate = 5",
+            "tie = true",
+            "on_at_start = true",
+            "program = \"main\"",
+        ] {
+            let doc = format!("id = \"u\"\nfill = \"bars\"\n{field}\n");
+            assert!(
+                toml::from_str::<UpstreamKeyerConfig>(&doc).is_err(),
+                "{field} is a DSK field"
+            );
+        }
+        // No USKs: nothing new is serialized.
+        let plain = toml::to_string(&me_without_keyers()).unwrap();
+        assert!(!plain.contains("keyers"), "{plain}");
+    }
+
+    fn me_without_keyers() -> MixEffectsConfig {
+        me()
     }
 }

@@ -279,3 +279,29 @@ async fn read_role_gets_403() {
     assert_eq!(r.status(), StatusCode::FORBIDDEN);
     assert_eq!(count(&h).await, 0);
 }
+
+/// #474 review B1 (bulk path): a bulk entry of kind `media_player` exposes the
+/// bound player's frames through the new id, so the caller must be authorized
+/// for that player as well as the id. An out-of-scope player refuses the whole
+/// request before anything is persisted; an in-scope player is accepted.
+#[tokio::test]
+async fn bulk_media_player_entry_requires_authorization_on_the_bound_player() {
+    use support::TALLY_SCOPED_TOKEN;
+    // Scoped to ["tile:2", "main-profile", "in-cell"]: "in-cell" is the source,
+    // "main-profile" an authorized player id, "vt-1" an out-of-scope player.
+    let h = harness();
+    let bind = |player: &str| {
+        json!({ "sources": [ { "id": "in-cell", "name": "VT",
+            "body": { "id": "in-cell", "kind": "media_player", "player": player } } ] })
+    };
+    let before = count(&h).await;
+    let r = send(
+        &h.router,
+        post_json(PATH, TALLY_SCOPED_TOKEN, &bind("vt-1")),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    assert_eq!(count(&h).await, before, "nothing persisted");
+    let r = send(&h.router, get("/api/v1/sources/in-cell", ADMIN_TOKEN)).await;
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+}

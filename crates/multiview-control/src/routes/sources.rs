@@ -410,8 +410,7 @@ pub(crate) fn switcher_bus_consumers(
             consumers.push(SourceConsumerView::new("preview", "bus"));
         }
     }
-    for keyer in declared_keyers(state) {
-        let object = format!("{}/{}", keyer.program, keyer.id);
+    for (object, keyer) in declared_keyers(state) {
         if keyer.fill == id {
             consumers
                 .push(SourceConsumerView::new("keyer fill", object.clone()).naming(Some(&object)));
@@ -426,8 +425,9 @@ pub(crate) fn switcher_bus_consumers(
 
 /// The downstream keyers the running engine admitted: the committed runtime
 /// definitions when a keyer runtime is installed (K4 `keyer_set` changes
-/// them after boot), else the adopted config.
-fn declared_keyers(state: &AppState) -> Vec<multiview_config::DownstreamKeyerConfig> {
+/// them after boot), else the adopted config. Each with its object id
+/// (`<program>/<id>` for a DSK, `<me>/<id>` for a USK, K3).
+fn declared_keyers(state: &AppState) -> Vec<(String, multiview_config::DownstreamKeyerConfig)> {
     if let Some(defs) = state
         .switcher
         .as_ref()
@@ -437,23 +437,34 @@ fn declared_keyers(state: &AppState) -> Vec<multiview_config::DownstreamKeyerCon
             .defs
             .iter()
             .flatten()
-            .map(|def| (*def.config).clone())
+            .map(|def| (def.object_id.to_string(), (*def.config).clone()))
             .collect();
     }
-    if let Some(model) = &state.boot_model {
-        return model
-            .adopted_config()
-            .switcher
-            .map(|switcher| switcher.downstream_keyers)
-            .unwrap_or_default();
+    let switcher: Option<multiview_config::SwitcherConfig> = match &state.boot_model {
+        Some(model) => model.adopted_config().switcher,
+        None => state
+            .base_document
+            .as_deref()
+            .and_then(|document| document.get("switcher"))
+            .and_then(|switcher| serde_json::from_value(switcher.clone()).ok()),
+    };
+    let Some(switcher) = switcher else {
+        return Vec::new();
+    };
+    let mut out: Vec<_> = switcher
+        .downstream_keyers
+        .into_iter()
+        .map(|k| (format!("{}/{}", k.program, k.id), k))
+        .collect();
+    for me in &switcher.mix_effects {
+        for usk in &me.keyers {
+            out.push((
+                format!("{}/{}", me.id, usk.id),
+                usk.as_definition(&me.program),
+            ));
+        }
     }
-    state
-        .base_document
-        .as_deref()
-        .and_then(|document| document.get("switcher"))
-        .and_then(|switcher| switcher.get("downstream_keyers"))
-        .and_then(|keyers| serde_json::from_value(keyers.clone()).ok())
-        .unwrap_or_default()
+    out
 }
 
 /// How long `Start` waits for a source the engine adopted live to reach the
@@ -651,6 +662,7 @@ pub(crate) async fn create_source(
         body: validated_body(TypedCollection::Sources, &id, &input.body)?,
     };
     authorize_written_automation(&principal, None, &input.body)?;
+    authorize_bound_player(&principal, None, &input.body)?;
     // ADR-W024 MAJOR-B round 4: hold the config-mutation lock across the whole
     // store-write → submit → adopt-snapshot sequence, so the persister (which
     // takes the same lock) can never compose mid-mutation and the adopted
@@ -738,6 +750,34 @@ pub(crate) fn validate_source_body(
     validated_body(TypedCollection::Sources, id, body)
 }
 
+/// The media player a `media_player` source body binds (ADR-M012), if any.
+fn bound_player(body: &serde_json::Value) -> Option<&str> {
+    (body.get("kind").and_then(serde_json::Value::as_str) == Some("media_player"))
+        .then(|| body.get("player").and_then(serde_json::Value::as_str))
+        .flatten()
+}
+
+/// Per-object authorization of the player a `media_player` source binds
+/// (BOLA): binding a player puts its picture and audio on the desk, so the
+/// caller must be authorized for that player, and — when an update moves the
+/// binding off a player — for the player it is moved off. Checked before
+/// anything is persisted or submitted to the engine.
+pub(crate) fn authorize_bound_player(
+    principal: &Principal,
+    previous: Option<&serde_json::Value>,
+    next: &serde_json::Value,
+) -> ControlResult<()> {
+    if let Some(player) = bound_player(next) {
+        crate::auth::authorize_object(principal, player)?;
+    }
+    if let Some(old) = previous.and_then(bound_player) {
+        if bound_player(next) != Some(old) {
+            crate::auth::authorize_object(principal, old)?;
+        }
+    }
+    Ok(())
+}
+
 /// `PUT /api/v1/sources/{id}` — replace a source (role: write; If-Match → 412).
 #[cfg_attr(
     feature = "openapi",
@@ -776,6 +816,9 @@ pub(crate) async fn update_source(
     // this check.
     if let Ok(current) = accepted_source(&state, &id) {
         authorize_written_automation(&principal, Some(&current.resource.body), &input.body)?;
+        authorize_bound_player(&principal, Some(&current.resource.body), &input.body)?;
+    } else {
+        authorize_bound_player(&principal, None, &input.body)?;
     }
     let (mode, versioned) = apply_source_update(
         &state,

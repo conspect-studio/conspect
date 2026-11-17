@@ -22,10 +22,14 @@
 // reads only post-range-expand Y (step 1), of the fill or of a separate key
 // source resident in its own `y_planes` layer, sampled with its own
 // nearest-neighbour map (kx = floor(ddx × key_w / dst_w)). Mirrors
-// `key::key_factor`. Scene groups fold into a second pair of vec4 registers
+// `key::key_factor`. A chroma key (slice K7, ADR-C007 §3) instead measures
+// the Euclidean distance of the fill's tile-gamut linear RGB (after step 3,
+// before the step-4 primaries convert) to a reference converted once per
+// frame on the CPU, through a CPU-sanitized edge (`chroma_edge`). Scene groups fold into a second pair of vec4 registers
 // (outgoing / incoming) merged at the next top tile or the end of the list,
 // mirroring the CPU oracle's segment semantics (the last grouped tile's
-// merge wins).
+// merge wins). K3: a WIPE merge (kind >= 2) and a complemented mask (`1 − m`)
+// share `mask_coverage` with the tile wipe.
 //
 // `common.wgsl` is prepended at load time (transfer fns, mat3_apply, ids).
 
@@ -60,18 +64,28 @@ struct KeyParams {
     // bits 8-9 the scene group: 0 top, 1 both, 2 out, 3 in).
     head: vec4<u32>,
     // x: base of this tile's 256-entry matte table in `mattes` (valid under
-    // KEY_HAS_TABLE); y,z,w: padding.
+    // KEY_HAS_TABLE). A chroma key: x the reference's fill codes
+    // y | cb << 8 | cr << 16, y edge mode (CHROMA_EDGE_*), z,w the sanitized
+    // finite clip and gain as f32 bits.
     table: vec4<u32>,
     // Mask rectangle in fill-source pixels: x, y, w, h (half-open).
     mask: vec4<u32>,
-    // x: merge kind (0 MIX, 1 DIP); y: p | d; z: i (all in [0, 1]).
+    // x: merge kind (0 MIX, 1 DIP; >= 2 WIPE: 2 + shape + 8·reverse +
+    // 16·complement); y: p | d | softness; z: i | extent; w: radius.
     merge: vec4<f32>,
-    // Opaque DIP colour (linear, canvas gamut), a = 1.
+    // Opaque DIP colour (linear, canvas gamut), a = 1. WIPE: origin x, y,
+    // expand.
     dip_colour: vec4<f32>,
+    // A chroma key's reference, tile-gamut linear RGB; w padding.
+    chroma: vec4<f32>,
 };
 
 const KEY_KIND_BITS: u32 = 3u;
 const KEY_KIND_LINEAR: u32 = 1u;
+const KEY_KIND_CHROMA: u32 = 3u;
+const CHROMA_EDGE_ONE: u32 = 1u;
+const CHROMA_EDGE_STEP: u32 = 2u;
+const CHROMA_EDGE_RAMP: u32 = 3u;
 const KEY_INVERT: u32 = 4u;
 const KEY_HAS_SOURCE: u32 = 8u;
 const KEY_HAS_MASK: u32 = 16u;
@@ -120,7 +134,8 @@ fn y_code(v8: f32) -> u32 {
 // function of the signal's 8-bit Y code (the key source's, else the fill's),
 // looked up in the tile's table (`KeyParams::build` / `push_matte_table`).
 fn key_factor(k: KeyParams, sx: u32, sy: u32, ddx: u32, ddy: u32, dst_w: u32, dst_h: u32,
-              fill_y8: f32) -> f32 {
+              yuv8: vec3<f32>, lin_tile: vec3<f32>) -> f32 {
+    let fill_y8 = yuv8.x;
     let flags = k.head.w;
     let kind = flags & KEY_KIND_BITS;
     if kind == 0u {
@@ -132,6 +147,13 @@ fn key_factor(k: KeyParams, sx: u32, sy: u32, ddx: u32, ddy: u32, dst_w: u32, ds
         if sx < m.x || sy < m.y || (sx - m.x) >= m.z || (sy - m.y) >= m.w {
             return 0.0;
         }
+    }
+    if kind == KEY_KIND_CHROMA {
+        let m = chroma_matte(k, yuv8, lin_tile);
+        if (flags & KEY_INVERT) != 0u {
+            return 1.0 - m;
+        }
+        return m;
     }
     if (flags & KEY_HAS_TABLE) == 0u {
         // A linear self key: no signal, matte 1.
@@ -146,9 +168,47 @@ fn key_factor(k: KeyParams, sx: u32, sy: u32, ddx: u32, ddy: u32, dst_w: u32, ds
     return mattes[k.table.x + code];
 }
 
+// The chroma matte before invert. Mirrors `key::chroma_matte` through the
+// CPU-sanitized edge (`uniforms::chroma_edge`): no NaN or infinity reaches
+// the shader, and the distance of finite linear values is finite. A pixel
+// whose 8-bit codes equal the reference's is at distance exactly 0, as on
+// the CPU where both run the identical front half (review K7 MEDIA-1), so
+// the shader's EOTF approximation never leaves a residue a huge gain blows
+// up.
+fn chroma_matte(k: KeyParams, yuv8: vec3<f32>, lin_tile: vec3<f32>) -> f32 {
+    let codes = y_code(yuv8.x) | (y_code(yuv8.y) << 8u) | (y_code(yuv8.z) << 16u);
+    var d = 0.0;
+    if codes != k.table.x {
+        let diff = lin_tile - k.chroma.rgb;
+        d = sqrt(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
+    }
+    let mode = k.table.y;
+    let clip = bitcast<f32>(k.table.z);
+    let gain = bitcast<f32>(k.table.w);
+    if mode == CHROMA_EDGE_ONE {
+        return 1.0;
+    }
+    if mode == CHROMA_EDGE_STEP {
+        return select(0.0, 1.0, d > clip);
+    }
+    if mode == CHROMA_EDGE_RAMP {
+        return clamp((d - clip) * gain, 0.0, 1.0);
+    }
+    return 0.0;
+}
+
 // Merge the two scene accumulators (premultiplied linear). Mirrors
-// `SceneMerge::apply`: MIX lerp(out, in, p); DIP lerp(lerp(out, c, d), in, i).
-fn scene_merge(o: vec4<f32>, inc: vec4<f32>, m: vec4<f32>, dip: vec4<f32>) -> vec4<f32> {
+// `SceneMerge::apply`: MIX lerp(out, in, p); DIP lerp(lerp(out, c, d), in, i);
+// WIPE (K3) lerp(out, in, m(px, py)) with the mask in canvas coordinates.
+fn scene_merge(o: vec4<f32>, inc: vec4<f32>, m: vec4<f32>, dip: vec4<f32>,
+               px: u32, py: u32, cw: u32, ch: u32) -> vec4<f32> {
+    if m.x > 1.5 {
+        let code = u32(m.x + 0.5) - 2u;
+        let cov = mask_coverage(code & 7u, (code & 8u) != 0u, (code & 16u) != 0u,
+                                dip.xy, m.z, m.w, m.y, dip.z, px, py, cw, ch);
+        let t = clamp(cov, 0.0, 1.0);
+        return o * (1.0 - t) + inc * t;
+    }
     if m.x > 0.5 {
         let c = vec4<f32>(dip.rgb, 1.0);
         let od = o * (1.0 - m.y) + c * m.y;
@@ -174,14 +234,30 @@ fn wipe_coverage(t: TileParams, px: u32, py: u32, cw: u32, ch: u32) -> f32 {
     if shape == 0u {
         return 1.0;
     }
+    return mask_coverage(shape, t.opacity_transfer.w > 0.5, t.prim2.w > 0.5,
+                         vec2<f32>(t.yuv2rgb0.w, t.yuv2rgb1.w), t.yuv2rgb2.w, t.prim0.w,
+                         t.range.w, t.prim1.w, px, py, cw, ch);
+}
+
+// The coverage of one mask (shape id >= 1) at canvas pixel (px, py). Mirrors
+// `mask::WipeMask::coverage`, the complement (K3: `1 − coverage`) included.
+fn mask_coverage(shape: u32, reverse: bool, complement: bool, origin: vec2<f32>,
+                 extent: f32, radius_in: f32, softness: f32, expand: f32,
+                 px: u32, py: u32, cw: u32, ch: u32) -> f32 {
+    let c = edge_coverage(shape, reverse, origin, extent, radius_in, softness, expand,
+                          px, py, cw, ch);
+    return select(c, 1.0 - c, complement);
+}
+
+fn edge_coverage(shape: u32, reverse: bool, origin: vec2<f32>, extent: f32,
+                 radius_in: f32, softness: f32, expand: f32,
+                 px: u32, py: u32, cw: u32, ch: u32) -> f32 {
     let aspect = f32(max(cw, 1u)) / f32(max(ch, 1u));
     let u = (f32(px) + 0.5) / f32(max(cw, 1u));
     let v = (f32(py) + 0.5) / f32(max(ch, 1u));
-    let origin = vec2<f32>(t.yuv2rgb0.w, t.yuv2rgb1.w);
-    let extent = t.yuv2rgb2.w;
-    var radius = t.prim0.w;
+    var radius = radius_in;
     var sign = 1.0;
-    if t.opacity_transfer.w > 0.5 {
+    if reverse {
         radius = extent - radius;
         sign = -1.0;
     }
@@ -203,8 +279,6 @@ fn wipe_coverage(t: TileParams, px: u32, py: u32, cw: u32, ch: u32) -> f32 {
         }
     }
     let d = sign * inside;
-    let softness = t.range.w;
-    let expand = t.prim1.w;
     // A border band (expand > 0) is the grown edge attenuated by the edge's
     // own coverage: smooth on both sides, never the revealed interior
     // (mirrors `mask::coverage`).
@@ -279,7 +353,7 @@ fn composite_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // and a top tile closes it, exactly as on the CPU oracle.
         if group == 0u {
             if seg_open {
-                acc = scene_merge(seg_out, seg_in, seg_merge, seg_dip);
+                acc = scene_merge(seg_out, seg_in, seg_merge, seg_dip, px, py, cw, ch);
                 seg_open = false;
             }
         } else {
@@ -350,10 +424,11 @@ fn composite_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         //    per-pixel alpha folds into the opacity here, premultiplied ONCE.
         //    A keyer's mask × matte (ADR-0113 §3) folds in at the same step;
         //    its matte is a table lookup on the fill's (or key source's) 8-bit
-        //    Y code, the input of step 1 (never steps 2-4).
+        //    Y code, the input of step 1, or for a chroma key the distance of
+        //    `lin_tile` (step 3's output); it never alters steps 2-4.
         let a = clamp(t.opacity_transfer.x, 0.0, 1.0) * sample_tile_alpha(t, sx, sy)
             * wipe_coverage(t, px, py, cw, ch)
-            * key_factor(k, sx, sy, ddx, ddy, dst_w, dst_h, yuv8.x);
+            * key_factor(k, sx, sy, ddx, ddy, dst_w, dst_h, yuv8, lin_tile);
         let src = vec4<f32>(lin * a, a);
         let inv = 1.0 - src.a;
         switch group {
@@ -367,7 +442,7 @@ fn composite_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     if seg_open {
-        acc = scene_merge(seg_out, seg_in, seg_merge, seg_dip);
+        acc = scene_merge(seg_out, seg_in, seg_merge, seg_dip, px, py, cw, ch);
     }
 
     // Store the straight (un-premultiplied) linear RGBA for the encode pass.

@@ -13,7 +13,7 @@ i18n.activate('en');
 afterEach(() => { vi.unstubAllGlobals(); });
 
 const ROW: KeyerRow = {
-  id: 'dsk1', family: 'dsk', fill: 'gfx-channel-1', key: null, type: 'linear', clip: 0, gain: 1, invert: false,
+  id: 'dsk1', family: 'dsk', armed: false, fill: 'gfx-channel-1', key: null, type: 'linear', clip: 0, gain: 1, invert: false,
   fly: null, mask: null, max_source: null, on_air: false, tie: false, ramp: null, rate: 15,
   loss: 'drop_to_off_air', loss_trigger: 'reconnecting', stale: false, pending: false,
 };

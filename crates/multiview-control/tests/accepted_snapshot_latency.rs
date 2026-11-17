@@ -186,7 +186,7 @@ async fn accepted_snapshot_is_faster_than_a_fresh_disk_read_for_a_200_item_famil
     // isolates exactly the removed disk read + parse + whole-envelope
     // validate on top of that shared serialization cost.
     const MIN_SPEEDUP_SINGLE: u128 = 3;
-    let (_dir, path, state) = committed(ITEMS).await;
+    let (_dir, path, state) = Box::pin(committed(ITEMS)).await;
     let model = state.boot_model.clone().expect("boot model");
 
     // OLD path, reconstructed exactly: `load_desired` is the untouched
@@ -253,7 +253,7 @@ async fn accepted_snapshot_is_faster_than_a_fresh_disk_read_for_a_200_item_famil
 /// path lazily loads and returns the identical envelope `load_desired` would.
 #[tokio::test]
 async fn restart_still_loads_the_accepted_snapshot_from_disk() {
-    let (_dir, path, _state) = committed(3).await;
+    let (_dir, path, _state) = Box::pin(committed(3)).await;
     let fresh_config =
         MultiviewConfig::load_from_toml(&std::fs::read_to_string(&path).unwrap()).unwrap();
     let restarted = BootModel::new(

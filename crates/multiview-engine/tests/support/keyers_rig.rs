@@ -10,7 +10,8 @@
 use multiview_compositor::blend::LinearRgba;
 use multiview_compositor::pipeline::{CanvasColor, Nv12Image};
 use multiview_config::{
-    DownstreamKeyerConfig, KeyerLossPolicy, KeyerLossTrigger, KeyerSize, KeyerType,
+    DownstreamKeyerConfig, KeyerLossPolicy, KeyerLossTrigger, KeyerRect, KeyerSize, KeyerType,
+    UpstreamKeyerConfig,
 };
 use multiview_core::color::ColorInfo;
 use multiview_core::layout::{Canvas, Cell, Layout};
@@ -181,9 +182,36 @@ impl Rig {
         self.build_inner(keyers, budget, program, preview, "pgm", Some(hidden))
     }
 
+    /// Like [`Self::build`] with upstream keyers of `me1` (K3), key index
+    /// 1.. in the order given.
+    pub(crate) fn build_usk(
+        &self,
+        dsks: &[DownstreamKeyerConfig],
+        usks: &[UpstreamKeyerConfig],
+        budget: f32,
+        program: &str,
+        preview: &str,
+    ) -> (SwitcherControl, Hook, CompositorDrive<Nv12Image>) {
+        self.build_full(dsks, usks, budget, program, preview, "pgm", None)
+    }
+
     fn build_inner(
         &self,
         keyers: &[DownstreamKeyerConfig],
+        budget: f32,
+        program: &str,
+        preview: &str,
+        cell: &str,
+        hidden: Option<&str>,
+    ) -> (SwitcherControl, Hook, CompositorDrive<Nv12Image>) {
+        self.build_full(keyers, &[], budget, program, preview, cell, hidden)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_full(
+        &self,
+        keyers: &[DownstreamKeyerConfig],
+        usks: &[UpstreamKeyerConfig],
         budget: f32,
         program: &str,
         preview: &str,
@@ -209,10 +237,15 @@ impl Rig {
             vec![],
         ));
         driver.set_prime_stores(self.stores.clone());
-        let defs = keyers
+        let mut defs: Vec<_> = keyers
             .iter()
             .map(|cfg| keyer::KeyerDef::from_config(cfg, &self.stores, SIDE, SIDE).unwrap())
             .collect();
+        for cfg in usks {
+            defs.push(
+                keyer::KeyerDef::from_usk(cfg, "me1", "main", &self.stores, SIDE, SIDE).unwrap(),
+            );
+        }
         driver.set_keyers(keyer::admit(defs, SIDE, SIDE, budget).unwrap());
         handle
             .set_scenes(ScenePair {
@@ -237,6 +270,7 @@ pub(crate) fn dsk(id: &str, fill: &str, key: Option<&str>, z: i32) -> Downstream
         key_type: KeyerType::Linear,
         clip: 0.0,
         gain: 1.0,
+        color: None,
         invert: false,
         mask: None,
         fly: None,
@@ -251,11 +285,25 @@ pub(crate) fn dsk(id: &str, fill: &str, key: Option<&str>, z: i32) -> Downstream
     }
 }
 
+/// A USK config on `fill` with test-friendly defaults (K3); `fly` is
+/// optional canvas pixels.
+pub(crate) fn usk(
+    id: &str,
+    fill: &str,
+    z: i32,
+    fly: Option<(u32, u32, u32, u32)>,
+) -> UpstreamKeyerConfig {
+    let mut cfg = UpstreamKeyerConfig::from_definition(&dsk(id, fill, None, z));
+    cfg.fly = fly.map(|(x, y, w, h)| KeyerRect { x, y, w, h });
+    cfg
+}
+
 pub(crate) fn cmd(op: &str, verb: SwitcherVerb) -> SwitcherCommand {
     SwitcherCommand {
         operation_id: op.into(),
         scene_version: 1,
         verb,
+        expect: None,
     }
 }
 

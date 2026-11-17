@@ -3,7 +3,8 @@
 
 use super::reauth::Need;
 use super::registry::{
-    Claim, ClaimError, Ended, Entry, Registry, ReportError, SinkMark, Slot, StreamView,
+    Admitted, Claim, ClaimError, Ended, Entry, LadderError, Registry, ReportError, SinkMark, Slot,
+    StreamView,
 };
 use super::{
     bounded_user_agent, token, CastFetches, CastStreams, ReceiverFetch, ReceiverReport,
@@ -242,6 +243,7 @@ impl CastStreams {
             principal: None,
             origin: None,
             generation: None,
+            ladder: super::ladder::LadderState::default(),
         });
         Ok(Claim { id, token, first })
     }
@@ -650,10 +652,12 @@ impl CastStreams {
     }
 
     /// What a public request with `token` may be served (ABUSE-1): the
-    /// stream id and output config id of a live token armed at its output's
-    /// CURRENT generation, else `None` (the same 404 as an unknown token).
+    /// stream id, output config id and generation of a live token armed at
+    /// its output's CURRENT generation, else `None` (the same 404 as an
+    /// unknown token). Callers go through [`super::reauth::admit`], which runs
+    /// the re-authorization barrier first.
     #[must_use]
-    pub fn serve(&self, token: &str) -> Option<(String, String)> {
+    pub fn serve(&self, token: &str) -> Option<Admitted> {
         if !token::well_formed(token) {
             return None;
         }
@@ -661,9 +665,98 @@ impl CastStreams {
         let inner = self.lock();
         let at = inner.find(token, now)?;
         let entry = inner.entries.get(at)?;
-        inner
-            .servable(entry)
-            .then(|| (entry.id.clone(), entry.config_id.clone()))
+        if !inner.servable(entry) {
+            return None;
+        }
+        Some(Admitted {
+            stream_id: entry.id.clone(),
+            config_id: entry.config_id.clone(),
+            generation: entry.generation?,
+        })
+    }
+
+    /// Take one ladder call on stream `id` (the caller admitted its token):
+    /// one per [`super::ladder::LADDER_REFILL_MS`], burst
+    /// [`super::ladder::LADDER_BURST`]. Run BEFORE the body is validated, so
+    /// an invalid call costs its sender the same.
+    ///
+    /// # Errors
+    /// [`LadderError`].
+    pub fn admit_ladder(&self, id: &str) -> Result<(), LadderError> {
+        let now = self.now_ms();
+        let mut inner = self.lock();
+        let entry = inner
+            .entries
+            .iter_mut()
+            .find(|e| e.id == id && !e.expired(now))
+            .ok_or(LadderError::Unknown)?;
+        if entry.ladder.admit(now) {
+            Ok(())
+        } else {
+            Err(LadderError::TooSoon)
+        }
+    }
+
+    /// Record an answered ladder call on stream `id`: its probe (a full
+    /// call), the rung offered and the receiver's `failed`. A stream with a
+    /// live push attachment counts the call as a playlist fetch for its
+    /// liveness (ADR-0114 decision 5.5).
+    ///
+    /// # Errors
+    /// [`LadderError::Unknown`] when the stream is gone.
+    pub fn record_ladder(
+        &self,
+        id: &str,
+        request: super::ladder::LadderRequest,
+        offered: Option<&str>,
+    ) -> Result<(), LadderError> {
+        let now = self.now_ms();
+        let mut inner = self.lock();
+        let entry = inner
+            .entries
+            .iter_mut()
+            .find(|e| e.id == id && !e.expired(now))
+            .ok_or(LadderError::Unknown)?;
+        if let Some(probe) = request.probe {
+            entry.ladder.probe = Some(probe);
+        }
+        if let Some(rung) = offered {
+            entry.ladder.offered(rung, request.failed, now);
+        }
+        Self::push_liveness(entry, now);
+        Ok(())
+    }
+
+    /// A stream with a live push attachment is live as long as its receiver
+    /// keeps calling (decision 5.5); without one, only a playlist fetch is.
+    fn push_liveness(entry: &mut Entry, now: u64) {
+        if entry.ladder.push_attachments > 0 {
+            entry.last_playlist_ms = Some(now);
+        }
+    }
+
+    /// Register a push attachment (`moq`, `webrtc`, `srt`) on stream `id`: from
+    /// now on a ladder call or report keeps its token live. No rung of this
+    /// build attaches; the later rungs call this. `false`: no such stream.
+    pub fn attach_push(&self, id: &str) -> bool {
+        let now = self.now_ms();
+        let mut inner = self.lock();
+        let Some(entry) = inner
+            .entries
+            .iter_mut()
+            .find(|e| e.id == id && !e.expired(now))
+        else {
+            return false;
+        };
+        entry.ladder.push_attachments = entry.ladder.push_attachments.saturating_add(1);
+        true
+    }
+
+    /// End a push attachment of stream `id` (see [`Self::attach_push`]).
+    pub fn detach_push(&self, id: &str) {
+        if let Some(entry) = self.lock().entries.iter_mut().find(|e| e.id == id) {
+            entry.ladder.push_attachments = entry.ladder.push_attachments.saturating_sub(1);
+        }
     }
 
     /// Count a successful fetch on stream `id`; a playlist moves it to
@@ -713,10 +806,14 @@ impl CastStreams {
         }
         inner.last_report_ms.insert(id, now);
         if let Some(entry) = inner.entries.get_mut(at) {
+            if let Some(transport) = super::ladder::parse_transport_report(&report) {
+                entry.ladder.reported(transport, now);
+            }
             entry.last_report = Some(ReceiverReport {
                 received_unix_ms: now,
                 report,
             });
+            Self::push_liveness(entry, now);
         }
         Ok(())
     }

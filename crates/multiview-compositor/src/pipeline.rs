@@ -90,6 +90,26 @@ pub fn tile_yuv_to_canvas_linear(
     tile_color: ColorInfo,
     canvas: CanvasColor,
 ) -> Result<[f32; 3]> {
+    let lin = tile_yuv_to_tile_linear(y8, cb8, cr8, tile_color)?;
+    // 4. primaries convert into the canvas gamut (linear light).
+    let conv = primaries::convert_matrix(tile_color.primaries, canvas.primaries)?;
+    Ok(primaries::apply(conv, lin))
+}
+
+/// Steps 1-3 of the front half: range-expand -> YUV->RGB matrix -> tile EOTF,
+/// giving linear RGB in the **tile's own gamut** (before the primaries
+/// convert). [`tile_yuv_to_canvas_linear`] is exactly this followed by step 4.
+/// A chroma key measures its distance here (ADR-C007 §3).
+///
+/// # Errors
+///
+/// As [`tile_yuv_to_canvas_linear`].
+pub fn tile_yuv_to_tile_linear(
+    y8: u8,
+    cb8: u8,
+    cr8: u8,
+    tile_color: ColorInfo,
+) -> Result<[f32; 3]> {
     // detect/resolve guard: the kernel never sees Unspecified.
     let tile_range = range::require_resolved(tile_color.range)?;
     if tile_color.transfer == TransferCharacteristic::Unspecified {
@@ -111,15 +131,11 @@ pub fn tile_yuv_to_canvas_linear(
     let rgb_gamma = matrix::yuv_to_rgb(y, cb, cr, tile_color.matrix)?;
 
     // 3. linearize via the tile's own EOTF.
-    let lin = [
+    Ok([
         transfer::eotf(rgb_gamma[0], tile_color.transfer)?,
         transfer::eotf(rgb_gamma[1], tile_color.transfer)?,
         transfer::eotf(rgb_gamma[2], tile_color.transfer)?,
-    ];
-
-    // 4. primaries convert into the canvas gamut (linear light).
-    let conv = primaries::convert_matrix(tile_color.primaries, canvas.primaries)?;
-    Ok(primaries::apply(conv, lin))
+    ])
 }
 
 /// Convert a linear RGB triple in the **canvas gamut** through the **back half**
@@ -1540,12 +1556,22 @@ fn composite_band_reference(
             for tile in tiles {
                 if tile.group == TileGroup::Top {
                     if let Some((o, i, merge)) = seg.take() {
-                        acc = merge.apply(o, i);
+                        acc = merge.apply(o, i, (px, py), canvas_wh);
                     }
                 }
                 let src = match tile_dst_offset(tile, px, py) {
                     Some((ddx, ddy)) => {
-                        tile_pixel(tile, ddx, ddy, (px, py), canvas_wh, canvas, luts)?
+                        let chroma_ref = tile_chroma_ref(tile, luts)?;
+                        tile_pixel(
+                            tile,
+                            ddx,
+                            ddy,
+                            (px, py),
+                            canvas_wh,
+                            canvas,
+                            luts,
+                            chroma_ref,
+                        )?
                     }
                     None => None,
                 };
@@ -1570,7 +1596,7 @@ fn composite_band_reference(
                 }
             }
             if let Some((o, i, merge)) = seg {
-                acc = merge.apply(o, i);
+                acc = merge.apply(o, i, (px, py), canvas_wh);
             }
             let straight = PremulRgba {
                 r: acc.r,
@@ -1759,6 +1785,7 @@ fn fold_tiles<'s>(
             TileGroup::Top => {
                 if let Some(merge) = seg.take() {
                     merge_scenes(
+                        geom,
                         acc,
                         covered,
                         bg_premul,
@@ -1815,6 +1842,7 @@ fn fold_tiles<'s>(
     }
     if let Some(merge) = seg {
         merge_scenes(
+            geom,
             acc,
             covered,
             bg_premul,
@@ -1937,8 +1965,12 @@ fn grow_scene(buf: &mut Vec<PremulRgba>, span_pixels: usize, counter: &AtomicU64
 }
 
 /// Close a scene segment: write `merge(out, in)` for every pixel of the span
-/// into the main accumulator and mark it covered (ADR-0113 §2).
+/// into the main accumulator and mark it covered (ADR-0113 §2). A WIPE
+/// merge reads its mask at each pixel's canvas position (K3).
+#[allow(clippy::too_many_arguments)]
+// reason: the band geometry, both scene accumulators and the main one.
 fn merge_scenes(
+    geom: &BandGeom,
     acc: &mut [PremulRgba],
     covered: &mut Coverage,
     bg_premul: PremulRgba,
@@ -1947,21 +1979,44 @@ fn merge_scenes(
     span_pixels: usize,
     merge: SceneMerge,
 ) {
+    let w = geom.w.max(1);
+    let row0 = u64::from(geom.py_start).saturating_add(u64::try_from(geom.span_start).unwrap_or(0));
     for idx in 0..span_pixels {
         let o = scene_out.get(idx).copied().unwrap_or(bg_premul);
         let i = scene_in.get(idx).copied().unwrap_or(bg_premul);
+        // Canvas position of this accumulator pixel (bands split rows only).
+        let px = u32::try_from(idx % w).unwrap_or(u32::MAX);
+        let py = u32::try_from(row0.saturating_add(u64::try_from(idx / w).unwrap_or(0)))
+            .unwrap_or(u32::MAX);
         if let Some(slot) = acc.get_mut(idx) {
-            *slot = merge.apply(o, i);
+            *slot = merge.apply(o, i, (px, py), geom.canvas_wh);
         }
         covered.mark(idx);
+    }
+}
+
+/// A chroma-keyed tile's reference colour in its fill's tile-gamut linear
+/// RGB ([`crate::key::chroma_reference_linear`], through `luts` exactly when
+/// the pixels are); `None` for every other tile.
+fn tile_chroma_ref(tile: &Tile<'_>, luts: Option<&LutSet>) -> Result<Option<[f32; 3]>> {
+    match tile.key.as_ref().map(|k| k.kind) {
+        // The same front half as the tile's pixels (review K7 MEDIA-1).
+        Some(crate::key::KeyKind::Chroma { reference, .. }) => Ok(Some(
+            crate::key::chroma_reference_linear(reference, tile.image.color(), luts)?,
+        )),
+        _ => Ok(None),
     }
 }
 
 /// One tile's premultiplied-linear source value at destination-rect offset
 /// `(ddx, ddy)`: the fixed front half (#8 steps 1-4) and the coverage
 /// `opacity × fill_alpha × wipe_mask(canvas_px) × key_mask × matte`
-/// (ADR-0113 §3, ADR-0112 §3), premultiplied once.
+/// (ADR-0113 §3, ADR-0112 §3), premultiplied once. `chroma_ref` is the
+/// tile's chroma reference in tile-gamut linear RGB ([`tile_chroma_ref`]),
+/// `Some` exactly for a chroma-keyed tile.
 /// `None` when the source sample is out of bounds (defensive).
+#[allow(clippy::too_many_arguments)]
+// reason: one pixel's context plus the tile's once-per-frame chroma reference.
 fn tile_pixel(
     tile: &Tile<'_>,
     ddx: u32,
@@ -1970,6 +2025,7 @@ fn tile_pixel(
     canvas_wh: (u32, u32),
     canvas: CanvasColor,
     luts: Option<&LutSet>,
+    chroma_ref: Option<[f32; 3]>,
 ) -> Result<Option<PremulRgba>> {
     // Scale-at-composite: map the destination-rect offset to the source
     // pixel (nearest-neighbour; identity when dst size == src size).
@@ -1977,9 +2033,29 @@ fn tile_pixel(
     let Some((y8, cb8, cr8)) = tile.image.sample(sx, sy) else {
         return Ok(None);
     };
-    let lin = match luts {
-        Some(lut) => lut.tile_yuv_to_canvas_linear(y8, cb8, cr8, tile.image.color(), canvas)?,
-        None => tile_yuv_to_canvas_linear(y8, cb8, cr8, tile.image.color(), canvas)?,
+    let color = tile.image.color();
+    // A chroma key (ADR-C007 §3) measures its distance on the tile-gamut
+    // linear RGB of steps 1-3; step 4 then runs on that same value, so the
+    // order and the canvas-linear result are unchanged.
+    let (lin, chroma) = match chroma_ref {
+        Some(reference) => {
+            let tile_lin = match luts {
+                Some(lut) => lut.tile_yuv_to_tile_linear(y8, cb8, cr8, color)?,
+                None => tile_yuv_to_tile_linear(y8, cb8, cr8, color)?,
+            };
+            let conv = primaries::convert_matrix(color.primaries, canvas.primaries)?;
+            (
+                primaries::apply(conv, tile_lin),
+                Some((tile_lin, reference)),
+            )
+        }
+        None => (
+            match luts {
+                Some(lut) => lut.tile_yuv_to_canvas_linear(y8, cb8, cr8, color, canvas)?,
+                None => tile_yuv_to_canvas_linear(y8, cb8, cr8, color, canvas)?,
+            },
+            None,
+        ),
     };
     // `unit` maps a NaN opacity (a keyer's weight rides it) to 0, so a bad
     // weight never poisons the layers beneath; finite values clamp as before.
@@ -1999,6 +2075,7 @@ fn tile_pixel(
             tile.eff_dst_w(),
             tile.eff_dst_h(),
             fill_y,
+            chroma,
         )?;
     }
     Ok(Some(
@@ -2049,6 +2126,8 @@ fn fold_tile_into_band(
         return Ok(()); // disjoint from the accumulator span (or fully off-canvas)
     }
 
+    // The chroma reference, converted once for the tile (not per pixel).
+    let chroma_ref = tile_chroma_ref(tile, luts)?;
     let mut gy = gy0;
     while gy < gy1 {
         // Accumulator-local row + the destination-rect-local row offset `ddy`.
@@ -2072,8 +2151,16 @@ fn fold_tile_into_band(
                 u32::try_from(gx).unwrap_or(0),
                 u32::try_from(gy).unwrap_or(0),
             );
-            if let Some(src) = tile_pixel(tile, ddx, ddy, canvas_px, geom.canvas_wh, canvas, luts)?
-            {
+            if let Some(src) = tile_pixel(
+                tile,
+                ddx,
+                ddy,
+                canvas_px,
+                geom.canvas_wh,
+                canvas,
+                luts,
+                chroma_ref,
+            )? {
                 fold(row_base + col, src);
             }
             gx += 1;

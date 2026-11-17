@@ -122,6 +122,18 @@ pub const KEY_KIND_BITS: u32 = 0b11;
 pub const KEY_KIND_LINEAR: u32 = 1;
 /// Key kind: luma (`clamp((y − clip) × gain, 0, 1)`).
 pub const KEY_KIND_LUMA: u32 = 2;
+/// Key kind: chroma (slice K7, ADR-C007 §3): the matte is computed in-shader
+/// from the fill's tile-gamut linear RGB distance to `KeyParams::chroma`,
+/// with the CPU-sanitized edge in `KeyParams::table[1..4]`.
+pub const KEY_KIND_CHROMA: u32 = 3;
+/// Chroma edge mode (`table[1]`): the matte is 0 for every distance.
+pub const CHROMA_EDGE_ZERO: u32 = 0;
+/// Chroma edge mode: the matte is 1 for every distance.
+pub const CHROMA_EDGE_ONE: u32 = 1;
+/// Chroma edge mode: a step, `d > clip` → 1, else 0 (an infinite gain).
+pub const CHROMA_EDGE_STEP: u32 = 2;
+/// Chroma edge mode: `clamp((d − clip) × gain, 0, 1)`, finite clip and gain.
+pub const CHROMA_EDGE_RAMP: u32 = 3;
 /// Invert the matte (a matte from a signal only; ignored by a linear self
 /// key). Already folded into the matte table; kept for inspection.
 pub const KEY_INVERT: u32 = 1 << 2;
@@ -148,14 +160,59 @@ pub struct KeyParams {
     pub head: [u32; 4],
     /// `[base, 0, 0, 0]`: the first entry of this tile's matte table in the
     /// `mattes` storage buffer (binding 7), valid under [`KEY_HAS_TABLE`].
+    /// A chroma key has no table: `[ref_codes, edge_mode, clip_bits,
+    /// gain_bits]`, where `ref_codes` packs the reference's fill codes
+    /// `y | cb << 8 | cr << 16` (see [`pack_chroma_codes`])
+    /// (`CHROMA_EDGE_*`, then the sanitized finite clip and gain as `f32`
+    /// bits; see [`chroma_edge`]).
     pub table: [u32; 4],
     /// `[x, y, w, h]` of the mask in fill-source pixels.
     pub mask: [u32; 4],
     /// `[kind, p | d, i, 0]` of the segment merge (`0` MIX, `1` DIP), weights
-    /// already clamped to `[0, 1]` with NaN read as 0.
+    /// already clamped to `[0, 1]` with NaN read as 0. A WIPE (K3) is
+    /// `[2 + shape_id + 8·reverse, softness, extent, radius]` (see
+    /// [`MERGE_WIPE_BASE`]).
     pub merge: [f32; 4],
-    /// The opaque DIP colour (linear, canvas gamut), alpha 1.
+    /// The opaque DIP colour (linear, canvas gamut), alpha 1. A WIPE merge
+    /// carries its origin here: `[origin_x, origin_y, 0, 0]`.
     pub dip_colour: [f32; 4],
+    /// `[r, g, b, 0]`: a chroma key's reference colour in the fill's
+    /// tile-gamut linear RGB, converted once per frame here
+    /// ([`crate::key::chroma_reference_linear`]); zero otherwise.
+    pub chroma: [f32; 4],
+}
+
+/// Pack a chroma reference's fill codes as the shader compares them:
+/// `y | cb << 8 | cr << 16`.
+#[must_use]
+pub fn pack_chroma_codes((y, cb, cr): (u8, u8, u8)) -> u32 {
+    u32::from(y) | (u32::from(cb) << 8) | (u32::from(cr) << 16)
+}
+
+/// Reduce a chroma key's `(clip, gain)` to a NaN- and infinity-free edge the
+/// shader evaluates exactly like [`crate::key::chroma_matte`] for every
+/// finite distance `d >= 0` (a shader may not honour NaN or infinity):
+/// `(mode, clip, gain)` with `mode` one of `CHROMA_EDGE_*`.
+///
+/// The oracle is `unit((d − flush(clip)) × max(gain, 0))` with a NaN gain read
+/// as 0, so: a NaN clip, a zero gain or a `+∞` clip is always 0; a `−∞` clip
+/// with a positive gain is always 1; an infinite gain is a step at the clip
+/// (`d == clip` is `0 × ∞` = NaN → 0, hence strictly greater); otherwise the
+/// finite ramp.
+#[must_use]
+pub fn chroma_edge(clip: f32, gain: f32) -> (u32, f32, f32) {
+    let clip = crate::key::flush_subnormal(clip);
+    let gain = crate::key::flush_subnormal(if gain.is_nan() { 0.0 } else { gain.max(0.0) });
+    if clip.is_nan() || gain == 0.0 || clip == f32::INFINITY {
+        return (CHROMA_EDGE_ZERO, 0.0, 0.0);
+    }
+    if clip == f32::NEG_INFINITY {
+        return (CHROMA_EDGE_ONE, 0.0, 0.0);
+    }
+    if gain == f32::INFINITY {
+        return (CHROMA_EDGE_STEP, clip, 0.0);
+    }
+    (CHROMA_EDGE_RAMP, clip, gain)
 }
 
 impl KeyParams {
@@ -174,13 +231,15 @@ impl KeyParams {
         tile: &crate::pipeline::Tile<'_>,
         key_layer: Option<u32>,
         mattes: &mut Vec<f32>,
+        canvas_wh: (u32, u32),
     ) -> Result<Self> {
-        use crate::key::{unit, KeyKind, SceneMember, SceneMerge, TileGroup};
+        use crate::key::KeyKind;
         let mut out = Self::zeroed();
         if let Some(key) = &tile.key {
             let mut flags = match key.kind {
                 KeyKind::Linear => KEY_KIND_LINEAR,
                 KeyKind::Luma { .. } => KEY_KIND_LUMA,
+                KeyKind::Chroma { .. } => KEY_KIND_CHROMA,
             };
             if key.invert {
                 flags |= KEY_INVERT;
@@ -188,6 +247,33 @@ impl KeyParams {
             if let Some(mask) = key.mask {
                 flags |= KEY_HAS_MASK;
                 out.mask = [mask.x, mask.y, mask.w, mask.h];
+            }
+            if let KeyKind::Chroma {
+                reference,
+                clip,
+                gain,
+            } = key.kind
+            {
+                // Chroma keys the fill itself (ADR-C007 §3): no key source,
+                // no table; the reference is converted once per frame into
+                // the fill's linear space, as the oracle does per tile.
+                // The shader linearizes analytically, so the reference goes
+                // through the analytic front half (no LUT); a pixel with the
+                // reference's codes short-circuits to distance 0 in-shader
+                // (review K7 MEDIA-1).
+                let color = tile.image.color();
+                let codes = crate::key::chroma_reference_codes(reference, color)?;
+                let lin = crate::key::chroma_reference_linear(reference, color, None)?;
+                let (mode, clip, gain) = chroma_edge(clip, gain);
+                out.table = [
+                    pack_chroma_codes(codes),
+                    mode,
+                    clip.to_bits(),
+                    gain.to_bits(),
+                ];
+                out.chroma = [lin[0], lin[1], lin[2], 0.0];
+                out.head[3] = flags;
+                return Ok(out.with_group(tile, canvas_wh));
             }
             let source = key.source.zip(key_layer);
             if let Some((src, layer)) = source {
@@ -213,6 +299,17 @@ impl KeyParams {
             }
             out.head[3] = flags;
         }
+        Ok(out.with_group(tile, canvas_wh))
+    }
+
+    /// Fold the tile's scene group and merge into the block. Lane-disjoint
+    /// from the key: the group owns `head[3]` bits 8-9, `merge` and
+    /// `dip_colour` (a WIPE's code, softness, extent, radius, origin and
+    /// expand, K3); a key owns `head[0..3]`, `head[3]` bits 0-5, `table`,
+    /// `mask` and `chroma` (K7). So a chroma key in a WIPE group packs both.
+    fn with_group(mut self, tile: &crate::pipeline::Tile<'_>, canvas_wh: (u32, u32)) -> Self {
+        use crate::key::{unit, SceneMember, SceneMerge, TileGroup};
+        let out = &mut self;
         if let TileGroup::Scene { member, merge } = tile.group {
             let g: u32 = match member {
                 SceneMember::Both => 1,
@@ -226,9 +323,14 @@ impl KeyParams {
                     out.merge = [1.0, unit(d), unit(i), 0.0];
                     out.dip_colour = [colour.r, colour.g, colour.b, 1.0];
                 }
+                SceneMerge::Wipe { mask } => {
+                    let (merge, origin) = wipe_merge(&mask, canvas_wh);
+                    out.merge = merge;
+                    out.dip_colour = origin;
+                }
             }
         }
-        Ok(out)
+        self
     }
 
     /// The `y_planes` layer of the key source, or `None`.
@@ -240,6 +342,37 @@ impl KeyParams {
             Some(self.head[0])
         }
     }
+}
+
+/// `KeyParams::merge[0]` of a WIPE merge (K3) is `MERGE_WIPE_BASE +
+/// shape_id + 8 × reverse + 16 × complement`: exact small integers in `f32`
+/// (MIX is 0, DIP 1). The shader decodes it with integer arithmetic.
+pub const MERGE_WIPE_BASE: f32 = 2.0;
+
+/// The `(merge, dip_colour)` lanes of a WIPE scene merge (K3) on a
+/// `canvas_wh` canvas: `[code, softness, extent, radius]` and
+/// `[origin_x, origin_y, expand, 0]`. Exactly as the CPU oracle reads the
+/// mask (`SceneMerge::apply`): a mask not valid for the canvas merges at 0
+/// (an exact MIX of the outgoing scene) and a pinned endpoint at its pinned
+/// coverage (an exact MIX at 0 or 1, the complement applied), so neither
+/// depends on float rounding.
+fn wipe_merge(mask: &crate::mask::WipeMask, canvas_wh: (u32, u32)) -> ([f32; 4], [f32; 4]) {
+    if !mask.is_valid_for(canvas_wh.0, canvas_wh.1) {
+        return ([0.0; 4], [0.0; 4]);
+    }
+    if let Some(c) = mask.pinned {
+        let c = crate::key::unit(c);
+        let c = if mask.complement { 1.0 - c } else { c };
+        return ([0.0, c, 0.0, 0.0], [0.0; 4]);
+    }
+    let code = MERGE_WIPE_BASE
+        + shape_lane(mask.shape.id())
+        + if mask.reverse { 8.0 } else { 0.0 }
+        + if mask.complement { 16.0 } else { 0.0 };
+    (
+        [code, mask.softness, mask.extent, mask.radius],
+        [mask.origin[0], mask.origin[1], mask.expand, 0.0],
+    )
 }
 
 /// Append the 256-entry matte table of a signal-based key to `out`: entry `c`
@@ -261,7 +394,9 @@ pub fn push_matte_table(
         let y = range::expand_luma(c, range);
         let m = match kind {
             KeyKind::Luma { clip, gain } => luma_matte(y, clip, gain),
-            KeyKind::Linear => unit(y),
+            // A chroma key never has a table (its matte depends on RGB);
+            // `KeyParams::build` never calls this for one.
+            KeyKind::Linear | KeyKind::Chroma { .. } => unit(y),
         };
         if invert {
             1.0 - m
@@ -473,7 +608,8 @@ impl TileParams {
     /// Carry a wipe mask (ADR-0112 §3) in the spare `.z/.w` lanes, the same
     /// no-growth precedent as the alpha layer: `opacity_transfer.z` = shape
     /// id (`0` = none), `.w` = reverse; `range.w` = softness; `yuv2rgb0..2.w`
-    /// = origin x, origin y, extent; `prim0.w` = radius, `prim1.w` = expand.
+    /// = origin x, origin y, extent; `prim0.w` = radius, `prim1.w` = expand,
+    /// `prim2.w` = complement (K3: `1 − coverage`).
     /// The shader derives the aspect from the canvas size, as the CPU does.
     #[must_use]
     pub fn with_mask(mut self, mask: &crate::mask::WipeMask, canvas_w: u32, canvas_h: u32) -> Self {
@@ -486,14 +622,18 @@ impl TileParams {
             self.opacity_transfer[0] = 0.0;
             return self;
         }
-        match mask.pinned {
-            Some(c) if c <= 0.0 => {
+        // A pinned endpoint covers exactly 0 or 1; a complement (K3, a tied
+        // keyer going off) swaps them.
+        match mask.pinned.map(|c| (c <= 0.0) != mask.complement) {
+            Some(true) => {
                 self.opacity_transfer[0] = 0.0;
                 return self;
             }
-            Some(_) => return self,
+            Some(false) => return self,
             None => {}
         }
+        // `prim2.w` = complement: the shader draws `1 − coverage`.
+        self.prim2[3] = if mask.complement { 1.0 } else { 0.0 };
         self.opacity_transfer[2] = shape_lane(mask.shape.id());
         self.opacity_transfer[3] = if mask.reverse { 1.0 } else { 0.0 };
         self.range[3] = mask.softness;
@@ -574,13 +714,13 @@ mod key_params_tests {
     fn an_ordinary_tile_packs_all_zero() {
         let a = img(4, 4, ColorRange::Limited);
         let mut mattes = Vec::new();
-        let k = KeyParams::build(&Tile::placed(&a, 0, 0, 1.0), None, &mut mattes).unwrap();
+        let k = KeyParams::build(&Tile::placed(&a, 0, 0, 1.0), None, &mut mattes, (8, 8)).unwrap();
         assert_eq!(k, KeyParams::zeroed());
         assert_eq!(mattes.len(), 0);
-        assert_eq!(core::mem::size_of::<KeyParams>(), 80);
+        assert_eq!(core::mem::size_of::<KeyParams>(), 96);
         // The linear self key has no signal, hence no table.
         let t = Tile::placed(&a, 0, 0, 1.0).with_key(TileKey::linear().inverted(true));
-        let k = KeyParams::build(&t, None, &mut mattes).unwrap();
+        let k = KeyParams::build(&t, None, &mut mattes, (8, 8)).unwrap();
         assert_eq!(k.head[3] & KEY_HAS_TABLE, 0);
         assert_eq!(mattes.len(), 0);
     }
@@ -601,7 +741,7 @@ mod key_params_tests {
                 }),
         );
         let mut mattes = vec![0.5; 7];
-        let k = KeyParams::build(&t, Some(9), &mut mattes).unwrap();
+        let k = KeyParams::build(&t, Some(9), &mut mattes, (8, 8)).unwrap();
         assert_eq!(k.key_layer(), Some(9));
         assert_eq!(&k.head[..3], &[9, 8, 6]);
         let flags = k.head[3];
@@ -636,7 +776,7 @@ mod key_params_tests {
                         let t = Tile::placed(&fill, 0, 0, 1.0)
                             .with_key(TileKey::luma(clip, gain).inverted(invert));
                         let mut mattes = Vec::new();
-                        let k = KeyParams::build(&t, None, &mut mattes).unwrap();
+                        let k = KeyParams::build(&t, None, &mut mattes, (8, 8)).unwrap();
                         assert_eq!(k.table[0], 0);
                         assert_eq!(mattes.len(), MATTE_TABLE_LEN);
                         for c in 0..=u8::MAX {
@@ -672,11 +812,53 @@ mod key_params_tests {
         let key = img(4, 4, ColorRange::Limited);
         let t = Tile::placed(&fill, 0, 0, 1.0).with_key(TileKey::linear().with_source(&key));
         let mut mattes = Vec::new();
-        KeyParams::build(&t, Some(1), &mut mattes).unwrap();
+        KeyParams::build(&t, Some(1), &mut mattes, (8, 8)).unwrap();
         assert_eq!(mattes[16], 0.0);
         assert_eq!(mattes[235], 1.0);
         assert_eq!(mattes[255], 1.0);
         assert_eq!(mattes[0], 0.0);
+    }
+
+    #[test]
+    fn a_wipe_merge_and_a_complemented_mask_pack_exactly() {
+        use crate::mask::{MaskShape, WipeMask};
+        let a = img(4, 4, ColorRange::Limited);
+        let pack = |mask: WipeMask| {
+            KeyParams::build(
+                &Tile::placed(&a, 0, 0, 1.0).in_group(TileGroup::Scene {
+                    member: SceneMember::In,
+                    merge: SceneMerge::Wipe { mask },
+                }),
+                None,
+                &mut Vec::new(),
+                (8, 8),
+            )
+            .unwrap()
+        };
+        let mid = WipeMask::new(MaskShape::Circle, 0.5, 8, 8, [0.25, 0.5], true, 0.1, 0.0);
+        let k = pack(mid);
+        // 2 + circle (5) + 8 (reverse).
+        assert_eq!(k.merge[0], 15.0);
+        assert_eq!(k.merge[1..], [mid.softness, mid.extent, mid.radius]);
+        assert_eq!(k.dip_colour[..3], [0.25, 0.5, 0.0]);
+        assert_eq!(pack(mid.complemented()).merge[0], 31.0, "+16 complement");
+        // Endpoints and a foreign mask are exact MIXes.
+        let end = WipeMask::new(MaskShape::Box, 1.0, 8, 8, [0.5, 0.5], false, 0.0, 0.0);
+        assert_eq!(pack(end).merge, [0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(pack(end.complemented()).merge, [0.0, 0.0, 0.0, 0.0]);
+        let foreign = WipeMask::new(MaskShape::Box, 0.5, 16, 8, [0.5, 0.5], false, 0.0, 0.0);
+        assert_eq!(pack(foreign).merge, [0.0; 4]);
+        // A tile mask carries the complement in `prim2.w`; a complemented
+        // endpoint flips the pinned coverage.
+        let canvas = CanvasColor::default();
+        let base = || TileParams::build(0, 0, 8, 8, 4, 4, 1.0, a.color(), canvas).unwrap();
+        assert_eq!(base().with_mask(&mid.complemented(), 8, 8).prim2[3], 1.0);
+        assert_eq!(base().with_mask(&mid, 8, 8).prim2[3], 0.0);
+        assert_eq!(
+            base().with_mask(&end.complemented(), 8, 8).opacity_transfer[0],
+            0.0
+        );
+        assert_eq!(base().with_mask(&end, 8, 8).opacity_transfer[0], 1.0);
     }
 
     #[test]
@@ -687,6 +869,7 @@ mod key_params_tests {
                 &Tile::placed(&a, 0, 0, 1.0).in_group(TileGroup::Scene { member, merge }),
                 None,
                 &mut Vec::new(),
+                (8, 8),
             )
             .unwrap()
         };
@@ -720,5 +903,212 @@ mod key_params_tests {
         )
         .unwrap();
         assert_eq!(p.opacity_transfer[0], 0.0);
+    }
+
+    /// The shader's chroma edge, written out in Rust exactly as
+    /// `composite.wgsl::chroma_matte` evaluates it.
+    fn shader_edge(d: f32, mode: u32, clip: f32, gain: f32) -> f32 {
+        match mode {
+            CHROMA_EDGE_ONE => 1.0,
+            CHROMA_EDGE_STEP => {
+                if d > clip {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            CHROMA_EDGE_RAMP => ((d - clip) * gain).clamp(0.0, 1.0),
+            _ => 0.0,
+        }
+    }
+
+    #[test]
+    fn the_chroma_edge_is_finite_and_equals_the_oracle_matte() {
+        let nan = f32::NAN;
+        let inf = f32::INFINITY;
+        let sub = 1e-40_f32;
+        let clips = [
+            0.0,
+            0.05,
+            0.2,
+            1.0,
+            -0.3,
+            nan,
+            inf,
+            -inf,
+            sub,
+            -sub,
+            f32::MAX,
+        ];
+        let gains = [1.0, 8.0, 1e30, f32::MAX, inf, -inf, -1.0, 0.0, nan, sub];
+        let ds = [0.0, sub, 0.01, 0.05, 0.05001, 0.1, 0.2, 0.5, 1.0, 1.7, 1e6];
+        for &clip in &clips {
+            for &gain in &gains {
+                let (mode, c, g) = chroma_edge(clip, gain);
+                assert!(c.is_finite() && g.is_finite(), "{clip} {gain}");
+                assert!(!c.is_subnormal() && !g.is_subnormal(), "{clip} {gain}");
+                for &d in &ds {
+                    let want = crate::key::chroma_matte(d, clip, gain);
+                    let got = shader_edge(d, mode, c, g);
+                    // By value: the oracle may yield -0.0 (a negative excess times a
+                    // zero gain), which is the same coverage.
+                    assert!(
+                        got == want,
+                        "d={d} clip={clip} gain={gain}: {got} != {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_chroma_key_packs_its_reference_and_edge_and_no_table() {
+        let fill = img(4, 4, ColorRange::Limited);
+        let key = img(4, 4, ColorRange::Full);
+        let t = Tile::placed(&fill, 0, 0, 1.0).with_key(
+            TileKey::chroma([0, 177, 64], 0.05, 8.0)
+                .with_source(&key)
+                .inverted(true),
+        );
+        let mut mattes = Vec::new();
+        let k = KeyParams::build(&t, None, &mut mattes, (8, 8)).unwrap();
+        assert_eq!(mattes.len(), 0);
+        assert_eq!(k.head[3] & KEY_KIND_BITS, KEY_KIND_CHROMA);
+        assert_eq!(k.head[3] & (KEY_HAS_TABLE | KEY_HAS_SOURCE), 0);
+        assert_ne!(k.head[3] & KEY_INVERT, 0);
+        assert_eq!(k.key_layer(), None);
+        let codes = crate::key::chroma_reference_codes([0, 177, 64], fill.color()).unwrap();
+        assert_eq!(
+            k.table,
+            [
+                pack_chroma_codes(codes),
+                CHROMA_EDGE_RAMP,
+                0.05_f32.to_bits(),
+                8.0_f32.to_bits()
+            ]
+        );
+        assert_eq!(pack_chroma_codes((1, 2, 3)), 0x0003_0201);
+        let want = crate::key::chroma_reference_linear([0, 177, 64], fill.color(), None).unwrap();
+        assert_eq!(k.chroma, [want[0], want[1], want[2], 0.0]);
+    }
+
+    /// K3 × K7 merge: the Rust blocks and their WGSL mirrors have the same
+    /// size and member offsets (naga's layouter), so a lane added on one
+    /// side only can never drift silently.
+    #[test]
+    fn rust_and_wgsl_blocks_share_one_layout() {
+        let module = naga::front::wgsl::parse_str(&crate::gpu::shader::composite_wgsl()).unwrap();
+        let mut layouter = naga::proc::Layouter::default();
+        layouter.update(module.to_ctx()).unwrap();
+        let check = |name: &str, size: usize, offsets: &[(&str, usize)]| {
+            let (handle, ty) = module
+                .types
+                .iter()
+                .find(|(_, t)| t.name.as_deref() == Some(name))
+                .unwrap();
+            let naga::TypeInner::Struct { members, span } = &ty.inner else {
+                panic!("{name} is not a struct");
+            };
+            assert_eq!(usize::try_from(*span).unwrap(), size, "{name} size");
+            assert_eq!(
+                usize::try_from(layouter[handle].size).unwrap(),
+                size,
+                "{name} layout size"
+            );
+            let wgsl: Vec<(&str, usize)> = members
+                .iter()
+                .map(|m| {
+                    (
+                        m.name.as_deref().unwrap(),
+                        usize::try_from(m.offset).unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(wgsl, offsets, "{name} members");
+        };
+        check(
+            "KeyParams",
+            core::mem::size_of::<KeyParams>(),
+            &[
+                ("head", core::mem::offset_of!(KeyParams, head)),
+                ("table", core::mem::offset_of!(KeyParams, table)),
+                ("mask", core::mem::offset_of!(KeyParams, mask)),
+                ("merge", core::mem::offset_of!(KeyParams, merge)),
+                ("dip_colour", core::mem::offset_of!(KeyParams, dip_colour)),
+                ("chroma", core::mem::offset_of!(KeyParams, chroma)),
+            ],
+        );
+        assert_eq!(core::mem::size_of::<KeyParams>(), 96);
+        let (_, tile) = module
+            .types
+            .iter()
+            .find(|(_, t)| t.name.as_deref() == Some("TileParams"))
+            .unwrap();
+        let naga::TypeInner::Struct { span, .. } = &tile.inner else {
+            panic!("TileParams is not a struct");
+        };
+        assert_eq!(
+            usize::try_from(*span).unwrap(),
+            core::mem::size_of::<TileParams>()
+        );
+    }
+
+    /// K3 × K7 merge: a chroma key (K7, `table` + `chroma` lanes) in every
+    /// scene group (K3 WIPE in `merge` + `dip_colour`, MIX, DIP) packs both
+    /// halves unchanged: the key lanes equal the ungrouped chroma tile's and
+    /// the group lanes equal the unkeyed grouped tile's.
+    #[test]
+    fn a_chroma_key_packs_beside_every_scene_merge() {
+        use crate::mask::{MaskShape, WipeMask};
+        let fill = img(4, 4, ColorRange::Limited);
+        let key = || TileKey::chroma([0, 177, 64], 0.05, 8.0).inverted(true);
+        let pack = |t: &Tile<'_>| KeyParams::build(t, None, &mut Vec::new(), (8, 8)).unwrap();
+        let alone = pack(&Tile::placed(&fill, 0, 0, 1.0).with_key(key()));
+        let mid = WipeMask::new(MaskShape::Circle, 0.5, 8, 8, [0.25, 0.5], true, 0.1, 0.0);
+        let end = WipeMask::new(MaskShape::Box, 1.0, 8, 8, [0.5, 0.5], false, 0.0, 0.0);
+        let merges = [
+            SceneMerge::Mix { p: 0.3 },
+            SceneMerge::Dip {
+                colour: crate::blend::LinearRgba::opaque(0.1, 0.2, 0.3),
+                d: 0.4,
+                i: 0.6,
+            },
+            SceneMerge::Wipe { mask: mid },
+            SceneMerge::Wipe {
+                mask: mid.complemented(),
+            },
+            SceneMerge::Wipe { mask: end },
+        ];
+        for merge in merges {
+            for member in [SceneMember::Both, SceneMember::Out, SceneMember::In] {
+                let group = TileGroup::Scene { member, merge };
+                let both = pack(
+                    &Tile::placed(&fill, 0, 0, 1.0)
+                        .with_key(key())
+                        .in_group(group),
+                );
+                let unkeyed = pack(&Tile::placed(&fill, 0, 0, 1.0).in_group(group));
+                assert_eq!(both.head[..3], alone.head[..3]);
+                assert_eq!(both.head[3] & 0xff, alone.head[3], "{merge:?}");
+                assert_eq!(
+                    both.head[3] >> KEY_GROUP_SHIFT,
+                    unkeyed.head[3] >> KEY_GROUP_SHIFT
+                );
+                assert_eq!(both.table, alone.table);
+                assert_eq!(both.mask, alone.mask);
+                assert_eq!(both.chroma, alone.chroma);
+                assert_eq!(both.merge, unkeyed.merge, "{merge:?}");
+                assert_eq!(both.dip_colour, unkeyed.dip_colour, "{merge:?}");
+            }
+        }
+        // The WIPE code survives beside the chroma lanes: 2 + circle (5) + 8.
+        let wipe = pack(&Tile::placed(&fill, 0, 0, 1.0).with_key(key()).in_group(
+            TileGroup::Scene {
+                member: SceneMember::In,
+                merge: SceneMerge::Wipe { mask: mid },
+            },
+        ));
+        assert_eq!(wipe.merge[0], 15.0);
+        assert_eq!(wipe.head[3] & KEY_KIND_BITS, KEY_KIND_CHROMA);
     }
 }

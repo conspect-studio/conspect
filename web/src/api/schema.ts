@@ -1842,6 +1842,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/media/fills/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_fill_refresh"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/media/fills/{id}/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_fill_refresh"];
+        put: operations["put_fill_refresh"];
+        post?: never;
+        delete: operations["delete_fill_refresh"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/media/players": {
         parameters: {
             query?: never;
@@ -4135,6 +4167,16 @@ export interface components {
             /** @description The output API id (the id `/api/v1/outputs/{id}` addresses). */
             output: string;
         };
+        /** @description The next-transition set (`arm`, K3) as the caller may see it. */
+        ArmedView: {
+            /** @description The background moves with the next transition. */
+            background: boolean;
+            /**
+             * @description Armed upstream keyer ids the caller may read (keyer object id
+             *     `<me>/<id>`); unreadable ones are dropped.
+             */
+            keys: string[];
+        };
         /** @description Exact immutable completed capture selector; no path or owner override. */
         ArtifactRef: {
             /** @description Exact artifact ID returned by that job. */
@@ -4761,12 +4803,14 @@ export interface components {
             path?: string | null;
             /** @description A receiver can start now. */
             ready: boolean;
+            receiver?: null | components["schemas"]["ReceiverProbe"];
             /**
              * Format: int64
              * @description Video segments published (Google's Default Media Receiver starts
              *     slowly on a young playlist: wait for 8).
              */
             segments: number;
+            transport?: null | components["schemas"]["Transport"];
         };
         /** @description The `POST /api/v1/cast/sessions/{id}/volume` request body. */
         CastVolumeRequest: {
@@ -5475,6 +5519,26 @@ export interface components {
             /** @description Optional `http://` hook that receives a `POST` on break start/end. */
             webhook_url?: string | null;
         };
+        /** @description One step down the ladder, as the receiver reported it in `failed`. */
+        Fallback: {
+            /**
+             * Format: int64
+             * @description When it was reported (Unix ms).
+             */
+            at_unix_ms: number;
+            /**
+             * Format: int64
+             * @description The receiver's figure for it (ms), if any.
+             */
+            ms?: number | null;
+            /** @description The rung that failed. */
+            rung: string;
+            /**
+             * @description `connect`, `first-frame`, `stall`, `latency` or `hook` (the WebRTC
+             *     media-element hook did not take).
+             */
+            stage: string;
+        };
         /** @description One feed's operator-visible status. */
         FeedStatus: {
             /** @description Channels kept from this feed. */
@@ -5501,6 +5565,55 @@ export interface components {
             /** @description The feed URL with credentials and query removed. */
             url: string;
         };
+        /** @description Public per-fill refresh status (no URL, credential or path). */
+        FillRefreshStatus: {
+            /**
+             * Format: int32
+             * @description Consecutive failed runs (drives the back-off).
+             */
+            consecutive_failures: number;
+            /** @description What the slot shows during a refresh (always `play_last` today). */
+            during_refresh: string;
+            /** @description Fill id. */
+            fill_id: string;
+            /** @description Whether a run is in flight. */
+            in_flight: boolean;
+            /** @description Artifact id of the last successful load. */
+            last_artifact_id?: string | null;
+            /**
+             * Format: int64
+             * @description Capture job id of the current or last run (owner-scoped).
+             */
+            last_capture_job_id?: number | null;
+            /** @description Last failure, cleared on success. */
+            last_error?: string | null;
+            /** @description Last successful native load (RFC 3339 UTC). */
+            last_success_at?: string | null;
+            /**
+             * Format: int32
+             * @description Refresh period in minutes.
+             */
+            minutes: number;
+            /** @description Next due time (RFC 3339 UTC); meaningful while idle. */
+            next_due?: string | null;
+            /** @description Whether the schedule survives a server restart (config: yes; API: no). */
+            persistent: boolean;
+            /** @description `idle`, `capturing` or `loading`. */
+            phase: string;
+            /** @description Target media player. */
+            player: string;
+            /** @description Origin of the schedule. */
+            source: components["schemas"]["FillSource"];
+            /** @description Landing intent of scheduled loads. */
+            then: components["schemas"]["LoadThen"];
+            /** @description A replacement schedule is staged and takes effect when the in-flight run ends. */
+            update_pending: boolean;
+        };
+        /**
+         * @description Where a scheduled fill came from.
+         * @enum {string}
+         */
+        FillSource: "config" | "api";
         /** @description The `202` body of a successful salvo fire. */
         FiredBody: {
             /** @description The queued action id (also the pending-action + audit correlation id). */
@@ -5539,6 +5652,11 @@ export interface components {
              */
             max_per_scope: number;
         };
+        /**
+         * @description Which presented-frame counter the receiver's stall watchdog uses.
+         * @enum {string}
+         */
+        FrameCounter: "rvfc" | "quality";
         /** @description Fetch freshness of one product. */
         FreshnessDoc: {
             /** @description Last attempt, good or bad (RFC 3339 UTC). */
@@ -6121,21 +6239,36 @@ export interface components {
             reserved?: number | null;
         };
         /**
+         * @description Which keyer family a request names (K3). Absent: `dsk` (K4 requests are
+         *     unchanged).
+         * @enum {string}
+         */
+        KeyerFamilyWire: "dsk" | "usk";
+        /**
          * @description The keyer fields of a switcher request (flattened into it). Every field
          *     is optional; which ones a verb takes is checked by shape.
          */
         KeyerFields: {
+            /** @description `arm` (K3): whether the background moves with the next transition. */
+            background?: boolean | null;
             /**
              * Format: float
-             * @description `keyer_set`: luma clip, `[0, 1]`.
+             * @description `keyer_set`: luma clip on Y, or chroma clip on the linear-RGB
+             *     distance, `[0, 1]`.
              */
             clip?: number | null;
+            /**
+             * @description `keyer_set`: chroma reference colour `#RRGGBB` (`type = chroma`
+             *     only); `""` clears it. Downstream keyers only (`keyer-usk` on a USK).
+             */
+            color?: string | null;
+            family?: null | components["schemas"]["KeyerFamilyWire"];
             /** @description `keyer_set`: fill source id (a source; `in:<n>` is refused). */
             fill?: string | null;
             fly?: null | components["schemas"]["KeyerRectDoc"];
             /**
              * Format: float
-             * @description `keyer_set`: luma gain, finite and `>= 0`.
+             * @description `keyer_set`: luma or chroma gain, finite and `>= 0`.
              */
             gain?: number | null;
             /** @description `keyer_set`: invert the matte. */
@@ -6150,6 +6283,11 @@ export interface components {
              *     `<program>/<keyer>`. Required by every keyer verb.
              */
             keyer?: string | null;
+            /**
+             * @description `arm` (K3): the upstream keyer ids (of this M/E) that toggle with the
+             *     next transition, at most 4, distinct.
+             */
+            keys?: string[] | null;
             /** @description `keyer_set`: `drop_to_off_air` or `hold_last_good`. */
             loss?: string | null;
             /** @description `keyer_set`: `stale`, `reconnecting` or `no_signal`. */
@@ -6168,7 +6306,11 @@ export interface components {
             rate?: number | null;
             /** @description `keyer_tie`: tied to the next background take. */
             tie?: boolean | null;
-            /** @description `keyer_set`: `linear` or `luma` (`chroma` is refused until K7). */
+            /**
+             * @description `keyer_set`: `linear`, `luma` or `chroma` (K7; needs `color`, refuses
+             *     a `key` source; downstream keyers only, a USK refuses it as
+             *     `usk-chroma`).
+             */
             type?: string | null;
             /**
              * Format: int32
@@ -6241,11 +6383,21 @@ export interface components {
         /** @description One `keyers[]` row of `GET /api/v1/switcher/{me}` (design note §8). */
         KeyerRow: {
             /**
+             * @description USK: armed to toggle with the next transition (K3); always `false`
+             *     for a DSK (its next-transition flag is `tie`).
+             */
+            armed: boolean;
+            /**
              * Format: float
              * @description Luma clip, `[0, 1]` (the committed value; meaningful for `luma`).
              */
             clip: number;
-            /** @description `dsk` (USKs arrive with K3). */
+            /**
+             * @description Chroma reference `#RRGGBB` / `#RGB` (K7), `null` for other types.
+             *     A colour, not a source id: never redacted.
+             */
+            color?: string | null;
+            /** @description `dsk` or `usk` (K3). */
             family: string;
             /** @description Fill source id, or `"redacted"`. */
             fill: string;
@@ -6255,7 +6407,7 @@ export interface components {
              * @description Luma gain (the committed value; meaningful for `luma`).
              */
             gain: number;
-            /** @description Keyer id within the program. */
+            /** @description Keyer id within the program (DSK) or the M/E (USK). */
             id: string;
             /** @description Matte inverted. */
             invert: boolean;
@@ -6281,7 +6433,7 @@ export interface components {
             stale: boolean;
             /** @description Tied to the next background take. */
             tie: boolean;
-            /** @description `linear` or `luma`. */
+            /** @description `linear`, `luma` or `chroma`. */
             type: string;
         };
         /** @description A picture size in pixels; mirrors `multiview_config::KeyerSize`. */
@@ -6304,6 +6456,37 @@ export interface components {
          * @enum {string}
          */
         LadderStateDoc: "compliant" | "grace" | "lapsed_soft" | "lapsed_hard" | "evaluation" | "class_mismatch" | "over_gpu";
+        /**
+         * @description How a latency figure was obtained (decision 2, "When there is no
+         *     trustworthy mapping").
+         * @enum {string}
+         */
+        LatencyMethod: "frame" | "playhead" | "unavailable";
+        /** @description Steady-state tick-to-present latency over the receiver's last window. */
+        LatencyStats: {
+            /**
+             * Format: int64
+             * @description The clock offset's error bound (ms).
+             */
+            clock_error_ms?: number | null;
+            /**
+             * Format: int64
+             * @description Median (ms).
+             */
+            median: number;
+            /** @description `frame` or `playhead`. */
+            method: components["schemas"]["LatencyMethod"];
+            /**
+             * Format: int64
+             * @description 95th percentile (ms).
+             */
+            p95: number;
+            /**
+             * Format: int64
+             * @description Valid samples in the window.
+             */
+            samples: number;
+        };
         /**
          * @description A persisted layout resource.
          *
@@ -6468,14 +6651,25 @@ export interface components {
             /** @description Whether the engine should stamp a corner watermark (derived, S3). */
             watermark: boolean;
         };
+        /**
+         * @description Typed reason a load operation ended `failed`. Stable wire codes.
+         * @enum {string}
+         */
+        LoadFailureCode: "not_found" | "invalid_data" | "timeout" | "wrong_cadence" | "vfr" | "no_cadence" | "alpha" | "no_video_stream" | "unknown_length" | "invalid_window" | "decoder_open" | "no_frames" | "audio_unavailable" | "journal_failed" | "reference_missing" | "other";
         /** @description Bounded operation view; completion needs native video and audio adoption. */
         LoadOperation: {
+            /**
+             * @description Short operator-facing explanation of `reason`. Redacted: never carries
+             *     a filesystem path, URL or credential; at most 256 bytes.
+             */
+            detail?: string | null;
             native?: null | components["schemas"]["NativeLoadAck"];
             /**
              * Format: int64
              * @description Operation id.
              */
             operation: number;
+            reason?: null | components["schemas"]["LoadFailureCode"];
             /** @description Lifecycle state name. */
             state: string;
         };
@@ -7610,7 +7804,10 @@ export interface components {
             /** @description `video`, `audio` or `subtitle` (output subtitle slots, #345). */
             plane: string;
             /**
-             * @description A mixer input: `{"source": id}` or `"none"`. An output video slot 0:
+             * @description A mixer input: `{"source": id}`, `{"layout": id}` (a stored layout as
+             *     an M/E source, #307: Read on it AND on every source its cells bind;
+             *     it must solve on the running canvas with opaque cells and bind no other
+             *     layout or bus) or `"none"`; `{"bus": ..}` is refused. An output video slot 0:
              *     `{"source": id}`, `{"layout": id}` (a stored layout; Read on it AND on
              *     every source its cells bind) or `{"bus": ..}`; audio slot 0: `"follow"`;
              *     an output subtitle slot: `{"source": id}` or `"none"`.
@@ -8159,6 +8356,28 @@ export interface components {
             /** @description The transport URN. */
             transport: string;
         };
+        /** @description What the receiver says it can do (`caps` of the probe). */
+        ReceiverCaps: {
+            adec?: null | components["schemas"]["Support"];
+            frames?: null | components["schemas"]["FrameCounter"];
+            /** @description Media Source Extensions accept the stream's codec strings. */
+            mse?: boolean | null;
+            /** @description `RTCPeerConnection` exists. */
+            rtc?: boolean | null;
+            /** @description H.264 `profile-level-id` values the receiver can take (at most 8). */
+            rtc_h264: string[];
+            /** @description Opus receive. */
+            rtc_opus?: boolean | null;
+            /** @description `requestVideoFrameCallback` exists. */
+            rvfc?: boolean | null;
+            /** @description The libsrt version an Android TV app loaded (`null` on the web). */
+            srt?: string | null;
+            vdec?: null | components["schemas"]["Support"];
+            /** @description The same with `prefer-hardware`. */
+            vdec_hw?: boolean | null;
+            /** @description `WebTransport` exists. */
+            wt?: boolean | null;
+        };
         /** @description The last fetch of the receiver app (no IP). */
         ReceiverFetch: {
             /** @description The fetcher was a Cast device (`User-Agent` contains `CrKey`). */
@@ -8170,6 +8389,33 @@ export interface components {
             unix_ms: number;
             /** @description The fetcher's `User-Agent` (at most 160 characters). */
             user_agent?: string | null;
+        };
+        /** @description What the session must carry (`need` of the probe). */
+        ReceiverNeed: {
+            /** @description The audio track required, if any. */
+            audio?: string | null;
+            /** @description Subtitles are required. */
+            subtitles?: boolean | null;
+        };
+        /** @description The last capability probe of a stream's receiver. */
+        ReceiverProbe: {
+            /** @description The receiver build (a sha256 prefix of its script). */
+            build?: string | null;
+            /** @description What it can do. */
+            caps: components["schemas"]["ReceiverCaps"];
+            /** @description `web` or `android-tv` (as claimed). */
+            kind?: string | null;
+            /** @description What it must carry. */
+            need: components["schemas"]["ReceiverNeed"];
+            /**
+             * Format: int64
+             * @description When the probe arrived (Unix ms).
+             */
+            received_unix_ms: number;
+            /** @description Rungs in its failure memory (at most 4). */
+            skip: components["schemas"]["SkipEntry"][];
+            /** @description The receiver's user agent (at most 200 characters). */
+            ua?: string | null;
         };
         /** @description The last receiver report of a stream, as received. */
         ReceiverReport: {
@@ -8238,6 +8484,23 @@ export interface components {
          * @enum {string}
          */
         RedactionReason: "secret" | "url";
+        /** @description Register (or replace) a runtime refresh schedule for one fill. */
+        RefreshScheduleBody: {
+            /**
+             * @description The capture submitted every run; `fill_id` must equal the path id and
+             *     `target_player` must name an existing player.
+             */
+            capture: components["schemas"]["CaptureBody"];
+            /**
+             * Format: int32
+             * @description Refresh period in minutes, 1 through 1440.
+             */
+            minutes: number;
+            /** @description Run the first refresh in the current slot instead of the next one. */
+            start_now?: boolean;
+            /** @description Landing intent of each scheduled load (default resume). */
+            then?: components["schemas"]["LoadThen"];
+        };
         /**
          * @description An IS-04 **registration request**: the `{type, data}` body posted to a
          *     Registry's `POST /x-nmos/registration/v1.3/resource`.
@@ -8280,6 +8543,21 @@ export interface components {
         ReplyRequest: {
             /** @description The reply text to append to the thread. */
             body: string;
+        };
+        /** @description Player resets inside the attachment. */
+        Resets: {
+            /**
+             * Format: int64
+             * @description Hard resets.
+             */
+            hard: number;
+            /** @description The last cause. */
+            last?: string | null;
+            /**
+             * Format: int64
+             * @description Soft resets.
+             */
+            soft: number;
         };
         /** @description One published playlist entry, resolved against the current configuration. */
         ResolvedEntry: {
@@ -8763,6 +9041,16 @@ export interface components {
              * @description The one-time setup code (8 words) printed on the host.
              */
             code: string;
+        };
+        /** @description A rung in the device's failure memory. */
+        SkipEntry: {
+            /** @description The rung. */
+            rung: string;
+            /**
+             * Format: int64
+             * @description Seconds left.
+             */
+            seconds: number;
         };
         /** @description The cost of an output-slot crosspoint (§12.4, §12.10). */
         SlotCost: {
@@ -9443,6 +9731,11 @@ export interface components {
             theme?: string | null;
         };
         /**
+         * @description A decoder check result (`isConfigSupported`).
+         * @enum {string}
+         */
+        Support: "supported" | "unsupported" | "absent";
+        /**
          * @description The full entitlement-routing answer the `GET /support/entitlement` endpoint
          *     returns: whether the machine is eligible for entitled support, the route, and
          *     the SLA token (a quiet line for the free tier).
@@ -9526,7 +9819,7 @@ export interface components {
             /**
              * @description Action to classify on `/plan`, one of `select_program`, `select_preview`,
              *     `cut`, `auto`, `set_transition`, `keyer_cut`, `keyer_auto`, `keyer_tie`,
-             *     `keyer_set`; the action is part of the same validated request.
+             *     `keyer_set`, `arm`; the action is part of the same validated request.
              */
             action: string;
             /**
@@ -9541,7 +9834,18 @@ export interface components {
              *     §12.8); exactly one of `source`/`input`. Requires declared inputs.
              */
             input?: number | null;
-            /** @description Referenced stored layout, when selecting an authored scene. */
+            /**
+             * @description A stored layout as the selected source (#307), for
+             *     `select_program`/`select_preview`: exactly one of
+             *     `source`/`input`/`layout`. Needs Read on the layout AND on every source
+             *     its cells bind (one generic 403); it must exist, solve on the running
+             *     canvas, have opaque cells and bind no other layout or bus (422
+             *     `unknown-source` / `layout-not-admissible`). With numbered inputs it
+             *     must be patched to an input (`not-on-an-input`). The engine source id
+             *     is `layout:<id>`; at most 4 layouts are M/E sources at once (409
+             *     `capacity`). Refused on `cut`/`auto`. A `source` of `layout:<id>` means
+             *     the same.
+             */
             layout?: string | null;
             /** @description M/E identity (`me1` for the first slice). */
             me: string;
@@ -9555,6 +9859,11 @@ export interface components {
         };
         /** @description Engine-owned bus selection and current tick, never guessed from request. */
         SwitcherStateResponse: {
+            /**
+             * @description The next-transition set (`arm`, K3): the background flag and the
+             *     armed upstream keyer ids the caller may read.
+             */
+            armed: components["schemas"]["ArmedView"];
             /**
              * Format: int32
              * @description Output canvas height in pixels.
@@ -10117,6 +10426,34 @@ export interface components {
             frames: number;
             /** @description `cut` or `mix`. */
             kind: string;
+        };
+        /** @description The transport a stream's receiver plays on and how it fares. */
+        Transport: {
+            /** @description The last steps down (at most 8, oldest first). */
+            fallbacks: components["schemas"]["Fallback"][];
+            /**
+             * Format: int64
+             * @description From the start of the attempt to the first presented frame (ms).
+             */
+            first_frame_ms?: number | null;
+            latency_method?: null | components["schemas"]["LatencyMethod"];
+            latency_ms?: null | components["schemas"]["LatencyStats"];
+            /**
+             * Format: int64
+             * @description When the receiver last reported these figures (Unix ms).
+             */
+            reported_unix_ms?: number | null;
+            /** @description Player resets. */
+            resets: components["schemas"]["Resets"];
+            /** @description The rung the engine last offered (`hls` in this build). */
+            rung?: string | null;
+            /**
+             * Format: int64
+             * @description Since when it plays that rung (Unix ms).
+             */
+            since_unix_ms?: number | null;
+            /** @description The receiver's frame watchdog says no frame was presented for 2 s. */
+            stalled: boolean;
         };
         /**
          * @description The optional JSON body a transport verb may carry: an `asset` (for `load`)
@@ -12035,7 +12372,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description The layout id does not exist, its stored body does not parse/solve, its canvas differs from the running session's pinned canvas (Class-2), or the running canvas is unknown (no seeded snapshot — the gate fails closed). Without `target` while a switcher M/E is declared: type `/problems/switcher-owns-program` (the Program canvas is the M/E bus; returned before the Idempotency-Key is reserved, so nothing is reserved, persisted or sent; the detail names `POST /routing/output/take` and a layout as a switcher source). With `target`: the output take's 422s. */
+            /** @description The layout id does not exist, its stored body does not parse/solve, its canvas differs from the running session's pinned canvas (Class-2), or the running canvas is unknown (no seeded snapshot — the gate fails closed). Without `target` while a switcher M/E is declared: type `/problems/switcher-owns-program` (the Program canvas is the M/E bus; returned before the Idempotency-Key is reserved, so nothing is reserved, persisted or sent; the detail names `POST /routing/output/take` and `POST /switcher/commands/select_preview` with `{"layout": id}`, a stored layout as an M/E source). With `target`: the output take's 422s. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -14988,7 +15325,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The replaced layout (new ETag in the response header). */
+            /** @description The replaced layout (new ETag in the response header). A layout registered as an M/E source (#307) swaps its body at the next tick. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -15006,7 +15343,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description Not authorized to write. */
+            /** @description Not authorized to write; or `routed-layout`: the layout is on air on an output, or registered as an M/E source and the caller lacks the Program scope, the M/E or Read on every source the new body shows. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -15026,6 +15363,15 @@ export interface operations {
             };
             /** @description If-Match precondition failed. */
             412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `layout-not-admissible`: the layout is registered as an M/E source and the new body would no longer be one (another canvas, a translucent cell, or a nested layout/bus cell); nothing was committed. */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -15119,6 +15465,15 @@ export interface operations {
             };
             /** @description No layout with that id. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `layout-on-air`: this layout is registered as an M/E source (#307): it is on Program, Preview or a mixer input, or was within the last 10 s; nothing changed. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -15594,6 +15949,196 @@ export interface operations {
                 };
             };
             /** @description Already finished or key conflict. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_fill_refresh: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Refresh status of every visible scheduled fill. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FillRefreshStatus"][];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to read. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_fill_refresh: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Fill id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Refresh status of one scheduled fill. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FillRefreshStatus"];
+                };
+            };
+            /** @description Not authorized for this fill. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No schedule for this fill. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_fill_refresh: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Fill id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RefreshScheduleBody"];
+            };
+        };
+        responses: {
+            /** @description Schedule installed; runs as the calling key. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FillRefreshStatus"];
+                };
+            };
+            /** @description Not authorized for this fill or player. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown target player. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Config-declared fill or schedule capacity reached. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid interval, body identity or terms. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_fill_refresh: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Fill id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Schedule removed; the current clip keeps playing. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not authorized for this fill. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No schedule for this fill. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Config-declared fill. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -17258,7 +17803,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `slot-medium-mismatch` (an audio slot other than slot 0 follow; a subtitle slot on an output kind that carries no subtitles, or a subtitle slot given a `{layout}` or `{bus}`: subtitle essences come from sources), `unknown-slot` (video slot >= 1; a subtitle slot >= the output's declared `slots.subtitle` count or named twice; subtitle crosspoints mixed with video/audio ones or naming two outputs), `unknown-source` (a layout or bus on a mixer input; an unknown feed; more than 4 distinct layouts in one set), or not 1..=64 crosspoints. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan. A subtitle slot (`{"source": id}` or `"none"`) is planned with path `subtitle`; an unknown source is an `unknown-source` refusal in the plan, and a source that declares no `captions` carries `note: source-has-no-captions` (not a refusal: the slot carries an empty track). */
+            /** @description `slot-medium-mismatch` (an audio slot other than slot 0 follow; a subtitle slot on an output kind that carries no subtitles, or a subtitle slot given a `{layout}` or `{bus}`: subtitle essences come from sources), `unknown-slot` (video slot >= 1; a subtitle slot >= the output's declared `slots.subtitle` count or named twice; subtitle crosspoints mixed with video/audio ones or naming two outputs), `unknown-source` (a bus on a mixer input; a mixer input's `{layout}` inside a multi-destination set; an unknown source or stored layout; an unknown feed; more than 4 distinct layouts in one request), `layout-not-admissible` (a mixer input's `{layout}`: not on the running canvas, a translucent cell, or a cell binding another layout or a bus — nested layouts and buses are not M/E sources), or not 1..=64 crosspoints. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan. A plan never registers a mixer input's layout. A subtitle slot (`{"source": id}` or `"none"`) is planned with path `subtitle`; an unknown source is an `unknown-source` refusal in the plan, and a source that declares no `captions` carries `note: source-has-no-captions` (not a refusal: the slot carries an empty track). */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -17321,7 +17866,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `conflict` (the Idempotency-Key was first used for another body: an output take's other output or feed, a set's other crosspoints; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity` (a set's new encoders exceed the caller's per-principal cap or the global sessions), `aux-capacity` (no free layout canvas), or no source lease. */
+            /** @description `conflict` (the Idempotency-Key was first used for another body: an output take's other output or feed, a set's other crosspoints; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity` (a set's new encoders exceed the caller's per-principal cap or the global sessions; also: a mixer input's `{layout}` would be the fifth stored layout registered as an M/E source, or a source it shows cannot be leased; the key is released), `layout-changed` (a mixer input's `{layout}` was edited or deleted while this request was in flight; the key is released, retry), `aux-capacity` (no free layout canvas), or no source lease. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -17330,7 +17875,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `slot-medium-mismatch`, `unknown-slot`, `unknown-source`, `unknown-feed` (an output slot's unknown layout or subtitle source) / `layout-not-admissible` (an output slot's layout), missing Idempotency-Key, or not 1..=64 crosspoints (subtitle rules as on `/patch/plan`). A subtitle take re-points the output's subtitle route table at once; its outcome rides `route.output` as `subtitle:applied` or `subtitle:refused:not-in-run` (see the subtitle design note). */
+            /** @description `slot-medium-mismatch`, `unknown-slot`, `unknown-source` (also: a mixer input's `{layout}` inside a multi-destination set), `unknown-feed` (an output slot's unknown layout or subtitle source) / `layout-not-admissible` (an output slot's or a mixer input's layout), missing Idempotency-Key, or not 1..=64 crosspoints (subtitle rules as on `/patch/plan`). A subtitle take re-points the output's subtitle route table at once; its outcome rides `route.output` as `subtitle:applied` or `subtitle:refused:not-in-run` (see the subtitle design note). */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -17348,7 +17893,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `engine-busy` (a mailbox is full: the key and leases are released, and a set's armed mixer half is refused; or a `{layout}` could not be read now: every layout-read slot is in use) or `idempotency-capacity` (also: 256 sets already await their outcome). */
+            /** @description `engine-busy` (a mailbox is full: the key and leases are released, and a set's armed mixer half is refused; or a `{layout}` could not be read now: every layout-read slot is in use; or the output clock did not adopt a newly registered mixer-input layout within 1 s) or `idempotency-capacity` (also: 256 sets already await their outcome). */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -20483,7 +21028,7 @@ export interface operations {
                     "application/json": components["schemas"]["SwitcherAccepted"];
                 };
             };
-            /** @description Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source; the key is not burned. */
+            /** @description Not authorized for the M/E, the Program scope, a referenced object, the keyer object id or a named fill/key source, or (a `layout` select, or a CUT/AUTO whose Preview is `layout:<id>`) every source the stored layout binds; one generic refusal; the key is not burned. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -20501,7 +21046,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `capacity` (keyer budget; generic for scoped callers), `on-air-protected` (a fill/key change of a keyer on air without `on_air = "allow"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyers-unavailable`; nothing is enqueued and every lease taken is released. */
+            /** @description `capacity` (keyer budget, generic for scoped callers; or a fifth stored layout as an M/E source, or a source it shows cannot be leased), `layout-changed` (the stored layout was edited or deleted while this request was in flight; retry), `on-air-protected` (a fill/key change of a keyer on air without `on_air = "allow"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyer-in-transition`, `in-flight` (`arm` during a transition), `keyers-unavailable`; nothing is enqueued and every lease and key taken is released. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -20510,6 +21055,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description Invalid verb or references (exactly one of `source`/`input`/`layout` on a select; none on cut/auto), `not-on-an-input`, `unknown-slot`, `unknown-source` (no such stored layout), `layout-not-admissible` (another canvas, a translucent cell, or a nested layout/bus cell). */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -20518,7 +21064,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `engine-busy` (the 64-slot mailbox is full; key and leases released) or `idempotency-capacity`. */
+            /** @description `engine-busy`: the 64-slot mailbox is full, a stored layout could not be read now, or the output clock did not adopt a newly registered layout within 1 s (key and leases released); or `idempotency-capacity`. */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -20542,7 +21088,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description `SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`). */
+            /** @description `SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set`/`arm` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`, `keyer-in-transition` (a USK `keyer_cut` during a transition), `in-flight` (`arm` during a transition)). */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -20551,7 +21097,7 @@ export interface operations {
                     "application/json": components["schemas"]["SwitcherPlanResponseDoc"];
                 };
             };
-            /** @description Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source (checked before any existence answer); a keyer verb also needs the command role (Operator), so a Viewer or ReadOnly key cannot plan one. */
+            /** @description Not authorized for the M/E, the Program scope, the keyer object id (`<program>/<id>` for a DSK, `<me>/<id>` for a USK; for `arm` every armed key) or a named fill/key source (for `arm` the fill and key of every armed key) (checked before any existence answer); a keyer verb also needs the command role (Operator), so a Viewer or ReadOnly key cannot plan one. */
             403: {
                 headers: {
                     [name: string]: unknown;

@@ -32,6 +32,7 @@
 pub mod admission;
 pub mod api;
 pub mod audio;
+pub mod cast;
 pub mod cast_dir;
 pub mod catalogues;
 pub mod device;
@@ -165,9 +166,10 @@ pub use schema::{
 };
 pub use switcher::{
     keyer_cost, DownstreamKeyerConfig, KeyerLossPolicy, KeyerLossTrigger, KeyerRect, KeyerSize,
-    KeyerType, MixEffectsConfig, MixerInput, MixerInputVideo, SwitcherConfig, DEFAULT_KEYER_BUDGET,
-    DEFAULT_KEYER_RATE, DSK_FOLD, INPUT_REF_PREFIX, KEYER_UPLOAD_WEIGHT, MAX_DOWNSTREAM_KEYERS,
-    MAX_KEYER_RATE, MAX_MIXER_INPUTS, MIN_KEYER_FLY,
+    KeyerType, MixEffectsConfig, MixerInput, MixerInputVideo, SwitcherConfig, UpstreamKeyerConfig,
+    DEFAULT_KEYER_BUDGET, DEFAULT_KEYER_RATE, DSK_FOLD, INPUT_REF_PREFIX, KEYER_UPLOAD_WEIGHT,
+    MAX_DOWNSTREAM_KEYERS, MAX_KEYER_RATE, MAX_MIXER_INPUTS, MAX_UPSTREAM_KEYERS, MIN_KEYER_FLY,
+    USK_FOLD,
 };
 pub use sync_group::{SyncGroup, SyncGroupMode, SyncMember};
 pub use tally::{BitColor, IndexCell, TallyProfile};
@@ -604,6 +606,11 @@ pub struct MultiviewConfig {
     /// `[events]`: retention bounds of the raw marker journal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<EventsConfig>,
+    /// `[cast]`: the cast transport ladder (ADR-0114): which rungs
+    /// `POST /cast/<token>/ladder` may offer. Absent ⇒ `["hls"]`; a default
+    /// section does not serialize.
+    #[serde(default, skip_serializing_if = "cast::CastConfig::is_default")]
+    pub cast: cast::CastConfig,
 }
 
 /// Shape-check the id a weather / graphics source references.
@@ -847,6 +854,7 @@ impl MultiviewConfig {
         if let Some(timing) = &self.timing {
             timing.validate()?;
         }
+        self.cast.validate()?;
 
         // Solving + the core structural check covers geometry (rects in 0..1,
         // positive extent, valid cadence) and grid wiring (areas resolve).
@@ -1113,6 +1121,21 @@ impl MultiviewConfig {
                     )));
                 }
                 _ => {}
+            }
+            // Source and player ids share one frame-store namespace (ADR-M012):
+            // a source may reuse a player's id only as that player's own binding.
+            if player_ids.contains(source.id.as_str()) {
+                let own_binding = matches!(
+                    &source.kind,
+                    SourceKind::MediaPlayer { player } if *player == source.id
+                );
+                if !own_binding {
+                    return Err(ConfigError::Validation(format!(
+                        "source {:?} reuses media player id {:?}: only a media_player source \
+                         bound to that same player may share its id",
+                        source.id, source.id
+                    )));
+                }
             }
         }
 

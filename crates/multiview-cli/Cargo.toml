@@ -266,6 +266,10 @@ required-features = ["tls"]
 name = "live_audio_routing_http"
 required-features = ["ffmpeg"]
 
+[[test]]
+name = "live_media_player_source"
+required-features = ["ffmpeg"]
+
 # The streaming-encode behavioural tests (ADR-0025) drive the bounded
 # bake→encode→fan-out path with injected fake sinks; they need the `ffmpeg`
 # feature (the streaming machinery lives in the `pipeline` module) but no

@@ -452,6 +452,7 @@ async fn a_selection_during_a_take_is_refused_and_the_flight_keeps_its_transitio
             operation_id: "auto".into(),
             scene_version: 1,
             verb: SwitcherVerb::Auto(FrameCount::try_from(10).unwrap()),
+            expect: None,
         })
         .unwrap();
     tick(&mut driver, 2);
@@ -494,6 +495,7 @@ async fn a_full_mailbox_is_engine_busy_and_releases_the_key() {
                 operation_id: format!("fill-{n}"),
                 scene_version: 1,
                 verb: SwitcherVerb::Cut,
+                expect: None,
             })
             .unwrap();
     }
@@ -555,6 +557,7 @@ fn persisted(state: &multiview_control::AppState) -> Option<TransitionDescriptor
 /// M/E without numbered inputs too), never before the engine applied it and
 /// never mid-flight; the persisted document validates and reloads with it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)] // one walk; the merge added `expect: None` lines (#307)
 async fn an_applied_selection_is_persisted_after_the_tick_and_survives_a_reload() {
     use multiview_config::{MultiviewConfig, StartMode};
     use multiview_control::{boot_model::BootModel, command_bus, AppState, InMemoryRepository};
@@ -603,6 +606,7 @@ async fn an_applied_selection_is_persisted_after_the_tick_and_survives_a_reload(
             operation_id: "auto".into(),
             scene_version: 1,
             verb: SwitcherVerb::Auto(FrameCount::try_from(3).unwrap()),
+            expect: None,
         })
         .unwrap();
     tick(&mut driver, 2);
@@ -640,6 +644,7 @@ async fn an_applied_selection_is_persisted_after_the_tick_and_survives_a_reload(
                 operation_id: id.into(),
                 scene_version: 1,
                 verb,
+                expect: None,
             })
             .unwrap();
         tick(&mut driver, if id == "cut" { 8 } else { 7 });
@@ -839,6 +844,7 @@ async fn a_replay_during_an_auto_returns_the_original_operation() {
             operation_id: "auto".into(),
             scene_version: 1,
             verb: SwitcherVerb::Auto(FrameCount::try_from(10).unwrap()),
+            expect: None,
         })
         .unwrap();
     tick(&mut driver, 2);

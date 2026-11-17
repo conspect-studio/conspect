@@ -200,9 +200,9 @@ impl FrameJob {
     /// ([`GpuComposer::draws_keys`]). An allocation-free scan.
     #[must_use]
     pub fn needs_cpu_keyer_path(&self) -> bool {
-        self.tiles
-            .iter()
-            .any(|t| t.key.is_some() || t.group != TileGroup::Top)
+        self.tiles.iter().any(|t| {
+            t.key.is_some() || t.group != TileGroup::Top || t.mask.is_some_and(|m| m.complement)
+        })
     }
 
     /// Composite this job through `composer`.

@@ -107,8 +107,9 @@ What is true on main (`1b59d254`), read from the code:
        fill and key pair).
      - `luma`: `clamp((y_norm − clip) × gain, 0, 1)`, then optional `invert`. `y_norm` is the
        post-range-expand Y of the key source, or of the fill when there is no key source.
-     - `chroma`: ADR-C007's linear-RGB, tile-gamut distance. It is slice K7, and validation
-       refuses it until then.
+     - `chroma`: ADR-C007's linear-RGB, tile-gamut distance,
+       `clamp((d − clip) × gain, 0, 1)` to a `color` reference, optional `invert`; the fill
+       keys itself (a key source is refused). Built in slice K7 (design note §14).
    - `mask`: a rectangle in fill-source pixels, 0 outside it. Because it is in source space, it
      travels with a flying key.
    - `weight`: the keyer's on-air weight. A key that rides a wipe as a group member gets the

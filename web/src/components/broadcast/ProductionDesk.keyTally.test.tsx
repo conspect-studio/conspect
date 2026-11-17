@@ -21,7 +21,7 @@ i18n.load('en', messages);
 i18n.activate('en');
 
 const DSK1 = {
-  id: 'dsk1', family: 'dsk', fill: 'gfx-1', key: null, type: 'linear',
+  id: 'dsk1', family: 'dsk', armed: false, fill: 'gfx-1', key: null, type: 'linear',
   fly: null, mask: null, on_air: true, tie: false, ramp: null, rate: 15,
   loss: 'drop_to_off_air', stale: false, pending: false,
 };

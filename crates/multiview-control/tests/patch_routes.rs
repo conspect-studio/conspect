@@ -344,14 +344,16 @@ async fn unsupported_shapes_are_typed_422s() {
     // destination naming both a mixer input and an output slot is refused.
     let output = json!({ "plane": "video", "destination": {"mixer": "me1", "input": 5, "output": "hls-1", "slot": 0}, "source": {"source": "bars"} });
     let audio = json!({ "plane": "audio", "destination": {"mixer": "me1", "input": 4}, "source": {"source": "bars"} });
-    let layout = json!({ "plane": "video", "destination": {"mixer": "me1", "input": 4}, "source": {"layout": "x"} });
+    // #307 PR 2: a stored layout is now a mixer-input source; a bus on a
+    // mixer input is still a later slice.
+    let bus = json!({ "plane": "video", "destination": {"mixer": "me1", "input": 4}, "source": {"bus": "program"} });
     let too_many: Vec<Value> = (0..65).map(|_| xp(4, "bars")).collect();
     let cases = [
         (vec![xp(4, "bars"), output], "unknown-slot", "not both"),
         (vec![audio], "slot-medium-mismatch", "video"),
         (vec![xp(4, "bars"), xp(4, "vt1")], "unknown-slot", "twice"),
         (vec![xp(9, "bars")], "unknown-slot", "not declared"),
-        (vec![layout], "unknown-source", "later slice"),
+        (vec![bus], "unknown-source", "later slice"),
         (vec![], "", "1..=64"),
         (too_many, "", "1..=64"),
     ];
@@ -538,6 +540,7 @@ async fn engine_busy_releases_the_key() {
                 operation_id: format!("fill-{i}"),
                 scene_version: 1,
                 verb: SwitcherVerb::Cut,
+                expect: None,
             })
             .unwrap();
     }

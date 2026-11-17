@@ -1884,7 +1884,7 @@
             }
           },
           "422": {
-            "description": "The layout id does not exist, its stored body does not parse/solve, its canvas differs from the running session's pinned canvas (Class-2), or the running canvas is unknown (no seeded snapshot — the gate fails closed). Without `target` while a switcher M/E is declared: type `/problems/switcher-owns-program` (the Program canvas is the M/E bus; returned before the Idempotency-Key is reserved, so nothing is reserved, persisted or sent; the detail names `POST /routing/output/take` and a layout as a switcher source). With `target`: the output take's 422s.",
+            "description": "The layout id does not exist, its stored body does not parse/solve, its canvas differs from the running session's pinned canvas (Class-2), or the running canvas is unknown (no seeded snapshot — the gate fails closed). Without `target` while a switcher M/E is declared: type `/problems/switcher-owns-program` (the Program canvas is the M/E bus; returned before the Idempotency-Key is reserved, so nothing is reserved, persisted or sent; the detail names `POST /routing/output/take` and `POST /switcher/commands/select_preview` with `{\"layout\": id}`, a stored layout as an M/E source). With `target`: the output take's 422s.",
             "content": {
               "application/json": {
                 "schema": {
@@ -5626,7 +5626,7 @@
         },
         "responses": {
           "200": {
-            "description": "The replaced layout (new ETag in the response header).",
+            "description": "The replaced layout (new ETag in the response header). A layout registered as an M/E source (#307) swaps its body at the next tick.",
             "content": {
               "application/json": {
                 "schema": {
@@ -5646,7 +5646,7 @@
             }
           },
           "403": {
-            "description": "Not authorized to write.",
+            "description": "Not authorized to write; or `routed-layout`: the layout is on air on an output, or registered as an M/E source and the caller lacks the Program scope, the M/E or Read on every source the new body shows.",
             "content": {
               "application/json": {
                 "schema": {
@@ -5667,6 +5667,16 @@
           },
           "412": {
             "description": "If-Match precondition failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`layout-not-admissible`: the layout is registered as an M/E source and the new body would no longer be one (another canvas, a translucent cell, or a nested layout/bus cell); nothing was committed.",
             "content": {
               "application/json": {
                 "schema": {
@@ -5780,6 +5790,16 @@
           },
           "404": {
             "description": "No layout with that id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`layout-on-air`: this layout is registered as an M/E source (#307): it is on Program, Preview or a mixer input, or was within the last 10 s; nothing changed.",
             "content": {
               "application/json": {
                 "schema": {
@@ -6380,6 +6400,231 @@
           },
           "409": {
             "description": "Already finished or key conflict.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/media/fills/refresh": {
+      "get": {
+        "tags": [
+          "media-captures"
+        ],
+        "operationId": "list_fill_refresh",
+        "responses": {
+          "200": {
+            "description": "Refresh status of every visible scheduled fill.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/FillRefreshStatus"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/media/fills/{id}/refresh": {
+      "get": {
+        "tags": [
+          "media-captures"
+        ],
+        "operationId": "get_fill_refresh",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Fill id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Refresh status of one scheduled fill.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FillRefreshStatus"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized for this fill.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No schedule for this fill.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "media-captures"
+        ],
+        "operationId": "put_fill_refresh",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Fill id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefreshScheduleBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Schedule installed; runs as the calling key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FillRefreshStatus"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized for this fill or player.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown target player.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Config-declared fill or schedule capacity reached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid interval, body identity or terms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "media-captures"
+        ],
+        "operationId": "delete_fill_refresh",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Fill id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Schedule removed; the current clip keeps playing."
+          },
+          "403": {
+            "description": "Not authorized for this fill.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No schedule for this fill.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Config-declared fill.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8412,7 +8657,7 @@
             }
           },
           "422": {
-            "description": "`slot-medium-mismatch` (an audio slot other than slot 0 follow; a subtitle slot on an output kind that carries no subtitles, or a subtitle slot given a `{layout}` or `{bus}`: subtitle essences come from sources), `unknown-slot` (video slot >= 1; a subtitle slot >= the output's declared `slots.subtitle` count or named twice; subtitle crosspoints mixed with video/audio ones or naming two outputs), `unknown-source` (a layout or bus on a mixer input; an unknown feed; more than 4 distinct layouts in one set), or not 1..=64 crosspoints. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan. A subtitle slot (`{\"source\": id}` or `\"none\"`) is planned with path `subtitle`; an unknown source is an `unknown-source` refusal in the plan, and a source that declares no `captions` carries `note: source-has-no-captions` (not a refusal: the slot carries an empty track).",
+            "description": "`slot-medium-mismatch` (an audio slot other than slot 0 follow; a subtitle slot on an output kind that carries no subtitles, or a subtitle slot given a `{layout}` or `{bus}`: subtitle essences come from sources), `unknown-slot` (video slot >= 1; a subtitle slot >= the output's declared `slots.subtitle` count or named twice; subtitle crosspoints mixed with video/audio ones or naming two outputs), `unknown-source` (a bus on a mixer input; a mixer input's `{layout}` inside a multi-destination set; an unknown source or stored layout; an unknown feed; more than 4 distinct layouts in one request), `layout-not-admissible` (a mixer input's `{layout}`: not on the running canvas, a translucent cell, or a cell binding another layout or a bus — nested layouts and buses are not M/E sources), or not 1..=64 crosspoints. A layout on an output slot is planned like the alias: `layout-not-admissible` and `aux-capacity` are refusals in the plan. A plan never registers a mixer input's layout. A subtitle slot (`{\"source\": id}` or `\"none\"`) is planned with path `subtitle`; an unknown source is an `unknown-source` refusal in the plan, and a source that declares no `captions` carries `note: source-has-no-captions` (not a refusal: the slot carries an empty track).",
             "content": {
               "application/json": {
                 "schema": {
@@ -8494,7 +8739,7 @@
             }
           },
           "409": {
-            "description": "`conflict` (the Idempotency-Key was first used for another body: an output take's other output or feed, a set's other crosspoints; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity` (a set's new encoders exceed the caller's per-principal cap or the global sessions), `aux-capacity` (no free layout canvas), or no source lease.",
+            "description": "`conflict` (the Idempotency-Key was first used for another body: an output take's other output or feed, a set's other crosspoints; nothing enqueued), `on-air-protected` (the input on Program under `protect`, or the Program/Preview input during an AUTO), `switcher-unavailable`, `routing-unavailable`, `switcher-required`, `output-kind-unroutable`, `capacity` (a set's new encoders exceed the caller's per-principal cap or the global sessions; also: a mixer input's `{layout}` would be the fifth stored layout registered as an M/E source, or a source it shows cannot be leased; the key is released), `layout-changed` (a mixer input's `{layout}` was edited or deleted while this request was in flight; the key is released, retry), `aux-capacity` (no free layout canvas), or no source lease.",
             "content": {
               "application/json": {
                 "schema": {
@@ -8504,7 +8749,7 @@
             }
           },
           "422": {
-            "description": "`slot-medium-mismatch`, `unknown-slot`, `unknown-source`, `unknown-feed` (an output slot's unknown layout or subtitle source) / `layout-not-admissible` (an output slot's layout), missing Idempotency-Key, or not 1..=64 crosspoints (subtitle rules as on `/patch/plan`). A subtitle take re-points the output's subtitle route table at once; its outcome rides `route.output` as `subtitle:applied` or `subtitle:refused:not-in-run` (see the subtitle design note).",
+            "description": "`slot-medium-mismatch`, `unknown-slot`, `unknown-source` (also: a mixer input's `{layout}` inside a multi-destination set), `unknown-feed` (an output slot's unknown layout or subtitle source) / `layout-not-admissible` (an output slot's or a mixer input's layout), missing Idempotency-Key, or not 1..=64 crosspoints (subtitle rules as on `/patch/plan`). A subtitle take re-points the output's subtitle route table at once; its outcome rides `route.output` as `subtitle:applied` or `subtitle:refused:not-in-run` (see the subtitle design note).",
             "content": {
               "application/json": {
                 "schema": {
@@ -8524,7 +8769,7 @@
             }
           },
           "503": {
-            "description": "`engine-busy` (a mailbox is full: the key and leases are released, and a set's armed mixer half is refused; or a `{layout}` could not be read now: every layout-read slot is in use) or `idempotency-capacity` (also: 256 sets already await their outcome).",
+            "description": "`engine-busy` (a mailbox is full: the key and leases are released, and a set's armed mixer half is refused; or a `{layout}` could not be read now: every layout-read slot is in use; or the output clock did not adopt a newly registered mixer-input layout within 1 s) or `idempotency-capacity` (also: 256 sets already await their outcome).",
             "content": {
               "application/json": {
                 "schema": {
@@ -12377,7 +12622,7 @@
             }
           },
           "403": {
-            "description": "Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source; the key is not burned.",
+            "description": "Not authorized for the M/E, the Program scope, a referenced object, the keyer object id or a named fill/key source, or (a `layout` select, or a CUT/AUTO whose Preview is `layout:<id>`) every source the stored layout binds; one generic refusal; the key is not burned.",
             "content": {
               "application/json": {
                 "schema": {
@@ -12397,7 +12642,7 @@
             }
           },
           "409": {
-            "description": "`capacity` (keyer budget; generic for scoped callers), `on-air-protected` (a fill/key change of a keyer on air without `on_air = \"allow\"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyers-unavailable`; nothing is enqueued and every lease taken is released.",
+            "description": "`capacity` (keyer budget, generic for scoped callers; or a fifth stored layout as an M/E source, or a source it shows cannot be leased), `layout-changed` (the stored layout was edited or deleted while this request was in flight; retry), `on-air-protected` (a fill/key change of a keyer on air without `on_air = \"allow\"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyer-in-transition`, `in-flight` (`arm` during a transition), `keyers-unavailable`; nothing is enqueued and every lease and key taken is released.",
             "content": {
               "application/json": {
                 "schema": {
@@ -12407,7 +12652,7 @@
             }
           },
           "422": {
-            "description": "",
+            "description": "Invalid verb or references (exactly one of `source`/`input`/`layout` on a select; none on cut/auto), `not-on-an-input`, `unknown-slot`, `unknown-source` (no such stored layout), `layout-not-admissible` (another canvas, a translucent cell, or a nested layout/bus cell).",
             "content": {
               "application/json": {
                 "schema": {
@@ -12417,7 +12662,7 @@
             }
           },
           "503": {
-            "description": "`engine-busy` (the 64-slot mailbox is full; key and leases released) or `idempotency-capacity`.",
+            "description": "`engine-busy`: the 64-slot mailbox is full, a stored layout could not be read now, or the output clock did not adopt a newly registered layout within 1 s (key and leases released); or `idempotency-capacity`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -12448,7 +12693,7 @@
         },
         "responses": {
           "200": {
-            "description": "`SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`).",
+            "description": "`SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set`/`arm` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`, `keyer-in-transition` (a USK `keyer_cut` during a transition), `in-flight` (`arm` during a transition)).",
             "content": {
               "application/json": {
                 "schema": {
@@ -12458,7 +12703,7 @@
             }
           },
           "403": {
-            "description": "Not authorized for the M/E, the Program scope, the keyer object id or a named fill/key source (checked before any existence answer); a keyer verb also needs the command role (Operator), so a Viewer or ReadOnly key cannot plan one.",
+            "description": "Not authorized for the M/E, the Program scope, the keyer object id (`<program>/<id>` for a DSK, `<me>/<id>` for a USK; for `arm` every armed key) or a named fill/key source (for `arm` the fill and key of every armed key) (checked before any existence answer); a keyer verb also needs the command role (Operator), so a Viewer or ReadOnly key cannot plan one.",
             "content": {
               "application/json": {
                 "schema": {
@@ -15015,6 +15260,27 @@
         },
         "additionalProperties": false
       },
+      "ArmedView": {
+        "type": "object",
+        "description": "The next-transition set (`arm`, K3) as the caller may see it.",
+        "required": [
+          "background",
+          "keys"
+        ],
+        "properties": {
+          "background": {
+            "type": "boolean",
+            "description": "The background moves with the next transition."
+          },
+          "keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Armed upstream keyer ids the caller may read (keyer object id\n`<me>/<id>`); unreadable ones are dropped."
+          }
+        }
+      },
       "ArtifactRef": {
         "type": "object",
         "description": "Exact immutable completed capture selector; no path or owner override.",
@@ -16369,11 +16635,33 @@
             "type": "boolean",
             "description": "A receiver can start now."
           },
+          "receiver": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReceiverProbe",
+                "description": "The receiver's last capability probe (`POST /cast/<token>/ladder`,\nADR-0114): device claims, shown as received. Owner and Admin only,\nlike the rest of this document."
+              }
+            ]
+          },
           "segments": {
             "type": "integer",
             "format": "int64",
             "description": "Video segments published (Google's Default Media Receiver starts\nslowly on a young playlist: wait for 8).",
             "minimum": 0
+          },
+          "transport": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Transport",
+                "description": "The rung the receiver plays and how it fares (ADR-0114)."
+              }
+            ]
           }
         }
       },
@@ -17789,6 +18077,40 @@
           }
         }
       },
+      "Fallback": {
+        "type": "object",
+        "description": "One step down the ladder, as the receiver reported it in `failed`.",
+        "required": [
+          "rung",
+          "stage",
+          "at_unix_ms"
+        ],
+        "properties": {
+          "at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was reported (Unix ms).",
+            "minimum": 0
+          },
+          "ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The receiver's figure for it (ms), if any.",
+            "minimum": 0
+          },
+          "rung": {
+            "type": "string",
+            "description": "The rung that failed."
+          },
+          "stage": {
+            "type": "string",
+            "description": "`connect`, `first-frame`, `stall`, `latency` or `hook` (the WebRTC\nmedia-element hook did not take)."
+          }
+        }
+      },
       "FeedStatus": {
         "type": "object",
         "description": "One feed's operator-visible status.",
@@ -17844,6 +18166,118 @@
             "description": "The feed URL with credentials and query removed."
           }
         }
+      },
+      "FillRefreshStatus": {
+        "type": "object",
+        "description": "Public per-fill refresh status (no URL, credential or path).",
+        "required": [
+          "fill_id",
+          "player",
+          "source",
+          "minutes",
+          "during_refresh",
+          "then",
+          "phase",
+          "in_flight",
+          "consecutive_failures",
+          "update_pending",
+          "persistent"
+        ],
+        "properties": {
+          "consecutive_failures": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Consecutive failed runs (drives the back-off).",
+            "minimum": 0
+          },
+          "during_refresh": {
+            "type": "string",
+            "description": "What the slot shows during a refresh (always `play_last` today)."
+          },
+          "fill_id": {
+            "type": "string",
+            "description": "Fill id."
+          },
+          "in_flight": {
+            "type": "boolean",
+            "description": "Whether a run is in flight."
+          },
+          "last_artifact_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Artifact id of the last successful load."
+          },
+          "last_capture_job_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Capture job id of the current or last run (owner-scoped).",
+            "minimum": 0
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Last failure, cleared on success."
+          },
+          "last_success_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Last successful native load (RFC 3339 UTC)."
+          },
+          "minutes": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Refresh period in minutes.",
+            "minimum": 0
+          },
+          "next_due": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Next due time (RFC 3339 UTC); meaningful while idle."
+          },
+          "persistent": {
+            "type": "boolean",
+            "description": "Whether the schedule survives a server restart (config: yes; API: no)."
+          },
+          "phase": {
+            "type": "string",
+            "description": "`idle`, `capturing` or `loading`."
+          },
+          "player": {
+            "type": "string",
+            "description": "Target media player."
+          },
+          "source": {
+            "$ref": "#/components/schemas/FillSource",
+            "description": "Origin of the schedule."
+          },
+          "then": {
+            "$ref": "#/components/schemas/LoadThen",
+            "description": "Landing intent of scheduled loads."
+          },
+          "update_pending": {
+            "type": "boolean",
+            "description": "A replacement schedule is staged and takes effect when the in-flight run ends."
+          }
+        }
+      },
+      "FillSource": {
+        "type": "string",
+        "description": "Where a scheduled fill came from.",
+        "enum": [
+          "config",
+          "api"
+        ]
       },
       "FiredBody": {
         "type": "object",
@@ -17901,6 +18335,14 @@
             "minimum": 0
           }
         }
+      },
+      "FrameCounter": {
+        "type": "string",
+        "description": "Which presented-frame counter the receiver's stall watchdog uses.",
+        "enum": [
+          "rvfc",
+          "quality"
+        ]
       },
       "FreshnessDoc": {
         "type": "object",
@@ -19006,17 +19448,50 @@
           }
         }
       },
+      "KeyerFamilyWire": {
+        "type": "string",
+        "description": "Which keyer family a request names (K3). Absent: `dsk` (K4 requests are\nunchanged).",
+        "enum": [
+          "dsk",
+          "usk"
+        ]
+      },
       "KeyerFields": {
         "type": "object",
         "description": "The keyer fields of a switcher request (flattened into it). Every field\nis optional; which ones a verb takes is checked by shape.",
         "properties": {
+          "background": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`arm` (K3): whether the background moves with the next transition."
+          },
           "clip": {
             "type": [
               "number",
               "null"
             ],
             "format": "float",
-            "description": "`keyer_set`: luma clip, `[0, 1]`."
+            "description": "`keyer_set`: luma clip on Y, or chroma clip on the linear-RGB\ndistance, `[0, 1]`."
+          },
+          "color": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`keyer_set`: chroma reference colour `#RRGGBB` (`type = chroma`\nonly); `\"\"` clears it. Downstream keyers only (`keyer-usk` on a USK)."
+          },
+          "family": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/KeyerFamilyWire",
+                "description": "Keyer verbs: `dsk` (default) or `usk` (K3). A USK's object id is\n`<me>/<keyer>`; it takes `keyer_cut` (outside a transition) and\n`keyer_set`, and changes on air through `arm` + CUT/AUTO."
+              }
+            ]
           },
           "fill": {
             "type": [
@@ -19042,7 +19517,7 @@
               "null"
             ],
             "format": "float",
-            "description": "`keyer_set`: luma gain, finite and `>= 0`."
+            "description": "`keyer_set`: luma or chroma gain, finite and `>= 0`."
           },
           "invert": {
             "type": [
@@ -19064,6 +19539,16 @@
               "null"
             ],
             "description": "Keyer id within the program (`dsk1`); the object id is\n`<program>/<keyer>`. Required by every keyer verb."
+          },
+          "keys": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "`arm` (K3): the upstream keyer ids (of this M/E) that toggle with the\nnext transition, at most 4, distinct."
           },
           "loss": {
             "type": [
@@ -19147,7 +19632,7 @@
               "string",
               "null"
             ],
-            "description": "`keyer_set`: `linear` or `luma` (`chroma` is refused until K7)."
+            "description": "`keyer_set`: `linear`, `luma` or `chroma` (K7; needs `color`, refuses\na `key` source; downstream keyers only, a USK refuses it as\n`usk-chroma`)."
           },
           "z": {
             "type": [
@@ -19287,6 +19772,7 @@
         "required": [
           "id",
           "family",
+          "armed",
           "fill",
           "type",
           "clip",
@@ -19301,14 +19787,25 @@
           "pending"
         ],
         "properties": {
+          "armed": {
+            "type": "boolean",
+            "description": "USK: armed to toggle with the next transition (K3); always `false`\nfor a DSK (its next-transition flag is `tie`)."
+          },
           "clip": {
             "type": "number",
             "format": "float",
             "description": "Luma clip, `[0, 1]` (the committed value; meaningful for `luma`)."
           },
+          "color": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Chroma reference `#RRGGBB` / `#RGB` (K7), `null` for other types.\nA colour, not a source id: never redacted."
+          },
           "family": {
             "type": "string",
-            "description": "`dsk` (USKs arrive with K3)."
+            "description": "`dsk` or `usk` (K3)."
           },
           "fill": {
             "type": "string",
@@ -19332,7 +19829,7 @@
           },
           "id": {
             "type": "string",
-            "description": "Keyer id within the program."
+            "description": "Keyer id within the program (DSK) or the M/E (USK)."
           },
           "invert": {
             "type": "boolean",
@@ -19410,7 +19907,7 @@
           },
           "type": {
             "type": "string",
-            "description": "`linear` or `luma`."
+            "description": "`linear`, `luma` or `chroma`."
           }
         }
       },
@@ -19449,6 +19946,58 @@
           "class_mismatch",
           "over_gpu"
         ]
+      },
+      "LatencyMethod": {
+        "type": "string",
+        "description": "How a latency figure was obtained (decision 2, \"When there is no\ntrustworthy mapping\").",
+        "enum": [
+          "frame",
+          "playhead",
+          "unavailable"
+        ]
+      },
+      "LatencyStats": {
+        "type": "object",
+        "description": "Steady-state tick-to-present latency over the receiver's last window.",
+        "required": [
+          "median",
+          "p95",
+          "samples",
+          "method"
+        ],
+        "properties": {
+          "clock_error_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The clock offset's error bound (ms).",
+            "minimum": 0
+          },
+          "median": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Median (ms).",
+            "minimum": 0
+          },
+          "method": {
+            "$ref": "#/components/schemas/LatencyMethod",
+            "description": "`frame` or `playhead`."
+          },
+          "p95": {
+            "type": "integer",
+            "format": "int64",
+            "description": "95th percentile (ms).",
+            "minimum": 0
+          },
+          "samples": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Valid samples in the window.",
+            "minimum": 0
+          }
+        }
       },
       "Layout": {
         "type": "object",
@@ -19726,6 +20275,28 @@
         },
         "additionalProperties": false
       },
+      "LoadFailureCode": {
+        "type": "string",
+        "description": "Typed reason a load operation ended `failed`. Stable wire codes.",
+        "enum": [
+          "not_found",
+          "invalid_data",
+          "timeout",
+          "wrong_cadence",
+          "vfr",
+          "no_cadence",
+          "alpha",
+          "no_video_stream",
+          "unknown_length",
+          "invalid_window",
+          "decoder_open",
+          "no_frames",
+          "audio_unavailable",
+          "journal_failed",
+          "reference_missing",
+          "other"
+        ]
+      },
       "LoadOperation": {
         "type": "object",
         "description": "Bounded operation view; completion needs native video and audio adoption.",
@@ -19734,6 +20305,13 @@
           "state"
         ],
         "properties": {
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Short operator-facing explanation of `reason`. Redacted: never carries\na filesystem path, URL or credential; at most 256 bytes."
+          },
           "native": {
             "oneOf": [
               {
@@ -19750,6 +20328,17 @@
             "format": "int64",
             "description": "Operation id.",
             "minimum": 0
+          },
+          "reason": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LoadFailureCode",
+                "description": "Typed failure reason; present only when `state` is `failed`."
+              }
+            ]
           },
           "state": {
             "type": "string",
@@ -22227,7 +22816,7 @@
           },
           "source": {
             "type": "object",
-            "description": "A mixer input: `{\"source\": id}` or `\"none\"`. An output video slot 0:\n`{\"source\": id}`, `{\"layout\": id}` (a stored layout; Read on it AND on\nevery source its cells bind) or `{\"bus\": ..}`; audio slot 0: `\"follow\"`;\nan output subtitle slot: `{\"source\": id}` or `\"none\"`."
+            "description": "A mixer input: `{\"source\": id}`, `{\"layout\": id}` (a stored layout as\nan M/E source, #307: Read on it AND on every source its cells bind;\nit must solve on the running canvas with opaque cells and bind no other\nlayout or bus) or `\"none\"`; `{\"bus\": ..}` is refused. An output video slot 0:\n`{\"source\": id}`, `{\"layout\": id}` (a stored layout; Read on it AND on\nevery source its cells bind) or `{\"bus\": ..}`; audio slot 0: `\"follow\"`;\nan output subtitle slot: `{\"source\": id}` or `\"none\"`."
           }
         },
         "additionalProperties": false
@@ -23265,6 +23854,104 @@
         ],
         "description": "An IS-04 **Receiver**: an ingress flow (a Conspect input)."
       },
+      "ReceiverCaps": {
+        "type": "object",
+        "description": "What the receiver says it can do (`caps` of the probe).",
+        "required": [
+          "rtc_h264"
+        ],
+        "properties": {
+          "adec": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Support",
+                "description": "`AudioDecoder.isConfigSupported` for the stream."
+              }
+            ]
+          },
+          "frames": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FrameCounter",
+                "description": "The presented-frame counter (`null`: none)."
+              }
+            ]
+          },
+          "mse": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Media Source Extensions accept the stream's codec strings."
+          },
+          "rtc": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`RTCPeerConnection` exists."
+          },
+          "rtc_h264": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "H.264 `profile-level-id` values the receiver can take (at most 8)."
+          },
+          "rtc_opus": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Opus receive."
+          },
+          "rvfc": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`requestVideoFrameCallback` exists."
+          },
+          "srt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The libsrt version an Android TV app loaded (`null` on the web)."
+          },
+          "vdec": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Support",
+                "description": "`VideoDecoder.isConfigSupported` for the stream."
+              }
+            ]
+          },
+          "vdec_hw": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "The same with `prefer-hardware`."
+          },
+          "wt": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`WebTransport` exists."
+          }
+        }
+      },
       "ReceiverFetch": {
         "type": "object",
         "description": "The last fetch of the receiver app (no IP).",
@@ -23289,6 +23976,80 @@
               "null"
             ],
             "description": "The fetcher's `User-Agent` (at most 160 characters)."
+          }
+        }
+      },
+      "ReceiverNeed": {
+        "type": "object",
+        "description": "What the session must carry (`need` of the probe).",
+        "properties": {
+          "audio": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The audio track required, if any."
+          },
+          "subtitles": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Subtitles are required."
+          }
+        }
+      },
+      "ReceiverProbe": {
+        "type": "object",
+        "description": "The last capability probe of a stream's receiver.",
+        "required": [
+          "caps",
+          "need",
+          "skip",
+          "received_unix_ms"
+        ],
+        "properties": {
+          "build": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The receiver build (a sha256 prefix of its script)."
+          },
+          "caps": {
+            "$ref": "#/components/schemas/ReceiverCaps",
+            "description": "What it can do."
+          },
+          "kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`web` or `android-tv` (as claimed)."
+          },
+          "need": {
+            "$ref": "#/components/schemas/ReceiverNeed",
+            "description": "What it must carry."
+          },
+          "received_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the probe arrived (Unix ms).",
+            "minimum": 0
+          },
+          "skip": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SkipEntry"
+            },
+            "description": "Rungs in its failure memory (at most 4)."
+          },
+          "ua": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The receiver's user agent (at most 200 characters)."
           }
         }
       },
@@ -23394,6 +24155,35 @@
           "url"
         ]
       },
+      "RefreshScheduleBody": {
+        "type": "object",
+        "description": "Register (or replace) a runtime refresh schedule for one fill.",
+        "required": [
+          "minutes",
+          "capture"
+        ],
+        "properties": {
+          "capture": {
+            "$ref": "#/components/schemas/CaptureBody",
+            "description": "The capture submitted every run; `fill_id` must equal the path id and\n`target_player` must name an existing player."
+          },
+          "minutes": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Refresh period in minutes, 1 through 1440.",
+            "minimum": 0
+          },
+          "start_now": {
+            "type": "boolean",
+            "description": "Run the first refresh in the current slot instead of the next one."
+          },
+          "then": {
+            "$ref": "#/components/schemas/LoadThen",
+            "description": "Landing intent of each scheduled load (default resume)."
+          }
+        },
+        "additionalProperties": false
+      },
       "Registration": {
         "type": "object",
         "description": "An IS-04 **registration request**: the `{type, data}` body posted to a\nRegistry's `POST /x-nmos/registration/v1.3/resource`.\n\nThe `data` is the resource JSON for the declared `type`. Modelled internally\ntagged on `type` (never `untagged`) so it round-trips robustly. The payload\nis the raw resource JSON value so this one type carries any resource kind.",
@@ -23477,6 +24267,35 @@
           "body": {
             "type": "string",
             "description": "The reply text to append to the thread."
+          }
+        }
+      },
+      "Resets": {
+        "type": "object",
+        "description": "Player resets inside the attachment.",
+        "required": [
+          "soft",
+          "hard"
+        ],
+        "properties": {
+          "hard": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Hard resets.",
+            "minimum": 0
+          },
+          "last": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The last cause."
+          },
+          "soft": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Soft resets.",
+            "minimum": 0
           }
         }
       },
@@ -24490,6 +25309,26 @@
             "format": "password",
             "description": "The one-time setup code (8 words) printed on the host.",
             "writeOnly": true
+          }
+        }
+      },
+      "SkipEntry": {
+        "type": "object",
+        "description": "A rung in the device's failure memory.",
+        "required": [
+          "rung",
+          "seconds"
+        ],
+        "properties": {
+          "rung": {
+            "type": "string",
+            "description": "The rung."
+          },
+          "seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds left.",
+            "minimum": 0
           }
         }
       },
@@ -26282,6 +27121,15 @@
           }
         }
       },
+      "Support": {
+        "type": "string",
+        "description": "A decoder check result (`isConfigSupported`).",
+        "enum": [
+          "supported",
+          "unsupported",
+          "absent"
+        ]
+      },
       "SupportEntitlement": {
         "type": "object",
         "description": "The full entitlement-routing answer the `GET /support/entitlement` endpoint\nreturns: whether the machine is eligible for entitled support, the route, and\nthe SLA token (a quiet line for the free tier).",
@@ -26420,7 +27268,7 @@
         "allOf": [
           {
             "$ref": "#/components/schemas/KeyerFields",
-            "description": "Downstream keyer fields (ADR-0113 §8, K4): `keyer` names the keyer\n(object id `<program>/<keyer>`); `on`, `tie` and the `keyer_set`\ndefinition fields. Fill and key name sources only (`in:<n>` is 422)."
+            "description": "Keyer fields (ADR-0113 §8, K4/K3): `keyer` names the keyer (object id\n`<program>/<keyer>`, or `<me>/<keyer>` with `family = \"usk\"`); `on`,\n`tie` and the `keyer_set` definition fields; `arm` takes `background`\nand `keys` (upstream keyer ids). Fill and key name sources only\n(`in:<n>` is 422)."
           },
           {
             "type": "object",
@@ -26432,7 +27280,7 @@
             "properties": {
               "action": {
                 "type": "string",
-                "description": "Action to classify on `/plan`, one of `select_program`, `select_preview`,\n`cut`, `auto`, `set_transition`, `keyer_cut`, `keyer_auto`, `keyer_tie`,\n`keyer_set`; the action is part of the same validated request."
+                "description": "Action to classify on `/plan`, one of `select_program`, `select_preview`,\n`cut`, `auto`, `set_transition`, `keyer_cut`, `keyer_auto`, `keyer_tie`,\n`keyer_set`, `arm`; the action is part of the same validated request."
               },
               "duration_frames": {
                 "type": [
@@ -26457,7 +27305,7 @@
                   "string",
                   "null"
                 ],
-                "description": "Referenced stored layout, when selecting an authored scene."
+                "description": "A stored layout as the selected source (#307), for\n`select_program`/`select_preview`: exactly one of\n`source`/`input`/`layout`. Needs Read on the layout AND on every source\nits cells bind (one generic 403); it must exist, solve on the running\ncanvas, have opaque cells and bind no other layout or bus (422\n`unknown-source` / `layout-not-admissible`). With numbered inputs it\nmust be patched to an input (`not-on-an-input`). The engine source id\nis `layout:<id>`; at most 4 layouts are M/E sources at once (409\n`capacity`). Refused on `cut`/`auto`. A `source` of `layout:<id>` means\nthe same."
               },
               "me": {
                 "type": "string",
@@ -26511,9 +27359,14 @@
           "fps_den",
           "keyers",
           "tally",
+          "armed",
           "transition"
         ],
         "properties": {
+          "armed": {
+            "$ref": "#/components/schemas/ArmedView",
+            "description": "The next-transition set (`arm`, K3): the background flag and the\narmed upstream keyer ids the caller may read."
+          },
           "canvas_height": {
             "type": "integer",
             "format": "int32",
@@ -27700,6 +28553,88 @@
           "kind": {
             "type": "string",
             "description": "`cut` or `mix`."
+          }
+        }
+      },
+      "Transport": {
+        "type": "object",
+        "description": "The transport a stream's receiver plays on and how it fares.",
+        "required": [
+          "fallbacks",
+          "resets",
+          "stalled"
+        ],
+        "properties": {
+          "fallbacks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Fallback"
+            },
+            "description": "The last steps down (at most 8, oldest first)."
+          },
+          "first_frame_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "From the start of the attempt to the first presented frame (ms).",
+            "minimum": 0
+          },
+          "latency_method": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LatencyMethod",
+                "description": "How the latency is measured (`unavailable`: no figure, by rule)."
+              }
+            ]
+          },
+          "latency_ms": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LatencyStats",
+                "description": "Steady-state latency; `null` when unavailable or not yet measured."
+              }
+            ]
+          },
+          "reported_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the receiver last reported these figures (Unix ms).",
+            "minimum": 0
+          },
+          "resets": {
+            "$ref": "#/components/schemas/Resets",
+            "description": "Player resets."
+          },
+          "rung": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The rung the engine last offered (`hls` in this build)."
+          },
+          "since_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Since when it plays that rung (Unix ms).",
+            "minimum": 0
+          },
+          "stalled": {
+            "type": "boolean",
+            "description": "The receiver's frame watchdog says no frame was presented for 2 s."
           }
         }
       },
