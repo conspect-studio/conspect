@@ -1,7 +1,7 @@
 //! Owned frame hook for a first-slice one-cell Program scene. No shared mutex
 //! crosses between the frame boundary and completion callbacks.
 use crate::clock::Tick;
-use crate::drive::{CompositedFrame, CompositorDrive, MixOverlay, TransitionStyle};
+use crate::drive::{CompositedFrame, CompositorDrive, TransitionStyle};
 use crate::keyer::{KeyerDraw, MAX_KEYERS};
 use crate::runtime::FrameControl;
 use crate::switcher_control::SwitcherTickDriver;
@@ -230,7 +230,8 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         // tied keyers follow the same envelope the transition tiles use (MIX
         // opacity, DIP weights), then one buffer swap into the drive (the
         // previous tick's `Arc`s come back and drop on the next resolve).
-        let envelope = drive.mix_overlay().map(MixOverlay::tie_envelope);
+        let background = drive.transition_background();
+        let envelope = drive.mix_overlay().map(|mix| mix.envelope(background));
         let incoming_drawn = drive.transition_incoming_drawn(tick.pts);
         self.driver
             .resolve_keyers(tick, envelope, incoming_drawn, &mut self.keyer_buf);

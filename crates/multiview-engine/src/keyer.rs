@@ -1760,9 +1760,21 @@ impl KeyerRuntime {
             let Some(target) = next.next() else {
                 break;
             };
-            program.insert(TallyRole::Fill(keyer));
-            if draw.key.is_some() {
-                program.insert(TallyRole::Key(keyer));
+            // A USK in a key-changing transition is drawn whole in its
+            // scene; it contributes to Program only while its side of the
+            // merge is visible (not at MIX p = 0 going on, nor before a
+            // DIP's switch point; K3).
+            let visible = match (slot.def.family, slot.flags.flight, auto_p) {
+                (KeyerFamily::Usk, Some(to_on), Some(e)) => {
+                    (if to_on { e.going_on } else { e.going_off }) > 0.0
+                }
+                _ => true,
+            };
+            if visible {
+                program.insert(TallyRole::Fill(keyer));
+                if draw.key.is_some() {
+                    program.insert(TallyRole::Key(keyer));
+                }
             }
             *target = Some(draw);
         }

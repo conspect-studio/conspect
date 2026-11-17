@@ -215,6 +215,17 @@ impl MixOverlay {
         }
     }
 
+    /// [`Self::tie_envelope`] for a transition that does (`background`) or
+    /// does not move the background: a key-only DIP draws as a MIX (design
+    /// note §4), so its keys follow `p`.
+    #[must_use]
+    pub fn envelope(&self, background: bool) -> TieEnvelope {
+        match self.style {
+            TransitionStyle::Dip { .. } if !background => TieEnvelope::mix(self.opacity()),
+            _ => self.tie_envelope(),
+        }
+    }
+
     /// The incoming tile's opacity for this frame.
     #[must_use]
     pub fn opacity(&self) -> f32 {
