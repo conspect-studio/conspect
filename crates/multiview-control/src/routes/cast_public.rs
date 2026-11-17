@@ -354,14 +354,14 @@ async fn take_ladder(state: &AppState, token: &str, body: Body) -> Response {
         .cast_engine
         .as_ref()
         .and_then(|engine| engine.clock(&again.config_id, t1.saturating_mul(1000)));
-    let offer = request.full.then(|| {
-        crate::cast_streams::ladder::offer(
-            &state.cast_streams.ladder(),
-            crate::cast_streams::ladder::SERVED_RUNGS,
-            request.probe.as_ref(),
-        )
-    });
-    let (attach, then) = offer.map_or((None, Vec::new()), |(attach, then)| (Some(attach), then));
+    let offered = if request.full {
+        Some(attach_best(state, &again, request.probe.as_ref()))
+    } else {
+        None
+    };
+    let (attach, then) = offered
+        .as_ref()
+        .map_or((None, Vec::new()), |o| (Some(o.rung), o.then.clone()));
     let full = request.full;
     let t0 = request.t0_us;
     if state
@@ -386,7 +386,7 @@ async fn take_ladder(state: &AppState, token: &str, body: Body) -> Response {
         serde_json::json!({
             "v": 1,
             "clock": clock,
-            "attach": attach.map(|rung| serde_json::json!({ "rung": rung })),
+            "attach": offered.map(|o| o.attach),
             "then": then,
             "srt": null,
         })
@@ -398,6 +398,96 @@ async fn take_ladder(state: &AppState, token: &str, body: Body) -> Response {
         answer.to_string(),
     )
         .into_response()
+}
+
+/// The rung a ladder call attaches, already admitted, and the rest.
+struct Offered {
+    rung: &'static str,
+    attach: serde_json::Value,
+    then: Vec<&'static str>,
+}
+
+/// The rungs the running engine can serve now (decision 3, first rule):
+/// HLS always; MoQ while a MoQ provider is ready and the run labels the
+/// output (no labels: no gate, so no push rung).
+fn served_now(state: &AppState, config_id: &str) -> Vec<&'static str> {
+    let mut served = vec!["hls"];
+    let labelled = crate::cast_streams::reauth::labels(state, config_id).is_some();
+    if labelled && state.moq.available() {
+        served.insert(0, "moq");
+    }
+    served
+}
+
+/// Walk the offer (decision 3, "What the engine leaves out", in order) and
+/// admit the first rung that admits: a rung that cannot be admitted now (no
+/// subscription left, a codec the lease refuses) is left out and the next
+/// one is tried, never an error (review note R2-N4). HLS needs no admission.
+fn attach_best(
+    state: &AppState,
+    admitted: &crate::cast_streams::Admitted,
+    probe: Option<&crate::cast_streams::ladder::ReceiverProbe>,
+) -> Offered {
+    let served = served_now(state, &admitted.config_id);
+    let (first, mut rest) =
+        crate::cast_streams::ladder::offer(&state.cast_streams.ladder(), &served, probe);
+    let mut candidate = first;
+    loop {
+        if candidate == "hls" {
+            return Offered {
+                rung: "hls",
+                attach: serde_json::json!({ "rung": "hls" }),
+                then: rest,
+            };
+        }
+        if candidate == "moq" {
+            if let Some(attach) = attach_moq(state, admitted) {
+                return Offered {
+                    rung: "moq",
+                    attach,
+                    then: rest,
+                };
+            }
+        }
+        candidate = if rest.is_empty() { "hls" } else { rest.remove(0) };
+    }
+}
+
+/// Admit a MoQ cast lease for `admitted` (ADR-0114 slice 4): the attachment
+/// is cleared for the identities current right after the shared check, the
+/// lease runs with the token owner's CURRENT principal (decision 5.6), and
+/// it is registered with the token in one critical section that requires
+/// the token still armed at the same generation; on any failure the lease
+/// is fenced and nothing is offered.
+fn attach_moq(state: &AppState, admitted: &crate::cast_streams::Admitted) -> Option<serde_json::Value> {
+    let owner = crate::cast_streams::reauth::owner_of(state, &admitted.stream_id)?;
+    let (labels, clearance) =
+        crate::cast_streams::reauth::clearance_now(state, &admitted.config_id)?;
+    let attachment = std::sync::Arc::new(crate::cast_streams::identity::CastAttachment::new(
+        &admitted.stream_id,
+        &admitted.config_id,
+        "moq",
+        labels,
+        clearance,
+    ));
+    let scope = crate::preview::WhepScope::Output(admitted.config_id.clone());
+    let lease = state.moq.open_cast(&owner, &scope, &attachment).ok()?;
+    if !state
+        .cast_streams
+        .attach(std::sync::Arc::clone(&attachment), admitted.generation)
+    {
+        attachment.fence();
+        return None;
+    }
+    Some(serde_json::json!({
+        "rung": "moq",
+        "url": lease.url,
+        "broadcast": lease.broadcast,
+        "protocol": lease.protocol,
+        "video": lease.video,
+        "audio": lease.audio,
+        "expires_in_ms": lease.expires_in_ms,
+    }))
 }
 
 async fn receiver_redirect() -> Response {

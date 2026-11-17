@@ -136,16 +136,117 @@ pub(crate) fn before_change(
     {
         return Vec::new();
     }
+    let ids = requested_ids(state, config_id, video, layout, audio);
     let change = Change {
         op: op.map(str::to_owned),
         bus: video.map(RoutedFeed::bus_name),
         needs: closure(state, config_id, video, layout, audio, None),
+        ids: ids.clone(),
     };
     let revoked =
         state
             .cast_streams
             .commit(config_id, change, sink(state, config_id), &check(state));
+    // Decision 5.4 "Who mints": the engine labels the change with these
+    // identities only because the control plane registered them first.
+    if let Some(labels) = labels(state, config_id) {
+        labels.expect(&ids.iter().map(|(_, id)| *id).collect::<Vec<_>>());
+    }
     report(state, revoked, actor)
+}
+
+/// The engine's content labels of cast output `config_id` (`None`: no run).
+pub(crate) fn labels(
+    state: &AppState,
+    config_id: &str,
+) -> Option<std::sync::Arc<super::identity::OutputLabels>> {
+    state.cast_engine.as_ref()?.labels(config_id)
+}
+
+/// The content identities a requested change brings (decision 5.4): the
+/// picture (`video`, with its resolved layout body or the stored one) and
+/// the program-audio slot it will carry. Computed by the same functions the
+/// engine labels with, so the engine's label of the applied change equals
+/// it.
+fn requested_ids(
+    state: &AppState,
+    config_id: &str,
+    video: Option<&RoutedFeed>,
+    layout: Option<&RoutedLayout>,
+    audio: Option<&RoutedAudio>,
+) -> Vec<(super::identity::Component, u64)> {
+    use super::identity::{audio_slot_content, identity, layout_content, video_content, Component};
+    let mut ids = Vec::new();
+    let feed = video.cloned().or_else(|| current_video(state, config_id));
+    let stored = |id: &str| {
+        crate::routes::routing::layout_sources(state)
+            .ok()
+            .and_then(|library| library.get(id).map(|l| (l.sources.clone(), l.audio.clone())))
+    };
+    let mut layout_audio = None;
+    if let Some(feed) = &feed {
+        let content = match (feed, layout.filter(|l| matches!(feed, RoutedFeed::Layout(id) if *id == l.id))) {
+            (RoutedFeed::Layout(_), Some(body)) => {
+                layout_audio = Some(body.audio.clone());
+                Some(video_content(&feed.bus_name(), Some(body)))
+            }
+            (RoutedFeed::Layout(id), None) => stored(id).map(|(sources, audio)| {
+                let content = layout_content(id, &sources, &audio);
+                layout_audio = Some(audio);
+                content
+            }),
+            _ => Some(video_content(&feed.bus_name(), None)),
+        };
+        if let (Some(content), true) = (content, video.is_some()) {
+            ids.push((Component::Video, identity(&Component::Video, &content)));
+        }
+    }
+    let choice = audio.cloned().or_else(|| configured_audio(state, config_id));
+    if let (Some(choice), Some(feed)) = (choice, feed.as_ref()) {
+        let content = audio_slot_content(&choice, feed, layout_audio.as_ref());
+        ids.push((Component::Audio, identity(&Component::Audio, &content)));
+    }
+    ids
+}
+
+/// The output's configured audio choice as a routed choice.
+fn configured_audio(state: &AppState, config_id: &str) -> Option<RoutedAudio> {
+    let config = desired(state)?;
+    let feed = config
+        .output_feeds()
+        .into_iter()
+        .find(|xp| xp.output == config_id)
+        .map_or(AudioFeed::Follow, |xp| xp.audio);
+    Some(match feed {
+        AudioFeed::Program => RoutedAudio::Program,
+        AudioFeed::None => RoutedAudio::None,
+        AudioFeed::Source(id) => RoutedAudio::Source(id),
+        AudioFeed::Tracks(tracks) if tracks.len() == 1 => {
+            let name = tracks.into_iter().next()?;
+            let input = crate::routes::output_routing::track_input(&config, &name)?;
+            RoutedAudio::Track { name, input }
+        }
+        _ => RoutedAudio::Follow,
+    })
+}
+
+/// The clearance of a new push attachment of an admitted token (decision
+/// 5.4, "Re-attachment"): the identities current at this moment, read from
+/// the engine's own labels AFTER the token was re-authorized against the
+/// engine's present state ([`admit`]). Engine-minted identities are
+/// included: the barrier just authorized the owner for what the output
+/// carries now. `None`: no labels (no run), the rung cannot attach.
+pub(crate) fn clearance_now(
+    state: &AppState,
+    config_id: &str,
+) -> Option<(std::sync::Arc<super::identity::OutputLabels>, super::identity::Clearance)> {
+    let labels = labels(state, config_id)?;
+    let current = labels.current();
+    if current.is_empty() {
+        return None;
+    }
+    let clearance = super::identity::Clearance::of(&current);
+    Some((labels, clearance))
 }
 
 /// Commit a subtitle re-patch of cast output `config_id` (slot → new
@@ -173,6 +274,7 @@ pub(crate) fn before_subtitle_change(
         op: None,
         bus: None,
         needs: closure(state, config_id, None, None, None, Some(slots)),
+        ids: Vec::new(),
     };
     let revoked =
         state
@@ -380,6 +482,13 @@ fn live_needs(state: &AppState, config_id: &str) -> (Option<String>, Option<Vec<
 fn live_bus(state: &AppState, config_id: &str) -> Option<String> {
     let snapshot = state.output_routing.as_ref()?.routing.snapshot()?;
     Some(snapshot.outputs.get(config_id)?.bus.clone())
+}
+
+/// The CURRENT principal of stream `id`'s owner (decision 5.6: a push
+/// rung's provider checks see the owner's present grants). `None`: gone or
+/// unresolvable.
+pub(crate) fn owner_of(state: &AppState, id: &str) -> Option<Principal> {
+    resolve_owner(state, &state.cast_streams.owned(id)?)
 }
 
 /// The owner's CURRENT principal, by how it authenticated at creation

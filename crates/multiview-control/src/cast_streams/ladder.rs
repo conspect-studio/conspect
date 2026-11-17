@@ -307,8 +307,9 @@ impl LadderState {
     }
 }
 
-/// The rungs this build serves (ADR-0114 slice 2: HLS only).
-pub const SERVED_RUNGS: &[&str] = &["hls"];
+/// The rungs this build can serve (ADR-0114 slices 2 and 4). What a run
+/// serves at a given moment is narrower (`routes::cast_public::served_now`).
+pub const SERVED_RUNGS: &[&str] = &["moq", "hls"];
 
 /// The rung to attach and the rest, best first (decision 3, "What the
 /// engine leaves out", in that order): rungs the build or the run cannot

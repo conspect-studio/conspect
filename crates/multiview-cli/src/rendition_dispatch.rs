@@ -2745,6 +2745,13 @@ impl RenditionDispatcher {
             .get(key)
             .is_none_or(|a| a.failed || a.retired)
     }
+    /// The index of the next window not dispatched yet (`None`: finished).
+    /// Windows are dispatched in ascending index, so every window offered
+    /// from now on has at least this index (ADR-0114 decision 5.4: the cast
+    /// labels' "labelled through" mark).
+    pub(crate) fn next_window_index(&self) -> Option<i128> {
+        self.next_window
+    }
     pub(crate) fn video_key_count(&self) -> usize {
         self.video.len()
     }

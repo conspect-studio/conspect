@@ -99,6 +99,23 @@ pub trait AuthorizedFeedFactory: Send + Sync {
         scope: &WhepScope,
         sink: Arc<Fence>,
     ) -> Result<AuthorizedFeed, MoqReject>;
+
+    /// [`Self::attach`] for a cast push attachment (ADR-0114 slice 4): one
+    /// output, single rendition, every window judged by `gate` before it is
+    /// offered to `sink`. The default refuses.
+    ///
+    /// # Errors
+    /// As [`Self::attach`].
+    fn attach_cast(
+        &self,
+        principal: &Principal,
+        scope: &WhepScope,
+        sink: Arc<Fence>,
+        gate: Arc<crate::cast_streams::identity::CastAttachment>,
+    ) -> Result<AuthorizedFeed, MoqReject> {
+        let _ = (principal, scope, sink, gate);
+        Err(MoqReject::Unavailable)
+    }
 }
 
 struct TransportFence(Arc<Fence>);
@@ -122,6 +139,16 @@ impl WebTransportProvider {
 impl MoqProvider for WebTransportProvider {
     fn available(&self) -> bool {
         self.runtime.available() && self.factory.available()
+    }
+    fn admit_cast(
+        &self,
+        principal: &Principal,
+        scope: &WhepScope,
+        subscription_id: &str,
+        ttl: Duration,
+        gate: Arc<crate::cast_streams::identity::CastAttachment>,
+    ) -> Result<(MoqLease, Arc<dyn MoqFence>), MoqReject> {
+        self.admit_cast_feed(principal, scope, subscription_id, ttl, gate)
     }
     fn admit(
         &self,
@@ -218,6 +245,74 @@ impl MoqProvider for WebTransportProvider {
                 // zero would claim every rung starts at the Unix epoch.
                 clock_wall_micros: None,
             },
+            Arc::new(TransportFence(fence)),
+        ))
+    }
+}
+
+impl WebTransportProvider {
+    fn lease_of(
+        subscription_id: &str,
+        admitted: &multiview_moq::provider::Admission,
+        feed: &AuthorizedFeed,
+    ) -> MoqLease {
+        MoqLease {
+            lease_id: subscription_id.into(),
+            generation: admitted.generation,
+            expires_at: String::new(),
+            expires_in_ms: 0,
+            url: admitted.url.clone(),
+            broadcast: admitted.broadcast.clone(),
+            protocol: admitted.protocol.clone(),
+            video: feed.video.clone(),
+            video_alternatives: Vec::new(),
+            audio: feed.audio.clone(),
+            clock_wall_micros: None,
+        }
+    }
+
+    /// The cast admission (see [`MoqProvider::admit_cast`]): the
+    /// single-rendition path only, through the gated attach.
+    fn admit_cast_feed(
+        &self,
+        principal: &Principal,
+        scope: &WhepScope,
+        subscription_id: &str,
+        ttl: Duration,
+        gate: Arc<crate::cast_streams::identity::CastAttachment>,
+    ) -> Result<(MoqLease, Arc<dyn MoqFence>), MoqReject> {
+        if !self.available() {
+            return Err(MoqReject::Unavailable);
+        }
+        let (fence, windows) = Fence::channel(4);
+        let feed = match self.factory.attach_cast(principal, scope, fence.clone(), gate) {
+            Ok(feed) => feed,
+            Err(error) => {
+                fence.revoke();
+                return Err(error);
+            }
+        };
+        let lease_feed = AuthorizedFeed {
+            generation: feed.generation,
+            catalog: Vec::new(),
+            video: feed.video.clone(),
+            audio: feed.audio.clone(),
+            ladder: Vec::new(),
+            demand: Box::new(()),
+        };
+        let transport = Feed {
+            generation: feed.generation,
+            catalog: feed.catalog.into(),
+            audio_tracks: feed.audio.iter().map(|track| track.track.clone()).collect(),
+            windows,
+            demand: feed.demand,
+        };
+        let Ok(admitted) = self.runtime.admit(transport, fence.clone(), ttl) else {
+            fence.revoke();
+            return Err(MoqReject::Unavailable);
+        };
+        Ok((
+            Self::lease_of(subscription_id, &admitted, &lease_feed),
             Arc::new(TransportFence(fence)),
         ))
     }

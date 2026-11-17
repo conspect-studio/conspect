@@ -23,6 +23,7 @@
 //! Isolation (invariant #10): one short `Mutex`, never held across an
 //! `.await`; nothing here touches an engine channel.
 
+pub mod identity;
 pub mod ladder;
 pub mod lifecycle;
 pub(crate) mod reauth;
@@ -101,6 +102,11 @@ pub const MAX_HISTORY: usize = MAX_CARRY;
 pub const MAX_HISTORY_NEEDS: usize = 256;
 /// Output authorization gates kept (one per cast output in practice).
 pub const MAX_GATES: usize = 64;
+/// Live push attachments per stream per rung (a renewal attaches the new
+/// one before the oldest is fenced).
+pub const MAX_PER_RUNG: usize = 2;
+/// Live push attachments per stream, all rungs.
+pub const MAX_ATTACHMENTS: usize = 4;
 /// The background sweep period (a lazy sweep also runs on every API call).
 pub const SWEEP_PERIOD: Duration = Duration::from_secs(5);
 

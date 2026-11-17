@@ -106,6 +106,14 @@ pub trait CastEngine: Send + Sync {
         let _ = (id, wall_now_unix_ns);
         None
     }
+
+    /// The per-component content labels of output `id` in the current run
+    /// (ADR-0114 decision 5.4): `None` when there is no run or no such
+    /// output. A lock-free read.
+    fn labels(&self, id: &str) -> Option<Arc<crate::cast_streams::identity::OutputLabels>> {
+        let _ = id;
+        None
+    }
 }
 
 /// A shared [`CastEngine`].

@@ -69,6 +69,7 @@ use multiview_control::{
 };
 use multiview_core::time::Rational;
 use multiview_ffmpeg::{is_idr, CodecId, CodecKind, EncodedPacket, NalFraming, StreamKind};
+use multiview_control::cast_streams::identity::{CastAttachment, Component, GateRefusal};
 use multiview_moq::provider::{Fence, Revocation};
 use multiview_output::batch::RecoveryGate;
 use std::{
@@ -317,6 +318,15 @@ impl AuthorizedFeedFactory for DynamicRegistryFactory {
         sink: Arc<Fence>,
     ) -> Result<Option<AuthorizedSharedFeed>, MoqReject> {
         self.current()?.attach_shared(principal, scope, sink)
+    }
+    fn attach_cast(
+        &self,
+        principal: &Principal,
+        scope: &WhepScope,
+        sink: Arc<Fence>,
+        gate: Arc<CastAttachment>,
+    ) -> Result<AuthorizedFeed, MoqReject> {
+        self.current()?.attach_cast(principal, scope, sink, gate)
     }
 }
 
@@ -763,6 +773,33 @@ impl AuthorizedFeedFactory for RegistryFeedFactory {
         scope: &WhepScope,
         sink: Arc<Fence>,
     ) -> Result<AuthorizedFeed, MoqReject> {
+        self.attach_gated(principal, scope, sink, None)
+    }
+
+    fn attach_cast(
+        &self,
+        principal: &Principal,
+        scope: &WhepScope,
+        sink: Arc<Fence>,
+        gate: Arc<CastAttachment>,
+    ) -> Result<AuthorizedFeed, MoqReject> {
+        // A cast is always one output, never Program or the wall.
+        if !matches!(scope, WhepScope::Output(_)) {
+            return Err(MoqReject::Forbidden);
+        }
+        self.attach_gated(principal, scope, sink, Some(gate))
+    }
+}
+
+impl RegistryFeedFactory {
+    #[allow(clippy::too_many_lines)] // One attach boundary, kept atomic.
+    fn attach_gated(
+        &self,
+        principal: &Principal,
+        scope: &WhepScope,
+        sink: Arc<Fence>,
+        gate: Option<Arc<CastAttachment>>,
+    ) -> Result<AuthorizedFeed, MoqReject> {
         if !self.available() {
             return Err(MoqReject::Unavailable);
         }
@@ -833,6 +870,9 @@ impl AuthorizedFeedFactory for RegistryFeedFactory {
             None
         };
         let metadata = program_metadata.as_ref().unwrap_or(prepared);
+        let gate = gate.map(|attachment| {
+            CastWindowGate::new(attachment, &binding, binding.video.time_base)
+        });
         let worker = OffClockWorker::spawn(
             &runtime,
             revocation,
@@ -843,6 +883,8 @@ impl AuthorizedFeedFactory for RegistryFeedFactory {
                 recovery: binding.video.recovery.ok_or(MoqReject::Codec)?,
                 generation: binding.config_generation,
                 handle: handle.clone(),
+                gate,
+                held: None,
             },
         )
         .map_err(|_| MoqReject::Unavailable)?;
@@ -1197,6 +1239,9 @@ enum TerminalCause {
     ProducerEnded,
     /// The transport rejected the offer (revoked fence or a full queue).
     TransportRejected,
+    /// A cast attachment's identity gate refused the window (ADR-0114
+    /// decision 5.4): the attachment is fenced.
+    Refused,
 }
 
 /// What a rejected or converted window means for the peer's subscription.
@@ -1209,6 +1254,8 @@ enum Outcome {
     Dropped(DroppedCause),
     /// Terminal for this peer.
     Terminal(TerminalCause),
+    /// Not labelled yet: keep the window and judge it again next round.
+    Held,
 }
 
 /// The off-clock conversion worker's owned state. It moves to its own thread so
@@ -1221,6 +1268,109 @@ struct WorkerState {
     recovery: RecoveryGate,
     generation: u64,
     handle: SubscriptionRevokeHandle,
+    /// A cast attachment's identity gate (ADR-0114 decision 5.4), judged
+    /// before each window is converted or offered.
+    gate: Option<CastWindowGate>,
+    /// A window whose ticks are not labelled yet (at most one; it is the
+    /// oldest, so nothing later is offered before it).
+    held: Option<SubscriptionWindow>,
+}
+
+/// Maps a window's packets to `(component, tick)` and asks the cast
+/// attachment's gate. Bounded: a window holds at most 512 packets (the
+/// converter's own budget) and the scratch vector is reused.
+pub(crate) struct CastWindowGate {
+    attachment: Arc<CastAttachment>,
+    video: Rational,
+    audio: Vec<(StreamKind, Component, Rational)>,
+    cadence: Rational,
+    scratch: Vec<(usize, u64)>,
+    components: Vec<Component>,
+}
+
+/// What the gate decided for one window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateVerdict {
+    Pass,
+    Hold,
+    Refuse,
+}
+
+impl CastWindowGate {
+    pub(crate) fn new(
+        attachment: Arc<CastAttachment>,
+        binding: &EffectiveBinding,
+        video: Rational,
+    ) -> Self {
+        let audio: Vec<(StreamKind, Component, Rational)> = binding
+            .audio
+            .iter()
+            .map(|a| {
+                let component = match a.kind {
+                    StreamKind::AudioTrack(_) => Component::Track(a.track.clone()),
+                    _ => Component::Audio,
+                };
+                (a.kind, component, a.time_base)
+            })
+            .collect();
+        let mut components = vec![Component::Video];
+        components.extend(audio.iter().map(|(_, c, _)| c.clone()));
+        Self {
+            attachment,
+            video,
+            audio,
+            cadence: binding.video.cadence,
+            scratch: Vec::with_capacity(512),
+            components,
+        }
+    }
+
+    /// The output tick a packet stamped `pts` in `base` belongs to: the
+    /// floor of its media time in ticks (video PTS is the tick itself in a
+    /// `1/fps` base; an audio block's samples sit inside one tick).
+    fn tick_of(&self, pts: i64, base: Rational) -> Option<u64> {
+        let num = i128::from(pts)
+            .checked_mul(i128::from(base.num))?
+            .checked_mul(i128::from(self.cadence.num))?;
+        let den = i128::from(base.den).checked_mul(i128::from(self.cadence.den))?;
+        if den <= 0 {
+            return None;
+        }
+        u64::try_from(num.div_euclid(den)).ok()
+    }
+
+    /// Judge one window (decision 5.4). A packet whose stream the binding
+    /// does not describe, or without a timestamp, has no identity: refused.
+    pub(crate) fn judge(&mut self, packets: &[EncodedPacket]) -> GateVerdict {
+        self.scratch.clear();
+        for packet in packets {
+            let (component, base) = match packet.kind() {
+                StreamKind::Video => (0, self.video),
+                kind => match self.audio.iter().position(|(k, _, _)| *k == kind) {
+                    Some(at) => (at + 1, self.audio.get(at).map_or(self.video, |a| a.2)),
+                    None => {
+                        self.attachment.fence();
+                        return GateVerdict::Refuse;
+                    }
+                },
+            };
+            let Some(tick) = packet.pts().and_then(|pts| self.tick_of(pts, base)) else {
+                self.attachment.fence();
+                return GateVerdict::Refuse;
+            };
+            self.scratch.push((component, tick));
+        }
+        let components = &self.components;
+        let refs = self
+            .scratch
+            .iter()
+            .filter_map(|(c, tick)| components.get(*c).map(|c| (c, *tick)));
+        match self.attachment.admit_window(refs) {
+            Ok(()) => GateVerdict::Pass,
+            Err(GateRefusal::NotYet) => GateVerdict::Hold,
+            Err(GateRefusal::Fenced) => GateVerdict::Refuse,
+        }
+    }
 }
 
 /// Convert one whole admitted lease and offer it once. The returned outcome
@@ -1232,6 +1382,22 @@ fn publish(
     generation: u64,
     handle: &SubscriptionRevokeHandle,
     window: &SubscriptionWindow,
+) -> Outcome {
+    publish_gated(sink, mapping, recovery, generation, handle, window, None)
+}
+
+/// [`publish`] with a cast attachment's identity gate: judged after the
+/// lease checks and before anything is converted or offered. A refused
+/// window fences the attachment and ends this subscription
+/// ([`TerminalCause::Refused`]); its queue is dropped with it.
+fn publish_gated(
+    sink: &Fence,
+    mapping: &TrackMapping,
+    recovery: RecoveryGate,
+    generation: u64,
+    handle: &SubscriptionRevokeHandle,
+    window: &SubscriptionWindow,
+    gate: Option<&mut CastWindowGate>,
 ) -> Outcome {
     // A changed effective generation is terminal (the control plane re-resolves)
     // and so is a revoked cancellation identity; the two authorities stay typed
@@ -1246,6 +1412,13 @@ fn publish(
     // (loss or an aged backlog), so drop this window and wait for the next RAP.
     if !window.permit.is_current() {
         return Outcome::Dropped(DroppedCause::SupersededLease);
+    }
+    if let Some(gate) = gate {
+        match gate.judge(window.permit.packets()) {
+            GateVerdict::Pass => {}
+            GateVerdict::Hold => return Outcome::Held,
+            GateVerdict::Refuse => return Outcome::Terminal(TerminalCause::Refused),
+        }
     }
     let Ok(packets) = window.clone_window() else {
         return Outcome::Dropped(DroppedCause::PacketReference);
@@ -1361,16 +1534,28 @@ impl WorkerState {
             if cancelled.try_recv().is_ok() {
                 break;
             }
-            match self.subscription.try_recv_window() {
-                Ok(Some(window)) => match publish(
+            if self.gate.as_ref().is_some_and(|g| g.attachment.is_fenced()) {
+                break;
+            }
+            let next = match self.held.take() {
+                Some(window) => Ok(Some(window)),
+                None => self.subscription.try_recv_window(),
+            };
+            match next {
+                Ok(Some(window)) => match publish_gated(
                     &self.sink,
                     &self.mapping,
                     self.recovery,
                     self.generation,
                     &self.handle,
                     &window,
+                    self.gate.as_mut(),
                 ) {
                     Outcome::Delivered | Outcome::Dropped(_) => {}
+                    Outcome::Held => {
+                        self.held = Some(window);
+                        thread::park_timeout(WORKER_PARK);
+                    }
                     Outcome::Terminal(_) => break,
                 },
                 Ok(None) => thread::park_timeout(WORKER_PARK),
@@ -1379,7 +1564,12 @@ impl WorkerState {
             }
         }
         // Exactly-once release of this peer's slot. The demand guard and the
-        // subscription's own drop revoke again idempotently.
+        // subscription's own drop revoke again idempotently. A held window is
+        // discarded, never offered (decision 5.4, "Packets already buffered").
+        self.held = None;
+        if let Some(gate) = &self.gate {
+            gate.attachment.fence();
+        }
         self.handle.revoke();
         self.sink.revoke();
     }
