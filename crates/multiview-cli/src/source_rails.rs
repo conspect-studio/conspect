@@ -60,6 +60,14 @@ impl CatalogEntry {
     }
 }
 
+fn lock_aliases(
+    aliases: &Mutex<std::collections::HashSet<String>>,
+) -> MutexGuard<'_, std::collections::HashSet<String>> {
+    aliases
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Whether `kind` is a `media_player` alias (ADR-M012).
 #[must_use]
 pub const fn is_alias(kind: &SourceKind) -> bool {
@@ -249,10 +257,17 @@ pub struct SourceRails {
     registry: crate::live_sources::StopRegistry,
     spawner: Arc<dyn RailSpawner>,
     owned: Mutex<HashMap<String, Owned>>,
-    /// Ids last seen catalogued as a `media_player` alias: a rail change of
-    /// one never touches the stop registry, even after its entry is gone (an
-    /// alias may share its player's id, whose producer is the player channel).
-    aliases: Mutex<std::collections::HashSet<String>>,
+    /// `media_player` aliases (ADR-M012) whose rails run or are changing: a
+    /// rail change of one never touches the stop registry, even after its
+    /// catalogue entry is gone (an alias may share its player's id, whose
+    /// producer is the player channel). An id is recorded only while its
+    /// rails run (a failed or stopped alias records nothing) and is dropped
+    /// by the transition (or teardown) that stops them — which a removal
+    /// always triggers, since demand stops every running rail of a removed
+    /// source. Never dropped earlier: a stop of an unrecorded id would take
+    /// the producer path, and for a player-identical id stop the player. So
+    /// the set is bounded by the running aliases.
+    aliases: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 /// Producer handles a rail owns, for a bounded join on stop.
@@ -275,29 +290,34 @@ impl SourceRails {
             registry,
             spawner,
             owned: Mutex::new(HashMap::new()),
-            aliases: Mutex::new(std::collections::HashSet::new()),
+            aliases: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
-    fn aliases(&self) -> MutexGuard<'_, std::collections::HashSet<String>> {
-        self.aliases
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// The number of aliases recorded as running (test seam).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn running_aliases(&self) -> usize {
+        self.aliases().len()
     }
 
-    /// Whether `id` is (or last was) a `media_player` alias, recording what
-    /// its current entry says.
+    fn aliases(&self) -> MutexGuard<'_, std::collections::HashSet<String>> {
+        lock_aliases(&self.aliases)
+    }
+
+    /// Whether this rail change of `id` belongs to a `media_player` alias: its
+    /// current entry is one, or its rails were last recorded running as one
+    /// (an entry removed or replaced while they run).
     fn alias_rails(&self, id: &str, entry: Option<&Arc<CatalogEntry>>) -> bool {
-        match entry {
-            Some(entry) if entry.is_alias() => {
-                self.aliases().insert(id.to_owned());
-                true
-            }
-            Some(_) => {
-                self.aliases().remove(id);
-                false
-            }
-            None => self.aliases().remove(id),
+        entry.is_some_and(|entry| entry.is_alias()) || self.aliases().contains(id)
+    }
+
+    /// Record (`running`) or drop the alias's running rails.
+    fn note_alias(&self, id: &str, running: bool) {
+        if running {
+            self.aliases().insert(id.to_owned());
+        } else {
+            self.aliases().remove(id);
         }
     }
 
@@ -383,7 +403,22 @@ impl RailDriver<Nv12Image> for SourceRails {
     ) -> Result<Rails, RailFailure> {
         let entry = self.entry(id);
         if self.alias_rails(id, entry.as_ref()) {
-            return Self::alias_transition(entry.as_ref(), to);
+            // A replaced entry (now a producer kind) leaves the alias's rails
+            // to stop first; the next transition starts the producer.
+            let alias_entry = entry.as_ref().filter(|entry| entry.is_alias());
+            let outcome = if alias_entry.is_none() && !to.is_empty() {
+                Err(RailFailure {
+                    running: Rails::NONE,
+                    reason: "the media player binding was replaced".to_owned(),
+                })
+            } else {
+                Self::alias_transition(alias_entry, to)
+            };
+            let running = outcome
+                .as_ref()
+                .map_or_else(|failure| failure.running, |running| *running);
+            self.note_alias(id, !running.is_empty());
+            return outcome;
         }
         // The audio-only/anchored choice depends on video, so a video change
         // rebuilds a running audio rail too.
@@ -438,6 +473,7 @@ impl RailDriver<Nv12Image> for SourceRails {
 
     fn teardown(&self, id: &str, rails: Rails) {
         if self.alias_rails(id, self.entry(id).as_ref()) {
+            self.note_alias(id, false);
             return;
         }
         let handles = self.owned().remove(id).map_or_else(Vec::new, |owned| {
@@ -507,5 +543,123 @@ impl RegisteredStop {
     #[must_use]
     pub fn stopped(&self) -> bool {
         self.stop.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use multiview_engine::{ConsumerClass, ConsumerTag, DemandConfig, DemandManager, DemandPhase};
+    use std::time::{Duration, Instant};
+
+    /// A spawner that must never be asked for anything: an alias has no
+    /// producer of its own.
+    struct NoSpawn;
+    impl RailSpawner for NoSpawn {
+        fn start_video(
+            &self,
+            source: &Source,
+            _: &Arc<TileStore<Nv12Image>>,
+            _: Option<RequestedSize>,
+            _: bool,
+        ) -> Result<Vec<JoinHandle<()>>, String> {
+            panic!("an alias never starts a producer: {}", source.id)
+        }
+        fn start_audio(&self, source: &Source, _: bool) -> Result<Vec<JoinHandle<()>>, String> {
+            panic!("an alias never starts audio: {}", source.id)
+        }
+        fn audio_stopped(&self, _: &str) {}
+        fn audio_available(&self) -> bool {
+            false
+        }
+    }
+
+    fn alias(id: &str, player: &str) -> Source {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "kind": "media_player", "player": player, "activation": "on_demand"
+        }))
+        .unwrap()
+    }
+
+    fn wait(mut done: impl FnMut() -> bool) -> bool {
+        let end = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            if Instant::now() > end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// Ship-1111 review #3: churn of aliases that fail (player has no
+    /// channel) or are consumed, stopped and idle-retired before removal
+    /// never leaves the running-alias record behind, and a removal never
+    /// touches the stop registry (a player-identical id keeps its player).
+    #[test]
+    fn alias_churn_leaves_no_running_alias_record_and_never_stops_the_player() {
+        let catalogue: Catalogue = Arc::new(SwapCell::from_pointee(HashMap::new()));
+        let registry = crate::live_sources::stop_registry();
+        let player_flag = Arc::new(AtomicBool::new(false));
+        let _exited = crate::live_sources::register_stop(&registry, "vt-1", &player_flag);
+        let rails = Arc::new(SourceRails::new(
+            Arc::clone(&catalogue),
+            Arc::clone(&registry),
+            Arc::new(NoSpawn),
+        ));
+        let config = DemandConfig {
+            close_after: Duration::from_millis(10),
+            ..DemandConfig::default()
+        };
+        let driver: Arc<dyn RailDriver<Nv12Image>> = rails.clone();
+        let manager = DemandManager::new(
+            multiview_engine::SourceRegistry::<Nv12Image>::new(),
+            driver,
+            config,
+        );
+        manager.start();
+        let player = empty_store("vt-1");
+        for round in 0..20_usize {
+            // An alias of a player with no channel: its start fails.
+            let ghost = format!("ghost{round}");
+            catalogue_alias(
+                &catalogue,
+                &alias(&ghost, "vt-9"),
+                &empty_store(&ghost),
+                Some("media player \"vt-9\" has no channel"),
+            );
+            let lease = manager.acquire(
+                &ghost,
+                Rails::VIDEO,
+                ConsumerTag::new(ConsumerClass::Preview, "pvw"),
+                None,
+            );
+            assert!(wait(|| manager.status(&ghost).phase == DemandPhase::Failed));
+            drop(lease);
+            catalogue_remove(&catalogue, &ghost);
+            manager.remove_source(&ghost);
+            // An identity alias consumed, stopped (idle-retired), then removed.
+            catalogue_alias(&catalogue, &alias("vt-1", "vt-1"), &player, None);
+            let lease = manager.acquire(
+                "vt-1",
+                Rails::VIDEO,
+                ConsumerTag::new(ConsumerClass::Preview, "pvw"),
+                None,
+            );
+            assert!(wait(|| manager.status("vt-1").running.video));
+            drop(lease);
+            assert!(wait(|| !manager.status("vt-1").running.video));
+            catalogue_remove(&catalogue, "vt-1");
+            manager.remove_source("vt-1");
+            assert!(wait(|| rails.running_aliases() == 0), "round {round}");
+        }
+        assert!(
+            !player_flag.load(Ordering::Acquire),
+            "the player channel's producer was never stopped"
+        );
+        assert!(registry.lock().unwrap().contains_key("vt-1"));
+        manager.shutdown();
     }
 }
