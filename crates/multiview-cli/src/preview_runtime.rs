@@ -590,6 +590,7 @@ mod actual_bridge_tests {
                 },
                 raw_pts: None,
                 a53_cc: None,
+                alpha: None,
             };
             let packets = first.encoder.encode_frame_at(frame, tick).unwrap();
             assert!(!packets.is_empty());

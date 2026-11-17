@@ -321,15 +321,12 @@ where
         .collect();
     let clock = Arc::new(multiview_engine::ManualTimeSource::new());
     let stop_clock = Arc::new(AtomicBool::new(false));
-    {
-        let (clock, stop_clock) = (Arc::clone(&clock), Arc::clone(&stop_clock));
-        std::thread::spawn(move || {
-            while !stop_clock.load(Ordering::Acquire) {
-                std::thread::sleep(Duration::from_millis(40));
-                clock.advance(Duration::from_millis(40));
-            }
-        });
-    }
+    spawn_paced_clock(
+        Arc::clone(&clock),
+        Arc::clone(&stop_clock),
+        Arc::clone(&slot),
+        policy == SendPolicy::BlockForExact,
+    );
     let hot_ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let control_slot = Arc::clone(&slot);
     let controller = std::thread::spawn(move || control(control_slot));
@@ -374,6 +371,121 @@ where
             .map(|v| std::mem::take(&mut *v.lock().unwrap()))
             .collect(),
     }
+}
+
+/// Advance the synthetic clock every 40 ms of wall time, paced (#461).
+///
+/// The synthetic clock stands in for the host. A free-running
+/// 40 ms clock on a loaded host outran the threads that run in wall
+/// time (the routing-aux compose thread, the live routed encoders and
+/// the bake consumer), so a routed layout was not fresh at its take
+/// (`FeedNotFresh`), a routed encoder fell behind, or the consumer
+/// fell beyond its 8-tick substitution envelope ("output fell N ticks
+/// behind the clock"): the tests measured the host. The clock now
+/// holds each tick (bounded) until
+/// - every aux feed has composed what the router will need fresh (both
+///   policies: the aux thread is not the consumer, so a live-policy
+///   test still proves the hot loop never waits on the consumer), and
+/// - under the offline policy only (`BlockForExact`, where pacing the
+///   renderer to the consumer is the design), the router ran within
+///   `CLOCK_LEAD_TICKS` of it and no live worker holds more than one
+///   unencoded frame.
+///
+/// A wait is bounded by `CLOCK_WAIT_BOUND`; pacing ends for the run after
+/// `CLOCK_GIVE_UP` waits hit that bound or after `CLOCK_HOLD_BUDGET` of
+/// total hold, so a test's deliberately wedged thread costs a bounded few
+/// seconds and still proves what it tests.
+///
+/// The live policy never waits on the consumer or the router: its hot loop
+/// is still free to outrun the consumer (shed and counted), which is what
+/// its tests prove. It does wait on the aux compose thread, whose staleness
+/// on a loaded host is the documented cause of #455 and whose fallback the
+/// live test asserts never happens.
+/// (A hold never nears the dispatcher's own 2 s wall-clock watchdog.)
+fn spawn_paced_clock(
+    clock: Arc<multiview_engine::ManualTimeSource>,
+    stop_clock: Arc<AtomicBool>,
+    paced: OutputRoutingSlot,
+    pace_consumer: bool,
+) {
+    std::thread::spawn(move || {
+        let mut ticks = 0_u64;
+        let mut timeouts = 0_u32;
+        let mut held = Duration::ZERO;
+        while !stop_clock.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(40));
+            let hold_started = Instant::now();
+            let bound = hold_started + CLOCK_WAIT_BOUND;
+            while timeouts < CLOCK_GIVE_UP
+                && held < CLOCK_HOLD_BUDGET
+                && !stop_clock.load(Ordering::Acquire)
+            {
+                if Instant::now() >= bound {
+                    timeouts += 1;
+                    break;
+                }
+                let Some(handle) = paced.load() else {
+                    break;
+                };
+                let ticked = handle.ticked.load(Ordering::Acquire);
+                let consumer_ok = !pace_consumer
+                    || (ticked + CLOCK_LEAD_TICKS >= ticks
+                        && handle.worker_lag.load(Ordering::Acquire) <= 1);
+                // Program and Clean come from the bake consumer, never
+                // from the aux thread. The next tick `ticks + 1` finds a
+                // feed fresh when its frame is at most one tick old (two
+                // at the halved aux cadence, `slot_fresh`): wait for that.
+                let lag = u64::from(handle.snapshot().aux_halved);
+                let aux_ok = handle
+                    .aux_feeds
+                    .load()
+                    .iter()
+                    .filter(|f| !matches!(f.bus, PictureBus::Program | PictureBus::Clean))
+                    .all(|f| {
+                        f.slot
+                            .latest
+                            .load()
+                            .is_some_and(|frame| frame.tick + lag >= ticks)
+                    });
+                if consumer_ok && aux_ok {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            held += hold_started.elapsed();
+            clock.advance(Duration::from_millis(40));
+            ticks += 1;
+        }
+    });
+}
+
+/// How far (in ticks) the offline synthetic clock may lead the router (#461),
+/// well inside the consumer's 8-tick substitution envelope.
+const CLOCK_LEAD_TICKS: u64 = 3;
+
+/// The most one synthetic tick waits for the threads it paces (#461). Well
+/// under the dispatcher's 2 s wall-clock stage watchdog, which a longer hold
+/// of the clock would trip by itself.
+const CLOCK_WAIT_BOUND: Duration = Duration::from_millis(300);
+
+/// After this many waits hit [`CLOCK_WAIT_BOUND`] the clock runs free for the
+/// rest of the run (#461).
+const CLOCK_GIVE_UP: u32 = 20;
+
+/// The most wall time pacing may add to one run in total (#461): after it the
+/// clock runs free, so no sequence of short holds can stretch a run without
+/// bound (a 250-tick run is 10 s free-running).
+const CLOCK_HOLD_BUDGET: Duration = Duration::from_secs(120);
+
+/// Let `ticks` output ticks pass on the router (#461). The controllers used
+/// to sleep the wall-clock equivalent at 25 fps (`ticks * 40 ms`); with the
+/// synthetic clock paced on the threads it drives, a loaded host runs fewer
+/// ticks in that time, so they now wait for the ticks themselves (bounded).
+fn wait_ticks(handle: &super::OutputRoutingHandle, ticks: u64) {
+    let from = handle.ticked.load(Ordering::Acquire);
+    wait_for("output ticks", Duration::from_secs(60), || {
+        (handle.ticked.load(Ordering::Acquire) >= from + ticks).then_some(())
+    });
 }
 
 fn wait_for<T>(what: &str, bound: Duration, mut f: impl FnMut() -> Option<T>) -> T {
@@ -427,7 +539,7 @@ fn a_take_to_a_source_and_back_through_the_real_pipeline() {
         wait_for("the first routing tick", Duration::from_secs(10), || {
             (handle.snapshot().video_keys > 0).then_some(())
         });
-        std::thread::sleep(Duration::from_millis(800));
+        wait_ticks(&handle, 800 / 40);
         // A take applies, or is refused FeedNotFresh when the (wall-clock)
         // synthetic producer was starved by a loaded host — the correct
         // refusal; the take is then re-issued (at most 5 attempts).
@@ -459,7 +571,7 @@ fn a_take_to_a_source_and_back_through_the_real_pipeline() {
             (s.outputs[1].bus == "src:route_take_b").then_some(s.video_keys)
         });
         record.lock().unwrap().to_source = Some((o, keys));
-        std::thread::sleep(Duration::from_millis(600));
+        wait_ticks(&handle, 600 / 40);
         let o = applied(&|| take("to-program", 1, PictureBus::Program));
         let keys = wait_for("snapshot", Duration::from_secs(1), || {
             let s = handle.snapshot();
@@ -647,7 +759,7 @@ fn audio_follows_a_take_to_a_source_with_a_crossfade_through_the_real_pipeline()
         wait_for("the first routing tick", Duration::from_secs(10), || {
             (handle.snapshot().video_keys > 0).then_some(())
         });
-        std::thread::sleep(Duration::from_millis(800));
+        wait_ticks(&handle, 800 / 40);
         let applied = |make: &dyn Fn() -> OutputTake| {
             for _ in 0..5 {
                 let op = make().operation_id;
@@ -665,7 +777,7 @@ fn audio_follows_a_take_to_a_source_with_a_crossfade_through_the_real_pipeline()
         };
         let o = applied(&|| take("to-bars", 1, PictureBus::Source("route_audio_b".to_owned())));
         record.lock().unwrap().to_source = Some((o, 0));
-        std::thread::sleep(Duration::from_millis(1600));
+        wait_ticks(&handle, 1600 / 40);
         let o = applied(&|| take("to-program", 1, PictureBus::Program));
         record.lock().unwrap().to_program = Some((o, 0));
     });
@@ -763,7 +875,7 @@ fn a_private_bus_is_fed_the_post_loudnorm_program_pcm_up_to_g() {
             (handle.snapshot().video_keys > 0).then_some(())
         });
         // After the normaliser's 3 s short-term window: a non-unity gain.
-        std::thread::sleep(Duration::from_millis(4500));
+        wait_ticks(&handle, 4500 / 40);
         for _ in 0..5 {
             let t = take("to-solid", 1, PictureBus::Source("route_ln_a".to_owned()));
             handle.try_take(t).unwrap();
@@ -959,7 +1071,7 @@ fn a_take_to_clean_carries_the_pre_bake_canvas_through_the_real_pipeline() {
             wait_for("the first routing tick", Duration::from_secs(10), || {
                 (handle.snapshot().video_keys > 0).then_some(())
             });
-            std::thread::sleep(Duration::from_millis(400));
+            wait_ticks(&handle, 400 / 40);
             handle
                 .try_take(take("to-clean", 1, PictureBus::Clean))
                 .unwrap();
@@ -1569,7 +1681,7 @@ fn an_audio_only_take_routes_a_source_and_returns_to_the_shared_stream() {
         wait_for("the first routing tick", Duration::from_secs(10), || {
             (handle.snapshot().video_keys > 0).then_some(())
         });
-        std::thread::sleep(Duration::from_millis(800));
+        wait_ticks(&handle, 800 / 40);
         let audio_take = |op: &str, choice: super::AudioChoice| {
             handle
                 .try_take(OutputTake {
@@ -1595,7 +1707,7 @@ fn an_audio_only_take_routes_a_source_and_returns_to_the_shared_stream() {
         assert_eq!(s.outputs[1].bus, "program", "the video stays");
         assert_eq!(s.outputs[1].audio, "src:route_ao_b");
         record.lock().unwrap().to_source = Some((o, s.audio_buses_live));
-        std::thread::sleep(Duration::from_millis(1600));
+        wait_ticks(&handle, 1600 / 40);
         let o = audio_take("to-program", super::AudioChoice::Program);
         record.lock().unwrap().to_program = Some((o, 0));
         // Back on the shared stream within ~10 ticks (4 frames + a fade):
@@ -1846,7 +1958,7 @@ fn a_take_to_a_layout_composes_it_live_and_survives_a_take_flood() {
         wait_for("the first routing tick", Duration::from_secs(10), || {
             (handle.snapshot().video_keys > 0).then_some(())
         });
-        std::thread::sleep(Duration::from_millis(800));
+        wait_ticks(&handle, 800 / 40);
         let layout = swapped_layout("route_layout");
         handle
             .try_take(take("to-layout", 1, layout.clone()))
@@ -1862,7 +1974,7 @@ fn a_take_to_a_layout_composes_it_live_and_survives_a_take_flood() {
         });
         assert_eq!(s.aux_canvases, vec!["aux:swapped".to_owned()]);
         assert_eq!(s.video_keys, 2, "+1 encoder for the layout bus");
-        std::thread::sleep(Duration::from_millis(1500));
+        wait_ticks(&handle, 1500 / 40);
         // The flood: 12 takes, no waiting between them.
         let flood: Vec<String> = (0..12).map(|i| format!("flood-{i}")).collect();
         for (i, op) in flood.iter().enumerate() {
@@ -1968,7 +2080,7 @@ fn a_live_edit_reaches_the_routed_layout_and_a_delete_falls_back() {
         wait_for("the first routing tick", Duration::from_secs(10), || {
             (handle.snapshot().video_keys > 0).then_some(())
         });
-        std::thread::sleep(Duration::from_millis(800));
+        wait_ticks(&handle, 800 / 40);
         let swapped = swapped_layout("live_edit");
         handle.try_take(take("to-layout", 1, swapped)).unwrap();
         let applied = wait_for("to-layout outcome", Duration::from_secs(10), || {
@@ -1976,7 +2088,7 @@ fn a_live_edit_reaches_the_routed_layout_and_a_delete_falls_back() {
         });
         assert_eq!(applied.outcome, TakeResult::Applied, "{applied:?}");
         // Past the per-key IDR floor, then the live edit.
-        std::thread::sleep(Duration::from_millis(1500));
+        wait_ticks(&handle, 1500 / 40);
         let PictureBus::Layout(edited) = two_cell_layout("live_edit", ["a", "b"]) else {
             panic!("a layout bus");
         };
@@ -1984,7 +2096,7 @@ fn a_live_edit_reaches_the_routed_layout_and_a_delete_falls_back() {
         handle
             .try_layout_change(crate::output_routing::LayoutChange::Edited(edited))
             .unwrap();
-        std::thread::sleep(Duration::from_millis(1500));
+        wait_ticks(&handle, 1500 / 40);
         assert!(outcomes.try_recv().is_err(), "a live edit is not a take");
         assert_eq!(handle.snapshot().outputs[1].bus, "aux:swapped");
         handle
@@ -2223,7 +2335,7 @@ fn a_live_reformat_resets_one_output_and_leaves_the_other_untouched() {
             wait_for("the first routing tick", Duration::from_secs(10), || {
                 (handle.snapshot().video_keys > 0).then_some(())
             });
-            std::thread::sleep(Duration::from_millis(600));
+            wait_ticks(&handle, 600 / 40);
             let cover = crate::routing_aux::AuxFormat::new(
                 32,
                 64,
@@ -2614,7 +2726,7 @@ fn take_two_overlay_layouts(
         wait_for("the first routing tick", Duration::from_secs(10), || {
             (handle.snapshot().video_keys > 0).then_some(())
         });
-        std::thread::sleep(Duration::from_millis(400));
+        wait_ticks(&handle, 400 / 40);
         for (op, output, id) in [("l1", 1, "news-a"), ("l2", 2, "news-b")] {
             handle
                 .try_take(take(op, output, overlay_layout(prefix, id)))

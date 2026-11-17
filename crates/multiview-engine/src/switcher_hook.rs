@@ -12,6 +12,9 @@ use multiview_framestore::{SwapCell, TileStore};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// One bus selection published for decode sizing (#469).
+pub type BusSizingSlot = Arc<SwapCell<Option<Arc<str>>>>;
+
 /// Rebinds only one named full-canvas cell; the separate PVW monitor/encode
 /// provider owns its own frame slot. Unknown source/store is rejected up front.
 pub struct SwitcherFrameHook<C> {
@@ -29,10 +32,18 @@ pub struct SwitcherFrameHook<C> {
     pub preview_slot: Option<Arc<SwapCell<Option<Arc<Nv12Image>>>>>,
     /// Shared store map, reused rather than decoding the preview source twice.
     pub preview_stores: Option<HashMap<String, Arc<TileStore<Nv12Image>>>>,
+    /// The drive store generation last synced into the driver (issue #464).
+    stores_seen: Option<u64>,
     /// Wait-free PVW selection for the routed Preview feed (ADR-0108 §2.5):
     /// written only when the PVW source changes, so it allocates only then.
     pub preview_selection: Option<Arc<SwapCell<Option<Arc<str>>>>>,
     last_preview: Option<Arc<str>>,
+    /// Decode sizing (#469): the PGM and PVW sources, in that order, for the
+    /// decode threads, which size a selected source at the full canvas.
+    /// Written only when a selection changes (one allocation then), never
+    /// per tick; the decoders act on it on their own threads.
+    pub bus_sizing: Option<[BusSizingSlot; 2]>,
+    last_bus: [Option<Arc<str>>; 2],
     fps_num: i64,
     fps_den: i64,
     /// Fixed exchange buffer for this tick's keyer draws (ADR-0113): filled
@@ -69,11 +80,37 @@ impl<C> SwitcherFrameHook<C> {
             last_error: None,
             preview_slot: None,
             preview_stores: None,
+            stores_seen: None,
             preview_selection: None,
             last_preview: None,
+            bus_sizing: None,
+            last_bus: [None, None],
             fps_num: 0,
             fps_den: 0,
             keyer_buf: Box::new([const { None }; MAX_DSK]),
+        }
+    }
+}
+
+impl<C> SwitcherFrameHook<C> {
+    /// Publish the PGM/PVW sources to the decode sizing slots when they
+    /// changed: a string compare per tick, one `Arc<str>` and a wait-free
+    /// store only on a change.
+    fn publish_bus_sizing(&mut self) {
+        let Some(slots) = &self.bus_sizing else {
+            return;
+        };
+        let (program, preview) = self.driver.resolved_selections();
+        for ((slot, last), now) in slots
+            .iter()
+            .zip(self.last_bus.iter_mut())
+            .zip([program.as_str(), preview.as_str()])
+        {
+            if last.as_deref() != Some(now) {
+                let id: Arc<str> = Arc::from(now);
+                slot.store(Some(Arc::clone(&id)));
+                *last = Some(id);
+            }
         }
     }
 }
@@ -83,7 +120,18 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         self.fps_num = drive.layout().canvas.fps_num;
         self.fps_den = drive.layout().canvas.fps_den;
         (self.legacy)(drive);
+        // Issue #464: a source the drain added (or removed) this tick joins
+        // the M/E's prime set before commands are drained. One integer
+        // compare per tick; the resync runs only on a store-set change.
+        let generation = drive.stores_generation();
+        if self.stores_seen != Some(generation) {
+            self.driver.sync_live_stores(drive.stores());
+            self.stores_seen = Some(generation);
+        }
         self.driver.drain_at_tick(tick);
+        // #469: the decoders see a new PGM/PVW source from the tick it is
+        // selected (they act on it on their own threads, after the settle).
+        self.publish_bus_sizing();
         // Resolved SOURCES: a re-patch of the PGM input changes `program`
         // without a machine change, and rebinds the cell on this same tick.
         let (program, preview) = self.driver.resolved_selections();
@@ -171,6 +219,8 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
             {
                 self.last_program = Some(restored.clone());
             }
+            // The rolled-back selection is what the decoders size for.
+            self.publish_bus_sizing();
             return;
         }
         // Downstream keyers (ADR-0113), only on a frame that will commit:
@@ -199,8 +249,12 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         // admitted compositor/rendition — this tap never composes or encodes.
         if let (Some(slot), Some(stores)) = (&self.preview_slot, &self.preview_stores) {
             let (_, preview) = self.driver.resolved_selections();
-            let picture = stores
-                .get(preview.as_str())
+            // The drive's current store first: a source added (or re-added)
+            // live is there; the boot map holds the rest.
+            let picture = self
+                .driver
+                .live_store(preview.as_str())
+                .or_else(|| stores.get(preview.as_str()))
                 .and_then(|store| store.read_at(frame.tick.pts).frame().cloned());
             // A missing PVW frame stays an honest "unavailable" monitor; it is
             // never replaced with the Program canvas.
@@ -268,5 +322,7 @@ impl<C: FnMut(&mut CompositorDrive<Nv12Image>)> FrameControl for SwitcherFrameHo
         {
             self.last_program = Some(restored.clone());
         }
+        // The rolled-back selection is what the decoders size for.
+        self.publish_bus_sizing();
     }
 }
