@@ -152,6 +152,9 @@ export function SwitcherPage(): JSX.Element {
   // starts that one. A failed refresh keeps them gated (fail closed) until a
   // later GET succeeds.
   const [refreshed, setRefreshed] = useState<{ readonly op: string; readonly ok: boolean; readonly at: number } | undefined>();
+  // Review K5-R2-04: a failed refresh offers an explicit retry (a read, never
+  // a mutation), so recovery needs no other switcher command or event.
+  const [refreshAttempt, setRefreshAttempt] = useState(0);
   useEffect(() => {
     if (operationId === undefined || !settled) return undefined;
     let live = true;
@@ -163,11 +166,13 @@ export function SwitcherPage(): JSX.Element {
       setRefreshed({ op: operationId, ok, at: Date.now() });
     });
     return () => { live = false; };
-  }, [operationId, settled, queryClient]);
+  }, [operationId, settled, queryClient, refreshAttempt]);
   const refreshReason = operationId === undefined || !settled ? undefined
     : refreshed?.op !== operationId ? t`Refreshing the switcher state after the last operation`
     : refreshed.ok || state.dataUpdatedAt > refreshed.at ? undefined
     : t`The switcher state could not be refreshed after the last operation; keyer and arm controls stay disabled until it is`;
+  const refreshFailed = operationId !== undefined && settled && refreshed?.op === operationId
+    && !refreshed.ok && state.dataUpdatedAt <= refreshed.at;
   const keyerReason = ready ? refreshReason : !state.data ? t`Switcher unavailable` : submitting ? t`A switcher request is in flight` : t`Operation in flight or outcome pending`;
   const [keyerError, setKeyerError] = useState<string | undefined>();
   const keyerMutate = useMutation({
@@ -269,6 +274,14 @@ export function SwitcherPage(): JSX.Element {
         <div className="space-y-1"><Label htmlFor="switcher-duration"><Trans>Auto frames</Trans></Label><Input id="switcher-duration" type="number" min="1" max="1000" value={duration} onChange={(event) => { setDuration(event.target.value); }} /></div>
         <Button disabled={!ready || !Number.isInteger(Number(duration)) || Number(duration) < 1} onClick={() => { take('auto'); }}><Trans>Auto</Trans></Button>
       </div>
+      {refreshFailed && (
+        <div role="alert" className="flex items-center gap-2" data-testid="switcher-refresh-failed">
+          <span>{refreshReason}</span>
+          <Button variant="outline" onClick={() => { setRefreshed(undefined); setRefreshAttempt((n) => n + 1); }}>
+            <Trans>Retry reading the switcher state</Trans>
+          </Button>
+        </div>
+      )}
       {/* A backend without upstream keyers (pre-K3) sends no `armed` view and no USK rows: no strip. */}
       {armedView !== undefined && uskRows.length > 0 && (
         <>

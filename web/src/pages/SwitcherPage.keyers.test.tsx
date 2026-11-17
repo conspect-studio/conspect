@@ -371,6 +371,26 @@ describe('arm and keyer editing after an outcome (review K5-R2-02)', () => {
     emit({ t: 'switcher.keyer', id: 'me1/usk1', data: { me: 'me1', program: 'main', keyer: 'me1/usk1', tick: 9, on_air: false, stale: false, fill: 'cam-1' } });
     await waitFor(() => { expect(screen.getByTestId('keyer-arm-usk2')).toHaveProperty('disabled', false); });
   });
+  it('K5-R2-04: a failed post-outcome refresh can be retried without any other command or event', async () => {
+    commandAnswer = () => HttpResponse.json({ operation_id: 'op-arm', kind: 'arm' }, { status: 202 });
+    state = { ...BASE_STATE, keyers: [DSK1, USK1, USK2], armed: { background: true, keys: [] } };
+    page();
+    await userEvent.click(await screen.findByTestId('keyer-arm-usk1'));
+    await screen.findByText(/op-arm/);
+    getFails = true;
+    applied('op-arm', 8);
+    const retry = await screen.findByRole('button', { name: 'Retry reading the switcher state' });
+    expect(screen.getByTestId('keyer-arm-usk2')).toHaveProperty('disabled', true);
+    // The API recovers; no realtime event arrives.
+    getFails = false;
+    state = { ...BASE_STATE, tick: 9, keyers: [DSK1, { ...USK1, armed: true }, USK2], armed: { background: true, keys: ['usk1'] } };
+    const commandsBefore = calls.filter((c) => c.path.startsWith('commands/')).length;
+    await userEvent.click(retry);
+    await waitFor(() => { expect(screen.getByTestId('keyer-arm-usk2')).toHaveProperty('disabled', false); });
+    expect(screen.getByTestId('keyer-arm-usk1')).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.queryByTestId('switcher-refresh-failed')).toBeNull();
+    expect(calls.filter((c) => c.path.startsWith('commands/'))).toHaveLength(commandsBefore);
+  });
 });
 
 describe('a DSK and a USK with the same id (review K5-R2-03)', () => {
