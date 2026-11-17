@@ -77,6 +77,37 @@ pub fn alpha_layout(format: Pixel) -> Option<AlphaLayout> {
     Some(layout)
 }
 
+/// Whether a media player can carry `format`'s alpha (keyers K6, #391).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlphaSupport {
+    /// The format has no alpha: an ordinary opaque clip.
+    Opaque,
+    /// The format's straight alpha is decoded into an NV12+A plane.
+    Supported(AlphaLayout),
+    /// The format carries alpha (libav's `AV_PIX_FMT_FLAG_ALPHA`, which
+    /// includes paletted `pal8`) that [`alpha_layout`] cannot map: playing it
+    /// would silently drop the alpha, so a player load refuses it.
+    Unsupported,
+}
+
+/// Classify `format` for a media-player load. This is the single source of
+/// truth the load gate uses: [`AlphaSupport::Supported`] exactly when
+/// [`alpha_layout`] maps the format, so a clip the gate admits is one the
+/// decoder's alpha path can carry.
+#[must_use]
+pub fn alpha_support(format: Pixel) -> AlphaSupport {
+    if let Some(layout) = alpha_layout(format) {
+        return AlphaSupport::Supported(layout);
+    }
+    let alpha = u64::try_from(ffmpeg::ffi::AV_PIX_FMT_FLAG_ALPHA).unwrap_or(0);
+    let flags = crate::frame::descriptor_flags(ffmpeg::ffi::AVPixelFormat::from(format));
+    if flags.is_some_and(|flags| flags & alpha != 0) {
+        AlphaSupport::Unsupported
+    } else {
+        AlphaSupport::Opaque
+    }
+}
+
 /// A decoded frame whose pixel format carries straight alpha, kept beside its
 /// NV12 conversion so a media player can publish NV12+A.
 ///
@@ -334,6 +365,39 @@ mod tests {
             Pixel::GBRP,
         ] {
             assert_eq!(alpha_layout(format), None, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn alpha_support_agrees_with_the_layout_map() {
+        // Every mapped format is supported with exactly its layout.
+        for format in [
+            Pixel::YUVA420P,
+            Pixel::YUVA444P10LE,
+            Pixel::YUVA444P12LE,
+            Pixel::GBRAP,
+            Pixel::ARGB,
+            Pixel::RGBA,
+            Pixel::BGRA,
+            Pixel::RGBA64LE,
+            Pixel::YA8,
+        ] {
+            assert_eq!(
+                alpha_support(format),
+                AlphaSupport::Supported(alpha_layout(format).unwrap()),
+                "{format:?}"
+            );
+        }
+        // Alpha libav flags but the layout map cannot carry: refused.
+        for format in [Pixel::PAL8, Pixel::AYUV64LE] {
+            assert_eq!(
+                alpha_support(format),
+                AlphaSupport::Unsupported,
+                "{format:?}"
+            );
+        }
+        for format in [Pixel::YUV420P, Pixel::NV12, Pixel::RGB24, Pixel::GBRP] {
+            assert_eq!(alpha_support(format), AlphaSupport::Opaque, "{format:?}");
         }
     }
 
