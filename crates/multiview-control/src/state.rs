@@ -590,6 +590,8 @@ pub struct AppState {
     pub web_capture: crate::web_capture::Provider,
     /// Off-clock native artifact-load executor, unavailable by default.
     pub player_load: Arc<dyn crate::player_load::PlayerLoadProvider>,
+    /// Scheduled `media_fill` refresh state (issue #472); control-plane only.
+    pub fill_refresh: Arc<crate::fill_refresh::FillRefresh>,
     /// The engine's outbound publisher (state slot + event broadcast).
     pub engine: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
     /// The inbound, bounded, non-blocking command bus sender.
@@ -1180,6 +1182,7 @@ impl AppState {
             #[allow(clippy::default_constructed_unit_structs)] // unit on non-unix
             web_capture: crate::web_capture::Provider::default(),
             player_load: Arc::new(crate::player_load::UnavailablePlayerLoad),
+            fill_refresh: Arc::default(),
             cloudflare: None,
             #[cfg(all(feature = "acme", unix))]
             tls: None,

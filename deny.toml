@@ -17,6 +17,16 @@ ignore = [
   # unavoidable until the upstream migrates (e.g. to `pastey`). Scoped to this
   # single advisory id; revisit when `utoipa-axum` updates.
   { id = "RUSTSEC-2024-0436", reason = "unmaintained compile-time proc-macro `paste`, transitive via utoipa-axum; no safe upgrade upstream" },
+  # RUSTSEC-2026-0543 / -0555 / -0542 (17 Nov 2026): `chrono`, `chrono-tz` and
+  # `humantime` (which wraps chrono) were declared unmaintained upstream
+  # (chronotope/chrono#1768). Informational "unmaintained" advisories, not
+  # vulnerabilities; RustSec lists no safe upgrade. chrono is a direct
+  # dependency of six workspace crates (config, control, licence, mesh,
+  # overlay, weather); migrating to a maintained date/time crate is tracked
+  # in #509. Scoped to these three ids; revisit when the migration lands.
+  { id = "RUSTSEC-2026-0543", reason = "chrono declared unmaintained (chronotope/chrono#1768); no safe upgrade; migration tracked in #509" },
+  { id = "RUSTSEC-2026-0555", reason = "chrono-tz declared unmaintained with chrono; no safe upgrade; migration tracked in #509" },
+  { id = "RUSTSEC-2026-0542", reason = "humantime wraps chrono, declared unmaintained with it; no safe upgrade; migration tracked in #509" },
 ]
 
 [licenses]

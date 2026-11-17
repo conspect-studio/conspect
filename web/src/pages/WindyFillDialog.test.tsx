@@ -871,4 +871,90 @@ describe('WindyFillDialog', () => {
     await userEvent.type(lon, '-181');
     expect(captureButton).toBeDisabled();
   });
+
+  it('registers a server schedule with the chosen interval when "Every N minutes" is selected', async () => {
+    let schedule: { minutes?: number; then?: string; start_now?: boolean; capture?: { fill_id?: string } } | undefined;
+    server.use(
+      capabilitiesHandler(),
+      http.get('*/api/v1/media/fills/vt-vt-1-windy/refresh', () =>
+        HttpResponse.json({ type: 'about:blank', title: 'Not found', status: 404 }, { status: 404 })),
+      http.put('*/api/v1/media/fills/vt-vt-1-windy/refresh', async ({ request }) => {
+        schedule = (await request.json()) as typeof schedule;
+        return HttpResponse.json({
+          fill_id: 'vt-vt-1-windy', player: 'vt-1', source: 'api', minutes: 15,
+          during_refresh: 'play_last', then: 'resume', phase: 'idle', in_flight: false,
+          next_due: '2026-11-15T00:15:00Z', last_success_at: null, last_artifact_id: null,
+          last_capture_job_id: null, last_error: null, consecutive_failures: 0,
+          update_pending: false, persistent: false,
+        });
+      }),
+      http.post('*/api/v1/media/captures', () =>
+        HttpResponse.json({ job_id: 1, status_url: '/api/v1/media/captures/1' }, { status: 202 })),
+      http.get('*/api/v1/media/captures/1', () =>
+        HttpResponse.json({ job_id: 1, fill_id: 'vt-vt-1-windy', state: 'queued' })),
+    );
+    renderDialog();
+    await waitFor(() => {
+      expect(screen.getByLabelText(/accept the/i)).toBeEnabled();
+    });
+    const scheduled = screen.getByLabelText('Every N minutes');
+    expect(scheduled).toBeEnabled();
+    const minutes = screen.getByLabelText('Refresh interval (minutes)');
+    expect(minutes).toBeDisabled();
+    await userEvent.click(scheduled);
+    expect(minutes).toBeEnabled();
+    expect(minutes).toHaveAttribute('min', '1');
+    expect(minutes).toHaveAttribute('max', '1440');
+    await userEvent.clear(minutes);
+    await userEvent.type(minutes, '15');
+    await userEvent.click(screen.getByLabelText(/accept the/i));
+    await userEvent.click(screen.getByRole('button', { name: 'Capture' }));
+    await waitFor(() => {
+      expect(schedule).toBeDefined();
+    });
+    expect(schedule).toMatchObject({ minutes: 15, then: 'resume', start_now: false });
+    expect(schedule?.capture?.fill_id).toBe('vt-vt-1-windy');
+    await waitFor(() => {
+      expect(screen.getByText(/Refreshes every 15 min/)).toBeInTheDocument();
+    });
+    expect(screen.getByText(/Not kept across a server restart/)).toBeInTheDocument();
+  });
+
+  it('blocks Capture for an out-of-range interval', async () => {
+    server.use(capabilitiesHandler());
+    renderDialog();
+    await waitFor(() => {
+      expect(screen.getByLabelText(/accept the/i)).toBeEnabled();
+    });
+    await userEvent.click(screen.getByLabelText(/accept the/i));
+    await userEvent.click(screen.getByLabelText('Every N minutes'));
+    const minutes = screen.getByLabelText('Refresh interval (minutes)');
+    await userEvent.clear(minutes);
+    await userEvent.type(minutes, '2000');
+    expect(screen.getByRole('button', { name: 'Capture' })).toBeDisabled();
+    expect(screen.getByText(/whole number of minutes from 1 to/)).toBeInTheDocument();
+  });
+
+  it('shows an existing schedule status including the last error', async () => {
+    server.use(
+      capabilitiesHandler(),
+      http.get('*/api/v1/media/fills/vt-vt-1-windy/refresh', () =>
+        HttpResponse.json({
+          fill_id: 'vt-vt-1-windy', player: 'vt-1', source: 'config', minutes: 5,
+          during_refresh: 'play_last', then: 'resume', phase: 'idle', in_flight: false,
+          next_due: '2026-11-15T00:05:00Z', last_success_at: '2026-11-15T00:00:00Z',
+          last_artifact_id: 'art-1', last_capture_job_id: 3, last_error: 'capture failed',
+          consecutive_failures: 2, update_pending: false, persistent: true,
+        })),
+    );
+    renderDialog();
+    await waitFor(() => {
+      expect(screen.getByText(/Refreshes every 5 min/)).toBeInTheDocument();
+    });
+    expect(screen.getByText(/previous clip kept/)).toBeInTheDocument();
+    expect(screen.getByText('art-1')).toBeInTheDocument();
+    expect(screen.getByText(/declared in the configuration/)).toBeInTheDocument();
+    expect(screen.queryByText(/Not kept across a server restart/)).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Stop scheduled refresh' })).toBeNull();
+  });
 });

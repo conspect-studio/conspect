@@ -6411,6 +6411,231 @@
         }
       }
     },
+    "/api/v1/media/fills/refresh": {
+      "get": {
+        "tags": [
+          "media-captures"
+        ],
+        "operationId": "list_fill_refresh",
+        "responses": {
+          "200": {
+            "description": "Refresh status of every visible scheduled fill.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/FillRefreshStatus"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/media/fills/{id}/refresh": {
+      "get": {
+        "tags": [
+          "media-captures"
+        ],
+        "operationId": "get_fill_refresh",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Fill id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Refresh status of one scheduled fill.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FillRefreshStatus"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized for this fill.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No schedule for this fill.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "media-captures"
+        ],
+        "operationId": "put_fill_refresh",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Fill id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefreshScheduleBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Schedule installed; runs as the calling key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FillRefreshStatus"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized for this fill or player.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown target player.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Config-declared fill or schedule capacity reached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid interval, body identity or terms.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "media-captures"
+        ],
+        "operationId": "delete_fill_refresh",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Fill id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Schedule removed; the current clip keeps playing."
+          },
+          "403": {
+            "description": "Not authorized for this fill.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No schedule for this fill.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Config-declared fill.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/media/players": {
       "get": {
         "tags": [
@@ -17921,6 +18146,118 @@
           }
         }
       },
+      "FillRefreshStatus": {
+        "type": "object",
+        "description": "Public per-fill refresh status (no URL, credential or path).",
+        "required": [
+          "fill_id",
+          "player",
+          "source",
+          "minutes",
+          "during_refresh",
+          "then",
+          "phase",
+          "in_flight",
+          "consecutive_failures",
+          "update_pending",
+          "persistent"
+        ],
+        "properties": {
+          "consecutive_failures": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Consecutive failed runs (drives the back-off).",
+            "minimum": 0
+          },
+          "during_refresh": {
+            "type": "string",
+            "description": "What the slot shows during a refresh (always `play_last` today)."
+          },
+          "fill_id": {
+            "type": "string",
+            "description": "Fill id."
+          },
+          "in_flight": {
+            "type": "boolean",
+            "description": "Whether a run is in flight."
+          },
+          "last_artifact_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Artifact id of the last successful load."
+          },
+          "last_capture_job_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Capture job id of the current or last run (owner-scoped).",
+            "minimum": 0
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Last failure, cleared on success."
+          },
+          "last_success_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Last successful native load (RFC 3339 UTC)."
+          },
+          "minutes": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Refresh period in minutes.",
+            "minimum": 0
+          },
+          "next_due": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Next due time (RFC 3339 UTC); meaningful while idle."
+          },
+          "persistent": {
+            "type": "boolean",
+            "description": "Whether the schedule survives a server restart (config: yes; API: no)."
+          },
+          "phase": {
+            "type": "string",
+            "description": "`idle`, `capturing` or `loading`."
+          },
+          "player": {
+            "type": "string",
+            "description": "Target media player."
+          },
+          "source": {
+            "$ref": "#/components/schemas/FillSource",
+            "description": "Origin of the schedule."
+          },
+          "then": {
+            "$ref": "#/components/schemas/LoadThen",
+            "description": "Landing intent of scheduled loads."
+          },
+          "update_pending": {
+            "type": "boolean",
+            "description": "A replacement schedule is staged and takes effect when the in-flight run ends."
+          }
+        }
+      },
+      "FillSource": {
+        "type": "string",
+        "description": "Where a scheduled fill came from.",
+        "enum": [
+          "config",
+          "api"
+        ]
+      },
       "FiredBody": {
         "type": "object",
         "description": "The `202` body of a successful salvo fire.",
@@ -23604,6 +23941,35 @@
           "secret",
           "url"
         ]
+      },
+      "RefreshScheduleBody": {
+        "type": "object",
+        "description": "Register (or replace) a runtime refresh schedule for one fill.",
+        "required": [
+          "minutes",
+          "capture"
+        ],
+        "properties": {
+          "capture": {
+            "$ref": "#/components/schemas/CaptureBody",
+            "description": "The capture submitted every run; `fill_id` must equal the path id and\n`target_player` must name an existing player."
+          },
+          "minutes": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Refresh period in minutes, 1 through 1440.",
+            "minimum": 0
+          },
+          "start_now": {
+            "type": "boolean",
+            "description": "Run the first refresh in the current slot instead of the next one."
+          },
+          "then": {
+            "$ref": "#/components/schemas/LoadThen",
+            "description": "Landing intent of each scheduled load (default resume)."
+          }
+        },
+        "additionalProperties": false
       },
       "Registration": {
         "type": "object",
