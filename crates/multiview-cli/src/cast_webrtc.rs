@@ -85,12 +85,6 @@ impl Viewers {
             closed: false,
         }
     }
-
-    /// The viewers (tests).
-    #[cfg(test)]
-    pub(crate) fn list(&self) -> &[Arc<CastAttachment>] {
-        &self.list
-    }
 }
 
 /// One cast output's feed while it has viewers. The worker thread owns its
@@ -868,7 +862,7 @@ mod tests {
         rung: Arc<CliCastWebRtc>,
         handle: WhepServeHandle,
         factory: Arc<crate::output_window_registry::SubscriptionFactory>,
-        _registry: crate::output_window_registry::OutputWindowRegistry,
+        registry: crate::output_window_registry::OutputWindowRegistry,
         _endpoint: multiview_webrtc::transport::WhepServeEndpoint,
     }
 
@@ -906,7 +900,7 @@ mod tests {
             rung: Arc::new(CliCastWebRtc::new(handle.clone(), windows, outputs)),
             handle,
             factory,
-            _registry: registry,
+            registry,
             _endpoint: endpoint,
         }
     }
@@ -1003,7 +997,7 @@ mod tests {
             .unwrap();
         // The producer ends: the run's registry closes.
         let feed_viewers = Arc::clone(&r.rung.feeds().get("cast-1").unwrap().viewers);
-        drop(r._registry);
+        drop(r.registry);
         wait("the feed closed", || feed_viewers.lock().unwrap().closed);
         assert!(first.is_fenced(), "its viewers are fenced");
         // An offer that had reserved the old feed before it closed: the
@@ -1037,7 +1031,7 @@ mod tests {
             .negotiate("cast-1", &offer(), Arc::clone(&a))
             .unwrap();
         a.fence();
-        std::thread::sleep(FEED_LINGER - Duration::from_millis(300));
+        std::thread::sleep(FEED_LINGER.saturating_sub(Duration::from_millis(300)));
         let b = attachment();
         r.rung
             .negotiate("cast-1", &offer(), Arc::clone(&b))
