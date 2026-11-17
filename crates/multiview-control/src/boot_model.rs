@@ -2136,6 +2136,13 @@ impl BootModel {
     }
 
     /// Whether this commit's directory sync is to fail (consumes the seam).
+    #[cfg_attr(
+        not(any(test, feature = "_test-seams")),
+        allow(
+            clippy::unused_self,
+            reason = "the seam field exists only in test builds"
+        )
+    )]
     fn take_dir_sync_fault(&self) -> bool {
         #[cfg(any(test, feature = "_test-seams"))]
         {
