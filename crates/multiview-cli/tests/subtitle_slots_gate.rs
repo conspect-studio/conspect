@@ -246,6 +246,7 @@ id = "cast-1"
         }
     }
 
+    #[cfg(not(feature = "overlay"))]
     fn binary(args: &[&str], path: &Path) -> (bool, String) {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_multiview"))
             .args(args)
