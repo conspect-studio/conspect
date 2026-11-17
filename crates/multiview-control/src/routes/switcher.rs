@@ -801,7 +801,7 @@ pub(crate) async fn plan_switcher(
 }
 
 /// Enqueue a checked verb; a 202 never asserts frame application.
-#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/commands/{kind}", tag = "switcher", params(("kind" = String, Path, description = "The verb; must equal `action`."), ("Idempotency-Key" = String, Header, description = "Required; a replay answers the first 202.")), request_body = SwitcherRequest, responses((status = 202, description = "Queued; the outcome arrives as `switcher.operation` at the engine tick. Keyer verbs also emit `switcher.keyer` on a committed state change.", body = SwitcherAccepted), (status = 403, description = "Not authorized for the M/E, the Program scope, a referenced object, the keyer object id or a named fill/key source, or (a `layout` select, or a CUT/AUTO whose Preview is `layout:<id>`) every source the stored layout binds; one generic refusal; the key is not burned.", body = crate::problem::Problem), (status = 404, description = "`unknown-keyer`.", body = crate::problem::Problem), (status = 409, description = "`capacity` (keyer budget, generic for scoped callers; or a fifth stored layout as an M/E source, or a source it shows cannot be leased), `layout-changed` (the stored layout was edited or deleted while this request was in flight; retry), `on-air-protected` (a fill/key change of a keyer on air without `on_air = \"allow\"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyer-in-transition`, `in-flight` (`arm` during a transition), `keyers-unavailable`; nothing is enqueued and every lease and key taken is released.", body = crate::problem::Problem), (status = 422, description = "Invalid verb or references (exactly one of `source`/`input`/`layout` on a select; none on cut/auto), `not-on-an-input`, `unknown-slot`, `unknown-source` (no such stored layout), `layout-not-admissible` (another canvas, a translucent cell, or a nested layout/bus cell).", body = crate::problem::Problem), (status = 503, description = "`engine-busy`: the 64-slot mailbox is full, a stored layout could not be read now, or the output clock did not adopt a newly registered layout within 1 s (key and leases released); or `idempotency-capacity`.", body = crate::problem::Problem))))]
+#[cfg_attr(feature = "openapi", utoipa::path(post, path = "/api/v1/switcher/commands/{kind}", tag = "switcher", params(("kind" = String, Path, description = "The verb; must equal `action`."), ("Idempotency-Key" = String, Header, description = "Required; a replay answers the first 202.")), request_body = SwitcherRequest, responses((status = 202, description = "Queued; the outcome arrives as `switcher.operation` at the engine tick. Keyer verbs also emit `switcher.keyer` on a committed state change.", body = SwitcherAccepted), (status = 403, description = "Not authorized for the M/E, the Program scope, a referenced object, the keyer object id or a named fill/key source, or (a `layout` select, or a CUT/AUTO whose Preview is `layout:<id>`) every source the stored layout binds; one generic refusal; the key is not burned.", body = crate::problem::Problem), (status = 404, description = "`unknown-keyer`.", body = crate::problem::Problem), (status = 409, description = "`capacity` (keyer budget, generic for scoped callers; or a fifth stored layout as an M/E source, or a source it shows cannot be leased), `layout-changed` (the stored layout was edited or deleted while this request was in flight; retry), `on-air-protected` (a fill/key change of a keyer on air without `on_air = \"allow\"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyer-in-transition`, `in-flight` (`arm` during a transition), `keyers-unavailable`, `source-unavailable` (a selected source that cannot be leased for the bus, or a `media_player` source whose player has no channel; the detail says why); nothing is enqueued and every lease and key taken is released.", body = crate::problem::Problem), (status = 422, description = "Invalid verb or references (exactly one of `source`/`input`/`layout` on a select; none on cut/auto), `not-on-an-input`, `unknown-slot`, `unknown-source` (no such stored layout), `layout-not-admissible` (another canvas, a translucent cell, or a nested layout/bus cell).", body = crate::problem::Problem), (status = 503, description = "`engine-busy`: the 64-slot mailbox is full, a stored layout could not be read now, or the output clock did not adopt a newly registered layout within 1 s (key and leases released); or `idempotency-capacity`.", body = crate::problem::Problem))))]
 #[allow(clippy::too_many_lines)]
 // reason: one linear admission sequence (authz → resolve input → buses → key →
 // lease → enqueue); the input resolution added the lines, not new branches.
@@ -985,11 +985,31 @@ pub(crate) async fn submit_switcher(
                         } else {
                             "switcher:me1:pvw"
                         };
+                        // A select that can never show a picture is refused
+                        // with its reason (the source was authorized above).
+                        if let Some(reason) = demand.select_refusal(source) {
+                            state.idempotency.release(Some(key), &op);
+                            return Ok(crate::problem::Problem::new(
+                                409,
+                                "source-unavailable",
+                                "Selection refused",
+                            )
+                            .with_detail(reason)
+                            .into_response());
+                        }
                         let Some(lease) = demand.switcher_preview_lease(source, label) else {
                             state.idempotency.release(Some(key), &op);
-                            return Err(ControlError::Conflict(
-                                "source lease unavailable (unknown source or lease limit)".into(),
-                            ));
+                            return Ok(crate::problem::Problem::new(
+                                409,
+                                "source-unavailable",
+                                "Selection refused",
+                            )
+                            .with_detail(format!(
+                                "source {source:?} cannot be leased for the bus: the running \
+                                 engine has not registered it yet (retry shortly) or the lease \
+                                 limit is reached"
+                            ))
+                            .into_response());
                         };
                         Some((
                             source.clone(),
@@ -1030,6 +1050,20 @@ pub(crate) async fn submit_switcher(
                 state.idempotency.release(Some(key), &op);
                 return Err(ControlError::EngineBusy);
             }
+            // Audit the accepted request (who selected what); the engine's
+            // outcome follows on the realtime stream. A replay is not audited
+            // again. The source id was authorized above.
+            state.audit(
+                &principal.key_id,
+                crate::audit::AuditAction::Command,
+                "switcher",
+                &req.me,
+                Some(serde_json::json!({
+                    "command": kind,
+                    "operation_id": op.to_string(),
+                    "source": target.as_ref().map(|t| t.source.clone()),
+                })),
+            );
             op
         }
     };

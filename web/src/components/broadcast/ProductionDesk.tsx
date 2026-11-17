@@ -8,7 +8,7 @@ import { Link } from 'react-router-dom';
 import { commandSwitcher, getSwitcher, planSwitcher } from '../../api/switcher';
 import { WIPE_PATTERNS } from '../../api/switcher';
 import type { SwitcherAction, SwitcherRequest, TransitionDescriptor, WipePattern } from '../../api/switcher';
-import { newIdempotencyKey } from '../../api/operations';
+import { newIdempotencyKey, OperationApiError } from '../../api/operations';
 import { createApiClient } from '../../api/client';
 import { useLayouts } from '../../api/queries';
 import { useAlarms } from '../../api/alarmsQueries';
@@ -90,6 +90,16 @@ function tileDetail(detail: string | null | undefined): string | undefined {
   // Count code points, not UTF-16 units, so a truncation never splits a pair.
   const chars = Array.from(flat);
   return chars.length > TILE_DETAIL_MAX_CHARS ? `${chars.slice(0, TILE_DETAIL_MAX_CHARS).join('')}…` : flat;
+}
+
+/**
+ * The banner text of a refused switcher command: the problem title, then the
+ * engine's reason (RFC 9457 `detail`) when it gave one, so a refusal says why
+ * (e.g. a media player with no channel) instead of only "Conflict".
+ */
+function commandErrorText(err: Error): string {
+  const detail = err instanceof OperationApiError ? tileDetail(err.detail) : undefined;
+  return detail !== undefined && detail !== err.message ? `${err.message}: ${detail}` : err.message;
 }
 
 /**
@@ -304,7 +314,7 @@ function ProductionDeskBody(): JSX.Element {
     const plan = await planSwitcher(req);
     if (!plan.can_take) throw new Error(t`The engine refused this plan`);
     return submit(() => commandSwitcher(action, req, { idempotencyKey: newIdempotencyKey() }), { topic: 'switcher', resource: 'me1', event: 'switcher.operation', terminal: { kind: 'switcher-operation', me: 'me1' } });
-  }, onSuccess: (result) => { setOperationId(result.operationId); setGuard(result.operationId); setError(undefined); setFailure(undefined); }, onError: (err: Error) => { setError(err.message); setGuard(undefined); lock.current = false; } });
+  }, onSuccess: (result) => { setOperationId(result.operationId); setGuard(result.operationId); setError(undefined); setFailure(undefined); }, onError: (err: Error) => { setError(commandErrorText(err)); setGuard(undefined); lock.current = false; } });
   const disabled = !!reason || mutate.isPending || inFlight;
   const sameBuses = state.data !== undefined && state.data.preview_source === state.data.program_source;
   const framesValid = /^[0-9]+$/.test(frames) && Number(frames) >= 1 && Number(frames) <= 1000;

@@ -491,6 +491,15 @@ pub trait SourceDemandProvider: Send + Sync {
         self.preview_lease(id, label)
     }
 
+    /// Why `id` can never show a picture on a switcher bus, when that is
+    /// known up front (a `media_player` source whose player has no channel in
+    /// this run, ADR-M012). `None` when a select may proceed. Called only
+    /// after the caller is authorized for `id`. The default knows no reason.
+    fn select_refusal(&self, id: &str) -> Option<String> {
+        let _ = id;
+        None
+    }
+
     /// Take a lease on `id`'s video and audio for an on-demand HLS session
     /// labelled `label` (`feat/rc-on-demand-hls` calls this). `None` when `id`
     /// is not a configured source. The default refuses, for providers without
