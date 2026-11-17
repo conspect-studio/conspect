@@ -303,6 +303,7 @@ pub(crate) fn cmd(op: &str, verb: SwitcherVerb) -> SwitcherCommand {
         operation_id: op.into(),
         scene_version: 1,
         verb,
+        expect: None,
     }
 }
 

@@ -407,6 +407,7 @@ async fn arm_shape_and_in_flight_refusal() {
             verb: multiview_engine::switcher_control::SwitcherVerb::Auto(
                 multiview_core::switcher::FrameCount::try_from(20).unwrap(),
             ),
+            expect: None,
         })
         .unwrap();
     rig.handle
@@ -416,6 +417,7 @@ async fn arm_shape_and_in_flight_refusal() {
             verb: multiview_engine::switcher_control::SwitcherVerb::SetTransition(
                 serde_json::from_value(json!({"kind": "mix", "rate": 20})).unwrap(),
             ),
+            expect: None,
         })
         .unwrap();
     tick(&mut rig.driver, 1);
@@ -803,6 +805,7 @@ async fn a_take_authorized_against_a_stale_arm_set_is_refused() {
                     .with_background()
                     .with_key(1),
             )),
+            expect: None,
         })
         .unwrap();
     // ...so NO_USK1 is admitted to CUT the set it saw, and the engine must

@@ -590,6 +590,8 @@ pub struct AppState {
     pub web_capture: crate::web_capture::Provider,
     /// Off-clock native artifact-load executor, unavailable by default.
     pub player_load: Arc<dyn crate::player_load::PlayerLoadProvider>,
+    /// Scheduled `media_fill` refresh state (issue #472); control-plane only.
+    pub fill_refresh: Arc<crate::fill_refresh::FillRefresh>,
     /// The engine's outbound publisher (state slot + event broadcast).
     pub engine: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
     /// The inbound, bounded, non-blocking command bus sender.
@@ -782,6 +784,9 @@ pub struct AppState {
     /// Output feed routing (ADR-0108 slice 1); `None` until the binary installs
     /// the engine seam (routes answer 409 `routing-unavailable`).
     pub output_routing: Option<Arc<crate::output_routing::OutputRoutingControl>>,
+    /// Stored layouts registered as M/E sources (#307); `None` until the
+    /// binary installs the engine side (a layout select then answers 409).
+    pub me_layouts: Option<Arc<crate::me_layouts::MeLayoutRegistry>>,
     /// The running engine's cast outputs (ADR-0111); `None` until the binary
     /// installs the engine seam (no cast output can be used).
     pub cast_engine: Option<crate::cast_engine::SharedCastEngine>,
@@ -1150,6 +1155,7 @@ impl AppState {
             idempotency: Arc::new(IdempotencyStore::new()),
             switcher: None,
             output_routing: None,
+            me_layouts: None,
             cast_engine: None,
             cast_run: None,
             cast_streams: Arc::new(crate::cast_streams::CastStreams::new()),
@@ -1176,6 +1182,7 @@ impl AppState {
             #[allow(clippy::default_constructed_unit_structs)] // unit on non-unix
             web_capture: crate::web_capture::Provider::default(),
             player_load: Arc::new(crate::player_load::UnavailablePlayerLoad),
+            fill_refresh: Arc::default(),
             cloudflare: None,
             #[cfg(all(feature = "acme", unix))]
             tls: None,
@@ -1608,6 +1615,13 @@ impl AppState {
         self.output_routing = Some(Arc::new(crate::output_routing::OutputRoutingControl::new(
             routing,
         )));
+        self
+    }
+
+    /// Install the engine side of stored layouts as M/E sources (#307).
+    #[must_use]
+    pub fn with_me_layouts(mut self, sources: crate::me_layouts::SharedMeLayoutSources) -> Self {
+        self.me_layouts = Some(Arc::new(crate::me_layouts::MeLayoutRegistry::new(sources)));
         self
     }
 

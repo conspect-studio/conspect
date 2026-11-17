@@ -366,6 +366,19 @@ fn shape(kind: &str, fields: &KeyerFields, other_refs: bool) -> Result<String, B
         )));
     }
     for source in fields.sources() {
+        if multiview_config::switcher::KEYER_RESERVED_PREFIXES
+            .iter()
+            .any(|p| source.starts_with(p))
+        {
+            return Err(Box::new(typed(
+                422,
+                "keyer-source-not-a-source",
+                format!(
+                    "{source:?} uses a reserved prefix (layout:/bus:); keyer fill and key \
+                     name configured sources only (#307)"
+                ),
+            )));
+        }
         if source.starts_with(INPUT_REF_PREFIX) {
             return Err(Box::new(typed(
                 422,
@@ -1448,6 +1461,9 @@ pub fn submit(
         operation_id: op.to_string(),
         scene_version,
         verb: checked.verb,
+        // A keyer verb names configured sources only (never a layout
+        // source): there is no layout revision to re-check (#307).
+        expect: None,
     };
     if handle.try_send(command).is_err() {
         state.idempotency.release(Some(key), &op);

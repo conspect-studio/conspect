@@ -76,6 +76,7 @@ fn command(op: impl std::fmt::Display, verb: SwitcherVerb) -> SwitcherCommand {
         operation_id: op.to_string(),
         scene_version: 1,
         verb,
+        expect: None,
     }
 }
 

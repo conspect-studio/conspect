@@ -2265,6 +2265,10 @@ pub struct Pipeline {
     /// Live control handle published only when the paired bus provider starts.
     switcher_control: Option<multiview_engine::switcher_control::SwitcherControl>,
     switcher_driver: Option<multiview_engine::switcher_control::SwitcherTickDriver>,
+    /// Stored layouts registered as M/E sources (#307): one registry per
+    /// pipeline, shared by every run (the frame hook adopts its engine set,
+    /// the routing-aux thread composes its compose set).
+    me_layouts: Arc<crate::me_layouts::MeLayoutAdapter>,
     /// Separate PVW JPEG tap: never silently copy the PGM canvas here.
     switcher_preview: Option<crate::preview::ProgramSlot>,
     /// Per-source native caption cue stores, keyed by source id. Each store is
@@ -3762,6 +3766,7 @@ impl Pipeline {
             switcher_cell_id,
             switcher_control: None,
             switcher_driver: None,
+            me_layouts: Arc::new(crate::me_layouts::MeLayoutAdapter::new()),
             switcher_preview: None,
             stores,
             source_registry,
@@ -4169,9 +4174,12 @@ impl Pipeline {
         let spawn_err =
             |source: std::io::Error| PipelineError::thread_spawn("output routing", source);
         let (aux_tx, aux_rx) = multiview_engine::aux_tick_channel();
+        // The M/E layout-source gate is the registry's own flag, shared by
+        // every run of this pipeline (#307).
+        let aux_tx = aux_tx.with_me_layout_flag(self.me_layouts.active_flag());
         let catalogue = Arc::clone(&self.catalogue);
         let boot = self.stores.clone();
-        let stores: crate::routing_aux::StoreLookup = Arc::new(move |id: &str| {
+        let base: crate::routing_aux::StoreLookup = Arc::new(move |id: &str| {
             catalogue
                 .load()
                 .get(id)
@@ -4179,6 +4187,13 @@ impl Pipeline {
                 .or_else(|| boot.get(id).cloned())
         });
         let has_preview = self.switcher_driver.is_some();
+        // #307 review M2: the routed Preview (and `src:`) lookup also sees
+        // the stored layouts registered as M/E sources, so a PVW of
+        // `layout:<id>` publishes the composed layout.
+        let stores = crate::routing_aux::with_me_layouts(
+            base,
+            has_preview.then(|| self.me_layouts.compose_set()),
+        );
         let preview_selection: Option<Arc<multiview_framestore::SwapCell<Option<Arc<str>>>>> =
             has_preview.then(|| Arc::new(multiview_framestore::SwapCell::new(None)));
         let feeds: crate::routing_aux::AuxFeeds =
@@ -4204,6 +4219,7 @@ impl Pipeline {
             layout_canvas: self.layout_canvas_spec(),
             program_lateness: Some(Arc::clone(&program_lateness)),
             tick_ns: u64::try_from(self.encode_cfg.cadence.period_nanos()).unwrap_or(0),
+            me_layouts: has_preview.then(|| self.me_layouts.compose_set()),
             #[cfg(feature = "overlay")]
             overlays: Some(aux_overlays),
         })
@@ -4831,6 +4847,12 @@ impl Pipeline {
     #[must_use]
     pub fn output_routing(&self) -> crate::output_routing::OutputRoutingSlot {
         Arc::clone(&self.output_routing)
+    }
+
+    /// The pipeline's stored-layout M/E source registry (#307).
+    #[must_use]
+    pub fn me_layouts(&self) -> Arc<crate::me_layouts::MeLayoutAdapter> {
+        Arc::clone(&self.me_layouts)
     }
 
     /// The running Program's metric handles (empty until a run starts).
@@ -6542,6 +6564,7 @@ impl Pipeline {
                     hook.preview_slot = Some(preview_slot);
                     hook.preview_stores = Some(self.catalogue_stores());
                     hook.preview_selection = preview_selection;
+                    hook.layout_sources = Some(self.me_layouts.engine());
                     // #469: the decoders size the PGM/PVW sources full-canvas.
                     hook.bus_sizing = Some([
                         Arc::clone(&self.bus_sizing.program),
@@ -32924,11 +32947,11 @@ segment_ms = 1000
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn displayed_8kib_captions_keep_the_cadence() {
-        run_with_cue_bytes(8 * 1024).await;
+        Box::pin(run_with_cue_bytes(8 * 1024)).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn displayed_64kib_captions_keep_the_cadence() {
-        run_with_cue_bytes(64 * 1024).await;
+        Box::pin(run_with_cue_bytes(64 * 1024)).await;
     }
 }
