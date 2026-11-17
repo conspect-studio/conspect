@@ -732,17 +732,34 @@ fn check_arm(
         };
         set = set.with_key(index);
     }
-    let refused = snapshot
-        .is_some_and(|s| s.in_flight)
-        .then(|| refusal("in-flight", "the arm set cannot change during a transition"));
+    let refused = if snapshot.is_some_and(|s| s.in_flight) {
+        Some(refusal(
+            "in-flight",
+            "the arm set cannot change during a transition",
+        ))
+    } else if snapshot.is_some_and(|s| armed_hidden(principal, defs, s)) {
+        // Review K5-R2-01: `arm` replaces the whole set, so a caller who
+        // cannot see an armed key would silently disarm it. Generic: the
+        // detail never names (or counts) the hidden key.
+        Some(refusal(
+            "arm-hidden-keys",
+            "the armed set includes a key you may not see or control; only a caller \
+             who sees every armed key can change it",
+        ))
+    } else {
+        None
+    };
     Ok(Ok(Checked {
         // Bound to the definitions the sources were authorized against
         // (review AUTHZ-R3-1): a `keyer_set` that re-points an armed key
         // before this drains makes the engine refuse the arm, never arm the
-        // new source on this caller's authority.
+        // new source on this caller's authority. And bound to the arm set
+        // the hidden-key check saw (review K5-R2-01): an arm that landed
+        // first (perhaps arming a key this caller cannot see) makes the
+        // engine refuse this one (`arm-changed`), never overwrite it.
         verb: SwitcherVerb::Bound(Box::new(multiview_engine::switcher_control::BoundVerb {
             verb: SwitcherVerb::Arm(Arc::new(set)),
-            arm_version: None,
+            arm_version: snapshot.map(|s| s.arm_version),
             defs_version: Some(defs.version),
         })),
         plan: KeyerPlan {
@@ -1188,6 +1205,27 @@ pub struct ArmedView {
     /// Armed upstream keyer ids the caller may read (keyer object id
     /// `<me>/<id>`); unreadable ones are dropped.
     pub keys: Vec<String>,
+    /// `false` when an armed key is hidden from the caller (review
+    /// K5-R2-01): `keys` is then not the whole set, and `arm` (which
+    /// replaces the set) is refused with 409 `arm-hidden-keys`. A boolean
+    /// only: it never names or counts the hidden keys.
+    pub complete: bool,
+}
+
+/// Whether the committed armed set holds a USK whose keyer object
+/// (`<me>/<id>`) the principal may not see (so it could not re-submit it).
+fn armed_hidden(
+    principal: &Principal,
+    defs: &KeyerDefinitions,
+    snapshot: &SwitcherSnapshot,
+) -> bool {
+    defs.defs.iter().enumerate().any(|(slot, def)| {
+        def.as_ref().is_some_and(|def| {
+            def.family == KeyerFamily::Usk
+                && snapshot.next.key_armed(slot)
+                && !readable(principal, &def.object_id)
+        })
+    })
 }
 
 /// The armed set the principal may read.
@@ -1211,6 +1249,7 @@ pub fn armed(
         .unwrap_or_default();
     ArmedView {
         background: snapshot.next.background,
+        complete: defs.is_none_or(|defs| !armed_hidden(principal, defs, snapshot)),
         keys,
     }
 }

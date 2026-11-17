@@ -4172,6 +4172,13 @@ export interface components {
             /** @description The background moves with the next transition. */
             background: boolean;
             /**
+             * @description `false` when an armed key is hidden from the caller (review
+             *     K5-R2-01): `keys` is then not the whole set, and `arm` (which
+             *     replaces the set) is refused with 409 `arm-hidden-keys`. A boolean
+             *     only: it never names or counts the hidden keys.
+             */
+            complete: boolean;
+            /**
              * @description Armed upstream keyer ids the caller may read (keyer object id
              *     `<me>/<id>`); unreadable ones are dropped.
              */
@@ -21046,7 +21053,7 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description `capacity` (keyer budget, generic for scoped callers; or a fifth stored layout as an M/E source, or a source it shows cannot be leased), `layout-changed` (the stored layout was edited or deleted while this request was in flight; retry), `on-air-protected` (a fill/key change of a keyer on air without `on_air = "allow"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyer-in-transition`, `in-flight` (`arm` during a transition), `keyers-unavailable`; nothing is enqueued and every lease and key taken is released. */
+            /** @description `capacity` (keyer budget, generic for scoped callers; or a fifth stored layout as an M/E source, or a source it shows cannot be leased), `layout-changed` (the stored layout was edited or deleted while this request was in flight; retry), `on-air-protected` (a fill/key change of a keyer on air without `on_air = "allow"`), `clean-unavailable-with-dsk` (the first DSK while an output carries Clean), `keyer-ramping`, `keyer-in-transition`, `in-flight` (`arm` during a transition), `arm-hidden-keys` (`arm` while the armed set holds a key the caller may not see: it replaces the whole set, so it would silently disarm it; generic, never naming it), `keyers-unavailable`; nothing is enqueued and every lease and key taken is released. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -21088,7 +21095,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description `SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set`/`arm` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`, `keyer-in-transition` (a USK `keyer_cut` during a transition), `in-flight` (`arm` during a transition)). */
+            /** @description `SwitcherPlan` for a background verb; `KeyerPlan` for `keyer_cut`/`keyer_auto`/`keyer_tie`/`keyer_set`/`arm` (class, keyer object id, on-air, the admission cost — scoped callers see only their own delta — and the refusal the command would answer: `capacity`, `on-air-protected`, `clean-unavailable-with-dsk`, `keyer-ramping`, `keyer-in-transition` (a USK `keyer_cut` during a transition), `in-flight` (`arm` during a transition), `arm-hidden-keys` (`arm` while the armed set holds a key the caller may not see; generic, never naming it)). */
             200: {
                 headers: {
                     [name: string]: unknown;

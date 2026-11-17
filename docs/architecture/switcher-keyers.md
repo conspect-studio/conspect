@@ -1436,3 +1436,20 @@ merge (see "K1 GPU key path as built", wipe masks).
   refusals and the engine's `take-held` / `unknown-keyer` outcomes are shown with their
   reasons. Keyer verbs and `arm` are tracked as correlated `switcher.operation` kinds. The
   background CUT is not gated on PGM == PVW, so a key-only CUT stays available.
+- **Review round 2 (K5-R2).** *Hidden armed keys (R2-01).* `arm` replaces the whole set,
+  but the GET `armed` view drops keys the caller may not read, so a scoped caller toggling a
+  readable key would have disarmed a hidden one. The server refuses it: plan reports and the
+  command answers 409 `arm-hidden-keys` (generic: it never names or counts the hidden key)
+  when the committed set holds a USK whose keyer object the caller may not read, and `arm` is
+  now bound to the `arm_version` it was checked against, so an arm that lands first is never
+  overwritten (`arm-changed`). `ArmedView.complete` is a non-identifying boolean; the strip is
+  read-only with a reason while it is `false`
+  (`arm_refuses_to_drop_an_armed_key_the_caller_cannot_see`,
+  `an_arm_admitted_against_a_stale_set_is_refused`). *Stale snapshot (R2-02).* After an
+  outcome every keyer and arm control stays gated until a GET started after the outcome
+  succeeds (the engine publishes the snapshot before the tick's outcomes, so that GET reads
+  a state at or after the terminal tick); a failed refresh keeps them disabled with a reason
+  until a later snapshot arrives. *Overlapping ids (R2-03).* DSK and USK ids are separate
+  namespaces, so React keys and DOM ids (label targets, `aria-describedby`) use
+  `keyerDomKey` (`dsk-<id>` / `usk-<id>`), and a USK's panel and strip are named "Upstream
+  keyer <id>".
