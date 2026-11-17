@@ -1108,7 +1108,15 @@ mod tests {
                 "-i",
             ])
             .arg("testsrc2=size=160x120:rate=25:duration=2")
-            .args(["-pix_fmt", "yuv420p", "-c:v", "libx264", "-x264-params"])
+            .args([
+                "-pix_fmt",
+                "yuv420p",
+                "-threads",
+                "1",
+                "-c:v",
+                "libx264",
+                "-x264-params",
+            ])
             .arg("keyint=10:min-keyint=10:scenecut=0:bframes=0:repeat-headers=0")
             .args(["-f", "mp4"])
             .arg(path)

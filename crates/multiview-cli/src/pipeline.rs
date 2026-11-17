@@ -2506,6 +2506,9 @@ pub struct Pipeline {
     /// Per runnable output (same order): a live format reset may reach it
     /// (#342 B3 review M-1: HLS with TS segments only).
     output_live_reset: Vec<bool>,
+    /// Per runnable output (same order): its passthrough (P0) eligibility
+    /// (#344 D2b: HLS with TS segments, slot-0 H.264/HEVC, a known format).
+    output_passthrough: Vec<crate::output_routing::PassEligibility>,
     output_audio_tracks: Vec<Vec<usize>>,
     /// Outputs that EXPLICITLY declared an audio selection (per output: the id
     /// and its full declared track list). Drives the run-time truthful binding:
@@ -3494,6 +3497,7 @@ impl Pipeline {
         let mut output_video_keys = Vec::with_capacity(outputs.len());
         let mut output_inband_sets = Vec::with_capacity(outputs.len());
         let mut output_live_reset = Vec::with_capacity(outputs.len());
+        let mut output_passthrough = Vec::with_capacity(outputs.len());
         let mut output_audio_tracks = Vec::with_capacity(outputs.len());
         let mut declared_audio_outputs: Vec<(String, Vec<usize>)> = Vec::new();
         for output in &outputs {
@@ -3564,6 +3568,16 @@ impl Pipeline {
             // Only a TS-segment HLS sink rebuilds its muxer at a flagged
             // change (#342 B3 review M-1).
             output_live_reset.push(!ll_hls && matches!(output, RunnableOutput::Hls { .. }));
+            output_passthrough.push(passthrough_eligibility(
+                declared,
+                !ll_hls && matches!(output, RunnableOutput::Hls { .. }),
+                requested,
+                (width, height),
+                cfg.cadence,
+                bit_rate,
+                canvas_color.output_tag(),
+                key,
+            ));
             let audio_selection = match output {
                 RunnableOutput::File { sink, .. }
                 | RunnableOutput::Hls { sink, .. }
@@ -3785,6 +3799,7 @@ impl Pipeline {
             output_video_keys,
             output_inband_sets,
             output_live_reset,
+            output_passthrough,
             output_audio_tracks,
             declared_audio_outputs,
             outputs,
@@ -4180,7 +4195,18 @@ impl Pipeline {
         );
         let reformat_open =
             reformat_opener(self.encode_cfg.clone(), self.rendition_configs.clone());
-        let (mut router, handle) = crate::output_routing::OutputRouter::new_with_openers(
+        let pass_hooks = crate::output_routing::PassHooks {
+            open: passthrough_opener(
+                self.rendition_configs.clone(),
+                self.encode_cfg.cadence,
+                Arc::clone(&self.epoch_anchor),
+            ),
+            traits: Arc::new(|id: &str| {
+                crate::passthrough_tap::lookup(id)
+                    .and_then(|t| t.stream().map(|s| s.traits.clone()))
+            }),
+        };
+        let (mut router, handle) = crate::output_routing::OutputRouter::new_with_passthrough(
             crate::output_routing::RouterConfig {
                 cadence: self.encode_cfg.cadence,
                 gop: self.encode_cfg.gop.max(1),
@@ -4192,6 +4218,7 @@ impl Pipeline {
                 max_aux_canvases: self.max_aux_canvases,
                 formats: self.output_formats.clone(),
                 live_reset: self.output_live_reset.clone(),
+                passthrough: self.output_passthrough.clone(),
                 boot_retry: self.boot_retry,
             },
             crate::output_routing::AuxWiring {
@@ -4208,6 +4235,7 @@ impl Pipeline {
             },
             open,
             Some(reformat_open),
+            Some(pass_hooks),
         )
         .map_err(spawn_err)?;
         // Atomic sets (#308) pick their adoption tick after the clock's last
@@ -5151,6 +5179,8 @@ impl Pipeline {
                 self.output_inband_sets.insert(0, true);
                 // The internal `program.ts` anchor is a file: never reset.
                 self.output_live_reset.insert(0, false);
+                self.output_passthrough
+                    .insert(0, crate::output_routing::PassEligibility::NotSupported);
                 self.output_audio_tracks
                     .insert(0, hls_audio.unwrap_or_default());
             }
@@ -8439,6 +8469,185 @@ fn reformat_opener(
             ))),
             _ => Ok(live),
         }
+    })
+}
+
+/// The passthrough (P0) eligibility of one runnable output (#344 D2b): an
+/// HLS output with TS segments whose slot-0 codec is H.264 or HEVC (HEVC has
+/// no repeat AU: an underrun bridges to the slate). The slot is the
+/// output's own format (canvas or `[outputs.format]`), the run cadence, the
+/// canvas colour, 8-bit 4:2:0 progressive, the slot-0 bit rate as ceiling,
+/// and the HLS segment length as the longest GOP. Anything else is
+/// `passthrough-not-supported-on-medium`.
+#[allow(clippy::too_many_arguments)]
+// reason: one output's already-resolved facts, called once per output at plan build.
+fn passthrough_eligibility(
+    declared: Option<&Output>,
+    ts_hls: bool,
+    codec_token: &str,
+    (width, height): (u32, u32),
+    cadence: Rational,
+    bit_rate: usize,
+    colour: multiview_core::color::ColorInfo,
+    settings: usize,
+) -> crate::output_routing::PassEligibility {
+    use multiview_config::CodecFamily;
+    use multiview_output::passthrough::match_rules::{PassCodec, Scan};
+    use multiview_output::passthrough::SlotSpec;
+    let not = crate::output_routing::PassEligibility::NotSupported;
+    let Some(Output::Hls { segment_ms, .. }) = declared else {
+        return not;
+    };
+    if !ts_hls {
+        return not;
+    }
+    let (codec, max_profile, max_level) = match CodecFamily::of(codec_token) {
+        // The slot's encoder is High at any level the encoder picks: High
+        // 5.1 is the ceiling a decoder for the slot must handle.
+        Some(CodecFamily::H264) => (PassCodec::H264, 100, 51),
+        Some(CodecFamily::Hevc) => (PassCodec::Hevc, 1, 153),
+        _ => return not,
+    };
+    let Some(colour) = slot_colour(colour) else {
+        return not;
+    };
+    // Segment length in ticks (default 2 s): a segment boundary must find
+    // an IDR within it.
+    let ms = u64::from(segment_ms.unwrap_or(2_000).max(1));
+    let num = u64::try_from(cadence.num).unwrap_or(0);
+    let den = u64::try_from(cadence.den).unwrap_or(1).max(1);
+    let max_gop_ticks = ms.saturating_mul(num) / den.saturating_mul(1_000);
+    if max_gop_ticks == 0 {
+        return not;
+    }
+    crate::output_routing::PassEligibility::Eligible {
+        slot: SlotSpec {
+            codec,
+            max_profile,
+            max_level,
+            width,
+            height,
+            fps: cadence,
+            scan: Scan::Progressive,
+            colour,
+            bit_depth: 8,
+            chroma: 1,
+            bitrate_ceiling_kbps: u64::try_from(bit_rate / 1000).unwrap_or(u64::MAX).max(1),
+            max_gop_ticks,
+            b_frames_allowed: true,
+        },
+        settings,
+    }
+}
+
+/// The ITU-T H.273 code points of the slot's colour (`None` when an axis is
+/// unspecified: an untagged slot never matches).
+fn slot_colour(
+    c: multiview_core::color::ColorInfo,
+) -> Option<multiview_output::passthrough::match_rules::ColourTags> {
+    use multiview_core::color::{
+        ColorPrimaries, ColorRange, MatrixCoefficients, TransferCharacteristic,
+    };
+    let primaries = match c.primaries {
+        ColorPrimaries::Bt709 => 1,
+        ColorPrimaries::Bt601_625 => 5,
+        ColorPrimaries::Bt601_525 => 6,
+        ColorPrimaries::Bt2020 => 9,
+        _ => return None,
+    };
+    let transfer = match c.transfer {
+        TransferCharacteristic::Bt709 => 1,
+        TransferCharacteristic::Bt601 => 6,
+        TransferCharacteristic::Bt2020 => 14,
+        TransferCharacteristic::Srgb => 13,
+        TransferCharacteristic::Pq => 16,
+        TransferCharacteristic::Hlg => 18,
+        _ => return None,
+    };
+    let matrix = match c.matrix {
+        MatrixCoefficients::Bt709 => 1,
+        MatrixCoefficients::Bt601 => 6,
+        MatrixCoefficients::Bt2020Ncl => 9,
+        MatrixCoefficients::Rgb => 0,
+        _ => return None,
+    };
+    let range = match c.range {
+        ColorRange::Limited => 0,
+        ColorRange::Full => 1,
+        _ => return None,
+    };
+    Some(multiview_output::passthrough::match_rules::ColourTags {
+        primaries: Some(primaries),
+        transfer: Some(transfer),
+        matrix: Some(matrix),
+        range: Some(range),
+    })
+}
+
+/// The passthrough key opener (#344 D2b), run on the `routing-open` thread:
+/// subscribes the source's tap, bakes the format slate with the output's
+/// own encoder settings (the encoder is dropped after the bake: no session
+/// is held) and builds the key with its own matcher. A bake failure (for
+/// example no H.264 encoder linked) is the open's error: the candidate is
+/// not opened and the readback says why.
+fn passthrough_opener(
+    configs: Vec<EncodeConfig>,
+    cadence: Rational,
+    origin: crate::timing_status::EpochAnchorSlot,
+) -> crate::output_routing::PassOpenFn {
+    use multiview_ffmpeg::idr::CodecKind;
+    Box::new(move |req| {
+        let cfg = configs
+            .get(req.settings)
+            .ok_or_else(|| "unknown rendition settings".to_owned())?;
+        let tap = crate::passthrough_tap::lookup(&req.source)
+            .ok_or_else(|| "source has no compressed tap".to_owned())?;
+        let codec = match req.slot.codec {
+            multiview_output::passthrough::match_rules::PassCodec::H264 => CodecKind::H264,
+            multiview_output::passthrough::match_rules::PassCodec::Hevc => CodecKind::Hevc,
+            _ => return Err("slot codec has no passthrough".to_owned()),
+        };
+        let black = Nv12Image::solid(
+            cfg.width,
+            cfg.height,
+            16,
+            128,
+            128,
+            multiview_core::color::ColorInfo::default(),
+        )
+        .map_err(|e| e.to_string())?;
+        let slate = crate::passthrough_live::bake_slate(cfg, &black, codec)?;
+        let reader = tap
+            .tap()
+            .subscribe()
+            .ok_or_else(|| "the source's tap has no free consumer".to_owned())?;
+        let origin = Arc::clone(&origin);
+        let now: crate::passthrough_live::NowNs = Box::new(move || {
+            origin
+                .load()
+                .and_then(|run| u64::try_from(run.time().now_nanos()).ok())
+                .unwrap_or(0)
+        });
+        let traits_tap = Arc::clone(&tap);
+        let live = crate::passthrough_live::PassthroughLive::new(
+            crate::passthrough_live::PassthroughSpec {
+                cadence,
+                codec,
+                stream_params: None,
+            },
+            reader,
+            &slate,
+            now,
+        )
+        .ok_or_else(|| "empty slate".to_owned())?
+        .with_matcher(
+            req.slot.clone(),
+            Box::new(move || traits_tap.stream().map(|s| s.traits.clone())),
+        )
+        .with_slate_move_points(false);
+        let status = live.status();
+        let live: Box<dyn crate::output_routing::LiveEncoder> = Box::new(live);
+        Ok((live, status))
     })
 }
 

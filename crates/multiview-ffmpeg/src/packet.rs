@@ -272,6 +272,21 @@ impl StreamCodecParameters {
         }
     }
 
+    /// Snapshot demuxed stream parameters (an independent copy): a muxer
+    /// carrying a stream's packets unchanged (passthrough, #344) is seeded
+    /// from the source's own parameters.
+    #[must_use]
+    pub fn from_parameters(
+        parameters: &codec::Parameters,
+        video_dimensions: Option<(u32, u32)>,
+    ) -> Self {
+        Self {
+            parameters: parameters.clone(),
+            configured_bit_rate: None,
+            video_dimensions,
+        }
+    }
+
     /// Snapshot the codec parameters of an opened audio encoder.
     #[must_use]
     pub fn from_audio_encoder(encoder: &crate::encode::AudioEncoder) -> Self {

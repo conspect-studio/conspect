@@ -238,6 +238,7 @@ pub(crate) fn plan(
             cost: None,
             refusal,
             note,
+            passthrough: None,
         });
     }
     let can_take = crosspoints.iter().all(|c| c.refusal.is_none());
