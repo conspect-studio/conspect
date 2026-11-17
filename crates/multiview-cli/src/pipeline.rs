@@ -32208,11 +32208,11 @@ segment_ms = 1000
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn displayed_8kib_captions_keep_the_cadence() {
-        run_with_cue_bytes(8 * 1024).await;
+        Box::pin(run_with_cue_bytes(8 * 1024)).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn displayed_64kib_captions_keep_the_cadence() {
-        run_with_cue_bytes(64 * 1024).await;
+        Box::pin(run_with_cue_bytes(64 * 1024)).await;
     }
 }
