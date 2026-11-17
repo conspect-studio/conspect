@@ -6132,8 +6132,7 @@ export interface components {
             clip?: number | null;
             /** @description `keyer_set`: fill source id (a source; `in:<n>` is refused). */
             fill?: string | null;
-            /** @description `keyer_set`: destination rectangle in canvas pixels. */
-            fly?: Record<string, never> | null;
+            fly?: null | components["schemas"]["KeyerRectDoc"];
             /**
              * Format: float
              * @description `keyer_set`: luma gain, finite and `>= 0`.
@@ -6155,10 +6154,8 @@ export interface components {
             loss?: string | null;
             /** @description `keyer_set`: `stale`, `reconnecting` or `no_signal`. */
             loss_trigger?: string | null;
-            /** @description `keyer_set`: mask in fill-source pixels. */
-            mask?: Record<string, never> | null;
-            /** @description `keyer_set`: admitted source envelope `{w, h}`. */
-            max_source?: Record<string, never> | null;
+            mask?: null | components["schemas"]["KeyerRectDoc"];
+            max_source?: null | components["schemas"]["KeyerSizeDoc"];
             /** @description `keyer_cut` / `keyer_auto`: the target state. */
             on?: boolean | null;
             on_air?: null | components["schemas"]["KeyerOnAir"];
@@ -6197,28 +6194,84 @@ export interface components {
             on_air: boolean;
             refusal?: null | components["schemas"]["PatchRefusal"];
         };
+        /**
+         * @description An in-flight keyer AUTO: the weight at output tick `t` is
+         *     `clamp((t - start_tick) / rate, 0, 1)`, reversed when `to_on` is false.
+         */
+        KeyerRampView: {
+            /**
+             * Format: int32
+             * @description Duration in output frames.
+             */
+            rate: number;
+            /**
+             * Format: int64
+             * @description Output tick the ramp started on.
+             */
+            start_tick: number;
+            /** @description Ramping on (`true`) or off. */
+            to_on: boolean;
+        };
+        /**
+         * @description A keyer rectangle in pixels (`fly` in canvas pixels, `mask` in
+         *     fill-source pixels); mirrors `multiview_config::KeyerRect`.
+         */
+        KeyerRectDoc: {
+            /**
+             * Format: int32
+             * @description Height.
+             */
+            h: number;
+            /**
+             * Format: int32
+             * @description Width.
+             */
+            w: number;
+            /**
+             * Format: int32
+             * @description Left column.
+             */
+            x: number;
+            /**
+             * Format: int32
+             * @description Top row.
+             */
+            y: number;
+        };
         /** @description One `keyers[]` row of `GET /api/v1/switcher/{me}` (design note §8). */
         KeyerRow: {
+            /**
+             * Format: float
+             * @description Luma clip, `[0, 1]` (the committed value; meaningful for `luma`).
+             */
+            clip: number;
             /** @description `dsk` (USKs arrive with K3). */
             family: string;
             /** @description Fill source id, or `"redacted"`. */
             fill: string;
-            /** @description Destination rectangle, `null` = full canvas. */
-            fly?: Record<string, never> | null;
+            fly?: null | components["schemas"]["KeyerRectDoc"];
+            /**
+             * Format: float
+             * @description Luma gain (the committed value; meaningful for `luma`).
+             */
+            gain: number;
             /** @description Keyer id within the program. */
             id: string;
+            /** @description Matte inverted. */
+            invert: boolean;
             /** @description Key source id, `"redacted"`, or `null` (self key). */
             key?: string | null;
             /** @description `drop_to_off_air` or `hold_last_good`. */
             loss: string;
-            /** @description Mask in fill-source pixels. */
-            mask?: Record<string, never> | null;
+            /** @description `stale`, `reconnecting` or `no_signal`. */
+            loss_trigger: string;
+            mask?: null | components["schemas"]["KeyerRectDoc"];
+            max_source?: null | components["schemas"]["KeyerSizeDoc"];
             /** @description On air. */
             on_air: boolean;
             /** @description An operator command is held waiting for fresh sources. */
             pending: boolean;
-            /** @description `{start_tick, rate, to_on}` while ramping; clients compute the weight. */
-            ramp?: Record<string, never> | null;
+            ramp?: null | components["schemas"]["KeyerRampView"];
             /**
              * Format: int32
              * @description AUTO rate in frames.
@@ -6230,6 +6283,19 @@ export interface components {
             tie: boolean;
             /** @description `linear` or `luma`. */
             type: string;
+        };
+        /** @description A picture size in pixels; mirrors `multiview_config::KeyerSize`. */
+        KeyerSizeDoc: {
+            /**
+             * Format: int32
+             * @description Height.
+             */
+            h: number;
+            /**
+             * Format: int32
+             * @description Width.
+             */
+            w: number;
         };
         /**
          * @description `OpenAPI` mirror of [`multiview_licence::LadderState`] (the seven conditions).
@@ -9489,6 +9555,27 @@ export interface components {
         };
         /** @description Engine-owned bus selection and current tick, never guessed from request. */
         SwitcherStateResponse: {
+            /**
+             * Format: int32
+             * @description Output canvas height in pixels.
+             */
+            canvas_height: number;
+            /**
+             * Format: int32
+             * @description Output canvas width in pixels (the `fly` coordinate space).
+             */
+            canvas_width: number;
+            /**
+             * Format: int64
+             * @description Exact output cadence denominator.
+             */
+            fps_den: number;
+            /**
+             * Format: int64
+             * @description Exact output cadence numerator: `tick` advances `fps_num / fps_den`
+             *     times a second (clients extrapolate a keyer ramp from it).
+             */
+            fps_num: number;
             /** @description Active AUTO status. */
             in_flight: boolean;
             /**

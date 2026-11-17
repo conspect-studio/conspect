@@ -1,20 +1,24 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  commandKeyer, flyPresetRect, keyerFillRedacted, keyerFillSource, keyerKeyRedacted,
+  commandKeyer, extrapolatedTick, flyPresetRect, keyerFillRedacted, keyerFillSource, keyerKeyRedacted,
   keyerKeySource, keyerRampWeight, keyerRamping, keyTallyForSource, planKeyer,
 } from './keyers';
 import type { KeyerRow } from './keyers';
+import { i18n } from '@lingui/core';
+import { messages } from '../locales/en/messages';
+
+i18n.load('en', messages);
+i18n.activate('en');
 
 afterEach(() => { vi.unstubAllGlobals(); });
 
 const ROW: KeyerRow = {
-  id: 'dsk1', family: 'dsk', fill: 'gfx-channel-1', key: null, type: 'linear',
-  fly: null, mask: null, on_air: false, tie: false, ramp: null, rate: 15,
-  loss: 'drop_to_off_air', stale: false, pending: false,
+  id: 'dsk1', family: 'dsk', fill: 'gfx-channel-1', key: null, type: 'linear', clip: 0, gain: 1, invert: false,
+  fly: null, mask: null, max_source: null, on_air: false, tie: false, ramp: null, rate: 15,
+  loss: 'drop_to_off_air', loss_trigger: 'reconnecting', stale: false, pending: false,
 };
-/** `ramp` is a free-form object in the generated schema; build a row with a concrete ramp shape for these tests. */
-function withRamp(ramp: Record<string, unknown>): KeyerRow {
-  return { ...ROW, ramp } as unknown as KeyerRow;
+function withRamp(ramp: NonNullable<KeyerRow['ramp']>): KeyerRow {
+  return { ...ROW, ramp };
 }
 
 describe('keyerFillSource / keyerKeySource / redaction', () => {
@@ -55,9 +59,12 @@ describe('keyerRamping / keyerRampWeight', () => {
     expect(keyerRampWeight(row, 110)).toBeCloseTo(0);
   });
 
-  it('ignores a malformed ramp object', () => {
-    const row = withRamp({ start_tick: 90 });
-    expect(keyerRamping(row)).toBe(false);
+  it('extrapolates the output tick at the exact cadence between snapshots', () => {
+    expect(extrapolatedTick(100, 1000, 1000, 25, 1)).toBe(100);
+    expect(extrapolatedTick(100, 1000, 1400, 25, 1)).toBeCloseTo(110);
+    expect(extrapolatedTick(100, 1000, 2000, 30000, 1001)).toBeCloseTo(100 + 30000 / 1001);
+    expect(extrapolatedTick(100, 1000, 500, 25, 1)).toBe(100);
+    expect(extrapolatedTick(100, 1000, 2000, 0, 1)).toBe(100);
   });
 });
 
@@ -86,8 +93,11 @@ describe('keyTallyForSource', () => {
 describe('flyPresetRect', () => {
   const canvas = { w: 1920, h: 1080 };
   const box = { w: 480, h: 270 };
-  it('full ignores the box and covers the canvas', () => {
-    expect(flyPresetRect('full', canvas, box)).toEqual({ x: 0, y: 0, w: 1920, h: 1080 });
+  it('full is an explicit clear (null = the full canvas, whatever its size)', () => {
+    expect(flyPresetRect('full', canvas, box)).toBeNull();
+  });
+  it('lays presets out on a non-1080p canvas', () => {
+    expect(flyPresetRect('bottom_right', { w: 1280, h: 720 }, { w: 320, h: 180 })).toEqual({ x: 960, y: 540, w: 320, h: 180 });
   });
   it('corners place the box at each edge', () => {
     expect(flyPresetRect('top_left', canvas, box)).toEqual({ x: 0, y: 0, w: 480, h: 270 });
@@ -111,7 +121,9 @@ describe('planKeyer / commandKeyer', () => {
     vi.stubGlobal('fetch', fetchMock);
     const plan = await planKeyer(req);
     expect(plan.can_take).toBe(true);
-    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/v1/switcher/plan');
+    const sent = fetchMock.mock.calls[0]?.[0] as Request;
+    expect(new URL(sent.url).pathname).toBe('/api/v1/switcher/plan');
+    expect(await sent.json()).toEqual(req);
   });
 
   it('commandKeyer posts to /switcher/commands/<action> and parses the accepted body', async () => {
@@ -119,7 +131,13 @@ describe('planKeyer / commandKeyer', () => {
     vi.stubGlobal('fetch', fetchMock);
     const accepted = await commandKeyer('keyer_cut', req, { idempotencyKey: 'k1' });
     expect(accepted).toEqual({ operation_id: 'op-1', kind: 'keyer_cut' });
-    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/v1/switcher/commands/keyer_cut');
-    expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).get('Idempotency-Key')).toBe('k1');
+    const sent = fetchMock.mock.calls[0]?.[0] as Request;
+    expect(new URL(sent.url).pathname).toBe('/api/v1/switcher/commands/keyer_cut');
+    expect(sent.headers.get('Idempotency-Key')).toBe('k1');
+  });
+
+  it('a 409 problem keeps its type and detail for the caller', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ type: '/problems/on-air-protected', title: 'Keyer request refused', status: 409, detail: 'on air' }), { status: 409, headers: { 'Content-Type': 'application/problem+json' } })));
+    await expect(commandKeyer('keyer_set', { ...req, action: 'keyer_set' }, { idempotencyKey: 'k2' })).rejects.toMatchObject({ status: 409, problemType: '/problems/on-air-protected', detail: 'on air' });
   });
 });
