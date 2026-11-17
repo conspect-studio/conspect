@@ -136,6 +136,8 @@ struct FakeCast {
     hidden: std::sync::atomic::AtomicBool,
     /// The outputs report `disabled` (#418 review r7).
     disabled: std::sync::atomic::AtomicBool,
+    /// Per output: the engine's content labels (ADR-0114 decision 5.4).
+    labels: HashMap<String, Arc<multiview_control::cast_streams::identity::OutputLabels>>,
 }
 
 impl FakeCast {
@@ -209,6 +211,12 @@ impl CastEngine for FakeCast {
     }
     fn clock(&self, _id: &str, _wall_now_unix_ns: i64) -> Option<CastClock> {
         *self.clock.lock().unwrap()
+    }
+    fn labels(
+        &self,
+        id: &str,
+    ) -> Option<Arc<multiview_control::cast_streams::identity::OutputLabels>> {
+        self.labels.get(id).cloned()
     }
 }
 
@@ -414,6 +422,17 @@ fn rig_mode(doc: &str, mode: Mode, adjust: impl FnOnce(AppState) -> AppState) ->
         segments: Mutex::new(HashMap::new()),
         hidden: std::sync::atomic::AtomicBool::new(false),
         disabled: std::sync::atomic::AtomicBool::new(false),
+        labels: ["cast-1", "cast-2"]
+            .iter()
+            .map(|id| {
+                use multiview_control::cast_streams::identity::{identity, Component, OutputLabels};
+                let labels = Arc::new(OutputLabels::new());
+                labels.record(&Component::Video, 0, identity(&Component::Video, "program"));
+                labels.record(&Component::Audio, 0, identity(&Component::Audio, "program"));
+                labels.set_labelled_through(1);
+                ((*id).to_owned(), labels)
+            })
+            .collect(),
     });
     let routing = FakeRouting::new();
     let now = Arc::new(AtomicU64::new(1_000_000));
@@ -3852,4 +3871,222 @@ async fn the_preflight_runs_the_shared_token_check() {
         StatusCode::NOT_FOUND,
         "revoked"
     );
+}
+
+
+// ---------------------------------------------------------------- ADR-0114 slice 4: the MoQ rung
+
+mod moq_rung {
+    use super::*;
+    use multiview_control::auth::Principal;
+    use multiview_control::cast_streams::identity::{identity, CastAttachment, Component};
+    use multiview_control::moq::{
+        MoqFence, MoqLease, MoqProvider, MoqReject, MoqRegistry, MoqVideo,
+    };
+    use multiview_control::WhepScope;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct Fake {
+        /// `(principal key id, scope label)` of each cast admission.
+        admitted: Mutex<Vec<(String, String)>>,
+        attachments: Mutex<Vec<Arc<CastAttachment>>>,
+        revoked: Arc<AtomicU64>,
+    }
+    struct Revoke(Arc<AtomicU64>);
+    impl MoqFence for Revoke {
+        fn revoke(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl MoqProvider for Fake {
+        fn available(&self) -> bool {
+            true
+        }
+        fn admit(
+            &self,
+            _: &Principal,
+            _: &WhepScope,
+            _: &str,
+            _: Duration,
+        ) -> Result<(MoqLease, Arc<dyn MoqFence>), MoqReject> {
+            Err(MoqReject::Unavailable)
+        }
+        fn admit_cast(
+            &self,
+            principal: &Principal,
+            scope: &WhepScope,
+            _: &str,
+            _: Duration,
+            gate: Arc<CastAttachment>,
+        ) -> Result<(MoqLease, Arc<dyn MoqFence>), MoqReject> {
+            self.admitted
+                .lock()
+                .unwrap()
+                .push((principal.key_id.clone(), scope.label()));
+            self.attachments.lock().unwrap().push(gate);
+            Ok((
+                MoqLease {
+                    lease_id: String::new(),
+                    generation: 1,
+                    expires_at: String::new(),
+                    expires_in_ms: 0,
+                    url: "https://engine.test/moq?ticket=t".into(),
+                    broadcast: "media".into(),
+                    protocol: "moq-transport-18".into(),
+                    video: MoqVideo {
+                        codec: "avc1.640029".into(),
+                        coded_width: 640,
+                        coded_height: 360,
+                        description: None,
+                    },
+                    video_alternatives: vec![],
+                    audio: vec![],
+                    clock_wall_micros: None,
+                },
+                Arc::new(Revoke(Arc::clone(&self.revoked))),
+            ))
+        }
+    }
+
+    fn moq_rig(capacity: usize) -> (Rig, Arc<Fake>) {
+        let fake = Arc::new(Fake::default());
+        let provider: Arc<dyn MoqProvider> = fake.clone();
+        let rig = rig_with(move |state| {
+            state
+                .with_moq(Arc::new(MoqRegistry::new(provider, Duration::from_secs(30), capacity)))
+                .with_cast_ladder(vec!["moq".into(), "hls".into()])
+        });
+        (rig, fake)
+    }
+
+    /// A stream of SCOPED (owner of output-0, may read source `a`) on
+    /// output-0 showing `a`: `(id, token)`.
+    async fn scoped_stream(rig: &Rig) -> (String, String) {
+        let (status, doc) = create(
+            rig,
+            SCOPED,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{doc}");
+        (doc["id"].as_str().unwrap().to_owned(), token_of(&doc))
+    }
+
+    /// The ladder attaches MoQ through the shared check: one admission with
+    /// the owner's principal on the cast output only, the lease fields of
+    /// decision 3, `then: ["hls"]`, and the attachment cleared for the
+    /// identities current now and registered with the token.
+    #[tokio::test]
+    async fn the_ladder_attaches_moq_cleared_for_the_present() {
+        let (rig, fake) = moq_rig(16);
+        let (id, token) = scoped_stream(&rig).await;
+        let (status, body, headers) = ladder(&rig, &token, &probe_body()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_eq!(body["attach"]["rung"], "moq", "{body}");
+        assert_eq!(body["attach"]["broadcast"], "media");
+        assert_eq!(body["attach"]["url"], "https://engine.test/moq?ticket=t");
+        assert_eq!(body["attach"]["video"]["codec"], "avc1.640029");
+        assert!(body["attach"]["expires_in_ms"].as_u64().unwrap() <= 30_000);
+        assert_eq!(body["then"], serde_json::json!(["hls"]));
+        let admitted = fake.admitted.lock().unwrap().clone();
+        assert_eq!(admitted, [("cs-scoped".to_owned(), "output:cast-1".to_owned())]);
+        let attachment = fake.attachments.lock().unwrap()[0].clone();
+        assert!(attachment
+            .clearance()
+            .clears(&Component::Video, identity(&Component::Video, "program")));
+        assert_eq!(rig.state.cast_streams.attachments(&id).len(), 1);
+    }
+
+    /// Review note R2-N4: no subscription left gives the next rung, not an
+    /// error; a receiver without a frame counter is never offered MoQ.
+    #[tokio::test]
+    async fn no_subscription_left_offers_the_next_rung() {
+        let (rig, fake) = moq_rig(0);
+        let (_, token) = scoped_stream(&rig).await;
+        let (status, body, _) = ladder(&rig, &token, &probe_body()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["attach"], serde_json::json!({"rung": "hls"}));
+        let (rig, fake2) = moq_rig(16);
+        let (_, token) = scoped_stream(&rig).await;
+        let mut no_frames = probe_body();
+        no_frames["caps"]["frames"] = serde_json::Value::Null;
+        let (_, body, _) = ladder(&rig, &token, &no_frames).await;
+        assert_eq!(body["attach"]["rung"], "hls");
+        assert!(fake.admitted.lock().unwrap().is_empty());
+        assert!(fake2.admitted.lock().unwrap().is_empty());
+    }
+
+    /// Decision 5.2: deleting the stream fences the attachment and closes
+    /// the lease (the transport fence runs); the token then gets the 404.
+    #[tokio::test]
+    async fn a_revoke_fences_the_moq_attachment_and_closes_its_lease() {
+        let (rig, fake) = moq_rig(16);
+        let (id, token) = scoped_stream(&rig).await;
+        let (_, body, _) = ladder(&rig, &token, &probe_body()).await;
+        assert_eq!(body["attach"]["rung"], "moq");
+        let attachment = fake.attachments.lock().unwrap()[0].clone();
+        let r = send(&rig.router, delete(&format!("/api/v1/cast/streams/{id}"), SCOPED)).await;
+        assert!(r.status().is_success(), "{}", r.status());
+        assert!(attachment.is_fenced());
+        assert!(fake.revoked.load(Ordering::SeqCst) >= 1, "the lease's transport fence ran");
+        let (status, _, _) = ladder(&rig, &token, &probe_body()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Decision 5.4 "Who mints": a take the owner may read clears the live
+    /// attachment for the new identity before the engine hears of it and
+    /// registers that identity as requested; a take the owner may not read
+    /// revokes the token and fences the attachment before the take is sent.
+    #[tokio::test]
+    async fn a_take_clears_or_fences_the_live_attachment() {
+        let (rig, fake) = moq_rig(16);
+        let (_, token) = scoped_stream(&rig).await;
+        let (_, body, _) = ladder(&rig, &token, &probe_body()).await;
+        assert_eq!(body["attach"]["rung"], "moq", "{body}");
+        let attachment = fake.attachments.lock().unwrap()[0].clone();
+        let readable = send(
+            &rig.router,
+            route_take(OPERATOR_TOKEN, "moq-take-a", "output-0", serde_json::json!({"bus": "program"})),
+        )
+        .await;
+        assert_eq!(readable.status(), StatusCode::ACCEPTED);
+        let program = identity(&Component::Video, "program");
+        assert!(attachment.clearance().clears(&Component::Video, program));
+        let labels = rig.cast.labels["cast-1"].clone();
+        assert_eq!(labels.label(program), program, "registered as requested");
+        assert!(!attachment.is_fenced());
+        let takes_before = rig.routing.takes().len();
+        let unreadable = send(
+            &rig.router,
+            route_take(
+                OPERATOR_TOKEN,
+                "moq-take-secret",
+                "output-0",
+                serde_json::json!({"source": "secret-cam"}),
+            ),
+        )
+        .await;
+        assert_eq!(unreadable.status(), StatusCode::ACCEPTED);
+        assert!(attachment.is_fenced(), "revoked and fenced");
+        assert_eq!(rig.routing.takes().len(), takes_before + 1);
+        assert!(!attachment
+            .clearance()
+            .clears(&Component::Video, identity(&Component::Video, "src:secret-cam")));
+    }
+
+    /// Decision 3: a call reporting `failed` for MoQ answers with the next
+    /// rung (here HLS), not MoQ again.
+    #[tokio::test]
+    async fn a_failed_moq_answers_the_next_rung() {
+        let (rig, fake) = moq_rig(16);
+        let (_, token) = scoped_stream(&rig).await;
+        let mut failed = probe_body();
+        failed["failed"] = serde_json::json!({"rung": "moq", "stage": "first-frame", "ms": 3000});
+        let (status, body, _) = ladder(&rig, &token, &failed).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["attach"]["rung"], "hls", "{body}");
+        assert!(fake.admitted.lock().unwrap().is_empty());
+    }
 }

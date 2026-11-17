@@ -355,7 +355,8 @@ async fn take_ladder(state: &AppState, token: &str, body: Body) -> Response {
         .as_ref()
         .and_then(|engine| engine.clock(&again.config_id, t1.saturating_mul(1000)));
     let offered = if request.full {
-        Some(attach_best(state, &again, request.probe.as_ref()))
+        let failed = request.failed.as_ref().map(|f| f.rung.clone());
+        Some(attach_best(state, &again, request.probe.as_ref(), failed.as_deref()))
     } else {
         None
     };
@@ -427,8 +428,13 @@ fn attach_best(
     state: &AppState,
     admitted: &crate::cast_streams::Admitted,
     probe: Option<&crate::cast_streams::ladder::ReceiverProbe>,
+    failed: Option<&str>,
 ) -> Offered {
-    let served = served_now(state, &admitted.config_id);
+    // A call reporting `failed` answers with the next rung: the failed one
+    // is left out of this answer (the device's own memory keeps it out of
+    // later ones through `skip`). HLS is the floor and is never left out.
+    let mut served = served_now(state, &admitted.config_id);
+    served.retain(|rung| *rung == "hls" || Some(*rung) != failed);
     let (first, mut rest) =
         crate::cast_streams::ladder::offer(&state.cast_streams.ladder(), &served, probe);
     let mut candidate = first;

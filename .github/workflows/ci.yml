@@ -857,6 +857,11 @@ jobs:
           cargo test --locked -p multiview-cli --features gpl-codecs,overlay --lib -- \
             cast_output::pipeline_tests::g_ --test-threads=1 2>&1 | tee cast-subtitle-tests.log
           grep -Eq '^test result: ok\. 1 passed; 0 failed;' cast-subtitle-tests.log
+          # ADR-0114 slice 4: the cast MoQ rung on the real pipeline (labels, the
+          # identity gate on the real attachment, the stalled-viewer chaos run).
+          cargo test --locked -p multiview-cli --features gpl-codecs,moq-output --lib -- \
+            cast_output::pipeline_tests::moq_rung cast_gate --test-threads=2 2>&1 | tee cast-moq-tests.log
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed;' cast-moq-tests.log
           npm ci --prefix tools/cast-proof --no-audit --no-fund
           # The receiver's probe.js: clock, latency windows, ES5-only (gating, no browser).
           node tools/cast-proof/test-probe-unit.mjs

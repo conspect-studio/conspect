@@ -242,7 +242,12 @@ pub(crate) fn clearance_now(
 ) -> Option<(std::sync::Arc<super::identity::OutputLabels>, super::identity::Clearance)> {
     let labels = labels(state, config_id)?;
     let current = labels.current();
-    if current.is_empty() {
+    // No picture label (the output is not routed by this run): no gate can
+    // judge its video, so no push rung attaches.
+    if !current
+        .iter()
+        .any(|(c, _)| *c == super::identity::Component::Video)
+    {
         return None;
     }
     let clearance = super::identity::Clearance::of(&current);
