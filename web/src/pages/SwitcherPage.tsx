@@ -20,11 +20,13 @@ import { useJpegPreview } from '../preview/useJpegPreview';
 import { getPatch, planPatch, takePatch } from '../api/patch';
 import type { PatchRequest } from '../api/patch';
 import { MixerInputBank } from '../components/switcher/MixerInputBank';
-import { commandKeyer, extrapolatedTick, keyerRampWeight, planKeyer } from '../api/keyers';
-import type { KeyerFields, KeyerRequest } from '../api/keyers';
+import { commandKeyer, extrapolatedTick, keyerIsUsk, keyerRampWeight, planKeyer } from '../api/keyers';
+import type { ArmedView, KeyerFields, KeyerRequest, KeyerRow } from '../api/keyers';
+import { OperationApiError } from '../api/operations';
 import type { RealtimeStatus } from '../realtime/connection';
 import { KeyerStrip } from '../components/switcher/KeyerStrip';
 import { KeyerPanel } from '../components/switcher/KeyerPanel';
+import { ArmStrip } from '../components/switcher/ArmStrip';
 
 const STATE_KEY = ['switcher', 'me1'] as const;
 const PATCH_KEY = ['patch'] as const;
@@ -158,6 +160,23 @@ export function SwitcherPage(): JSX.Element {
   const keyerVerb = (fields: Omit<KeyerRequest, 'me' | 'program'>): void => {
     void gated(() => keyerMutate.mutateAsync(fields)).catch(() => undefined);
   };
+  // `arm` (K3): the full next-transition set, planned then commanded behind
+  // the same gate; the toggles light only from the engine's `armed` view.
+  const [armError, setArmError] = useState<string | undefined>();
+  const armMutate = useMutation({
+    mutationFn: async (next: ArmedView) => {
+      const req: KeyerRequest = { me: 'me1', program: 'main', action: 'arm', background: next.background, keys: [...next.keys] };
+      const plan = await planKeyer(req);
+      if (!plan.can_take) throw new Error(plan.refusal?.detail ?? t`The arm set was refused`);
+      return submitTracked(() => commandKeyer('arm', req, { idempotencyKey: newIdempotencyKey() }),
+        { topic: 'switcher', resource: 'me1', event: 'switcher.operation', terminal: { kind: 'switcher-operation', me: 'me1' } });
+    },
+    onSuccess: (result) => { setOperationId(result.operationId); setFailureReason(undefined); setArmError(undefined); },
+    onError: (reason: Error) => {
+      setArmError(reason instanceof OperationApiError && reason.detail !== undefined ? `${reason.message}: ${reason.detail}` : reason.message);
+    },
+  });
+  const arm = (next: ArmedView): void => { void gated(() => armMutate.mutateAsync(next)).catch(() => undefined); };
   const take = (intent: Intent): void => { void gated(() => mutate.mutateAsync(intent)).catch(() => undefined); };
   // The output tick now, extrapolated from the snapshot at the exact cadence
   // so a ramp's progress advances between (change-only) snapshots.
@@ -178,6 +197,10 @@ export function SwitcherPage(): JSX.Element {
   useEffect(() => {
     if (rampDone) void queryClient.invalidateQueries({ queryKey: STATE_KEY });
   }, [rampDone, queryClient]);
+  // Defensive against older backends: `keyers`/`armed` may be absent at runtime.
+  const keyerRows: readonly KeyerRow[] = state.data?.keyers ?? [];
+  const uskRows = keyerRows.filter(keyerIsUsk);
+  const armedView: ArmedView | undefined = state.data?.armed;
   const canvas = state.data === undefined ? undefined : { w: state.data.canvas_width, h: state.data.canvas_height };
   const keyerSet = (keyer: string, fields: KeyerFields, allow: boolean): KeyerRequest => ({
     ...fields, me: 'me1', program: 'main', action: 'keyer_set', keyer, ...(allow ? { on_air: 'allow' } : {}),
@@ -222,15 +245,21 @@ export function SwitcherPage(): JSX.Element {
         <div className="space-y-1"><Label htmlFor="switcher-duration"><Trans>Auto frames</Trans></Label><Input id="switcher-duration" type="number" min="1" max="1000" value={duration} onChange={(event) => { setDuration(event.target.value); }} /></div>
         <Button disabled={!ready || !Number.isInteger(Number(duration)) || Number(duration) < 1} onClick={() => { take('auto'); }}><Trans>Auto</Trans></Button>
       </div>
-      {/*
-        TODO(#388): the BKGD/KEY 1-4 arm strip is built behind the presence of
-        USK rows/an `arm` verb in the generated client. K3 (upstream keyers)
-        is not merged — `components['schemas']` has no `arm` field as of this
-        commit — so this renders nothing rather than inventing API types.
-      */}
+      {/* A backend without upstream keyers (pre-K3) sends no `armed` view and no USK rows: no strip. */}
+      {armedView !== undefined && uskRows.length > 0 && (
+        <>
+          <ArmStrip
+            armed={armedView}
+            keys={uskRows}
+            disabledReason={keyerReason ?? (state.data?.in_flight === true ? t`The arm set cannot change during a transition` : undefined)}
+            onArm={arm}
+          />
+          {armError !== undefined && <p role="alert" className="text-destructive" data-testid="arm-error">{armError}</p>}
+        </>
+      )}
       {(state.data?.keyers ?? []).length > 0 && canvas !== undefined && (
-        <section className="space-y-3" aria-label={t`Downstream keyers`}>
-          <h2 className="font-semibold"><Trans>Downstream keyers</Trans></h2>
+        <section className="space-y-3" aria-label={t`Keyers`}>
+          <h2 className="font-semibold"><Trans>Keyers</Trans></h2>
           {stream !== 'open' && (
             <p role="status" className="rounded border border-amber-600 p-2" data-testid="keyer-stream-stale">
               <Trans>Realtime updates are not connected: keyer lamps and tally may be stale.</Trans>
@@ -242,8 +271,9 @@ export function SwitcherPage(): JSX.Element {
               row={row}
               tick={tickNow}
               disabledReason={keyerReason}
+              transitionInFlight={state.data?.in_flight === true}
               onTie={(tie) => { keyerVerb({ action: 'keyer_tie', keyer: row.id, tie }); }}
-              onCut={() => { keyerVerb({ action: 'keyer_cut', keyer: row.id, on: !row.on_air }); }}
+              onCut={() => { keyerVerb({ action: 'keyer_cut', keyer: row.id, on: !row.on_air, ...(keyerIsUsk(row) ? { family: 'usk' as const } : {}) }); }}
               onAuto={(rateFrames) => { keyerVerb({ action: 'keyer_auto', keyer: row.id, on: !row.on_air, duration_frames: rateFrames }); }}
             />
           ))}
@@ -268,7 +298,7 @@ export function SwitcherPage(): JSX.Element {
           ))}
         </section>
       )}
-      <p className="text-xs text-muted-foreground"><Trans>Aux buses, multi-M/E and compositions as sources remain future switcher stages. Upstream keyers (USK) and the BKGD/KEY arm strip arrive with #388.</Trans></p>
+      <p className="text-xs text-muted-foreground"><Trans>Aux buses and multi-M/E remain future switcher stages.</Trans></p>
     </main>
   );
 }

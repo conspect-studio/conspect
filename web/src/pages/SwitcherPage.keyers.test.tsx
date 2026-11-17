@@ -26,6 +26,7 @@ import { I18nProvider } from '@lingui/react';
 import { MemoryRouter } from 'react-router-dom';
 import { messages } from '../locales/en/messages';
 import { SwitcherPage } from './SwitcherPage';
+import { getOperationTracker } from '../components/broadcast/operationTracker';
 
 i18n.load('en', messages);
 i18n.activate('en');
@@ -37,8 +38,8 @@ const DSK1 = {
 };
 const BASE_STATE = {
   program_source: 'cam-1', preview_source: 'cam-2', tick: 7, in_flight: false,
-  canvas_width: 1280, canvas_height: 720, fps_num: 25, fps_den: 1, keyers: [DSK1], tally: { program: [], preview: [] },
-  transition: { kind: 'cut' },
+  canvas_width: 1280, canvas_height: 720, fps_num: 25, fps_den: 1, keyers: [DSK1] as typeof DSK1[], tally: { program: [], preview: [] },
+  transition: { kind: 'cut' }, armed: { background: true, keys: [] as string[] },
 };
 let state = BASE_STATE;
 let calls: { path: string; key: string | null; body: unknown }[] = [];
@@ -72,8 +73,10 @@ afterEach(() => {
 });
 afterAll(() => { server.close(); });
 
+let lastClient: QueryClient | undefined;
 function page() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+  lastClient = client;
   return render(<QueryClientProvider client={client}><I18nProvider i18n={i18n}><MemoryRouter><SwitcherPage /></MemoryRouter></I18nProvider></QueryClientProvider>);
 }
 function emit(envelope: Partial<Envelope> & Pick<Envelope, 't' | 'data'>): void {
@@ -193,7 +196,115 @@ describe('SwitcherPage keyer desk (K5)', () => {
     state = { ...BASE_STATE, keyers: [] };
     page();
     await screen.findByRole('button', { name: 'Cut' });
-    expect(screen.queryByText('Downstream keyers')).toBeNull();
-    expect(screen.queryByTestId('keyer-arm-bkgd')).toBeNull();
+    expect(screen.queryByText('Keyers')).toBeNull();
+    expect(screen.queryByTestId('arm-strip')).toBeNull();
+  });
+});
+
+const USK1 = { ...DSK1, id: 'usk1', family: 'usk', fill: 'cam-1' };
+const USK2 = { ...DSK1, id: 'usk2', family: 'usk', fill: 'gfx-channel-1', on_air: true };
+
+describe('SwitcherPage arm strip (K3 #388)', () => {
+  it('lights BKGD and KEY toggles from the armed view, with a lamp per KEY', async () => {
+    state = { ...BASE_STATE, keyers: [DSK1, USK1, USK2], armed: { background: false, keys: ['usk2'] } };
+    page();
+    const bkgd = await screen.findByTestId('keyer-arm-background');
+    expect(bkgd).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByTestId('keyer-arm-usk1')).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByTestId('keyer-arm-usk2')).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByTestId('keyer-arm-lamp-usk2')).toHaveAttribute('data-on-air', 'true');
+    expect(screen.getByTestId('keyer-arm-lamp-usk1')).toHaveAttribute('data-on-air', 'false');
+    expect(screen.queryByTestId('keyer-arm-dsk1')).toBeNull();
+  });
+
+  it('a toggle plans then commands arm with the full next set and an Idempotency-Key', async () => {
+    state = { ...BASE_STATE, keyers: [DSK1, USK1], armed: { background: true, keys: [] } };
+    page();
+    await userEvent.click(await screen.findByTestId('keyer-arm-usk1'));
+    await waitFor(() => { expect(calls.map((c) => c.path)).toEqual(['plan', 'commands/arm']); });
+    expect(calls[1]?.body).toEqual({ me: 'me1', program: 'main', action: 'arm', background: true, keys: ['usk1'] });
+    expect(calls[1]?.key).toMatch(/[0-9a-f-]{36}/);
+    // Not lit optimistically: only the next armed view lights it.
+    expect(screen.getByTestId('keyer-arm-usk1')).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('an arm in flight holds the shared gate: a second toggle or CUT submits nothing more', async () => {
+    const gate = deferred();
+    planGate = gate.promise;
+    state = { ...BASE_STATE, keyers: [DSK1, USK1], armed: { background: true, keys: [] } };
+    page();
+    await userEvent.click(await screen.findByTestId('keyer-arm-usk1'));
+    const bkgd = screen.getByTestId('keyer-arm-background');
+    await waitFor(() => { expect(bkgd).toHaveProperty('disabled', true); });
+    expect(bkgd).toHaveAttribute('title', 'A switcher request is in flight');
+    expect(bkgd.getAttribute('aria-describedby')).toBeTruthy();
+    const backgroundCut = screen.getAllByRole('button', { name: 'Cut' }).find((b) => !screen.getByTestId('keyer-strip-dsk1').contains(b));
+    expect(backgroundCut).toHaveProperty('disabled', true);
+    gate.resolve();
+    await waitFor(() => { expect(calls.filter((c) => c.path.startsWith('commands/'))).toHaveLength(1); });
+  });
+
+  it('a plan refusal (in-flight) shows its reason and commands nothing', async () => {
+    planAnswer = { can_take: false, class: 'class1', keyer: 'me1', on_air: false, refusal: { type: 'in-flight', detail: 'the arm set cannot change during a transition' } };
+    state = { ...BASE_STATE, keyers: [DSK1, USK1], armed: { background: true, keys: [] } };
+    page();
+    await userEvent.click(await screen.findByTestId('keyer-arm-usk1'));
+    expect(await screen.findByTestId('arm-error')).toHaveTextContent('the arm set cannot change during a transition');
+    expect(calls.map((c) => c.path)).toEqual(['plan']);
+  });
+
+  it('an unknown key (404 problem) shows the problem detail', async () => {
+    server.use(http.post('*/api/v1/switcher/plan', () => HttpResponse.json(
+      { type: '/problems/unknown-keyer', title: 'Keyer request refused', status: 404, detail: 'no upstream keyer "me1/usk1" is defined' }, { status: 404 })));
+    state = { ...BASE_STATE, keyers: [DSK1, USK1], armed: { background: true, keys: [] } };
+    page();
+    await userEvent.click(await screen.findByTestId('keyer-arm-usk1'));
+    expect(await screen.findByTestId('arm-error')).toHaveTextContent('no upstream keyer "me1/usk1" is defined');
+  });
+
+  it('a take-held refusal at the engine tick is shown as the operation failure reason', async () => {
+    commandAnswer = () => HttpResponse.json({ operation_id: 'op-arm', kind: 'arm' }, { status: 202 });
+    state = { ...BASE_STATE, keyers: [DSK1, USK1], armed: { background: true, keys: [] } };
+    page();
+    await userEvent.click(await screen.findByTestId('keyer-arm-usk1'));
+    await waitFor(() => { expect(calls.map((c) => c.path)).toEqual(['plan', 'commands/arm']); });
+    await screen.findByText(/op-arm/);
+    const outcome = { t: 'switcher.operation', id: 'me1', corr: 'op-arm', data: { me: 'me1', program: 'main', operation_id: 'op-arm', tick: 8, completed: false,
+      error: 'take-held: a take is held waiting for a fresh frame; arm after it lands or is refused' } } as const;
+    // The app shell's engine-events hook feeds the shared tracker; here the test does.
+    act(() => { if (lastClient) getOperationTracker(lastClient).onEnvelope({ v: 1, topic: 'switcher', seq: 2, ts: 0, ...outcome }); });
+    emit(outcome);
+    expect(await screen.findByText(/take-held/)).toBeTruthy();
+  });
+
+  it('a transition running disables every toggle with its reason', async () => {
+    state = { ...BASE_STATE, in_flight: true, keyers: [DSK1, USK1], armed: { background: true, keys: [] } };
+    page();
+    const key = await screen.findByTestId('keyer-arm-usk1');
+    expect(key).toHaveProperty('disabled', true);
+    expect(key).toHaveAttribute('title', 'The arm set cannot change during a transition');
+  });
+
+  it('CUT after a key-only arm is enabled even with PGM == PVW', async () => {
+    planAnswer = { can_take: true, class: 'class1', scene_version: 1 };
+    state = { ...BASE_STATE, program_source: 'cam-1', preview_source: 'cam-1', keyers: [DSK1, USK1], armed: { background: false, keys: ['usk1'] } };
+    page();
+    await screen.findByTestId('keyer-arm-usk1');
+    const strip = screen.getByTestId('keyer-strip-dsk1');
+    const backgroundCut = screen.getAllByRole('button', { name: 'Cut' }).find((b) => !strip.contains(b) && !screen.getByTestId('keyer-strip-usk1').contains(b));
+    expect(backgroundCut).toHaveProperty('disabled', false);
+    await userEvent.click(backgroundCut!);
+    await waitFor(() => { expect(calls.map((c) => c.path)).toEqual(['plan', 'commands/cut']); });
+  });
+
+  it('a USK strip offers CUT with family usk and no TIE/AUTO', async () => {
+    state = { ...BASE_STATE, keyers: [DSK1, USK1], armed: { background: true, keys: [] } };
+    page();
+    const strip = await screen.findByTestId('keyer-strip-usk1');
+    expect(within(strip).queryByRole('button', { name: 'Auto' })).toBeNull();
+    expect(within(strip).queryByRole('checkbox', { name: 'Tie' })).toBeNull();
+    await userEvent.click(within(strip).getByRole('button', { name: 'Cut' }));
+    await waitFor(() => { expect(calls.map((c) => c.path)).toEqual(['plan', 'commands/keyer_cut']); });
+    expect(calls[1]?.body).toMatchObject({ action: 'keyer_cut', keyer: 'usk1', family: 'usk', on: true });
   });
 });

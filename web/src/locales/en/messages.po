@@ -149,7 +149,7 @@ msgid "{0} failed before save; original slot remains attached."
 msgstr "{0} failed before save; original slot remains attached."
 
 #. placeholder {0}: row.id
-#: src/components/switcher/KeyerPanel.tsx:323
+#: src/components/switcher/KeyerPanel.tsx:355
 msgid "{0} is on air: this fill/key change needs explicit confirmation to allow it."
 msgstr "{0} is on air: this fill/key change needs explicit confirmation to allow it."
 
@@ -603,6 +603,10 @@ msgstr "A bearer token sent on the WHIP POST to the remote origin."
 msgid "A bearer token the publisher presents on the WHIP POST. Leave blank to require a control-plane API key with Write scope instead — publishing is never anonymous."
 msgstr "A bearer token the publisher presents on the WHIP POST. Leave blank to require a control-plane API key with Write scope instead — publishing is never anonymous."
 
+#: src/components/switcher/KeyerPanel.tsx:168
+msgid "A chroma key keys the fill itself, but this keyer's key source is hidden from you, so it cannot be cleared"
+msgstr "A chroma key keys the fill itself, but this keyer's key source is hidden from you, so it cannot be cleared"
+
 #: src/pages/docs/ConfigPage.tsx:26
 msgid "A Conspect deployment is one declarative document. It is authored as TOML and round-trips losslessly to JSON (the API wire form)."
 msgstr "A Conspect deployment is one declarative document. It is authored as TOML and round-trips losslessly to JSON (the API wire form)."
@@ -756,7 +760,7 @@ msgstr "A source is a managed input. Each one owns its ingest, decode, color han
 msgid "A source is an ingest input referenced by id for production, routing, and monitoring."
 msgstr "A source is an ingest input referenced by id for production, routing, and monitoring."
 
-#: src/pages/SwitcherPage.tsx:145
+#: src/pages/SwitcherPage.tsx:147
 msgid "A switcher request is in flight"
 msgstr "A switcher request is in flight"
 
@@ -1295,7 +1299,7 @@ msgstr "Allow a confirmed down/up-mix to the pinned layout"
 msgid "Allow a private/LAN address"
 msgstr "Allow a private/LAN address"
 
-#: src/components/switcher/KeyerPanel.tsx:324
+#: src/components/switcher/KeyerPanel.tsx:356
 msgid "Allow on-air change"
 msgstr "Allow on-air change"
 
@@ -1334,6 +1338,10 @@ msgstr "Amber"
 #: src/pages/SystemPage.tsx:91
 msgid "AMD"
 msgstr "AMD"
+
+#: src/components/switcher/ArmStrip.tsx:48
+msgid "An armed key's sources are hidden from you, so the arm set cannot be changed here"
+msgstr "An armed key's sources are hidden from you, so the arm set cannot be changed here"
 
 #: src/pages/MediaPlayersPage.tsx:907
 msgid "An asset id is required"
@@ -1383,6 +1391,10 @@ msgstr "An RTSP source URL must start with rtsp:// (or rtsps://)."
 msgid "An SRT URL must start with srt://."
 msgstr "An SRT URL must start with srt://."
 
+#: src/components/switcher/KeyerStrip.tsx:46
+msgid "An upstream keyer cuts only outside a transition"
+msgstr "An upstream keyer cuts only outside a transition"
+
 #: src/pages/SourcesPage.tsx:395
 msgid "Analog (hands on a dial)"
 msgstr "Analog (hands on a dial)"
@@ -1419,7 +1431,7 @@ msgstr "Another route already uses this input."
 msgid "Another slot already uses this menu label (name, else language); give this slot a distinct name or language."
 msgstr "Another slot already uses this menu label (name, else language); give this slot a distinct name or language."
 
-#: src/pages/SwitcherPage.tsx:263
+#: src/pages/SwitcherPage.tsx:293
 msgid "Another switcher request is in flight"
 msgstr "Another switcher request is in flight"
 
@@ -1497,7 +1509,7 @@ msgstr "Applied as {0}. Operation {1}."
 msgid "Applies on the next restart."
 msgstr "Applies on the next restart."
 
-#: src/components/switcher/KeyerPanel.tsx:307
+#: src/components/switcher/KeyerPanel.tsx:339
 #: src/iptv/SourceLinks.tsx:359
 #: src/pages/LayoutsPage.tsx:153
 msgid "Apply"
@@ -1574,6 +1586,10 @@ msgstr "Arm vamp exit"
 msgid "Arm vamp exit on {0}"
 msgstr "Arm vamp exit on {0}"
 
+#: src/components/switcher/KeyerStrip.tsx:65
+msgid "Armed"
+msgstr "Armed"
+
 #: src/events/AutomationPanel.tsx:35
 msgid "Armed — idle, waiting for a break."
 msgstr "Armed — idle, waiting for a break."
@@ -1622,6 +1638,10 @@ msgstr "Assign to selection"
 #: src/layout/components/AreaMatrixEditor.tsx:159
 msgid "Assigned the selection to area \"{0}\"."
 msgstr "Assigned the selection to area \"{0}\"."
+
+#: src/components/switcher/ArmStrip.tsx:49
+msgid "At least one of BKGD or a key must stay armed"
+msgstr "At least one of BKGD or a key must stay armed"
 
 #: src/pages/SourcesPage.tsx:658
 msgid "At the target"
@@ -1774,8 +1794,8 @@ msgstr "Authentication required to read source events."
 msgid "auto"
 msgstr "auto"
 
-#: src/components/switcher/KeyerStrip.tsx:100
-#: src/pages/SwitcherPage.tsx:223
+#: src/components/switcher/KeyerStrip.tsx:109
+#: src/pages/SwitcherPage.tsx:246
 msgid "Auto"
 msgstr "Auto"
 
@@ -1796,7 +1816,7 @@ msgid "AUTO {kindLabel} over {frames} frames"
 msgstr "AUTO {kindLabel} over {frames} frames"
 
 #: src/components/broadcast/ProductionDesk.tsx:328
-#: src/pages/SwitcherPage.tsx:222
+#: src/pages/SwitcherPage.tsx:245
 msgid "Auto frames"
 msgstr "Auto frames"
 
@@ -1833,9 +1853,9 @@ msgstr "Automation executor is not running on this server (source events are una
 msgid "Automation status could not be read."
 msgstr "Automation status could not be read."
 
-#: src/pages/SwitcherPage.tsx:271
-msgid "Aux buses, multi-M/E and compositions as sources remain future switcher stages. Upstream keyers (USK) and the BKGD/KEY arm strip arrive with #388."
-msgstr "Aux buses, multi-M/E and compositions as sources remain future switcher stages. Upstream keyers (USK) and the BKGD/KEY arm strip arrive with #388."
+#: src/pages/SwitcherPage.tsx:301
+msgid "Aux buses and multi-M/E remain future switcher stages."
+msgstr "Aux buses and multi-M/E remain future switcher stages."
 
 #: src/docs/registry.ts:528
 #: src/pages/docs/concepts/CodecsPage.tsx:80
@@ -1963,7 +1983,11 @@ msgstr "Bit→colour rules"
 msgid "Bitrate"
 msgstr "Bitrate"
 
-#: src/components/switcher/KeyerPanel.tsx:192
+#: src/components/switcher/ArmStrip.tsx:78
+msgid "BKGD"
+msgstr "BKGD"
+
+#: src/components/switcher/KeyerPanel.tsx:218
 msgid "BL"
 msgstr "BL"
 
@@ -2046,7 +2070,7 @@ msgstr "Bounded skew: the decoder runs its own clock, so its presentation drifts
 msgid "Box wipe"
 msgstr "Box wipe"
 
-#: src/components/switcher/KeyerPanel.tsx:192
+#: src/components/switcher/KeyerPanel.tsx:218
 msgid "BR"
 msgstr "BR"
 
@@ -2167,7 +2191,7 @@ msgstr "Can take."
 
 #: src/components/broadcast/BroadcastShell.tsx:46
 #: src/components/broadcast/ProductionDesk.tsx:343
-#: src/components/switcher/KeyerPanel.tsx:325
+#: src/components/switcher/KeyerPanel.tsx:357
 #: src/components/switcher/MixerInputBank.tsx:75
 #: src/events/AutomationPanel.tsx:135
 #: src/iptv/AddSourceDialog.tsx:79
@@ -2511,7 +2535,7 @@ msgstr "Cells (accessible)"
 msgid "Cells (optional, comma-separated)"
 msgstr "Cells (optional, comma-separated)"
 
-#: src/components/switcher/KeyerPanel.tsx:192
+#: src/components/switcher/KeyerPanel.tsx:218
 msgid "Centre"
 msgstr "Centre"
 
@@ -2613,7 +2637,7 @@ msgstr "Checking capture capabilities…"
 msgid "Checking permission…"
 msgstr "Checking permission…"
 
-#: src/pages/SwitcherPage.tsx:189
+#: src/pages/SwitcherPage.tsx:212
 msgid "Checking switcher engine…"
 msgstr "Checking switcher engine…"
 
@@ -2642,8 +2666,8 @@ msgstr "Choose a salvo first"
 msgid "Choose a salvo…"
 msgstr "Choose a salvo…"
 
-#: src/components/switcher/KeyerPanel.tsx:213
-#: src/pages/SwitcherPage.tsx:213
+#: src/components/switcher/KeyerPanel.tsx:239
+#: src/pages/SwitcherPage.tsx:236
 msgid "Choose a source"
 msgstr "Choose a source"
 
@@ -2680,6 +2704,14 @@ msgstr "Choosing a device…"
 #: src/pages/docs/concepts/TransportsPage.tsx:239
 msgid "Choosing a transport"
 msgstr "Choosing a transport"
+
+#: src/components/switcher/KeyerPanel.tsx:259
+msgid "Chroma"
+msgstr "Chroma"
+
+#: src/components/switcher/KeyerPanel.tsx:265
+msgid "Chroma colour"
+msgstr "Chroma colour"
 
 #: src/docs/registry.ts:633
 #: src/pages/docs/concepts/GlossaryPage.tsx:38
@@ -2739,11 +2771,11 @@ msgstr "Class"
 msgid "class {0} · +{1} encoder{2} · {3}"
 msgstr "class {0} · +{1} encoder{2} · {3}"
 
-#: src/components/switcher/KeyerPanel.tsx:311
+#: src/components/switcher/KeyerPanel.tsx:343
 msgid "Class 1 (seamless, one tick)"
 msgstr "Class 1 (seamless, one tick)"
 
-#: src/components/switcher/KeyerPanel.tsx:311
+#: src/components/switcher/KeyerPanel.tsx:343
 msgid "Class 2 (controlled reset)"
 msgstr "Class 2 (controlled reset)"
 
@@ -2837,7 +2869,7 @@ msgid "Cleared only"
 msgstr "Cleared only"
 
 #: src/components/broadcast/library/Chips.tsx:139
-#: src/components/switcher/KeyerPanel.tsx:238
+#: src/components/switcher/KeyerPanel.tsx:270
 #: src/pages/AudioPage.tsx:195
 #: src/pages/ProgramMeters.tsx:85
 msgid "Clip"
@@ -2876,7 +2908,7 @@ msgstr "Clip length is unknown"
 msgid "Clip library"
 msgstr "Clip library"
 
-#: src/components/switcher/KeyerPanel.tsx:139
+#: src/components/switcher/KeyerPanel.tsx:163
 msgid "Clip must be a number from 0 to 1"
 msgstr "Clip must be a number from 0 to 1"
 
@@ -3171,7 +3203,7 @@ msgstr "Confirm a program-affecting take?"
 msgid "Confirm a take on a Program output?"
 msgstr "Confirm a take on a Program output?"
 
-#: src/components/switcher/KeyerPanel.tsx:322
+#: src/components/switcher/KeyerPanel.tsx:354
 msgid "Confirm on-air keyer change"
 msgstr "Confirm on-air keyer change"
 
@@ -3420,12 +3452,12 @@ msgid "Correlation"
 msgstr "Correlation"
 
 #. placeholder {0}: reviewed.plan.cost.delta.toFixed(2)
-#: src/components/switcher/KeyerPanel.tsx:314
+#: src/components/switcher/KeyerPanel.tsx:346
 msgid "cost delta {0} canvas folds, exceeds the budget"
 msgstr "cost delta {0} canvas folds, exceeds the budget"
 
 #. placeholder {0}: reviewed.plan.cost.delta.toFixed(2)
-#: src/components/switcher/KeyerPanel.tsx:313
+#: src/components/switcher/KeyerPanel.tsx:345
 msgid "cost delta {0} canvas folds, fits the budget"
 msgstr "cost delta {0} canvas folds, fits the budget"
 
@@ -4008,8 +4040,8 @@ msgstr "Custom frame rate (num/den)"
 msgid "Custom…"
 msgstr "Custom…"
 
-#: src/components/switcher/KeyerStrip.tsx:77
-#: src/pages/SwitcherPage.tsx:221
+#: src/components/switcher/KeyerStrip.tsx:85
+#: src/pages/SwitcherPage.tsx:244
 msgid "Cut"
 msgstr "Cut"
 
@@ -4610,11 +4642,6 @@ msgstr "Download the current stores (sources, outputs, overlays, layouts, canvas
 msgid "Downloads a salted challenge as a CBOR file. It carries no raw identifiers — only salted digests the licence server can verify."
 msgstr "Downloads a salted challenge as a CBOR file. It carries no raw identifiers — only salted digests the licence server can verify."
 
-#: src/pages/SwitcherPage.tsx:232
-#: src/pages/SwitcherPage.tsx:233
-msgid "Downstream keyers"
-msgstr "Downstream keyers"
-
 #: src/pages/AudioPage.tsx:439
 msgid "draft"
 msgstr "draft"
@@ -4692,7 +4719,7 @@ msgstr "Drivers are compiled in; each maps its device family onto the same capab
 msgid "Drop the lease file into the machine's configured licence directory; it is picked up on the next start."
 msgstr "Drop the lease file into the machine's configured licence directory; it is picked up on the next start."
 
-#: src/components/switcher/KeyerPanel.tsx:301
+#: src/components/switcher/KeyerPanel.tsx:333
 msgid "Drop to off air"
 msgstr "Drop to off air"
 
@@ -5002,7 +5029,7 @@ msgstr "Element name"
 msgid "Embedded CEA-608 (CC1–CC4 only)"
 msgstr "Embedded CEA-608 (CC1–CC4 only)"
 
-#: src/components/switcher/KeyerPanel.tsx:279
+#: src/components/switcher/KeyerPanel.tsx:311
 msgid "Enable mask"
 msgstr "Enable mask"
 
@@ -5410,7 +5437,7 @@ msgstr "File path"
 msgid "Files and synthetic sources"
 msgstr "Files and synthetic sources"
 
-#: src/components/switcher/KeyerPanel.tsx:208
+#: src/components/switcher/KeyerPanel.tsx:234
 msgid "Fill"
 msgstr "Fill"
 
@@ -5490,40 +5517,40 @@ msgstr "Flags"
 
 #. placeholder {0}: canvas.w
 #. placeholder {1}: canvas.h
-#: src/components/switcher/KeyerPanel.tsx:249
+#: src/components/switcher/KeyerPanel.tsx:281
 msgid "Fly (canvas {0}×{1})"
 msgstr "Fly (canvas {0}×{1})"
 
 #. placeholder {0}: axisLabel(axis)
-#: src/components/switcher/KeyerPanel.tsx:266
+#: src/components/switcher/KeyerPanel.tsx:298
 msgid "Fly {0}"
 msgstr "Fly {0}"
 
-#: src/components/switcher/KeyerPanel.tsx:250
+#: src/components/switcher/KeyerPanel.tsx:282
 msgid "Fly preset"
 msgstr "Fly preset"
 
-#: src/components/switcher/KeyerPanel.tsx:194
+#: src/components/switcher/KeyerPanel.tsx:220
 msgid "Fly to the bottom left corner"
 msgstr "Fly to the bottom left corner"
 
-#: src/components/switcher/KeyerPanel.tsx:195
+#: src/components/switcher/KeyerPanel.tsx:221
 msgid "Fly to the bottom right corner"
 msgstr "Fly to the bottom right corner"
 
-#: src/components/switcher/KeyerPanel.tsx:195
+#: src/components/switcher/KeyerPanel.tsx:221
 msgid "Fly to the centre"
 msgstr "Fly to the centre"
 
-#: src/components/switcher/KeyerPanel.tsx:193
+#: src/components/switcher/KeyerPanel.tsx:219
 msgid "Fly to the top left corner"
 msgstr "Fly to the top left corner"
 
-#: src/components/switcher/KeyerPanel.tsx:194
+#: src/components/switcher/KeyerPanel.tsx:220
 msgid "Fly to the top right corner"
 msgstr "Fly to the top right corner"
 
-#: src/components/switcher/KeyerPanel.tsx:141
+#: src/components/switcher/KeyerPanel.tsx:165
 msgid "Fly x/y must be whole numbers of 0 or more and width/height at least 1"
 msgstr "Fly x/y must be whole numbers of 0 or more and width/height at least 1"
 
@@ -5663,15 +5690,15 @@ msgstr "Frozen / stale"
 msgid "Frozen picture"
 msgstr "Frozen picture"
 
-#: src/components/switcher/KeyerPanel.tsx:192
+#: src/components/switcher/KeyerPanel.tsx:218
 msgid "Full"
 msgstr "Full"
 
-#: src/components/switcher/KeyerPanel.tsx:291
+#: src/components/switcher/KeyerPanel.tsx:323
 msgid "Full (clear mask)"
 msgstr "Full (clear mask)"
 
-#: src/components/switcher/KeyerPanel.tsx:195
+#: src/components/switcher/KeyerPanel.tsx:221
 msgid "Full canvas (no fly)"
 msgstr "Full canvas (no fly)"
 
@@ -5683,7 +5710,7 @@ msgstr "Full content interpreted as limited: shadows <0>crush to solid black</0>
 msgid "Fully deterministic"
 msgstr "Fully deterministic"
 
-#: src/components/switcher/KeyerPanel.tsx:240
+#: src/components/switcher/KeyerPanel.tsx:272
 msgid "Gain"
 msgstr "Gain"
 
@@ -5691,7 +5718,7 @@ msgstr "Gain"
 msgid "Gain in dB (route {row})"
 msgstr "Gain in dB (route {row})"
 
-#: src/components/switcher/KeyerPanel.tsx:140
+#: src/components/switcher/KeyerPanel.tsx:164
 msgid "Gain must be a number of 0 or more"
 msgstr "Gain must be a number of 0 or more"
 
@@ -5988,7 +6015,7 @@ msgstr "Healthcheck"
 msgid "healthy"
 msgstr "healthy"
 
-#: src/components/switcher/KeyerPanel.tsx:196
+#: src/components/switcher/KeyerPanel.tsx:222
 msgid "Height"
 msgstr "Height"
 
@@ -6092,7 +6119,7 @@ msgstr "Hold at 00:00:00"
 msgid "Hold cue"
 msgstr "Hold cue"
 
-#: src/components/switcher/KeyerPanel.tsx:301
+#: src/components/switcher/KeyerPanel.tsx:333
 msgid "Hold last good"
 msgstr "Hold last good"
 
@@ -6487,7 +6514,7 @@ msgstr "invalid gain; edit exact gain in Details"
 msgid "Invalid source"
 msgstr "Invalid source"
 
-#: src/components/switcher/KeyerPanel.tsx:246
+#: src/components/switcher/KeyerPanel.tsx:278
 msgid "Invert matte"
 msgstr "Invert matte"
 
@@ -6557,19 +6584,40 @@ msgstr "Jitter buffer"
 msgid "Journal"
 msgstr "Journal"
 
-#: src/components/switcher/KeyerPanel.tsx:218
+#: src/components/switcher/KeyerPanel.tsx:244
 msgid "Key"
 msgstr "Key"
 
+#. placeholder {0}: index + 1
+#. placeholder {1}: row.id
+#: src/components/switcher/ArmStrip.tsx:83
+msgid "KEY {0} ({1})"
+msgstr "KEY {0} ({1})"
+
+#. placeholder {0}: index + 1
+#: src/components/switcher/ArmStrip.tsx:86
+msgid "KEY {0} off air"
+msgstr "KEY {0} off air"
+
+#. placeholder {0}: index + 1
+#: src/components/switcher/ArmStrip.tsx:86
+msgid "KEY {0} on air"
+msgstr "KEY {0} on air"
+
 #. placeholder {0}: row.id
-#: src/components/switcher/KeyerPanel.tsx:203
+#: src/components/switcher/KeyerPanel.tsx:229
 msgid "Keyer {0} panel"
 msgstr "Keyer {0} panel"
 
 #. placeholder {0}: row.id
-#: src/components/switcher/KeyerStrip.tsx:44
+#: src/components/switcher/KeyerStrip.tsx:50
 msgid "Keyer {0} strip"
 msgstr "Keyer {0} strip"
+
+#: src/pages/SwitcherPage.tsx:261
+#: src/pages/SwitcherPage.tsx:262
+msgid "Keyers"
+msgstr "Keyers"
 
 #: src/pages/AlarmsPage.tsx:218
 #: src/pages/OverlaysPage.tsx:173
@@ -6919,7 +6967,7 @@ msgstr "Limited content interpreted as full: blacks turn grey, the picture looks
 msgid "Limited vs full range"
 msgstr "Limited vs full range"
 
-#: src/components/switcher/KeyerPanel.tsx:231
+#: src/components/switcher/KeyerPanel.tsx:257
 msgid "Linear"
 msgstr "Linear"
 
@@ -7352,7 +7400,7 @@ msgstr "Loop"
 msgid "Loop default"
 msgstr "Loop default"
 
-#: src/components/switcher/KeyerPanel.tsx:298
+#: src/components/switcher/KeyerPanel.tsx:330
 msgid "Loss policy"
 msgstr "Loss policy"
 
@@ -7380,7 +7428,7 @@ msgstr "Low-latency HLS, adding <0>part_target_ms</0> and <1>gop_ms</1> tuning."
 msgid "Low–medium (window-tuned)"
 msgstr "Low–medium (window-tuned)"
 
-#: src/components/switcher/KeyerPanel.tsx:232
+#: src/components/switcher/KeyerPanel.tsx:258
 msgid "Luma"
 msgstr "Luma"
 
@@ -7495,16 +7543,16 @@ msgstr "Map rendering by <0>MapLibre GL JS</0> (BSD-3-Clause). No map tiles are 
 msgid "Marker type"
 msgstr "Marker type"
 
-#: src/components/switcher/KeyerPanel.tsx:275
+#: src/components/switcher/KeyerPanel.tsx:307
 msgid "Mask"
 msgstr "Mask"
 
 #. placeholder {0}: axisLabel(axis)
-#: src/components/switcher/KeyerPanel.tsx:285
+#: src/components/switcher/KeyerPanel.tsx:317
 msgid "Mask {0}"
 msgstr "Mask {0}"
 
-#: src/components/switcher/KeyerPanel.tsx:142
+#: src/components/switcher/KeyerPanel.tsx:166
 msgid "Mask x/y must be whole numbers of 0 or more and width/height at least 1"
 msgstr "Mask x/y must be whole numbers of 0 or more and width/height at least 1"
 
@@ -8087,6 +8135,11 @@ msgstr "Next due"
 msgid "Next page"
 msgstr "Next page"
 
+#: src/components/switcher/ArmStrip.tsx:76
+#: src/components/switcher/ArmStrip.tsx:77
+msgid "Next transition"
+msgstr "Next transition"
+
 #: src/pages/CapabilitiesPage.tsx:192
 #: src/pages/CapabilitiesPage.tsx:256
 #: src/pages/CapabilitiesPage.tsx:264
@@ -8173,7 +8226,7 @@ msgstr "No cast sessions are running."
 msgid "No cells yet. Add one to start composing the multiview."
 msgstr "No cells yet. Add one to start composing the multiview."
 
-#: src/components/switcher/KeyerPanel.tsx:144
+#: src/components/switcher/KeyerPanel.tsx:170
 msgid "No changes to review"
 msgstr "No changes to review"
 
@@ -8836,11 +8889,12 @@ msgstr "Off"
 msgid "Off (pinned off)"
 msgstr "Off (pinned off)"
 
-#: src/components/switcher/KeyerStrip.tsx:48
+#: src/components/switcher/KeyerStrip.tsx:54
 msgid "Off air"
 msgstr "Off air"
 
-#: src/components/switcher/KeyerStrip.tsx:54
+#: src/components/switcher/ArmStrip.tsx:91
+#: src/components/switcher/KeyerStrip.tsx:60
 msgid "OFF AIR"
 msgstr "OFF AIR"
 
@@ -8880,14 +8934,15 @@ msgstr "on {0}"
 msgid "on air"
 msgstr "on air"
 
-#: src/components/switcher/KeyerStrip.tsx:48
+#: src/components/switcher/KeyerStrip.tsx:54
 #: src/pages/approved/SourcesSurface.tsx:326
 #: src/pages/approved/SourcesSurface.tsx:337
 msgid "On air"
 msgstr "On air"
 
 #: src/components/broadcast/library/Chips.tsx:22
-#: src/components/switcher/KeyerStrip.tsx:54
+#: src/components/switcher/ArmStrip.tsx:91
+#: src/components/switcher/KeyerStrip.tsx:60
 msgid "ON AIR"
 msgstr "ON AIR"
 
@@ -9064,7 +9119,7 @@ msgstr "Operation {0}; the result arrives on the realtime stream."
 msgid "Operation id"
 msgstr "Operation id"
 
-#: src/pages/SwitcherPage.tsx:145
+#: src/pages/SwitcherPage.tsx:147
 msgid "Operation in flight or outcome pending"
 msgstr "Operation in flight or outcome pending"
 
@@ -9135,7 +9190,7 @@ msgstr "Outcome unknown; controls remain blocked until a correlated terminal eve
 msgid "outcome unknown; do not repeat"
 msgstr "outcome unknown; do not repeat"
 
-#: src/pages/SwitcherPage.tsx:196
+#: src/pages/SwitcherPage.tsx:219
 msgid "Outcome unknown; refresh the engine state before taking again"
 msgstr "Outcome unknown; refresh the engine state before taking again"
 
@@ -9364,7 +9419,7 @@ msgstr "Peers discovered"
 msgid "pending"
 msgstr "pending"
 
-#: src/components/switcher/KeyerStrip.tsx:58
+#: src/components/switcher/KeyerStrip.tsx:66
 msgid "Pending"
 msgstr "Pending"
 
@@ -9842,7 +9897,7 @@ msgstr "PROGRAM"
 msgid "Program (follows the switcher)"
 msgstr "Program (follows the switcher)"
 
-#: src/pages/SwitcherPage.tsx:187
+#: src/pages/SwitcherPage.tsx:210
 msgid "Program / Preview switcher"
 msgstr "Program / Preview switcher"
 
@@ -9996,7 +10051,7 @@ msgstr "Publish this source's upstream URL directly (credentials are always remo
 msgid "Publisher token (optional)"
 msgstr "Publisher token (optional)"
 
-#: src/pages/SwitcherPage.tsx:218
+#: src/pages/SwitcherPage.tsx:241
 msgid "Punch PGM"
 msgstr "Punch PGM"
 
@@ -10088,11 +10143,11 @@ msgid "Ranked by probe verdict, quality and flags."
 msgstr "Ranked by probe verdict, quality and flags."
 
 #. placeholder {0}: row.id
-#: src/components/switcher/KeyerStrip.tsx:79
+#: src/components/switcher/KeyerStrip.tsx:88
 msgid "Rate in frames for {0}"
 msgstr "Rate in frames for {0}"
 
-#: src/components/switcher/KeyerStrip.tsx:35
+#: src/components/switcher/KeyerStrip.tsx:40
 msgid "Rate must be a whole number of frames, 1–300"
 msgstr "Rate must be a whole number of frames, 1–300"
 
@@ -10158,7 +10213,7 @@ msgstr "Realtime"
 msgid "Realtime streams"
 msgstr "Realtime streams"
 
-#: src/pages/SwitcherPage.tsx:236
+#: src/pages/SwitcherPage.tsx:265
 msgid "Realtime updates are not connected: keyer lamps and tally may be stale."
 msgstr "Realtime updates are not connected: keyer lamps and tally may be stale."
 
@@ -10248,8 +10303,8 @@ msgid "Red = on Program, green = on Preview."
 msgstr "Red = on Program, green = on Preview."
 
 #: src/components/routing/SubtitlePatchPanel.tsx:252
-#: src/components/switcher/KeyerPanel.tsx:210
-#: src/components/switcher/KeyerPanel.tsx:220
+#: src/components/switcher/KeyerPanel.tsx:236
+#: src/components/switcher/KeyerPanel.tsx:246
 msgid "redacted"
 msgstr "redacted"
 
@@ -10675,7 +10730,7 @@ msgstr "Reveal {label}"
 msgid "Reverse"
 msgstr "Reverse"
 
-#: src/components/switcher/KeyerPanel.tsx:305
+#: src/components/switcher/KeyerPanel.tsx:337
 msgid "Review"
 msgstr "Review"
 
@@ -10691,7 +10746,7 @@ msgstr "Review changes"
 msgid "Review changes: {sourceName}"
 msgstr "Review changes: {sourceName}"
 
-#: src/components/switcher/KeyerPanel.tsx:145
+#: src/components/switcher/KeyerPanel.tsx:171
 msgid "Review this change first"
 msgstr "Review this change first"
 
@@ -11237,7 +11292,7 @@ msgstr "Select crosspoints first"
 msgid "Select or cue an item to see its fields."
 msgstr "Select or cue an item to see its fields."
 
-#: src/pages/SwitcherPage.tsx:217
+#: src/pages/SwitcherPage.tsx:240
 msgid "Select PVW"
 msgstr "Select PVW"
 
@@ -11273,7 +11328,7 @@ msgstr "Selected:"
 msgid "Selection unavailable"
 msgstr "Selection unavailable"
 
-#: src/components/switcher/KeyerPanel.tsx:223
+#: src/components/switcher/KeyerPanel.tsx:249
 msgid "Self key (fill alpha)"
 msgstr "Self key (fill alpha)"
 
@@ -11532,7 +11587,7 @@ msgstr "Sort order"
 #: src/pages/approved/SourcesSurface.tsx:365
 #: src/pages/IptvPage.tsx:232
 #: src/pages/OutputFormatFields.tsx:321
-#: src/pages/SwitcherPage.tsx:211
+#: src/pages/SwitcherPage.tsx:234
 msgid "Source"
 msgstr "Source"
 
@@ -11697,7 +11752,7 @@ msgstr "Stage"
 
 #: src/components/broadcast/ProductionDesk.tsx:51
 #: src/components/broadcast/ProductionDesk.tsx:69
-#: src/components/switcher/KeyerStrip.tsx:57
+#: src/components/switcher/KeyerStrip.tsx:63
 #: src/components/TileStateBadge.tsx:35
 msgid "Stale"
 msgstr "Stale"
@@ -12116,12 +12171,12 @@ msgstr "Switched to the alternative"
 
 #: src/app/navigation.tsx:63
 #: src/components/broadcast/ProductionDesk.tsx:320
-#: src/pages/SwitcherPage.tsx:193
+#: src/pages/SwitcherPage.tsx:216
 msgid "Switcher"
 msgstr "Switcher"
 
 #: src/components/broadcast/ProductionDesk.tsx:320
-#: src/pages/SwitcherPage.tsx:195
+#: src/pages/SwitcherPage.tsx:218
 msgid "Switcher operation rejected"
 msgstr "Switcher operation rejected"
 
@@ -12129,15 +12184,15 @@ msgstr "Switcher operation rejected"
 msgid "switcher required"
 msgstr "switcher required"
 
-#: src/pages/SwitcherPage.tsx:145
+#: src/pages/SwitcherPage.tsx:147
 msgid "Switcher unavailable"
 msgstr "Switcher unavailable"
 
-#: src/pages/SwitcherPage.tsx:188
+#: src/pages/SwitcherPage.tsx:211
 msgid "Switcher unavailable: no real Program/Preview bus is attached. Controls are disabled."
 msgstr "Switcher unavailable: no real Program/Preview bus is attached. Controls are disabled."
 
-#: src/pages/SwitcherPage.tsx:188
+#: src/pages/SwitcherPage.tsx:211
 msgid "Switcher unavailable: this server does not provide it yet (backend not deployed). Controls are disabled."
 msgstr "Switcher unavailable: this server does not provide it yet (backend not deployed). Controls are disabled."
 
@@ -12511,6 +12566,14 @@ msgstr "The API exposes no per-output restart readback."
 msgid "The applied event was not observed on the realtime stream. The command may or may not have been applied."
 msgstr "The applied event was not observed on the realtime stream. The command may or may not have been applied."
 
+#: src/pages/SwitcherPage.tsx:254
+msgid "The arm set cannot change during a transition"
+msgstr "The arm set cannot change during a transition"
+
+#: src/pages/SwitcherPage.tsx:170
+msgid "The arm set was refused"
+msgstr "The arm set was refused"
+
 #: src/pages/OutputFormatFields.tsx:184
 msgid "The bitrate must be a whole number from 1 to 1000000 kbit/s."
 msgstr "The bitrate must be a whole number from 1 to 1000000 kbit/s."
@@ -12554,6 +12617,10 @@ msgstr "The cell is too small."
 #: src/pages/graphics/PlayoutView.tsx:250
 msgid "The channel is a source the switcher uses: put its PGM source in a layout cell above program/video (it is transparent when clear), or use it full-screen."
 msgstr "The channel is a source the switcher uses: put its PGM source in a layout cell above program/video (it is transparent when clear), or use it full-screen."
+
+#: src/components/switcher/KeyerPanel.tsx:167
+msgid "The chroma colour must be #RRGGBB"
+msgstr "The chroma colour must be #RRGGBB"
 
 #: src/pages/docs/ContainerPage.tsx:153
 msgid "The compose stack uses a real liveness check: the HLS playlist must have been rewritten within the last 30 seconds. Because the segmenter rewrites the playlist every segment, a fresh timestamp proves the output clock is still producing frames. The check uses only coreutils, so it works on the slim runtime."
@@ -12746,23 +12813,23 @@ msgstr "The journal could not be downloaded."
 msgid "The key idea to keep: a <0>reference</0> is trusted timing infrastructure that carries only rate and phase — it is not a video source. Facilities lock outputs to a reference and then frame-align sources to those outputs; nobody lets program content drive a device's clock, because content can stall or lie. Conspect follows the same discipline in software: its output cadence can be disciplined by a reference, but never by a source."
 msgstr "The key idea to keep: a <0>reference</0> is trusted timing infrastructure that carries only rate and phase — it is not a video source. Facilities lock outputs to a reference and then frame-align sources to those outputs; nobody lets program content drive a device's clock, because content can stall or lie. Conspect follows the same discipline in software: its output cadence can be disciplined by a reference, but never by a source."
 
-#: src/api/keyers.ts:67
+#: src/api/keyers.ts:69
 msgid "The keyer command failed"
 msgstr "The keyer command failed"
 
-#: src/api/keyers.ts:68
+#: src/api/keyers.ts:70
 msgid "The keyer command was not accepted"
 msgstr "The keyer command was not accepted"
 
-#: src/api/keyers.ts:52
+#: src/api/keyers.ts:54
 msgid "The keyer plan failed"
 msgstr "The keyer plan failed"
 
-#: src/components/switcher/KeyerPanel.tsx:183
+#: src/components/switcher/KeyerPanel.tsx:209
 msgid "The keyer state changed; review the new plan before applying"
 msgstr "The keyer state changed; review the new plan before applying"
 
-#: src/pages/SwitcherPage.tsx:151
+#: src/pages/SwitcherPage.tsx:153
 msgid "The keyer verb was refused"
 msgstr "The keyer verb was refused"
 
@@ -12876,7 +12943,7 @@ msgstr "The output clock, genlock, PTP, and wall-clock time — how frames are p
 msgid "The output's own rendition"
 msgstr "The output's own rendition"
 
-#: src/pages/SwitcherPage.tsx:130
+#: src/pages/SwitcherPage.tsx:132
 msgid "The patch cannot be taken"
 msgstr "The patch cannot be taken"
 
@@ -12960,7 +13027,7 @@ msgstr "The requested screen does not exist."
 msgid "The REST base, long-running operations, ETags, the WebSocket and SSE streams, and the live API playground."
 msgstr "The REST base, long-running operations, ETags, the WebSocket and SSE streams, and the live API playground."
 
-#: src/components/switcher/KeyerPanel.tsx:145
+#: src/components/switcher/KeyerPanel.tsx:171
 msgid "The reviewed change was refused"
 msgstr "The reviewed change was refused"
 
@@ -12993,11 +13060,11 @@ msgstr "The same 8-bit pixel can use two different scales. <0>Limited (\"TV\") r
 msgid "The server re-captures this view on schedule as your key and reloads the player; the current clip keeps playing until each new one is ready, and a failed refresh keeps the previous clip."
 msgstr "The server re-captures this view on schedule as your key and reloads the player; the current clip keeps playing until each new one is ready, and a failed refresh keeps the previous clip."
 
-#: src/api/keyers.ts:70
+#: src/api/keyers.ts:72
 msgid "The server returned an invalid keyer operation id"
 msgstr "The server returned an invalid keyer operation id"
 
-#: src/api/keyers.ts:53
+#: src/api/keyers.ts:55
 msgid "The server returned an invalid keyer plan"
 msgstr "The server returned an invalid keyer plan"
 
@@ -13243,6 +13310,10 @@ msgstr "This is the current engine program. Saved and unsaved layouts do not hav
 msgid "This is the lowest-latency way to reach a web page (well under a second, glass to glass) and the transport the in-app live preview uses when the build supports it, falling back to a ~1 fps still image otherwise. Reaching viewers across restrictive networks can need a TURN relay; that is configured by the operator on the server, not in the browser. A <0>webrtc</0> output is published at a derived WHEP URL and a <1>webrtc</1> source is published to at a derived WHIP URL — the forms show both so a publisher or viewer can be configured without reading the protocol specs."
 msgstr "This is the lowest-latency way to reach a web page (well under a second, glass to glass) and the transport the in-app live preview uses when the build supports it, falling back to a ~1 fps still image otherwise. Reaching viewers across restrictive networks can need a TURN relay; that is configured by the operator on the server, not in the browser. A <0>webrtc</0> output is published at a derived WHEP URL and a <1>webrtc</1> source is published to at a derived WHIP URL — the forms show both so a publisher or viewer can be configured without reading the protocol specs."
 
+#: src/components/switcher/ArmStrip.tsx:47
+msgid "This key's sources are hidden from you, so you cannot arm it"
+msgstr "This key's sources are hidden from you, so you cannot arm it"
+
 #: src/pages/LayoutsPage.tsx:394
 msgid "This layout changed elsewhere since it was opened here. Reopen Layers to edit the current version — nothing was overwritten."
 msgstr "This layout changed elsewhere since it was opened here. Reopen Layers to edit the current version — nothing was overwritten."
@@ -13396,7 +13467,7 @@ msgstr "This URL must start with http:// or https://."
 msgid "This would capture {nominalFrames} frames, above the server's cap of {MAX_NOMINAL_FRAMES}. Lower max steps, frame duration or end hold."
 msgstr "This would capture {nominalFrames} frames, above the server's cap of {MAX_NOMINAL_FRAMES}. Lower max steps, frame duration or end hold."
 
-#: src/pages/SwitcherPage.tsx:198
+#: src/pages/SwitcherPage.tsx:221
 msgid "Tick"
 msgstr "Tick"
 
@@ -13408,7 +13479,7 @@ msgstr "Tick timestamp is ahead of the clock — age cannot be verified"
 msgid "Ticket raised"
 msgstr "Ticket raised"
 
-#: src/components/switcher/KeyerStrip.tsx:68
+#: src/components/switcher/KeyerStrip.tsx:76
 msgid "Tie"
 msgstr "Tie"
 
@@ -13489,7 +13560,7 @@ msgstr "Timing & sync"
 msgid "Tip: the Program and Preview monitors on the desk have their own Cast buttons."
 msgstr "Tip: the Program and Preview monitors on the desk have their own Cast buttons."
 
-#: src/components/switcher/KeyerPanel.tsx:191
+#: src/components/switcher/KeyerPanel.tsx:217
 msgid "TL"
 msgstr "TL"
 
@@ -13529,7 +13600,7 @@ msgstr "Too many unresolved commands. Wait for an outcome or resolve an unknown 
 msgid "Top (%)"
 msgstr "Top (%)"
 
-#: src/components/switcher/KeyerPanel.tsx:191
+#: src/components/switcher/KeyerPanel.tsx:217
 msgid "TR"
 msgstr "TR"
 
@@ -13622,7 +13693,7 @@ msgstr "Transition"
 msgid "Transition parameters"
 msgstr "Transition parameters"
 
-#: src/pages/SwitcherPage.tsx:198
+#: src/pages/SwitcherPage.tsx:221
 msgid "Transition running"
 msgstr "Transition running"
 
@@ -13695,7 +13766,7 @@ msgstr "tvg-id"
 msgid "Two image families are published. The default image is LGPL-clean and software-only; the NVIDIA image adds CUDA-based decode, encode, and compositing."
 msgstr "Two image families are published. The default image is LGPL-clean and software-only; the NVIDIA image adds CUDA-based decode, encode, and compositing."
 
-#: src/components/switcher/KeyerPanel.tsx:228
+#: src/components/switcher/KeyerPanel.tsx:254
 msgid "Type"
 msgstr "Type"
 
@@ -14015,6 +14086,10 @@ msgstr "User-Agent header (optional)"
 msgid "Using Google's default receiver. Register the Conspect receiver for diagnostics and the branded screen."
 msgstr "Using Google's default receiver. Register the Conspect receiver for diagnostics and the branded screen."
 
+#: src/components/switcher/KeyerStrip.tsx:64
+msgid "USK"
+msgstr "USK"
+
 #: src/components/broadcast/ProductionDesk.tsx:341
 msgid "USK, DSK and AUX have no supported control contract."
 msgstr "USK, DSK and AUX have no supported control contract."
@@ -14184,7 +14259,7 @@ msgstr "VT transport, graphics, capture and the clip library."
 msgid "Waiting for a frame…"
 msgstr "Waiting for a frame…"
 
-#: src/pages/SwitcherPage.tsx:39
+#: src/pages/SwitcherPage.tsx:41
 msgid "Waiting for a real frame"
 msgstr "Waiting for a real frame"
 
@@ -14496,7 +14571,7 @@ msgstr "Why the output clock never depends on inputs"
 msgid "Wide distribution, browser viewing"
 msgstr "Wide distribution, browser viewing"
 
-#: src/components/switcher/KeyerPanel.tsx:196
+#: src/components/switcher/KeyerPanel.tsx:222
 msgid "Width"
 msgstr "Width"
 
@@ -14560,7 +14635,7 @@ msgstr "would cycle"
 msgid "Writes an HLS playlist and segments to <0>path</0> with a <1>codec</1> and a <2>segment_ms</2> duration."
 msgstr "Writes an HLS playlist and segments to <0>path</0> with a <1>codec</1> and a <2>segment_ms</2> duration."
 
-#: src/components/switcher/KeyerPanel.tsx:196
+#: src/components/switcher/KeyerPanel.tsx:222
 msgid "X"
 msgstr "X"
 
@@ -14568,7 +14643,7 @@ msgstr "X"
 msgid "XMLTV guide URL"
 msgstr "XMLTV guide URL"
 
-#: src/components/switcher/KeyerPanel.tsx:196
+#: src/components/switcher/KeyerPanel.tsx:222
 msgid "Y"
 msgstr "Y"
 

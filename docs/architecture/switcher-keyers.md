@@ -1418,5 +1418,21 @@ merge (see "K1 GPU key path as built", wipe masks).
   separates Review (plan, class and cost shown) from Apply (bound to the reviewed draft),
   and turns a command-time `on-air-protected` 409 into a fresh plan plus an explicit allow
   confirmation. `switcher.keyer` events and operation outcomes refresh the snapshot; a
-  stale indicator shows while the realtime stream is not open. The BKGD/KEY arm strip
-  stays deferred to K3 (#388).
+  stale indicator shows while the realtime stream is not open.
+- **`keyers[]` × K3/K7 (merge with main after PR #507/#512).** A row carries K3's `family`
+  and `armed`, K7's chroma `color` (a colour, never redacted; `null` for other types) and the
+  K5 params; the row filter and source-id redaction are unchanged and cover the colour
+  (`get_rows_carry_committed_params_and_the_canvas_with_the_same_redaction`).
+- **Desk × K3/K7.** The panel offers `chroma` on a DSK only, with a `#RRGGBB` colour picker
+  and clip/gain; choosing chroma clears a key source (`chroma-key-source`) and leaving it
+  clears the colour (`chroma-color-without-chroma`); a hidden key source blocks the switch.
+  USK rows get a strip with CUT only (disabled during a background transition, as the engine
+  refuses `keyer-in-transition`), no TIE/rate/AUTO, an Armed badge, and a panel without
+  chroma that sends `family = "usk"`. The BKGD / KEY 1-4 arm strip lights only from the GET
+  `armed` view; a toggle plans then commands `arm {background, keys}` (the whole next set)
+  behind the shared submission gate. The last lit toggle cannot clear the set (an empty arm
+  is 422); a key whose fill or key is redacted is shown with its lamp but not toggleable, and
+  an armed one blocks every toggle (the set is replaced whole and needs Read on it). Plan
+  refusals and the engine's `take-held` / `unknown-keyer` outcomes are shown with their
+  reasons. Keyer verbs and `arm` are tracked as correlated `switcher.operation` kinds. The
+  background CUT is not gated on PGM == PVW, so a key-only CUT stays available.

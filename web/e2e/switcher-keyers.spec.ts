@@ -14,9 +14,13 @@ const DSK1 = {
   loss: 'drop_to_off_air', loss_trigger: 'reconnecting', stale: false, pending: false,
 };
 
+const USK1 = { ...DSK1, id: 'usk1', family: 'usk', fill: 'cam-1' };
+
 interface Engine {
   tick: number;
   dsk1: typeof DSK1;
+  usk1: typeof USK1;
+  armed: { background: boolean; keys: string[] };
   calls: { path: string; key: string | null; body: Record<string, unknown> }[];
   socket?: WebSocketRoute;
   seq: number;
@@ -25,8 +29,8 @@ interface Engine {
 function snapshot(engine: Engine) {
   return {
     program_source: 'cam-1', preview_source: 'cam-1', tick: engine.tick, in_flight: false,
-    canvas_width: 1280, canvas_height: 720, fps_num: 25, fps_den: 1,
-    keyers: [engine.dsk1], tally: { program: engine.dsk1.on_air ? ['cam-1', 'gfx-channel-1'] : ['cam-1'], preview: [] },
+    canvas_width: 1280, canvas_height: 720, fps_num: 25, fps_den: 1, armed: engine.armed,
+    keyers: [engine.dsk1, { ...engine.usk1, armed: engine.armed.keys.includes('usk1') }], tally: { program: engine.dsk1.on_air ? ['cam-1', 'gfx-channel-1'] : ['cam-1'], preview: [] },
     transition: { kind: 'cut' },
   };
 }
@@ -37,7 +41,7 @@ function send(engine: Engine, t: string, id: string, data: Record<string, unknow
 }
 
 async function mockEngine(page: Page, plan: (body: Record<string, unknown>) => Record<string, unknown>): Promise<Engine> {
-  const engine: Engine = { tick: 10, dsk1: { ...DSK1 }, calls: [], seq: 0 };
+  const engine: Engine = { tick: 10, dsk1: { ...DSK1 }, usk1: { ...USK1 }, armed: { background: true, keys: [] }, calls: [], seq: 0 };
   await page.route('**/api/v1/auth/status*', (route) => route.fulfill({ json: { auth_required: false, authenticated: true } }));
   await page.route('**/api/v1/sources', (route) => route.fulfill({ json: [
     { id: 'gfx-channel-1', name: 'GFX 1', body: { id: 'gfx-channel-1', kind: 'bars' } },
@@ -63,6 +67,9 @@ async function mockEngine(page: Page, plan: (body: Record<string, unknown>) => R
     setTimeout(() => {
       engine.tick += 1;
       if (kind === 'keyer_cut') engine.dsk1 = { ...engine.dsk1, on_air: body.on === true };
+      if (kind === 'arm') engine.armed = { background: body.background === true, keys: Array.isArray(body.keys) ? body.keys.map(String) : [] };
+      // A key-only CUT toggles the armed keys; the background stays.
+      if (kind === 'cut' && engine.armed.keys.includes('usk1')) engine.usk1 = { ...engine.usk1, on_air: !engine.usk1.on_air };
       if (kind === 'keyer_set' && body.fill !== undefined) engine.dsk1 = { ...engine.dsk1, fill: String(body.fill) };
       send(engine, 'switcher.operation', 'me1', { me: 'me1', program: 'main', operation_id: op, tick: engine.tick, completed: true }, op);
       send(engine, 'switcher.keyer', 'main/dsk1', {
@@ -76,13 +83,45 @@ async function mockEngine(page: Page, plan: (body: Record<string, unknown>) => R
 
 const PASS = () => ({ can_take: true, class: 'class1', keyer: 'main/dsk1', on_air: false, cost: { delta: 0.1, fits: true } });
 
-test('renders the DSK strip and keyer panel from a real build, with no arm strip (#388 not merged)', async ({ page }) => {
+test('renders the DSK strip, the keyer panels and the BKGD/KEY arm strip from the armed snapshot', async ({ page }) => {
   await mockEngine(page, PASS);
   await page.goto('/switcher');
   await expect(page.getByTestId('keyer-strip-dsk1')).toBeVisible({ timeout: 10000 });
   await expect(page.getByTestId('keyer-panel-dsk1')).toBeVisible();
   await expect(page.getByTestId('keyer-lamp-dsk1')).toHaveAttribute('data-on-air', 'false');
-  await expect(page.locator('[data-testid^="keyer-arm-"]')).toHaveCount(0);
+  await expect(page.getByTestId('keyer-arm-background')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.getByTestId('keyer-arm-usk1')).toHaveAttribute('aria-pressed', 'false');
+  await expect(page.getByTestId('keyer-arm-lamp-usk1')).toHaveAttribute('data-on-air', 'false');
+  await expect(page.getByTestId('keyer-arm-dsk1')).toHaveCount(0);
+});
+
+test('arming a key plans then commands arm; the toggle lights from the next armed snapshot; a key-only CUT with PGM == PVW takes it on air', async ({ page }) => {
+  const engine = await mockEngine(page, (body) => body.action === 'cut' ? { can_take: true, class: 'class1', scene_version: 1 } : PASS());
+  await page.goto('/switcher');
+  await expect(page.getByTestId('keyer-arm-usk1')).toBeVisible({ timeout: 10000 });
+  await page.getByTestId('keyer-arm-usk1').click();
+  await expect(page.getByTestId('keyer-arm-usk1')).toHaveAttribute('aria-pressed', 'true', { timeout: 10000 });
+  expect(engine.calls.map((c) => c.path)).toEqual(['plan', 'commands/arm']);
+  expect(engine.calls[1]?.body).toEqual({ me: 'me1', program: 'main', action: 'arm', background: true, keys: ['usk1'] });
+  expect(engine.calls[1]?.key).toMatch(/^[0-9a-f-]{36}$/);
+  // Key only: BKGD off, then CUT (PGM == PVW in this snapshot).
+  await page.getByTestId('keyer-arm-background').click();
+  await expect(page.getByTestId('keyer-arm-background')).toHaveAttribute('aria-pressed', 'false', { timeout: 10000 });
+  expect(engine.calls[3]?.body).toEqual({ me: 'me1', program: 'main', action: 'arm', background: false, keys: ['usk1'] });
+  const backgroundCut = page.getByRole('button', { name: 'Cut', exact: true }).first();
+  await expect(backgroundCut).toBeEnabled({ timeout: 10000 });
+  await backgroundCut.click();
+  await expect(page.getByTestId('keyer-arm-lamp-usk1')).toHaveAttribute('data-on-air', 'true', { timeout: 10000 });
+  expect(engine.calls.slice(4).map((c) => c.path)).toEqual(['plan', 'commands/cut']);
+});
+
+test('an arm plan refusal shows its reason and commands nothing', async ({ page }) => {
+  const engine = await mockEngine(page, () => ({ can_take: false, class: 'class1', keyer: 'me1', on_air: false, refusal: { type: 'in-flight', detail: 'the arm set cannot change during a transition' } }));
+  await page.goto('/switcher');
+  await expect(page.getByTestId('keyer-arm-usk1')).toBeVisible({ timeout: 10000 });
+  await page.getByTestId('keyer-arm-usk1').click();
+  await expect(page.getByTestId('arm-error')).toContainText('the arm set cannot change during a transition');
+  expect(engine.calls.map((c) => c.path)).toEqual(['plan']);
 });
 
 test('CUT plans before the command, sends an Idempotency-Key, and the lamp follows the outcome/keyer events', async ({ page }) => {
