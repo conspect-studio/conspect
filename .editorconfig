@@ -16,3 +16,7 @@ indent_size = 2
 
 [*.md]
 trim_trailing_whitespace = false
+
+# Recorded caption fixtures keep their wire bytes (space-padded cue lines).
+[*.vtt]
+trim_trailing_whitespace = false

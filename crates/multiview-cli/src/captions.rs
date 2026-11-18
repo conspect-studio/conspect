@@ -12,37 +12,40 @@
 //!    rendition for the requested language (or the default),
 //! 4. resolves the rendition's (usually relative) `URI` against the master's base
 //!    directory ([`resolve_rendition_uri`]), and
-//! 5. spawns a **second isolated demux** of that rendition `m3u8` on its own
-//!    ingest thread that decodes each `WebVTT` cue with
-//!    [`multiview_ffmpeg::CaptionDecoder`] and publishes it into a per-source
-//!    [`CaptionCueStore`].
+//! 5. spawns an **isolated reader** thread that polls that media playlist,
+//!    fetches each new `.vtt` segment and parses its cues in pure Rust
+//!    ([`crate::vtt_rendition`], issue #526: no libav `webvtt` demuxer or
+//!    decoder is needed, so a minimal libav build still carries captions), and
+//!    publishes them into a per-source [`CaptionCueStore`].
 //!
-//! The reader is **best-effort**: any fetch/parse/decode error logs and yields no
+//! The reader is **best-effort**: any fetch/parse error logs and yields no
 //! cues (the tile simply shows none). It only ever *writes* the lock-free cue
 //! store — it can neither pace nor stall the output clock (invariant #1) nor
 //! back-pressure the engine (invariant #10), exactly like the video ingest
-//! threads. The off-hot-path overlay baker *samples* the store at each output
-//! tick (`active_at(pts)`), mirroring frame-store latch-on-tick.
+//! threads. Every fetch is bounded in bytes and time. The off-hot-path
+//! samplers read the store at the selected picture's source time.
 //!
 //! ## Timing (invariant #3)
 //!
-//! libav applies the rendition's `X-TIMESTAMP-MAP` itself, so the `WebVTT`
-//! packets arrive already rebased onto a 0-based media timeline (the first cue's
-//! packet PTS is `1.0s`, matching the bipbop video's source-relative timeline).
-//! The reader anchors each cue's window with [`multiview_ffmpeg::CaptionDecoder`]
-//! (packet PTS rebased to ns through the stream time-base) and publishes it on
-//! the same source-relative timeline the video frames use, so a cue burns in at
-//! the same media instant the output clock samples it.
+//! A segment's `X-TIMESTAMP-MAP` puts its cues on the MPEG-TS clock the video
+//! rides (RFC 8216 §3.5; a segment without one is already on it). The reader
+//! projects that instant onto the video's **normalized** source timeline
+//! through the source's live video anchor (the raw container PTS and the
+//! normalized PTS of one picture,
+//! [`LiveAnchor`](crate::pipeline::LiveAnchor)), nearest the 33-bit wrap — the
+//! timeline the selected picture's [`SourceFrameTime`] carries — so a cue
+//! shows with the picture it was authored for. A source without a live anchor
+//! (a local/VOD rendition) keeps the cue's time as written.
+//!
+//! [`SourceFrameTime`]: multiview_framestore::tile::SourceFrameTime
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use ffmpeg_next as ffmpeg;
-
 use multiview_config::schema::CaptionSelector;
 use multiview_core::time::MediaTime;
 use multiview_ffmpeg::caption::CaptionCue;
-use multiview_ffmpeg::{CaptionDecoder, CaptionSource};
+use multiview_ffmpeg::CaptionSource;
 use multiview_input::caption_store::CaptionCueStore;
 use multiview_input::hls::MasterPlaylist;
 
@@ -417,6 +420,11 @@ pub struct CaptionPlan {
     pub displayed_time: Arc<
         multiview_framestore::SwapCell<Option<Arc<multiview_framestore::tile::SourceFrameTime>>>,
     >,
+    /// The source's live video anchor (raw container PTS <-> normalized PTS,
+    /// [`LiveAnchor`](crate::pipeline::LiveAnchor)): maps a cue's MPEG-TS time
+    /// onto the timeline [`Self::displayed_time`] carries (#526). Empty ⇒ the
+    /// cue's MPEG-TS time is used as is.
+    pub video_anchor: crate::pipeline::LiveAnchorSlot,
 }
 
 /// Resolve a rendition's (possibly relative) `URI` against the master playlist's
@@ -879,6 +887,15 @@ fn resolve_caption_plan(
     // requested one (RFC 3986 §5 / RFC 8216). For a non-redirecting fetch the
     // effective URL equals the requested URL, so this is unchanged.
     let rendition_url = resolve_rendition_uri(&playlist.url, uri);
+    // #526 review: a network master may only name a network rendition. A
+    // remote playlist must never steer the reader onto a local file.
+    if is_network_url(&playlist.url) && !is_network_url(&rendition_url) {
+        tracing::warn!(
+            source = %id,
+            "HLS master names a non-network subtitle rendition; no captions"
+        );
+        return None;
+    }
     tracing::info!(
         source = %id,
         language = ?rendition.language,
@@ -897,6 +914,9 @@ fn resolve_caption_plan(
         live: true,
         generation: 1,
         displayed_time: Arc::new(multiview_framestore::SwapCell::empty()),
+        // Bound to the video producer's own slot when the pipeline wires the
+        // plan (startup and live spawn); empty until then.
+        video_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
     })
 }
 
@@ -1086,80 +1106,493 @@ pub fn caption_loop(plan: &CaptionPlan, stop: &AtomicBool) {
     }
 }
 
-/// Open `plan.rendition_url`, decode its `WebVTT` subtitle stream, and publish
-/// each cue into `plan.store`. Returns `Ok(())` at clean EOF.
+/// Read `plan.rendition_url` — the rendition's media playlist — and publish
+/// every cue of its `.vtt` segments into `plan.store`, in pure Rust (#526).
+/// Returns `Ok(())` at the end of a finished (`EXT-X-ENDLIST`) playlist or on
+/// stop; `Err` when the playlist cannot be fetched or parsed (the live
+/// supervisor in [`caption_loop`] backs off and retries).
 ///
-/// libav's HLS demuxer is strict about segment extensions; the rendition's
-/// `.webvtt` segments mismatch the default allow-list, so `extension_picky` is
-/// disabled for this isolated demux (it never touches the program path). No FFI,
-/// no `unsafe`: only `ffmpeg-next`'s safe `Input`/`Parameters` value API bridges
-/// into `multiview-ffmpeg`'s safe `CaptionDecoder`.
+/// No libav demuxer/decoder is involved: a minimal libav build may lack the
+/// `webvtt` components, and libav ignores `X-TIMESTAMP-MAP`. Each cue is put
+/// on the MPEG-TS clock by its segment's `X-TIMESTAMP-MAP`
+/// ([`crate::vtt_rendition`]) and projected onto the video's normalized
+/// timeline through the source's [`video anchor`](CaptionPlan::video_anchor).
+/// Every fetch is bounded in bytes and in total time and aborts on stop; the
+/// segment schemes are limited to the rendition's own (`http(s)` for a network
+/// rendition, which a network master always names: [`resolve_caption_plan`]
+/// refuses a local one). Cues are mapped only through a video anchor on their
+/// own clock ([`ClockMatch`]): a splice restarts the cue clock.
 fn read_captions(plan: &CaptionPlan, stop: &AtomicBool) -> Result<(), String> {
-    multiview_ffmpeg::ensure_initialized().map_err(|e| e.to_string())?;
-
-    // The HLS demuxer rejects `.webvtt` segments under its default extension
-    // allow-list; relax it for THIS isolated rendition demux only. Cap the
-    // stream-probe so `avformat_find_stream_info` does NOT read the entire VOD
-    // rendition (all 60 segments) up front — a tiny probe is enough to identify
-    // the single WebVTT subtitle stream, and decoding then streams the cues out
-    // promptly rather than after a multi-second whole-playlist read-ahead.
-    let mut opts = ffmpeg::Dictionary::new();
-    opts.set("extension_picky", "0");
-    for (key, value) in plan.http_headers.open_options() {
-        opts.set(key, &value);
-    }
-    if !plan.http_headers.is_empty() {
-        tracing::debug!(source = %plan.id, "caption rendition demux carries operator request headers");
-    }
-    opts.set("allowed_extensions", "ALL");
-    opts.set("probesize", "131072");
-    opts.set("analyzeduration", "0");
-
-    let mut input = ffmpeg::format::input_with_dictionary(&plan.rendition_url.as_str(), opts)
-        .map_err(|e| e.to_string())?;
-
-    let (stream_index, params, time_base) = {
-        let stream = input
-            .streams()
-            .best(ffmpeg::media::Type::Subtitle)
-            .ok_or_else(|| "rendition has no subtitle stream".to_owned())?;
-        (
-            stream.index(),
-            stream.parameters(),
-            multiview_ffmpeg::from_ff_rational(stream.time_base()),
-        )
+    // A bare local path (a local master) becomes a `file://` URL once, so
+    // relative segment URIs resolve and fetch in the same form.
+    let rendition_url = if has_scheme(&plan.rendition_url) {
+        plan.rendition_url.clone()
+    } else {
+        format!("file://{}", plan.rendition_url)
     };
-
-    let mut decoder = CaptionDecoder::from_parameters(CaptionSource::WebVtt, params, time_base)
-        .map_err(|e| e.to_string())?;
-
-    // Bound rendition decode-ahead by the actual selected video source time.
-    // This isolated reader may wait; the output clock only publishes a cursor.
+    let allowed = rendition_protocols(&rendition_url)?;
+    let mut clock = ClockMatch::default();
+    let mut next_seq: Option<u64> = None;
     let mut pending = PendingCues::default();
-
     loop {
-        if stop.load(Ordering::Acquire) {
+        if stop.load(Ordering::Acquire) || plan.store.generation() != plan.generation {
             return Ok(());
         }
-        let mut packet = ffmpeg::codec::packet::Packet::empty();
-        match packet.read(&mut input) {
-            Ok(()) => {
-                if packet.stream() != stream_index {
+        let fetched = fetch_rendition_text(
+            &rendition_url,
+            MAX_RENDITION_PLAYLIST_BYTES,
+            allowed,
+            &plan.http_headers,
+            stop,
+        )?;
+        let playlist = crate::vtt_rendition::RenditionPlaylist::parse(&fetched.body)
+            .ok_or_else(|| "rendition is not an HLS media playlist".to_owned())?;
+        let first = first_new_segment(&playlist, next_seq, plan.live);
+        for segment in playlist.segments.iter().skip(first) {
+            if stop.load(Ordering::Acquire) || plan.store.generation() != plan.generation {
+                return Ok(());
+            }
+            next_seq = Some(segment.sequence.saturating_add(1));
+            let url = resolve_rendition_uri(&fetched.url, &segment.uri);
+            let body = match fetch_rendition_text(
+                &url,
+                MAX_VTT_SEGMENT_BYTES,
+                allowed,
+                &plan.http_headers,
+                stop,
+            ) {
+                Ok(fetched) => fetched.body,
+                Err(reason) => {
+                    // One missing segment loses its cues, never the reader nor
+                    // its position: its listed duration still advances it.
+                    tracing::debug!(source = %plan.id, %reason, "caption segment fetch failed; skipped");
+                    clock.advance(segment, None);
                     continue;
                 }
-                // A decode error on one packet is logged and skipped — captions
-                // are intermittent and a malformed cue must never stall ingest.
-                match decoder.decode(&packet) {
-                    Ok(cues) => publish_cues(plan, &mut pending, cues, stop),
-                    Err(e) => {
-                        tracing::debug!(source = %plan.id, error = %e, "caption packet decode error");
-                    }
+            };
+            let Some(cues) = crate::vtt_rendition::parse_segment(&body) else {
+                tracing::debug!(source = %plan.id, "caption segment is not WebVTT; skipped");
+                clock.advance(segment, None);
+                continue;
+            };
+            // Map the segment through the video mapping of ITS discontinuity
+            // epoch (see [`ClockMatch`]).
+            let anchor = match clock.segment(plan, segment, cues.first(), stop) {
+                SegmentMapping::Map(anchor) => anchor,
+                SegmentMapping::Skip => {
+                    pending.dropped = pending
+                        .dropped
+                        .saturating_add(u64::try_from(cues.len()).unwrap_or(u64::MAX));
+                    pending.report_drops(&plan.id);
+                    clock.advance(segment, None);
+                    continue;
                 }
+                SegmentMapping::Stop => return Ok(()),
+            };
+            let mapped: Vec<CaptionCue> =
+                cues.iter().filter_map(|cue| map_cue(anchor, cue)).collect();
+            let latest_start = mapped.iter().map(CaptionCue::start).max();
+            let earliest_end = mapped.iter().map(CaptionCue::end).min();
+            clock.advance(segment, latest_start.zip(earliest_end));
+            // Feed the bounded pending window in chunks it always holds whole
+            // (a 5 s live segment carries ~25 cues; the window keeps 16), so a
+            // dense rolling-caption segment loses none to the cap.
+            let mut mapped = mapped.into_iter().peekable();
+            while mapped.peek().is_some() {
+                let chunk: Vec<CaptionCue> = mapped.by_ref().take(PENDING_CUE_CAP / 2).collect();
+                publish_cues(plan, &mut pending, chunk, stop);
             }
-            Err(ffmpeg::Error::Eof) => return Ok(()),
-            Err(other) => return Err(other.to_string()),
+        }
+        if playlist.ended {
+            return Ok(());
+        }
+        let poll = std::time::Duration::from_secs(playlist.target_duration_s.clamp(2, 12) / 2);
+        crate::pipeline::sleep_interruptible(poll, stop);
+    }
+}
+
+/// Live segments a fresh reader starts behind the playlist's edge (the video
+/// demux, like libav's default, also starts a few segments back).
+const LIVE_START_SEGMENTS: usize = 3;
+/// Byte bound of one rendition media playlist fetch.
+const MAX_RENDITION_PLAYLIST_BYTES: usize = 1024 * 1024;
+/// Byte bound of one `.vtt` segment fetch (a 5 s live segment is ~3 KiB).
+const MAX_VTT_SEGMENT_BYTES: usize = 512 * 1024;
+
+/// The index of the first segment of `playlist` not yet read: after
+/// `next_seq`, or (a fresh reader) [`LIVE_START_SEGMENTS`] behind a live edge /
+/// the start of a finished playlist. A media sequence that moved backwards past
+/// the whole window (an origin restart) restarts at the live edge.
+fn first_new_segment(
+    playlist: &crate::vtt_rendition::RenditionPlaylist,
+    next_seq: Option<u64>,
+    live: bool,
+) -> usize {
+    let edge = if live && !playlist.ended {
+        playlist.segments.len().saturating_sub(LIVE_START_SEGMENTS)
+    } else {
+        0
+    };
+    let Some(next) = next_seq else {
+        return edge;
+    };
+    let last = playlist.segments.last().map(|s| s.sequence);
+    if last.is_some_and(|last| last.saturating_add(1) < next) {
+        return edge;
+    }
+    playlist
+        .segments
+        .iter()
+        .position(|s| s.sequence >= next)
+        .unwrap_or(playlist.segments.len())
+}
+
+/// Whether `url` is an `http(s)` URL.
+fn is_network_url(url: &str) -> bool {
+    matches!(
+        url.split_once("://").map(|(scheme, _)| scheme),
+        Some("http" | "https")
+    )
+}
+
+/// The libav protocols a rendition's playlist and segments may use: the
+/// network set for an `http(s)` rendition, `file` only for a local one (a
+/// local master). Anything else is refused.
+fn rendition_protocols(url: &str) -> Result<&'static str, String> {
+    let scheme = url.split_once("://").map(|(scheme, _)| scheme);
+    match scheme {
+        Some("http" | "https") => Ok(ALLOWED_PROTOCOLS),
+        Some("file") | None => Ok("file"),
+        Some(other) => Err(format!("rendition scheme {other:?} is not supported")),
+    }
+}
+
+/// Fetch one rendition text resource (bounded bytes, bounded time). A bare
+/// local path is read as `file:`.
+fn fetch_rendition_text(
+    url: &str,
+    max_bytes: usize,
+    allowed: &str,
+    headers: &multiview_ffmpeg::HttpHeaders,
+    stop: &AtomicBool,
+) -> Result<multiview_ffmpeg::FetchedText, String> {
+    let limits = multiview_ffmpeg::FetchLimits {
+        budget: Some(RENDITION_FETCH_BUDGET),
+        stop: Some(stop),
+    };
+    multiview_ffmpeg::fetch_url_text_with_headers(url, max_bytes, allowed, headers, &limits)
+        .map_err(|e| e.to_string())
+}
+
+/// Total time budget of one rendition playlist/segment fetch (a trickling
+/// server cannot hold the reader past it; a raised stop aborts at once).
+const RENDITION_FETCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// With no position estimate (a reader's first segment, or after a sequence
+/// gap), a cue maps through the video's current mapping when that puts it
+/// within this distance of the shown picture.
+const SAME_CLOCK_NS: i64 = 60_000_000_000;
+/// The longest a segment waits for the video to resolve its mapping
+/// ([`ClockMatch`]): a reader runs a live window (a few segments) ahead.
+const CLOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// How a rendition chunk's cues map onto the video timeline: through a live
+/// anchor `(raw0, pts0)`, or (a file/VOD source, no live anchor) as written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CueAnchor {
+    Raw { raw0: i64, pts0: MediaTime },
+    AsWritten,
+}
+
+/// The reader's correlation of rendition discontinuity epochs with the
+/// video's raw <-> normalized mappings (#526 review). An `EXT-X-DISCONTINUITY`
+/// (an ad splice) may restart the cue clock, and raw times are then REUSED, so
+/// no raw-time comparison can tell which mapping a new epoch's cues belong to.
+/// What identifies it is WHERE the video is: the normalized timeline the
+/// selected picture carries is continuous across the video's rebases, and the
+/// rendition's `#EXTINF` durations locate every segment's start on it.
+///
+/// So the reader keeps an interval estimate `[lo, hi]` of the normalized start
+/// of the next segment it reads: calibrated by every mapped cue (a cue of a
+/// segment starts before the segment ends and ends after it starts; it may
+/// start segments earlier) and advanced by each segment's duration. A segment
+/// maps:
+///
+/// * of the epoch already mapped: through that epoch's stored mapping;
+///   an older epoch: dropped;
+/// * of a newer epoch: through the SHOWN picture's own mapping (the latest
+///   anchor, once it is not ahead of the picture), and only while the picture
+///   is provably in the segment's epoch: before the segment's earliest
+///   possible end (`lo + duration`, so not in a later epoch) and either past
+///   its latest possible start (`hi`) or, for the very next epoch, past `lo`
+///   with a mapping CHANGED from the previous epoch's (the video rebased: it
+///   crossed; an epoch's timestamps are continuous, so it never rebases
+///   inside one). A picture past the segment's earliest end skips it (fail
+///   closed: its epoch is unknown);
+/// * the first one, or after a sequence gap (the window slid past segments
+///   this reader never saw listed; a failed fetch is no gap, its listed
+///   duration still advances the estimate): a re-synchronisation through the
+///   shown picture's mapping when it puts the cues near that picture. This is
+///   the one place timestamps decide (as any HLS player syncing a subtitle
+///   rendition to its video does): a (re)sync landing within
+///   [`SAME_CLOCK_NS`] of a splice that reused the raw clock can pick the
+///   wrong side; it is re-decided at the next epoch.
+///
+/// This never maps a new epoch through a mapping of the wrong side of a
+/// splice; the price is timeliness when the splice KEEPS the raw clock (no
+/// rebase to observe): its first cues wait until the picture is surely past
+/// the segment start (the estimate's width, at most about one segment
+/// duration, or more after a long carried-over cue) and may expire. Exact
+/// correlation needs the video's own discontinuity position (tracked in the
+/// PR's Concerns).
+///
+/// The mapping is identified by its offset ([`same_mapping`]), never by the
+/// [`LiveAnchor`] generation. Every wait is bounded ([`CLOCK_WAIT`]) and
+/// stop-checked. A live source whose anchor slot holds only the lifecycle
+/// placeholder (no raw PTS yet) waits; an empty slot (a file/VOD rendition)
+/// plays cues as written.
+///
+/// [`LiveAnchor`]: crate::pipeline::LiveAnchor
+#[derive(Debug, Default)]
+struct ClockMatch {
+    /// The last mapped epoch and its mapping.
+    mapped: Option<(u64, CueAnchor)>,
+    /// The normalized `[lo, hi]` start estimate of the segment `next_seq`.
+    next_start: Option<(i64, i64)>,
+    /// The media sequence the estimate belongs to.
+    next_seq: Option<u64>,
+}
+
+/// Slack added to a segment's latest start before a new epoch is taken
+/// (`#EXTINF` rounding against the decoded media).
+const EPOCH_SLACK_NS: i64 = 500_000_000;
+
+/// What the reader does with one segment's cues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentMapping {
+    /// Map its cues through this mapping.
+    Map(CueAnchor),
+    /// Skip its cues (stale, or unresolvable within the bound).
+    Skip,
+    /// Stop reading (stop raised or a newer generation).
+    Stop,
+}
+
+impl ClockMatch {
+    /// Decide (waiting off the output clock, bounded, stop-checked) how the
+    /// cues of `segment` map. `first` is its first cue, if any.
+    fn segment(
+        &mut self,
+        plan: &CaptionPlan,
+        segment: &crate::vtt_rendition::Segment,
+        first: Option<&crate::vtt_rendition::VttCue>,
+        stop: &AtomicBool,
+    ) -> SegmentMapping {
+        self.continuity(segment);
+        let Some(first) = first else {
+            return SegmentMapping::Skip;
+        };
+        match self.mapped {
+            Some((epoch, anchor)) if epoch == segment.discontinuity => {
+                return SegmentMapping::Map(anchor)
+            }
+            Some((epoch, _)) if segment.discontinuity < epoch => return SegmentMapping::Skip,
+            _ => {}
+        }
+        // When the segment opens a new epoch after a mapped one: its start
+        // estimate, the previous mapping, and whether it is the very next epoch.
+        let crossing = match (self.mapped, self.next_start) {
+            (Some((epoch, previous)), Some((lo, hi))) => Some(Crossing {
+                lo,
+                hi,
+                previous,
+                adjacent: segment.discontinuity == epoch.saturating_add(1),
+            }),
+            _ => None,
+        };
+        let started = std::time::Instant::now();
+        loop {
+            if stop.load(Ordering::Acquire) || plan.store.generation() != plan.generation {
+                return SegmentMapping::Stop;
+            }
+            match Self::look(plan, first, crossing, segment.duration_ns) {
+                Look::Take(anchor) => {
+                    self.mapped = Some((segment.discontinuity, anchor));
+                    return SegmentMapping::Map(anchor);
+                }
+                Look::Stale => return SegmentMapping::Skip,
+                Look::Wait => {}
+            }
+            if started.elapsed() >= CLOCK_WAIT {
+                return SegmentMapping::Skip;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
+
+    /// The first segment, or a sequence gap (the live window slid past
+    /// segments never listed to this reader, an origin restart): no position
+    /// estimate and no epoch mapping, so the reader re-synchronises as on its
+    /// first segment. Idempotent for the segment being processed.
+    fn continuity(&mut self, segment: &crate::vtt_rendition::Segment) {
+        if self.next_seq != Some(segment.sequence) {
+            self.next_start = None;
+            self.mapped = None;
+            self.next_seq = Some(segment.sequence);
+        }
+    }
+
+    /// One look at the video for a segment whose first cue is `first`
+    /// (`crossing`: see [`Crossing`]; `None` is the near-picture rule).
+    fn look(
+        plan: &CaptionPlan,
+        first: &crate::vtt_rendition::VttCue,
+        crossing: Option<Crossing>,
+        duration_ns: i64,
+    ) -> Look {
+        let Some(shown) = plan
+            .displayed_time
+            .load()
+            .filter(|t| t.generation == plan.generation)
+        else {
+            return Look::Wait;
+        };
+        let shown = shown.pts.as_nanos();
+        let Some(anchor) = plan.video_anchor.load() else {
+            return Look::Take(CueAnchor::AsWritten);
+        };
+        let Some(raw0) = anchor.raw_pts0_ns else {
+            return Look::Wait;
+        };
+        // The latest anchor is the SHOWN picture's mapping only when it is
+        // not ahead of that picture (anchors are published in normalized
+        // order, up to the jitter hold before their picture is shown).
+        if anchor.pts0.as_nanos() > shown {
+            return Look::Wait;
+        }
+        let current = CueAnchor::Raw {
+            raw0,
+            pts0: anchor.pts0,
+        };
+        if let Some(Crossing {
+            lo,
+            hi,
+            previous,
+            adjacent,
+        }) = crossing
+        {
+            // The picture may already be past the segment (its earliest
+            // possible end): its epoch is unknown, fail closed.
+            let earliest_end = lo.saturating_add(duration_ns);
+            if shown >= earliest_end {
+                return Look::Stale;
+            }
+            // Before the segment's earliest end, the picture is in this
+            // segment's epoch or an earlier one. It is surely in this one when
+            // past the segment's latest start, or (the very next epoch) when
+            // the video rebased since the previous epoch's mapping: an epoch's
+            // timestamps are continuous, so it rebases only at a splice.
+            let surely = shown >= hi.saturating_add(EPOCH_SLACK_NS);
+            let rebased = adjacent
+                && shown >= lo.saturating_sub(EPOCH_SLACK_NS)
+                && !same_mapping(previous, current);
+            return if surely || rebased {
+                Look::Take(current)
+            } else {
+                Look::Wait
+            };
+        }
+        let at = crate::vtt_rendition::project_raw(first.raw_start, raw0, anchor.pts0);
+        if at.as_nanos().saturating_sub(shown).abs() <= SAME_CLOCK_NS {
+            Look::Take(current)
+        } else {
+            Look::Wait
+        }
+    }
+
+    /// Record a read segment: calibrate the start estimate with its mapped
+    /// cues (`(latest cue start, earliest cue end)` on the normalized
+    /// timeline, `None` when not mapped) and advance it past the segment.
+    /// A segment carries every cue active in it, with full times (a cue may
+    /// start segments earlier): each cue starts before the segment ends and
+    /// ends after it starts, so `latest start - duration < segment start <
+    /// earliest end`.
+    fn advance(
+        &mut self,
+        segment: &crate::vtt_rendition::Segment,
+        mapped: Option<(MediaTime, MediaTime)>,
+    ) {
+        // Every segment path (mapped, skipped, failed fetch, not WebVTT)
+        // records through here, so a gap is never concealed.
+        self.continuity(segment);
+        let duration = segment.duration_ns;
+        let mut estimate = self.next_start;
+        if let Some((latest_start, earliest_end)) = mapped {
+            let lo = latest_start.as_nanos().saturating_sub(duration);
+            let hi = earliest_end.as_nanos();
+            estimate = match estimate {
+                Some((old_lo, old_hi)) if old_lo.max(lo) <= old_hi.min(hi) => {
+                    Some((old_lo.max(lo), old_hi.min(hi)))
+                }
+                _ => Some((lo.min(hi), hi)),
+            };
+        }
+        self.next_start =
+            estimate.map(|(lo, hi)| (lo.saturating_add(duration), hi.saturating_add(duration)));
+        self.next_seq = Some(segment.sequence.saturating_add(1));
+    }
+}
+
+/// A segment that opens a new discontinuity epoch after a mapped one.
+#[derive(Debug, Clone, Copy)]
+struct Crossing {
+    /// Its earliest possible normalized start.
+    lo: i64,
+    /// Its latest possible normalized start.
+    hi: i64,
+    /// The mapping of the previous mapped epoch.
+    previous: CueAnchor,
+    /// Whether it is the epoch right after the mapped one.
+    adjacent: bool,
+}
+
+/// One look's outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Look {
+    Take(CueAnchor),
+    Stale,
+    Wait,
+}
+
+/// Whether two mappings are the same raw <-> normalized offset (within 1 ms,
+/// modulo the 33-bit wrap): an anchor republished without a rebase.
+fn same_mapping(a: CueAnchor, b: CueAnchor) -> bool {
+    match (a, b) {
+        (CueAnchor::AsWritten, CueAnchor::AsWritten) => true,
+        (
+            CueAnchor::Raw { raw0, pts0 },
+            CueAnchor::Raw {
+                raw0: raw1,
+                pts0: pts1,
+            },
+        ) => {
+            let at = crate::vtt_rendition::project_raw(raw1, raw0, pts0);
+            at.as_nanos().saturating_sub(pts1.as_nanos()).abs() <= 1_000_000
+        }
+        _ => false,
+    }
+}
+
+/// Place a rendition cue on the video's normalized timeline through `anchor`.
+fn map_cue(anchor: CueAnchor, cue: &crate::vtt_rendition::VttCue) -> Option<CaptionCue> {
+    let (start, end) = match anchor {
+        CueAnchor::Raw { raw0, pts0 } => (
+            crate::vtt_rendition::project_raw(cue.raw_start, raw0, pts0),
+            crate::vtt_rendition::project_raw(cue.raw_end, raw0, pts0),
+        ),
+        CueAnchor::AsWritten => (cue.local_start, cue.local_end),
+    };
+    CaptionCue::try_text(start, end, cue.lines.clone(), None).ok()
 }
 
 /// Hard caps for decoded cues retained between packets. A single libav decode
@@ -2015,6 +2448,506 @@ input_id = "cam_b"
         assert_eq!(stats.text_truncated(), 3, "a small cue is not counted");
     }
 
+    fn playlist(
+        seqs: std::ops::Range<u64>,
+        ended: bool,
+    ) -> crate::vtt_rendition::RenditionPlaylist {
+        let mut text = format!("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:{}\n", seqs.start);
+        for seq in seqs {
+            let _ = std::fmt::Write::write_fmt(&mut text, format_args!("#EXTINF:5,\n{seq}.vtt\n"));
+        }
+        if ended {
+            text.push_str("#EXT-X-ENDLIST\n");
+        }
+        crate::vtt_rendition::RenditionPlaylist::parse(&text).expect("playlist")
+    }
+
+    /// #526: a fresh live reader starts a few segments behind the edge, then
+    /// reads each new segment once; an origin restart re-joins at the edge.
+    #[test]
+    fn the_rendition_reader_reads_each_live_segment_once() {
+        let live = playlist(100..110, false);
+        assert_eq!(first_new_segment(&live, None, true), 7);
+        assert_eq!(first_new_segment(&live, Some(108), true), 8);
+        assert_eq!(first_new_segment(&live, Some(110), true), 10, "nothing new");
+        assert_eq!(
+            first_new_segment(&playlist(0..3, false), Some(500), true),
+            0
+        );
+        assert_eq!(
+            first_new_segment(&playlist(0..10, true), None, true),
+            0,
+            "VOD from start"
+        );
+        assert_eq!(first_new_segment(&live, None, false), 0);
+    }
+
+    #[test]
+    fn rendition_fetches_keep_to_the_rendition_scheme() {
+        assert_eq!(
+            rendition_protocols("https://a/b.m3u8"),
+            Ok(ALLOWED_PROTOCOLS)
+        );
+        assert_eq!(rendition_protocols("file:///tmp/x.m3u8"), Ok("file"));
+        assert_eq!(rendition_protocols("/tmp/x.m3u8"), Ok("file"));
+        assert!(rendition_protocols("concat://a|b").is_err());
+    }
+
+    fn vtt_cues(doc: &str) -> Vec<crate::vtt_rendition::VttCue> {
+        crate::vtt_rendition::parse_segment(doc).expect("segment")
+    }
+
+    fn reader_plan() -> CaptionPlan {
+        CaptionPlan {
+            http_headers: multiview_ffmpeg::HttpHeaders::default(),
+            id: "map".to_owned(),
+            rendition_url: String::new(),
+            store: Arc::new(CueStore::new()),
+            live: true,
+            generation: 1,
+            displayed_time: Arc::new(multiview_framestore::SwapCell::empty()),
+            video_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
+        }
+    }
+
+    /// Publish a video anchor of the next generation (as the video does).
+    fn set_anchor(plan: &CaptionPlan, raw0_s: i64, pts0_s: i64) {
+        let generation = plan.video_anchor.load().map_or(0, |a| a.generation) + 1;
+        plan.video_anchor
+            .store(Some(Arc::new(crate::pipeline::LiveAnchor {
+                generation,
+                out0: MediaTime::ZERO,
+                pts0: MediaTime::from_nanos(pts0_s * 1_000_000_000),
+                raw_pts0_ns: Some(raw0_s * 1_000_000_000),
+            })));
+    }
+
+    fn show_at(plan: &CaptionPlan, pts_s: i64) {
+        plan.displayed_time.store(Some(Arc::new(
+            multiview_framestore::tile::SourceFrameTime {
+                pts: MediaTime::from_nanos(pts_s * 1_000_000_000),
+                generation: 1,
+                event_clock: None,
+            },
+        )));
+    }
+
+    /// #526: a cue on the MPEG-TS clock maps through the video anchor; with
+    /// no live anchor (a file/VOD source) it keeps its written time.
+    #[test]
+    fn a_rendition_cue_maps_through_the_video_anchor() {
+        let cues = vtt_cues(
+            "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000\n\n00:00:01.000 --> 00:00:03.000\nx\n",
+        );
+        let cue = cues.first().expect("cue");
+        let written = map_cue(CueAnchor::AsWritten, cue).expect("cue");
+        assert_eq!(written.start(), MediaTime::from_nanos(1_000_000_000));
+        let anchor = CueAnchor::Raw {
+            raw0: 10_000_000_000,
+            pts0: MediaTime::from_nanos(500_000_000),
+        };
+        let mapped = map_cue(anchor, cue).expect("cue");
+        assert_eq!(mapped.start(), MediaTime::from_nanos(1_500_000_000));
+        assert_eq!(mapped.end(), MediaTime::from_nanos(3_500_000_000));
+    }
+
+    fn seg(sequence: u64, discontinuity: u64) -> crate::vtt_rendition::Segment {
+        crate::vtt_rendition::RenditionPlaylist::parse(&format!(
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:{sequence}\n#EXT-X-DISCONTINUITY-SEQUENCE:{discontinuity}\n#EXTINF:5,\ns.vtt\n"
+        ))
+        .and_then(|p| p.segments.into_iter().next())
+        .expect("segment")
+    }
+
+    /// Map `cues` of `segment` through `clock` (no concurrent video change)
+    /// and record the segment; the first cue's mapped start in ms.
+    fn read_segment(
+        clock: &mut ClockMatch,
+        plan: &CaptionPlan,
+        segment: &crate::vtt_rendition::Segment,
+        cues: &[crate::vtt_rendition::VttCue],
+        stop: &AtomicBool,
+    ) -> Option<i64> {
+        let mapping = clock.segment(plan, segment, cues.first(), stop);
+        let SegmentMapping::Map(anchor) = mapping else {
+            clock.advance(segment, None);
+            return None;
+        };
+        let mapped: Vec<CaptionCue> = cues.iter().filter_map(|c| map_cue(anchor, c)).collect();
+        let latest_start = mapped.iter().map(CaptionCue::start).max();
+        let earliest_end = mapped.iter().map(CaptionCue::end).min();
+        clock.advance(segment, latest_start.zip(earliest_end));
+        mapped.first().map(|c| c.start().as_nanos() / 1_000_000)
+    }
+
+    /// Like [`read_segment`], while (after 200 ms, on another thread) the
+    /// video plays to `shown_s` and publishes the mapping `raw0_s` = `pts0_s`.
+    fn read_while_video_moves(
+        clock: &mut ClockMatch,
+        plan: &Arc<CaptionPlan>,
+        segment: &crate::vtt_rendition::Segment,
+        cues: &[crate::vtt_rendition::VttCue],
+        (raw0_s, pts0_s, shown_s): (i64, i64, i64),
+    ) -> Option<i64> {
+        let mover = {
+            let plan = Arc::clone(plan);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                set_anchor(&plan, raw0_s, pts0_s);
+                show_at(&plan, shown_s);
+            })
+        };
+        let start = read_segment(clock, plan, segment, cues, &AtomicBool::new(false));
+        mover.join().expect("mover");
+        start
+    }
+
+    /// The epoch-1 opening used by the splice tests: mapping raw 30 s = 10 s,
+    /// picture at 12 s, segment 100 (5 s) carrying a cue at raw 32 s = 12 s.
+    fn opened_epoch(plan: &CaptionPlan) -> ClockMatch {
+        set_anchor(plan, 30, 10);
+        show_at(plan, 12);
+        let mut clock = ClockMatch::default();
+        let old = vtt_cues("WEBVTT\n\n00:00:32.000 --> 00:00:33.000\nold side\n");
+        let start = read_segment(
+            &mut clock,
+            plan,
+            &seg(100, 1),
+            &old,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(start, Some(12_000));
+        clock
+    }
+
+    /// #526 review r5: the reader runs AHEAD through a cue-free rest of epoch
+    /// 1 (segments 101..105, 25 s) into epoch 2, whose reset cue (raw 36 s)
+    /// maps under the OLD mapping to 16 s — right at the picture (14 s). It
+    /// must not be taken: epoch 2 starts at normalized ~37-40 s, so the reader
+    /// waits until the picture is there, then takes the video's (rebased)
+    /// mapping raw 35 s = 40 s: 41 s.
+    #[test]
+    fn a_reader_ahead_of_a_reused_clock_waits_for_the_picture_to_cross() {
+        let plan = Arc::new(reader_plan());
+        let mut clock = opened_epoch(&plan);
+        show_at(&plan, 14);
+        let stop = AtomicBool::new(false);
+        for sequence in 101..=105 {
+            assert_eq!(
+                read_segment(&mut clock, &plan, &seg(sequence, 1), &[], &stop),
+                None
+            );
+        }
+        let reset = vtt_cues("WEBVTT\n\n00:00:36.000 --> 00:00:37.000\nafter silence\n");
+        let start = read_while_video_moves(&mut clock, &plan, &seg(106, 2), &reset, (35, 40, 41));
+        assert_eq!(start, Some(41_000), "41 s, not 16 s");
+    }
+
+    /// The same splice when the picture is already in epoch 2 (rebase
+    /// published): the reset cue maps at once through the new mapping.
+    #[test]
+    fn a_reset_after_a_caption_silence_takes_the_rebased_mapping() {
+        let plan = reader_plan();
+        let mut clock = opened_epoch(&plan);
+        let stop = AtomicBool::new(false);
+        for sequence in 101..=105 {
+            read_segment(&mut clock, &plan, &seg(sequence, 1), &[], &stop);
+        }
+        set_anchor(&plan, 35, 40);
+        show_at(&plan, 41);
+        let reset = vtt_cues("WEBVTT\n\n00:00:36.000 --> 00:00:37.000\nafter silence\n");
+        assert_eq!(
+            read_segment(&mut clock, &plan, &seg(106, 2), &reset, &stop),
+            Some(41_000)
+        );
+    }
+
+    /// A short backward reset right after the old cues (raw 33 s -> 1 s) and a
+    /// forward jump (-> 61 s): each new epoch takes the mapping the video has
+    /// once it crossed, never the old one.
+    #[test]
+    fn short_resets_and_forward_jumps_take_the_crossed_mapping() {
+        for (cue, (raw0, pts0), expect) in [
+            ("00:00:01.000", (0, 15), 16_000),
+            ("00:01:01.000", (60, 15), 16_000),
+        ] {
+            let plan = Arc::new(reader_plan());
+            let mut clock = opened_epoch(&plan);
+            let next = vtt_cues(&format!("WEBVTT\n\n{cue} --> 00:59:00.000\nnew epoch\n"));
+            // Epoch 2 starts in [12, 18] s and ends no earlier than 17 s.
+            let start =
+                read_while_video_moves(&mut clock, &plan, &seg(101, 2), &next, (raw0, pts0, 16));
+            assert_eq!(start, Some(expect), "{cue}");
+        }
+    }
+
+    /// The video republishing the SAME mapping (a new anchor generation)
+    /// before it crosses is not a crossing: the reader still waits for the
+    /// picture to reach the new epoch.
+    #[test]
+    fn a_republished_same_mapping_is_not_a_splice_crossing() {
+        let plan = Arc::new(reader_plan());
+        let mut clock = opened_epoch(&plan);
+        set_anchor(&plan, 35, 15);
+        show_at(&plan, 13);
+        let reset = vtt_cues("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nad\n");
+        let start = read_while_video_moves(&mut clock, &plan, &seg(101, 2), &reset, (0, 16, 16));
+        assert_eq!(start, Some(17_000), "17 s, not -19 s");
+    }
+
+    /// Late chunks of the mapped epoch keep its stored mapping after the
+    /// video crossed; an older epoch after a newer one is skipped.
+    #[test]
+    fn a_late_old_epoch_segment_keeps_its_epoch_mapping() {
+        let plan = reader_plan();
+        let mut clock = opened_epoch(&plan);
+        set_anchor(&plan, 0, 20);
+        show_at(&plan, 14);
+        let stop = AtomicBool::new(false);
+        let late = vtt_cues("WEBVTT\n\n00:00:34.000 --> 00:00:35.000\nlate old side\n");
+        assert_eq!(
+            read_segment(&mut clock, &plan, &seg(101, 1), &late, &stop),
+            Some(14_000),
+            "through the old mapping, not 54 s"
+        );
+        show_at(&plan, 21);
+        let new = vtt_cues("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nnew\n");
+        assert_eq!(
+            read_segment(&mut clock, &plan, &seg(102, 2), &new, &stop),
+            Some(21_000)
+        );
+        assert_eq!(
+            read_segment(&mut clock, &plan, &seg(103, 1), &late, &stop),
+            None
+        );
+    }
+
+    /// A picture already past a new epoch's segment skips it (stale), at once.
+    #[test]
+    fn a_new_epoch_segment_the_picture_passed_is_skipped() {
+        let plan = reader_plan();
+        let mut clock = opened_epoch(&plan);
+        show_at(&plan, 40);
+        let started = std::time::Instant::now();
+        let next = vtt_cues("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nx\n");
+        assert_eq!(
+            read_segment(
+                &mut clock,
+                &plan,
+                &seg(101, 2),
+                &next,
+                &AtomicBool::new(false)
+            ),
+            None
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// #526 review r6/r9: a long cue carried over from segments earlier (it
+    /// starts at 90 s, the segment covers 100..105 s) widens the position
+    /// estimate. The reader then fails closed on epoch 2 segments whose epoch
+    /// the picture's position cannot prove (never a wrong mapping), and
+    /// resumes on the first segment it can place: here the 4th (120..125 s).
+    #[test]
+    fn a_carried_over_cue_fails_closed_then_recovers() {
+        let plan = reader_plan();
+        set_anchor(&plan, 0, 0);
+        show_at(&plan, 102);
+        let mut clock = ClockMatch::default();
+        let stop = AtomicBool::new(false);
+        let carried = vtt_cues("WEBVTT\n\n00:01:30.000 --> 00:01:44.000\nstill on screen\n");
+        assert_eq!(
+            read_segment(&mut clock, &plan, &seg(100, 1), &carried, &stop),
+            Some(90_000)
+        );
+        // Epoch 2 resets raw 105 -> 90 s; the video crossed (raw 90 s = 105 s).
+        set_anchor(&plan, 90, 105);
+        show_at(&plan, 106);
+        let mut results = Vec::new();
+        for (sequence, raw) in [
+            (101, "01:30.500"),
+            (102, "01:35.500"),
+            (103, "01:40.500"),
+            (104, "01:45.500"),
+        ] {
+            let cue = vtt_cues(&format!("WEBVTT\n\n00:{raw} --> 00:59:00.000\nepoch 2\n"));
+            results.push(read_segment(
+                &mut clock,
+                &plan,
+                &seg(sequence, 2),
+                &cue,
+                &stop,
+            ));
+        }
+        assert_eq!(results, vec![None, None, None, Some(120_500)]);
+    }
+
+    /// #526 review r8: after the carried-over cue (segment 100..105 s), the
+    /// next epoch RESETS the raw clock 105 -> 90 s. Its cue (raw 90.5 s)
+    /// projects inside the segment's possible span under the OLD mapping; it
+    /// is never mapped there (90.5 s).
+    #[test]
+    fn a_reset_into_the_possible_span_is_never_mapped_through_the_old_clock() {
+        let plan = reader_plan();
+        set_anchor(&plan, 0, 0);
+        show_at(&plan, 102);
+        let mut clock = ClockMatch::default();
+        let stop = AtomicBool::new(false);
+        let carried = vtt_cues("WEBVTT\n\n00:01:30.000 --> 00:01:44.000\nstill on screen\n");
+        read_segment(&mut clock, &plan, &seg(100, 1), &carried, &stop).expect("maps");
+        let next = vtt_cues("WEBVTT\n\n00:01:30.500 --> 00:01:32.000\nafter reset\n");
+        assert_eq!(
+            read_segment(&mut clock, &plan, &seg(101, 2), &next, &stop),
+            None
+        );
+    }
+
+    /// A splice that KEEPS the clock maps through the unchanged mapping once
+    /// the picture is surely past the segment start (never through a guess).
+    #[test]
+    fn a_clock_keeping_splice_maps_once_the_picture_surely_crossed() {
+        let plan = Arc::new(reader_plan());
+        set_anchor(&plan, 0, 0);
+        show_at(&plan, 101);
+        let mut clock = ClockMatch::default();
+        let stop = AtomicBool::new(false);
+        // Segment 100 starts in (98, 101) (cue 103..105.5 starts before its
+        // end, 100.5..101 ends after its start): the next in (103, 106).
+        let cues = vtt_cues(
+            "WEBVTT\n\n00:01:43.000 --> 00:01:45.500\na\n\n00:01:40.500 --> 00:01:41.000\nb\n",
+        );
+        read_segment(&mut clock, &plan, &seg(100, 1), &cues, &stop).expect("maps");
+        let next = vtt_cues("WEBVTT\n\n00:01:46.500 --> 00:01:49.000\nsame clock\n");
+        let start = read_while_video_moves(&mut clock, &plan, &seg(101, 2), &next, (0, 0, 107));
+        assert_eq!(
+            start,
+            Some(106_500),
+            "while its window (106.5..109 s) is open"
+        );
+    }
+
+    /// #526 review r9: a LAGGING reader reaches epoch 2's segment (105..110 s
+    /// after the carried-over cue) when the picture (111 s) is already in
+    /// epoch 3 (anchor raw 0 s = 110 s). It must skip the segment, never map
+    /// it through epoch 3's mapping.
+    #[test]
+    fn a_lagging_reader_never_maps_an_epoch_through_a_later_one() {
+        let plan = reader_plan();
+        set_anchor(&plan, 0, 0);
+        show_at(&plan, 102);
+        let mut clock = ClockMatch::default();
+        let stop = AtomicBool::new(false);
+        let carried = vtt_cues("WEBVTT\n\n00:01:30.000 --> 00:01:44.000\nstill on screen\n");
+        read_segment(&mut clock, &plan, &seg(100, 1), &carried, &stop).expect("maps");
+        set_anchor(&plan, 0, 110);
+        show_at(&plan, 111);
+        let epoch2 = vtt_cues("WEBVTT\n\n00:01:30.500 --> 00:01:32.000\nepoch 2\n");
+        assert_eq!(
+            read_segment(&mut clock, &plan, &seg(101, 2), &epoch2, &stop),
+            None
+        );
+    }
+
+    /// An anchor published ahead of the shown picture (the jitter hold) is
+    /// not the picture's mapping: the reader waits for the picture to reach
+    /// it.
+    #[test]
+    fn an_anchor_ahead_of_the_picture_is_not_taken() {
+        let plan = Arc::new(reader_plan());
+        let mut clock = opened_epoch(&plan);
+        show_at(&plan, 15);
+        // Rebase published for a picture at 16 s, not yet shown.
+        set_anchor(&plan, 0, 16);
+        let reset = vtt_cues("WEBVTT\n\n00:00:00.500 --> 00:00:03.000\nad\n");
+        let start = read_while_video_moves(&mut clock, &plan, &seg(101, 2), &reset, (0, 16, 16));
+        assert_eq!(start, Some(16_500));
+    }
+
+    /// #526 review r10: a failed segment fetch keeps the position estimate
+    /// (its listed duration advances it), so the following new-epoch segment
+    /// still goes through the crossing rules, never the timestamp re-sync.
+    #[test]
+    fn a_failed_segment_fetch_keeps_the_position_estimate() {
+        let plan = reader_plan();
+        set_anchor(&plan, 0, 0);
+        show_at(&plan, 102);
+        let mut clock = ClockMatch::default();
+        let stop = AtomicBool::new(false);
+        let cue = vtt_cues("WEBVTT\n\n00:01:41.000 --> 00:01:42.000\nepoch 1\n");
+        read_segment(&mut clock, &plan, &seg(100, 1), &cue, &stop).expect("maps");
+        // Segment 101 fails to fetch: only its duration is recorded.
+        clock.advance(&seg(101, 1), None);
+        // Segment 102 opens epoch 2 with a reused raw time near the picture:
+        // under the old mapping it would land at 90.5 s.
+        // It waits for the crossing (stopped here after 300 ms).
+        let reset = vtt_cues("WEBVTT\n\n00:01:30.500 --> 00:01:32.000\nepoch 2\n");
+        let waiting = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                waiting.store(true, Ordering::Release);
+            });
+            assert_eq!(
+                clock.segment(&plan, &seg(102, 2), reset.first(), &waiting),
+                SegmentMapping::Stop,
+                "waits for the crossing, never maps through epoch 1's mapping"
+            );
+        });
+    }
+
+    /// #526 review r11: a window slide whose first listed segment FAILS to
+    /// fetch is still a gap: the estimate and the epoch mapping are reset.
+    #[test]
+    fn a_gap_hidden_behind_a_failed_fetch_still_resets() {
+        let plan = reader_plan();
+        set_anchor(&plan, 0, 0);
+        show_at(&plan, 102);
+        let mut clock = ClockMatch::default();
+        let stop = AtomicBool::new(false);
+        let cue = vtt_cues("WEBVTT\n\n00:01:41.000 --> 00:01:42.000\nepoch 1\n");
+        read_segment(&mut clock, &plan, &seg(100, 1), &cue, &stop).expect("maps");
+        // The window slid to 200; segment 200 fails to fetch.
+        clock.advance(&seg(200, 3), None);
+        assert_eq!(clock.mapped, None, "epoch mapping reset");
+        assert_eq!(clock.next_start, None, "estimate reset");
+        assert_eq!(clock.next_seq, Some(201));
+    }
+
+    /// The wait ends at once on stop.
+    #[test]
+    fn a_clock_wait_ends_on_stop() {
+        let plan = reader_plan();
+        let cues = vtt_cues("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nx\n");
+        assert_eq!(
+            ClockMatch::default().segment(&plan, &seg(0, 0), cues.first(), &AtomicBool::new(true)),
+            SegmentMapping::Stop
+        );
+    }
+
+    /// #526 review: a network master can never point the reader at a local
+    /// file, whatever its subtitle rendition URI says.
+    #[test]
+    fn a_network_master_cannot_name_a_local_rendition() {
+        struct Remote;
+        impl PlaylistFetcher for Remote {
+            fn fetch(&self, _url: &str) -> Result<FetchedPlaylist, String> {
+                Ok(FetchedPlaylist {
+                    url: "https://cdn.example/live/master.m3u8".to_owned(),
+                    body: "#EXTM3U\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"s\",NAME=\"en\",\
+                           LANGUAGE=\"en\",DEFAULT=YES,URI=\"file:///etc/subs.m3u8\"\n\
+                           #EXT-X-STREAM-INF:BANDWIDTH=1,SUBTITLES=\"s\"\nv.m3u8\n"
+                        .to_owned(),
+                })
+            }
+        }
+        assert!(
+            resolve_caption_plan("cam", "https://cdn.example/live/master.m3u8", None, &Remote)
+                .is_none()
+        );
+        assert!(is_network_url("https://a/b"));
+        assert!(!is_network_url("file:///a/b"));
+    }
+
     /// RT-10b: a per-source [`CueStore`] carrying one text cue, for the router
     /// tests. `lines` is non-empty so it renders.
     #[cfg(feature = "overlay")]
@@ -2076,6 +3009,7 @@ input_id = "cam_b"
             live: false,
             generation: 1,
             displayed_time: cursor,
+            video_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
         };
         let cues: Vec<_> = (0..800)
             .rev()
@@ -2172,6 +3106,7 @@ input_id = "cam_b"
             live: false,
             generation: 2,
             displayed_time: Arc::clone(&cursor),
+            video_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
         };
         let stop = AtomicBool::new(false);
         publish_cues(&plan, &mut PendingCues::default(), vec![fresh], &stop);
@@ -2208,6 +3143,7 @@ input_id = "cam_b"
             live: false,
             generation: 1,
             displayed_time: Arc::clone(&cursor),
+            video_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
         };
         let stop = Arc::new(AtomicBool::new(false));
         let writer_stop = Arc::clone(&stop);
