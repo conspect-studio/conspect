@@ -136,11 +136,13 @@ class IdrFilterTest {
     }
 
     @Test fun resyncStartsRecoveryAfterVideoPidKnown() {
-        val f = TsIdrFilter()
-        f.resync() // no video PID yet: nothing to discard
+        var now = 0L
+        val f = TsIdrFilter { now }
+        assertFalse(f.resync()) // no video PID yet: nothing to discard
         assertFalse(f.recovering)
         run(f, unit(5, 2))
-        f.resync()
+        now = 10_000
+        assertTrue(f.resync())
         assertTrue(f.recovering)
         val out = run(f, unit(1, 2) + unit(5, 2) + tail())
         assertEquals(2, out.size) // only the IDR unit
@@ -207,15 +209,17 @@ class SrtReaderTest {
     }
 }
 
-private class SlowHttp : Http {
+internal class SlowHttp : Http {
     val started = AtomicInteger(0)
     val posts = java.util.concurrent.CopyOnWriteArrayList<String>()
+    val gets = AtomicInteger(0)
+    @Volatile var postDelayMs = 0L
     val release = CountDownLatch(1)
-    override fun get(url: String, scope: CallScope): HttpResult { started.incrementAndGet(); return HttpResult(200, "", null) }
+    override fun get(url: String, scope: CallScope): HttpResult { started.incrementAndGet(); gets.incrementAndGet(); return HttpResult(200, "", null) }
     override fun post(url: String, json: String, scope: CallScope): HttpResult {
         started.incrementAndGet()
         posts.add(json)
-        release.await(2, TimeUnit.SECONDS)
+        if (postDelayMs > 0) scope.sleep(postDelayMs) else release.await(2, TimeUnit.SECONDS)
         return HttpResult(200, "", null)
     }
 }
@@ -228,6 +232,7 @@ class NetWorkerTest {
         val blocker = CountDownLatch(1)
         val g1 = gate.next()
         w.run(g1) { blocker.await(2, TimeUnit.SECONDS) } // occupies the one thread
+        Thread.sleep(30)
         w.run(g1) { http.get("u", it) }                  // queued behind it
         gate.next()                                      // a new LOAD replaces the generation
         blocker.countDown()
@@ -258,7 +263,7 @@ class NetWorkerTest {
         w.report(g, "u", "r2"); w.report(g, "u", "r3"); w.report(g, "u", "r4")
         http.release.countDown()
         Thread.sleep(300)
-        assertEquals(listOf("r1", "r4"), http.posts.toList()) // at most one in flight; newest replaced pending
+        assertEquals(listOf("r1", "r4"), http.posts.toList()) // one slot: the newest replaced the pending ones
         w.dispose()
     }
 
@@ -267,7 +272,7 @@ class NetWorkerTest {
         val w = NetWorker(gate, SlowHttp())
         val g = gate.next()
         val cancelled = CountDownLatch(1)
-        w.run(g) { s -> s.onCancel { cancelled.countDown() }; s.sleep(5000) }
+        w.run(g) { s -> s.register { cancelled.countDown() }; s.sleep(5000) }
         Thread.sleep(50)
         w.cancelAll()
         assertTrue(cancelled.await(1, TimeUnit.SECONDS))
@@ -279,6 +284,7 @@ class NetWorkerTest {
         val w = NetWorker(gate, SlowHttp())
         assertTrue(w.run(gate.next()) { })
         w.dispose()
+        assertTrue(w.awaitTermination(2000))
         assertTrue(w.isShutdown)
         assertFalse(w.run(gate.current) { })
     }
@@ -291,8 +297,7 @@ class NetWorkerTest {
         Thread.sleep(100)
         val during = Thread.getAllStackTraces().keys.count { it.name == "cast-net-test" }
         assertTrue(during - before <= 1)
-        w.dispose()
-        Thread.sleep(100)
+        w.dispose(); assertTrue(w.awaitTermination(2000))
         assertEquals(before, Thread.getAllStackTraces().keys.count { it.name == "cast-net-test" })
     }
 
@@ -302,6 +307,114 @@ class NetWorkerTest {
         val t0 = System.nanoTime()
         assertFalse(s.sleep(5000))
         assertTrue(System.nanoTime() - t0 < 2_000_000_000L)
+    }
+
+    // R2-A: a report queued behind a slow task and then made stale must not wedge reporting for later LOADs.
+    @Test fun reportForTheNewGenerationPostsAfterAStaleQueuedReport() {
+        val gate = GenerationGate()
+        val http = SlowHttp()
+        val w = NetWorker(gate, http)
+        val g1 = gate.next()
+        val gate1 = CountDownLatch(1)
+        w.run(g1) { gate1.await(3, TimeUnit.SECONDS) } // a slow task occupies the worker
+        Thread.sleep(30)
+        w.report(g1, "u", "old-report")                // a report is queued
+        gate.invalidate(); w.cancelAll()               // stop() / a new LOAD
+        gate1.countDown()                              // release the worker
+        Thread.sleep(100)
+        val g2 = gate.next()
+        http.release.countDown()
+        w.report(g2, "u", "new-report")
+        Thread.sleep(300)
+        assertEquals(listOf("new-report"), http.posts.toList())
+        w.dispose()
+    }
+
+    // R2-B: continuous slow reports must not starve control work.
+    @Test fun controlWorkStartsWhileSlowReportsKeepComing() {
+        val gate = GenerationGate()
+        val http = SlowHttp().also { it.postDelayMs = 400 }
+        val w = NetWorker(gate, http)
+        val g = gate.next()
+        val ran = CountDownLatch(1)
+        val stop = java.util.concurrent.atomic.AtomicBoolean(false)
+        val feeder = Thread { var i = 0; while (!stop.get()) { w.report(g, "u", "r${i++}"); Thread.sleep(20) } }
+        feeder.start()
+        Thread.sleep(100) // a report is in flight and another is pending
+        val t0 = System.nanoTime()
+        w.run(g) { ran.countDown() } // a token check or failure ladder call
+        assertTrue(ran.await(2, TimeUnit.SECONDS))
+        // At most the one report in flight (400 ms) is waited for, never the stream of reports.
+        assertTrue((System.nanoTime() - t0) < 900_000_000L)
+        stop.set(true); feeder.join(); w.dispose()
+    }
+
+    // R2-D: cancelAll removes obsolete tasks, so a burst of replacement LOADs always admits the newest negotiation.
+    @Test fun burstOfLoadsAdmitsTheNewestNegotiation() {
+        val gate = GenerationGate()
+        val w = NetWorker(gate, SlowHttp(), queueCapacity = 2)
+        val hold = CountDownLatch(1)
+        val first = gate.next()
+        w.run(first) { hold.await(3, TimeUnit.SECONDS) }
+        Thread.sleep(30)
+        var last = 0
+        val ran = java.util.concurrent.CopyOnWriteArrayList<Int>()
+        repeat(20) { // 20 LOADs in a burst: each start() is gate.next() + cancelAll() + run()
+            gate.invalidate(); w.cancelAll()
+            last = gate.next()
+            val g = last
+            assertTrue("negotiation of load $it admitted", w.run(g) { ran.add(g) })
+        }
+        hold.countDown()
+        Thread.sleep(300)
+        assertEquals(listOf(last), ran.toList()) // only the newest ran; the obsolete ones were removed
+        w.dispose()
+    }
+}
+
+class CallScopeHooksTest {
+    @Test fun completedCallsLeaveNoHooks() {
+        val s = CallScope()
+        repeat(5000) { s.register { }.close() }
+        assertEquals(0, s.hookCount)
+    }
+
+    @Test fun handleClosesExactlyOnceAndRaceSafely() {
+        val s = CallScope()
+        val h = s.register { }
+        val ts = (1..8).map { Thread { h.close() } }
+        ts.forEach { it.start() }; ts.forEach { it.join() }
+        assertEquals(0, s.hookCount)
+        h.close(); assertEquals(0, s.hookCount)
+    }
+
+    @Test fun cancelRunsHooksOffTheCallerThread() {
+        val s = CallScope()
+        val ran = CountDownLatch(1)
+        var thread: String? = null
+        s.register { thread = Thread.currentThread().name; ran.countDown() }
+        s.cancel()
+        assertTrue(ran.await(2, TimeUnit.SECONDS))
+        assertEquals("cast-cancel", thread)
+        assertEquals(0, s.hookCount)
+    }
+
+    @Test fun registerAfterCancelRunsTheHookAtOnce() {
+        val s = CallScope()
+        s.cancel()
+        val ran = CountDownLatch(1)
+        s.register { ran.countDown() }
+        assertTrue(ran.await(2, TimeUnit.SECONDS))
+        assertEquals(0, s.hookCount)
+    }
+
+    @Test fun closedHandleIsNotRunOnCancel() {
+        val s = CallScope()
+        val ran = AtomicInteger(0)
+        s.register { ran.incrementAndGet() }.close()
+        s.cancel()
+        Thread.sleep(100)
+        assertEquals(0, ran.get())
     }
 }
 
@@ -376,5 +489,66 @@ class LadderStrictTest {
     @Test fun malformedAttachPlaysHls() {
         unusable("""{"v":1,"attach":"srt"}""")
         assertEquals(LadderAnswer.Hls, LadderParser.parse(200, """{"v":1,"attach":{"rung":5}}"""))
+    }
+}
+
+class LossCountingTest {
+    private val vpid = 0x100
+    private var cc = 0
+    private fun pkt(counter: Int, start: Boolean, type: Int = 1): ByteArray {
+        val p = ByteArray(188) { 0xff.toByte() }
+        p[0] = 0x47; p[1] = ((if (start) 0x40 else 0) or (vpid shr 8)).toByte(); p[2] = (vpid and 0xff).toByte()
+        p[3] = (0x10 or (counter and 0xf)).toByte()
+        if (start) { p[4] = 0; p[5] = 0; p[6] = 1; p[7] = 0xe0.toByte(); p[8] = 0; p[9] = 0; p[10] = 0; p[11] = 1; p[12] = type.toByte() }
+        return p
+    }
+    private fun unit(type: Int, lose: Boolean): List<ByteArray> {
+        val a = cc; cc = (cc + 1) and 15
+        val b = cc; cc = (cc + 1) and 15
+        return if (lose) listOf(pkt(a, true, type)) else listOf(pkt(a, true, type), pkt(b, false))
+    }
+    private fun feed(f: TsIdrFilter, l: List<ByteArray>) = l.forEach { f.process(it, 0, 188) }
+
+    @Test fun oneLossSeenByBothMechanismsCountsOnce() {
+        var now = 0L
+        val f = TsIdrFilter { now }
+        feed(f, unit(5, false) + unit(1, false) + unit(1, true) + unit(1, false)) // a gap: recovery 1
+        assertEquals(1, f.recoveries)
+        now += 200
+        assertFalse(f.resync()) // the drop counter rises for the same loss: merged, not counted
+        feed(f, unit(5, false) + unit(1, false) + unit(1, false)) // the IDR ends the recovery
+        now += 300
+        assertFalse(f.resync()) // evidence arriving on a later receive, shortly after the recovery: still merged
+        assertEquals(1, f.recoveries)
+    }
+
+    @Test fun threeRecoveriesDoNotStepDownTheFourthDoes() {
+        var now = 0L
+        val f = TsIdrFilter { now }
+        val policy = LossPolicy()
+        val actions = ArrayList<LossAction>()
+        feed(f, unit(5, false) + unit(1, false))
+        repeat(4) {
+            val before = f.recoveries
+            feed(f, unit(1, true) + unit(1, false) + unit(5, false) + unit(1, false) + unit(1, false))
+            if (f.recoveries != before) actions.add(policy.onLoss(now))
+            now += 5_000 // real, separate losses
+        }
+        assertEquals(
+            listOf(LossAction.CONTINUE_IN_CONNECTION, LossAction.CONTINUE_IN_CONNECTION, LossAction.CONTINUE_IN_CONNECTION, LossAction.STEP_DOWN),
+            actions,
+        )
+    }
+}
+
+class Ipv6LiteralTest {
+    @Test fun strictShape() {
+        for (h in listOf("::1", "2001:db8::1", "fe80::1", "::ffff:10.1.2.3", "1:2:3:4:5:6:7:8", "2001:db8:0:0:0:0:0:1")) {
+            assertTrue(h, LadderParser.validIpv6Literal(h))
+        }
+        for (h in listOf(":::", "1::2::3", "1:2:3:4:5:6:7:8:9", "12345::1", "g::1", "::1%eth0", "[::1]", "1.2.3.4",
+            "::256.1.1.1", "::1.2.3", ":", "::1::", "1:2:3:4:5:6:7::8:9")) {
+            assertFalse(h, LadderParser.validIpv6Literal(h))
+        }
     }
 }

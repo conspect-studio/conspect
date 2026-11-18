@@ -140,10 +140,7 @@ class SrtDataSource(
         lastStatsAtMs = now
         try {
             val drops = s.bistats(false, true).pktRcvDropTotal
-            if (drops > lastDrops) {
-                filter.resync()
-                events.onLoss()
-            }
+            if (drops > lastDrops && filter.resync()) events.onLoss() // merged into a recovery already counted
             lastDrops = drops
         } catch (e: Exception) {
             // statistics are advisory

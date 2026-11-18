@@ -2,7 +2,6 @@ package studio.conspect.cast.tv
 
 import java.net.HttpURLConnection
 import java.net.URL
-import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -10,24 +9,61 @@ import java.util.concurrent.TimeUnit
 
 class HttpResult(val status: Int, val body: String?, val retryAfter: String?)
 
-/** Work of one cast generation: cancelling it disconnects every call registered on it and wakes its sleeps. */
+/** Disconnects run here, never on the main thread. */
+internal object CancelExecutor {
+    val exec: java.util.concurrent.ExecutorService = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "cast-cancel").apply { isDaemon = true }
+    }
+}
+
+/**
+ * Work of one cast generation: cancelling it disconnects every call registered on it (on a worker thread, not the
+ * caller's) and wakes its sleeps. A registration is a [Handle]: closing it removes the hook exactly once.
+ */
 class CallScope {
     @Volatile
     var cancelled = false
         private set
     private val latch = CountDownLatch(1)
-    private val hooks = CopyOnWriteArrayList<() -> Unit>()
+    private val lock = Any()
+    private val hooks = LinkedHashMap<Handle, () -> Unit>()
 
-    fun onCancel(hook: () -> Unit) {
-        hooks.add(hook)
-        if (cancelled) hook()
+    inner class Handle internal constructor() : AutoCloseable {
+        private val done = java.util.concurrent.atomic.AtomicBoolean(false)
+        override fun close() {
+            if (done.compareAndSet(false, true)) synchronized(lock) { hooks.remove(this) }
+        }
+        internal fun markDone() = done.set(true)
     }
 
+    /** Registers [hook]; runs it (off-thread) at once when the scope is already cancelled. Close the handle when done. */
+    fun register(hook: () -> Unit): Handle {
+        val h = Handle()
+        val runNow: Boolean
+        synchronized(lock) {
+            runNow = cancelled
+            if (!runNow) hooks[h] = hook
+        }
+        if (runNow) {
+            h.markDone()
+            CancelExecutor.exec.execute { runCatching(hook) }
+        }
+        return h
+    }
+
+    val hookCount: Int get() = synchronized(lock) { hooks.size }
+
     fun cancel() {
-        if (cancelled) return
-        cancelled = true
+        val toRun: List<() -> Unit>
+        synchronized(lock) {
+            if (cancelled) return
+            cancelled = true
+            toRun = hooks.values.toList()
+            hooks.keys.forEach { it.markDone() }
+            hooks.clear()
+        }
         latch.countDown()
-        hooks.forEach { runCatching(it) }
+        toRun.forEach { h -> CancelExecutor.exec.execute { runCatching(h) } }
     }
 
     /** Sleeps up to [ms]; returns false when the scope was cancelled meanwhile. */
@@ -57,17 +93,17 @@ object UrlHttp : Http {
 
     private fun call(url: String, json: String?, scope: CallScope): HttpResult {
         if (scope.cancelled) return HttpResult(0, null, null)
-        var c: HttpURLConnection? = null
-        val deadline = try {
-            c = URL(url).openConnection() as HttpURLConnection
-            val conn = c
-            scope.onCancel { conn.disconnect() }
-            deadlines.schedule({ conn.disconnect() }, TOTAL_DEADLINE_MS, TimeUnit.MILLISECONDS)
+        val conn: HttpURLConnection
+        val handle: CallScope.Handle
+        val deadline: java.util.concurrent.ScheduledFuture<*>
+        try {
+            conn = URL(url).openConnection() as HttpURLConnection
+            handle = scope.register { conn.disconnect() }
+            deadline = deadlines.schedule({ conn.disconnect() }, TOTAL_DEADLINE_MS, TimeUnit.MILLISECONDS)
         } catch (e: Exception) {
             return HttpResult(0, null, null)
         }
         return try {
-            val conn = c!!
             conn.connectTimeout = TIMEOUT_MS
             conn.readTimeout = TIMEOUT_MS
             conn.instanceFollowRedirects = false
@@ -86,7 +122,8 @@ object UrlHttp : Http {
             HttpResult(0, null, null)
         } finally {
             deadline.cancel(false)
-            c?.disconnect()
+            handle.close() // the hook list never grows past the calls in flight
+            conn.disconnect()
         }
     }
 

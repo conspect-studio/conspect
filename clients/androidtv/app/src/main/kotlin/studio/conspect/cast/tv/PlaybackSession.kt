@@ -92,7 +92,8 @@ class PlaybackSession(
         lastError = null
         losses = LossPolicy()
         setState("loading")
-        net.run(gen) { negotiate(parsed, gen, it) }
+        // stop() emptied the queue, so the newest negotiation is always admitted; if not, fail loudly to HLS.
+        if (!net.run(gen) { negotiate(parsed, gen, it) }) playHls(parsed, gen)
     }
 
     /** Ends the session for good (Activity destroyed): stops everything, shuts the network worker down. */

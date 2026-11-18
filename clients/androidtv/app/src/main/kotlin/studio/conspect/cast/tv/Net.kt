@@ -1,87 +1,118 @@
 package studio.conspect.cast.tv
 
-import java.util.concurrent.ArrayBlockingQueue
-import java.util.concurrent.RejectedExecutionException
-import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicReference
 
 /**
- * The session's network work: one thread, a bounded queue, work tagged with a generation and dropped before it
- * starts when the generation is stale, cancellable through a [CallScope], and shut down by [dispose].
- * Reports are coalesced: at most one in flight, and the newest replaces a pending one.
+ * The session's network work: one daemon thread, shut down by [dispose].
+ *
+ * - Control work (negotiation, token checks, ladder failure calls) has priority over reports and is bounded.
+ * - There is one report slot: the newest report replaces a pending one, so reports never queue up and need no
+ *   in-flight flag. The worker takes at most one report per turn and looks at control work again before the next.
+ * - Every task carries its generation. A task whose generation is stale is dropped before it starts; [cancelAll]
+ *   removes every queued task, empties the report slot, and cancels the calls in flight through their [CallScope].
  */
 class NetWorker(
     private val gate: GenerationGate,
     private val http: Http,
-    queueCapacity: Int = 8,
+    private val queueCapacity: Int = 8,
     threadName: String = "cast-net",
 ) {
-    private val exec = ThreadPoolExecutor(
-        1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(queueCapacity),
-        { r -> Thread(r, threadName).apply { isDaemon = true } },
-        ThreadPoolExecutor.AbortPolicy(),
-    )
+    private class Task(val gen: Int, val scope: CallScope, val run: (CallScope) -> Unit)
+    private class Report(val gen: Int, val url: String, val json: String, val scope: CallScope)
 
-    @Volatile
+    private val lock = Object()
+    private val control = ArrayDeque<Task>()
+    private var report: Report? = null
     private var scope = CallScope()
-    private val disposed = AtomicBoolean(false)
+    private var disposed = false
     val rejected = AtomicInteger(0)
 
-    private class Pending(val gen: Int, val url: String, val json: String)
+    private val thread = Thread({ loop() }, threadName).apply { isDaemon = true; start() }
 
-    private val pending = AtomicReference<Pending?>(null)
-    private val inFlight = AtomicBoolean(false)
-
-    /** Cancels everything in flight and queued (the old scope), and starts a fresh one. */
+    /** Drops everything queued, empties the report slot and cancels the calls in flight. */
     fun cancelAll() {
-        val old = scope
-        scope = CallScope()
+        val old: CallScope
+        synchronized(lock) {
+            old = scope
+            scope = CallScope()
+            control.clear()
+            report = null
+        }
         old.cancel()
-        pending.set(null)
     }
 
-    /** Queues [task] for generation [gen]; false when the queue is full or the worker is disposed. */
-    fun run(gen: Int, task: (CallScope) -> Unit): Boolean {
-        if (disposed.get()) return false
-        val s = scope
-        return try {
-            exec.execute { if (gate.isCurrent(gen) && !s.cancelled) task(s) }
-            true
-        } catch (e: RejectedExecutionException) {
+    /** Queues control work for generation [gen]; false when the queue is full or the worker is disposed. */
+    fun run(gen: Int, task: (CallScope) -> Unit): Boolean = synchronized(lock) {
+        if (disposed) return false
+        if (control.size >= queueCapacity) {
             rejected.incrementAndGet()
-            false
+            return false
         }
+        control.addLast(Task(gen, scope, task))
+        lock.notifyAll()
+        true
     }
 
-    /** POSTs [json] to [url]; a pending report is replaced by this newer one. */
+    /** Puts [json] in the report slot (replacing a pending one); posted when the worker has no control work. */
     fun report(gen: Int, url: String, json: String) {
-        pending.set(Pending(gen, url, json))
-        if (inFlight.compareAndSet(false, true)) {
-            if (!run(gen) { drain(it) }) inFlight.set(false)
+        synchronized(lock) {
+            if (disposed) return
+            report = Report(gen, url, json, scope)
+            lock.notifyAll()
         }
     }
 
-    private fun drain(s: CallScope) {
-        do {
-            while (true) {
-                val p = pending.getAndSet(null) ?: break
-                if (gate.isCurrent(p.gen) && !s.cancelled) http.post(p.url, p.json, s)
+    private fun loop() {
+        while (true) {
+            var task: Task? = null
+            var rep: Report? = null
+            synchronized(lock) {
+                while (!disposed && control.isEmpty() && report == null) lock.wait()
+                if (disposed) return
+                task = control.removeFirstOrNull()
+                if (task == null) {
+                    rep = report
+                    report = null
+                }
             }
-            inFlight.set(false)
-        } while (pending.get() != null && inFlight.compareAndSet(false, true))
+            val t = task
+            val r = rep
+            try {
+                if (t != null) {
+                    if (gate.isCurrent(t.gen) && !t.scope.cancelled) t.run(t.scope)
+                } else if (r != null && gate.isCurrent(r.gen) && !r.scope.cancelled) {
+                    http.post(r.url, r.json, r.scope)
+                }
+            } catch (e: Throwable) {
+                // one failed task must not end the worker
+            }
+        }
     }
 
     fun dispose() {
-        if (!disposed.compareAndSet(false, true)) return
-        scope.cancel()
-        pending.set(null)
-        exec.shutdownNow()
+        val s: CallScope
+        synchronized(lock) {
+            if (disposed) return
+            disposed = true
+            s = scope
+            control.clear()
+            report = null
+            lock.notifyAll()
+        }
+        s.cancel()
+        thread.interrupt()
     }
 
-    val isShutdown: Boolean get() = exec.isShutdown
+    val isShutdown: Boolean get() = synchronized(lock) { disposed } && !thread.isAlive
+
+    /** Test aid: waits for the worker thread to end after [dispose]. */
+    fun awaitTermination(ms: Long): Boolean {
+        thread.join(ms)
+        return !thread.isAlive
+    }
+
+    val queued: Int get() = synchronized(lock) { control.size + (if (report != null) 1 else 0) }
 }
 
 /**

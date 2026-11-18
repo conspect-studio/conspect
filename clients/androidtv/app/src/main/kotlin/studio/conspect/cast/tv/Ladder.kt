@@ -117,8 +117,34 @@ object LadderParser {
     internal fun validHost(h: String): Boolean {
         if (h.isEmpty() || h.length > 253) return false
         if (h.any { it.code <= 0x20 || it.code == 0x7f || it.code > 0x7e }) return false
-        if (h.contains(':')) return Regex("^[0-9A-Fa-f:.]{2,45}$").matches(h) // IPv6 literal, no brackets
+        if (h.contains(':')) return validIpv6Literal(h)
         return h.split('.').all { DNS_LABEL.matches(it) }
+    }
+
+    /**
+     * An IPv6 literal without brackets or zone. A strict shape check first (at most 8 groups of 1..4 hex digits, one
+     * `::` at most, an optional trailing dotted IPv4), then `InetAddress.getByName`, which only parses a literal of
+     * this shape and never does a DNS lookup.
+     */
+    internal fun validIpv6Literal(h: String): Boolean {
+        if (h.length !in 2..45 || !h.contains(':') || h.contains('%') || h.contains('[')) return false
+        if (!Regex("^[0-9A-Fa-f:.]+$").matches(h)) return false
+        if (h.indexOf("::") != h.lastIndexOf("::")) return false
+        if (h.contains(":::")) return false
+        val v4 = h.contains('.')
+        val groups = h.split(':')
+        if (v4) {
+            val last = groups.last()
+            val oct = last.split('.')
+            if (oct.size != 4 || oct.any { it.isEmpty() || it.length > 3 || it.toInt() > 255 }) return false
+        }
+        val hexGroups = if (v4) groups.dropLast(1) else groups
+        if (hexGroups.any { it.length > 4 || it.contains('.') }) return false
+        return try {
+            java.net.InetAddress.getByName(h) is java.net.Inet6Address || v4
+        } catch (e: Exception) {
+            false
+        }
     }
 
     private fun srt(a: JSONObject): LadderAnswer {

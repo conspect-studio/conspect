@@ -82,7 +82,8 @@ class TsContinuityDetector {
  * audio frame is independently decodable. The extractor therefore never sees a frame that depends on lost data.
  * The held unit is bounded by [MAX_UNIT_BYTES]; a unit larger than that is passed on without further holding.
  */
-class TsIdrFilter {
+class TsIdrFilter(private val nowMs: () -> Long = { System.nanoTime() / 1_000_000L }) {
+    private var lastRecoveryMs = Long.MIN_VALUE / 2
     private val detector = TsContinuityDetector()
     private var dropping = false
     private val pending = java.io.ByteArrayOutputStream()
@@ -97,13 +98,20 @@ class TsIdrFilter {
 
     val recovering: Boolean get() = dropping
 
-    /** Starts a recovery without a continuity gap (libsrt's receive-drop counter rose). */
-    fun resync() {
-        if (detector.videoPid >= 0 && !dropping) beginDropping()
+    /**
+     * libsrt's receive-drop counter rose. The same loss is usually also a continuity gap, so this is merged into a
+     * recovery that is going on, or that began or ended less than [MERGE_MS] ago. Returns true when it started a
+     * recovery of its own.
+     */
+    fun resync(): Boolean {
+        if (detector.videoPid < 0 || dropping || nowMs() - lastRecoveryMs < MERGE_MS) return false
+        beginDropping()
+        return true
     }
 
     private fun beginDropping() {
         dropping = true
+        lastRecoveryMs = nowMs()
         recoveries += 1
         clearPending()
     }
@@ -177,6 +185,7 @@ class TsIdrFilter {
             scanForIdr()
             if (idrSeen) { // the candidate unit becomes the held unit of normal flow
                 dropping = false
+                lastRecoveryMs = nowMs()
                 payload.reset()
                 scanFrom = 0
                 idrSeen = false
@@ -210,11 +219,13 @@ class TsIdrFilter {
     fun reset() {
         detector.reset()
         dropping = false
+        lastRecoveryMs = Long.MIN_VALUE / 2
         clearPending()
         recoveries = 0
     }
 
     companion object {
         const val MAX_UNIT_BYTES = 1024 * 1024
+        const val MERGE_MS = 1000L
     }
 }
