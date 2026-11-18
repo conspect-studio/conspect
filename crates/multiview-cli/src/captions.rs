@@ -1163,8 +1163,10 @@ fn read_captions(plan: &CaptionPlan, stop: &AtomicBool) -> Result<(), String> {
             ) {
                 Ok(fetched) => fetched.body,
                 Err(reason) => {
-                    // One missing segment loses its cues, never the reader.
+                    // One missing segment loses its cues, never the reader nor
+                    // its position: its listed duration still advances it.
                     tracing::debug!(source = %plan.id, %reason, "caption segment fetch failed; skipped");
+                    clock.advance(segment, None);
                     continue;
                 }
             };
@@ -1327,8 +1329,14 @@ enum CueAnchor {
 ///   crossed; an epoch's timestamps are continuous, so it never rebases
 ///   inside one). A picture past the segment's earliest end skips it (fail
 ///   closed: its epoch is unknown);
-/// * the first one, or after a gap in the sequence (no estimate): through the
-///   current mapping when it puts the cues near the shown picture.
+/// * the first one, or after a sequence gap (the window slid past segments
+///   this reader never saw listed; a failed fetch is no gap, its listed
+///   duration still advances the estimate): a re-synchronisation through the
+///   shown picture's mapping when it puts the cues near that picture. This is
+///   the one place timestamps decide (as any HLS player syncing a subtitle
+///   rendition to its video does): a (re)sync landing within
+///   [`SAME_CLOCK_NS`] of a splice that reused the raw clock can pick the
+///   wrong side; it is re-decided at the next epoch.
 ///
 /// This never maps a new epoch through a mapping of the wrong side of a
 /// splice; the price is timeliness when the splice KEEPS the raw clock (no
@@ -1381,8 +1389,11 @@ impl ClockMatch {
         stop: &AtomicBool,
     ) -> SegmentMapping {
         if self.next_seq != Some(segment.sequence) {
-            // A gap (or the first segment): no position estimate.
+            // The first segment, or a sequence gap (the live window slid past
+            // segments never listed to this reader): no position estimate, so
+            // the reader re-synchronises as on its first segment.
             self.next_start = None;
+            self.mapped = None;
         }
         let Some(first) = first else {
             return SegmentMapping::Skip;
@@ -2841,6 +2852,38 @@ input_id = "cam_b"
         let reset = vtt_cues("WEBVTT\n\n00:00:00.500 --> 00:00:03.000\nad\n");
         let start = read_while_video_moves(&mut clock, &plan, &seg(101, 2), &reset, (0, 16, 16));
         assert_eq!(start, Some(16_500));
+    }
+
+    /// #526 review r10: a failed segment fetch keeps the position estimate
+    /// (its listed duration advances it), so the following new-epoch segment
+    /// still goes through the crossing rules, never the timestamp re-sync.
+    #[test]
+    fn a_failed_segment_fetch_keeps_the_position_estimate() {
+        let plan = reader_plan();
+        set_anchor(&plan, 0, 0);
+        show_at(&plan, 102);
+        let mut clock = ClockMatch::default();
+        let stop = AtomicBool::new(false);
+        let cue = vtt_cues("WEBVTT\n\n00:01:41.000 --> 00:01:42.000\nepoch 1\n");
+        read_segment(&mut clock, &plan, &seg(100, 1), &cue, &stop).expect("maps");
+        // Segment 101 fails to fetch: only its duration is recorded.
+        clock.advance(&seg(101, 1), None);
+        // Segment 102 opens epoch 2 with a reused raw time near the picture:
+        // under the old mapping it would land at 90.5 s.
+        // It waits for the crossing (stopped here after 300 ms).
+        let reset = vtt_cues("WEBVTT\n\n00:01:30.500 --> 00:01:32.000\nepoch 2\n");
+        let waiting = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                waiting.store(true, Ordering::Release);
+            });
+            assert_eq!(
+                clock.segment(&plan, &seg(102, 2), reset.first(), &waiting),
+                SegmentMapping::Stop,
+                "waits for the crossing, never maps through epoch 1's mapping"
+            );
+        });
     }
 
     /// The wait ends at once on stop.
