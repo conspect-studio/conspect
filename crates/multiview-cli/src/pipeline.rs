@@ -4197,9 +4197,14 @@ impl Pipeline {
         #[cfg(feature = "overlay")]
         let resolve: crate::subtitle_slots::CueResolver = {
             let captions = Arc::clone(&self.live_caption_stores);
+            let cursors = Arc::clone(&self.caption_display_times);
             Box::new(move |id: &str, now: MediaTime| {
                 let store = captions.load().get(id).cloned()?;
                 let picture = stores(id)?.peek_at_with_source_time(now)?;
+                // #526: a slot-only source (no cell) gets its rendition
+                // reader's cursor from here, off the output clock. One
+                // lock-free load, and a store only when the picture changed.
+                publish_cursor(&cursors, id, picture);
                 // Borrow-and-project (ABU-1/INV-1): bounded text only, a
                 // bitmap cue is skipped without copying its pixels.
                 crate::subtitle_slots::text_cue_lines(&store, picture.pts, picture.generation)
@@ -6430,8 +6435,14 @@ impl Pipeline {
             // per-source path below (the text-layer primitive RT-10a built is
             // text-only).
             #[cfg(feature = "overlay")]
+            // A source this frame does not composite keeps its last cursor
+            // (#526): a slot-only caption source (a cast subtitle slot, no
+            // cell) has its cursor published by the subtitle sampler instead,
+            // and clearing it here every tick would starve its reader.
             for (id, cursor) in caption_display_times.load().iter() {
-                cursor.store(frame.source_times.get(id).copied().map(Arc::new));
+                if let Some(time) = frame.source_times.get(id) {
+                    cursor.store(Some(Arc::new(*time)));
+                }
             }
             #[cfg(feature = "overlay")]
             let captions = subtitle_router.sample_selected(&frame.source_times);
@@ -12543,7 +12554,12 @@ impl LiveIngestSpawner {
             let existing = self.caption_stores.load().get(&id).cloned();
             self.set_caption_generation(&id, lifecycle);
             let generation = lifecycle;
-            let caption_plan = caption_plan_for_generation(&source, existing.clone(), generation);
+            let caption_plan = caption_plan_for_generation(&source, existing.clone(), generation)
+                .map(|mut captions| {
+                    // #526: cues map onto the timeline of THIS video producer.
+                    captions.video_anchor = Arc::clone(&plan.live_anchor);
+                    captions
+                });
             if caption_plan.is_none() {
                 if let Some(selector) = source.captions.as_ref() {
                     if let Some(channel) =
@@ -17112,6 +17128,22 @@ mod source_events_enabled_tests {
     }
 }
 
+/// Publish `picture` as source `id`'s caption reader cursor when it differs
+/// from the current one (#526: the subtitle sampler's view of a slot-only
+/// source). Wait-free: one registry load, one cursor load, at most one store.
+#[cfg(feature = "overlay")]
+fn publish_cursor(
+    cursors: &crate::captions::DisplayCursors,
+    id: &str,
+    picture: multiview_framestore::tile::SourceFrameTime,
+) {
+    if let Some(cursor) = cursors.load().get(id) {
+        if cursor.load().as_deref() != Some(&picture) {
+            cursor.store(Some(Arc::new(picture)));
+        }
+    }
+}
+
 /// Build an HLS caption plan for a specific source generation. The resolver
 /// returns a new generation-1 store; install the caller's token on the selected
 /// old or new store before any reader can observe it.
@@ -17170,6 +17202,8 @@ fn wire_source_captions(
     // concurrently off the build path (#48). A cheap map lookup — no network here.
     if let Some(mut caption_plan) = prefetched.remove(&source.id) {
         caption_plan.generation = plan.lifecycle;
+        // #526: cues map onto the timeline of THIS video producer.
+        caption_plan.video_anchor = Arc::clone(&plan.live_anchor);
         caption_plan.store.begin_generation(plan.lifecycle);
         caption_stores.insert(source.id.clone(), Arc::clone(&caption_plan.store));
         caption_plans.push(caption_plan);
@@ -23090,6 +23124,37 @@ mod overlay_clock_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
 
+    /// #526: the subtitle sampler publishes a slot-only source's picture time
+    /// as its caption reader cursor (only on change), and leaves sources with
+    /// no reader alone.
+    #[test]
+    fn the_subtitle_sampler_feeds_a_slot_only_caption_cursor() {
+        use multiview_framestore::tile::SourceFrameTime;
+        let cursor: crate::captions::DisplayCursor =
+            Arc::new(multiview_framestore::SwapCell::empty());
+        let cursors: crate::captions::DisplayCursors =
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashMap::from([("cc".to_owned(), Arc::clone(&cursor))]),
+            ));
+        let at = |ns| SourceFrameTime {
+            pts: MediaTime::from_nanos(ns),
+            generation: 4,
+            event_clock: None,
+        };
+        publish_cursor(&cursors, "cc", at(10));
+        assert_eq!(cursor.load().as_deref(), Some(&at(10)));
+        let first = cursor.load().expect("published");
+        publish_cursor(&cursors, "cc", at(10));
+        assert!(
+            Arc::ptr_eq(&first, &cursor.load().expect("kept")),
+            "an unchanged picture is not re-stored"
+        );
+        publish_cursor(&cursors, "cc", at(20));
+        assert_eq!(cursor.load().as_deref(), Some(&at(20)));
+        publish_cursor(&cursors, "other", at(30));
+        assert_eq!(cursor.load().as_deref(), Some(&at(20)));
+    }
+
     /// Build a `clock` overlay carrying `params` by deserializing JSON (the
     /// `#[non_exhaustive]` `Overlay` has no cross-crate struct literal).
     fn clock_overlay(params: serde_json::Value) -> multiview_config::Overlay {
@@ -25976,6 +26041,7 @@ input_id = "net1"
             live: true,
             generation: 1,
             displayed_time: Arc::new(multiview_framestore::SwapCell::empty()),
+            video_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
         };
         let registry = stop_registry();
         let supervisor = IngestSupervisor::start(

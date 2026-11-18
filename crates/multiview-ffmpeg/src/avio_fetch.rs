@@ -83,6 +83,28 @@ const RW_TIMEOUT_US: &str = "30000000";
 /// open fails (bad URL, network error), the body exceeds `max_bytes`, or the
 /// body is not valid UTF-8.
 pub fn fetch_url_text(url: &str, max_bytes: usize, allowed_protocols: &str) -> Result<FetchedText> {
+    fetch_url_text_with_headers(
+        url,
+        max_bytes,
+        allowed_protocols,
+        &crate::HttpHeaders::default(),
+    )
+}
+
+/// [`fetch_url_text`] that also sends the source's operator HTTP headers
+/// (`user_agent`/`referer` open options; values are never logged). The caption
+/// rendition reader (#526) fetches its media playlist and `.vtt` segments with
+/// the same headers the video demux sends.
+///
+/// # Errors
+///
+/// As [`fetch_url_text`]; a header value with an interior NUL is refused.
+pub fn fetch_url_text_with_headers(
+    url: &str,
+    max_bytes: usize,
+    allowed_protocols: &str,
+    headers: &crate::HttpHeaders,
+) -> Result<FetchedText> {
     // Hard, Rust-side scheme guarantee (independent of libav's own enforcement).
     let scheme = url.split(':').next().unwrap_or("");
     if scheme.is_empty() || !allowed_protocols.split(',').any(|p| p == scheme) {
@@ -101,12 +123,26 @@ pub fn fetch_url_text(url: &str, max_bytes: usize, allowed_protocols: &str) -> R
         .map_err(|_| fetch_err(url, format_args!("protocol list has an interior NUL")))?;
     let to_key = c_string("rw_timeout", url)?;
     let to_val = c_string(RW_TIMEOUT_US, url)?;
+    let mut extra: Vec<(CString, CString)> = Vec::new();
+    for (key, value) in headers.open_options() {
+        let value = CString::new(value)
+            .map_err(|_| fetch_err(url, format_args!("header {key} has an interior NUL")))?;
+        extra.push((c_string(key, url)?, value));
+    }
 
     // SAFETY: all pointers handed to libav below are either a fresh null
     // out-param libav fills (`opts`, `ctx`) or a `CString` we own for the whole
     // call; the options dict and the AVIOContext are freed on every return path
     // inside `fetch_inner`.
-    unsafe { fetch_inner(url, &curl, &wl_key, &wl_val, &to_key, &to_val, max_bytes) }
+    unsafe {
+        fetch_inner(
+            url,
+            &curl,
+            &[(&wl_key, &wl_val), (&to_key, &to_val)],
+            &extra,
+            max_bytes,
+        )
+    }
 }
 
 /// `AVOption` name for the HTTP(S) protocol's current/final URL after redirects.
@@ -119,23 +155,27 @@ fn c_string(s: &str, url: &str) -> Result<CString> {
 
 /// Open `url` read-only with the allowlist + timeout options, read to EOF into a
 /// bounded buffer, and close the context on every path.
-#[allow(clippy::too_many_arguments)]
 unsafe fn fetch_inner(
     url: &str,
     curl: &CString,
-    wl_key: &CString,
-    wl_val: &CString,
-    to_key: &CString,
-    to_val: &CString,
+    base: &[(&CString, &CString)],
+    extra: &[(CString, CString)],
     max_bytes: usize,
 ) -> Result<FetchedText> {
     let mut opts: *mut ffi::AVDictionary = ptr::null_mut();
-    // SAFETY: `opts` starts null; av_dict_set allocates and links entries into it.
-    // We free it (whether or not avio_open2 consumes it) before returning.
-    let r = ffi::av_dict_set(&raw mut opts, wl_key.as_ptr(), wl_val.as_ptr(), 0);
-    if r >= 0 {
-        // SAFETY: same live dict; second key.
-        ffi::av_dict_set(&raw mut opts, to_key.as_ptr(), to_val.as_ptr(), 0);
+    let pairs = base
+        .iter()
+        .copied()
+        .chain(extra.iter().map(|(key, value)| (key, value)));
+    let mut r = 0;
+    for (key, value) in pairs {
+        // SAFETY: `opts` starts null; av_dict_set allocates and links entries
+        // into it (copying both strings, which we own for this call). We free
+        // it (whether or not avio_open2 consumes it) before returning.
+        r = ffi::av_dict_set(&raw mut opts, key.as_ptr(), value.as_ptr(), 0);
+        if r < 0 {
+            break;
+        }
     }
     if r < 0 {
         // SAFETY: frees and nulls whatever av_dict_set allocated.
@@ -385,5 +425,43 @@ mod tests {
         let result = fetch_url_text(&url, 1024, "file");
         assert!(result.is_err(), "a non-UTF-8 body must be rejected");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn operator_headers_ride_the_text_fetch() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("[::1]:0").expect("bind loopback");
+        let port = listener.local_addr().expect("addr").port();
+        let seen = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut head = String::new();
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                head.push_str(&line);
+                line.clear();
+            }
+            let body = "#EXTM3U\n";
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            head
+        });
+        let headers = crate::HttpHeaders::new(Some("Opera/Test 9"), Some("https://ref.example/"));
+        let fetched = super::fetch_url_text_with_headers(
+            &format!("http://[::1]:{port}/subs.m3u8"),
+            4096,
+            "http,tcp",
+            &headers,
+        )
+        .expect("fetch");
+        assert_eq!(fetched.body, "#EXTM3U\n");
+        let head = seen.join().expect("server");
+        assert!(head.contains("User-Agent: Opera/Test 9"), "{head}");
+        assert!(head.contains("Referer: https://ref.example/"), "{head}");
     }
 }

@@ -12,37 +12,40 @@
 //!    rendition for the requested language (or the default),
 //! 4. resolves the rendition's (usually relative) `URI` against the master's base
 //!    directory ([`resolve_rendition_uri`]), and
-//! 5. spawns a **second isolated demux** of that rendition `m3u8` on its own
-//!    ingest thread that decodes each `WebVTT` cue with
-//!    [`multiview_ffmpeg::CaptionDecoder`] and publishes it into a per-source
-//!    [`CaptionCueStore`].
+//! 5. spawns an **isolated reader** thread that polls that media playlist,
+//!    fetches each new `.vtt` segment and parses its cues in pure Rust
+//!    ([`crate::vtt_rendition`], issue #526: no libav `webvtt` demuxer or
+//!    decoder is needed, so a minimal libav build still carries captions), and
+//!    publishes them into a per-source [`CaptionCueStore`].
 //!
-//! The reader is **best-effort**: any fetch/parse/decode error logs and yields no
+//! The reader is **best-effort**: any fetch/parse error logs and yields no
 //! cues (the tile simply shows none). It only ever *writes* the lock-free cue
 //! store — it can neither pace nor stall the output clock (invariant #1) nor
 //! back-pressure the engine (invariant #10), exactly like the video ingest
-//! threads. The off-hot-path overlay baker *samples* the store at each output
-//! tick (`active_at(pts)`), mirroring frame-store latch-on-tick.
+//! threads. Every fetch is bounded in bytes and time. The off-hot-path
+//! samplers read the store at the selected picture's source time.
 //!
 //! ## Timing (invariant #3)
 //!
-//! libav applies the rendition's `X-TIMESTAMP-MAP` itself, so the `WebVTT`
-//! packets arrive already rebased onto a 0-based media timeline (the first cue's
-//! packet PTS is `1.0s`, matching the bipbop video's source-relative timeline).
-//! The reader anchors each cue's window with [`multiview_ffmpeg::CaptionDecoder`]
-//! (packet PTS rebased to ns through the stream time-base) and publishes it on
-//! the same source-relative timeline the video frames use, so a cue burns in at
-//! the same media instant the output clock samples it.
+//! A segment's `X-TIMESTAMP-MAP` puts its cues on the MPEG-TS clock the video
+//! rides (RFC 8216 §3.5; a segment without one is already on it). The reader
+//! projects that instant onto the video's **normalized** source timeline
+//! through the source's live video anchor (the raw container PTS and the
+//! normalized PTS of one picture,
+//! [`LiveAnchor`](crate::pipeline::LiveAnchor)), nearest the 33-bit wrap — the
+//! timeline the selected picture's [`SourceFrameTime`] carries — so a cue
+//! shows with the picture it was authored for. A source without a live anchor
+//! (a local/VOD rendition) keeps the cue's time as written.
+//!
+//! [`SourceFrameTime`]: multiview_framestore::tile::SourceFrameTime
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use ffmpeg_next as ffmpeg;
-
 use multiview_config::schema::CaptionSelector;
 use multiview_core::time::MediaTime;
 use multiview_ffmpeg::caption::CaptionCue;
-use multiview_ffmpeg::{CaptionDecoder, CaptionSource};
+use multiview_ffmpeg::CaptionSource;
 use multiview_input::caption_store::CaptionCueStore;
 use multiview_input::hls::MasterPlaylist;
 
@@ -417,6 +420,11 @@ pub struct CaptionPlan {
     pub displayed_time: Arc<
         multiview_framestore::SwapCell<Option<Arc<multiview_framestore::tile::SourceFrameTime>>>,
     >,
+    /// The source's live video anchor (raw container PTS <-> normalized PTS,
+    /// [`LiveAnchor`](crate::pipeline::LiveAnchor)): maps a cue's MPEG-TS time
+    /// onto the timeline [`Self::displayed_time`] carries (#526). Empty ⇒ the
+    /// cue's MPEG-TS time is used as is.
+    pub video_anchor: crate::pipeline::LiveAnchorSlot,
 }
 
 /// Resolve a rendition's (possibly relative) `URI` against the master playlist's
@@ -897,6 +905,9 @@ fn resolve_caption_plan(
         live: true,
         generation: 1,
         displayed_time: Arc::new(multiview_framestore::SwapCell::empty()),
+        // Bound to the video producer's own slot when the pipeline wires the
+        // plan (startup and live spawn); empty until then.
+        video_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
     })
 }
 
@@ -1086,80 +1097,180 @@ pub fn caption_loop(plan: &CaptionPlan, stop: &AtomicBool) {
     }
 }
 
-/// Open `plan.rendition_url`, decode its `WebVTT` subtitle stream, and publish
-/// each cue into `plan.store`. Returns `Ok(())` at clean EOF.
+/// Read `plan.rendition_url` — the rendition's media playlist — and publish
+/// every cue of its `.vtt` segments into `plan.store`, in pure Rust (#526).
+/// Returns `Ok(())` at the end of a finished (`EXT-X-ENDLIST`) playlist or on
+/// stop; `Err` when the playlist cannot be fetched or parsed (the live
+/// supervisor in [`caption_loop`] backs off and retries).
 ///
-/// libav's HLS demuxer is strict about segment extensions; the rendition's
-/// `.webvtt` segments mismatch the default allow-list, so `extension_picky` is
-/// disabled for this isolated demux (it never touches the program path). No FFI,
-/// no `unsafe`: only `ffmpeg-next`'s safe `Input`/`Parameters` value API bridges
-/// into `multiview-ffmpeg`'s safe `CaptionDecoder`.
+/// No libav demuxer/decoder is involved: a minimal libav build may lack the
+/// `webvtt` components, and libav ignores `X-TIMESTAMP-MAP`. Each cue is put
+/// on the MPEG-TS clock by its segment's `X-TIMESTAMP-MAP`
+/// ([`crate::vtt_rendition`]) and projected onto the video's normalized
+/// timeline through the source's [`video anchor`](CaptionPlan::video_anchor).
+/// Every fetch is bounded in bytes and time; the segment schemes are limited to
+/// the rendition's own (`http(s)` for a network rendition).
 fn read_captions(plan: &CaptionPlan, stop: &AtomicBool) -> Result<(), String> {
-    multiview_ffmpeg::ensure_initialized().map_err(|e| e.to_string())?;
-
-    // The HLS demuxer rejects `.webvtt` segments under its default extension
-    // allow-list; relax it for THIS isolated rendition demux only. Cap the
-    // stream-probe so `avformat_find_stream_info` does NOT read the entire VOD
-    // rendition (all 60 segments) up front — a tiny probe is enough to identify
-    // the single WebVTT subtitle stream, and decoding then streams the cues out
-    // promptly rather than after a multi-second whole-playlist read-ahead.
-    let mut opts = ffmpeg::Dictionary::new();
-    opts.set("extension_picky", "0");
-    for (key, value) in plan.http_headers.open_options() {
-        opts.set(key, &value);
-    }
-    if !plan.http_headers.is_empty() {
-        tracing::debug!(source = %plan.id, "caption rendition demux carries operator request headers");
-    }
-    opts.set("allowed_extensions", "ALL");
-    opts.set("probesize", "131072");
-    opts.set("analyzeduration", "0");
-
-    let mut input = ffmpeg::format::input_with_dictionary(&plan.rendition_url.as_str(), opts)
-        .map_err(|e| e.to_string())?;
-
-    let (stream_index, params, time_base) = {
-        let stream = input
-            .streams()
-            .best(ffmpeg::media::Type::Subtitle)
-            .ok_or_else(|| "rendition has no subtitle stream".to_owned())?;
-        (
-            stream.index(),
-            stream.parameters(),
-            multiview_ffmpeg::from_ff_rational(stream.time_base()),
-        )
-    };
-
-    let mut decoder = CaptionDecoder::from_parameters(CaptionSource::WebVtt, params, time_base)
-        .map_err(|e| e.to_string())?;
-
-    // Bound rendition decode-ahead by the actual selected video source time.
-    // This isolated reader may wait; the output clock only publishes a cursor.
+    let allowed = rendition_protocols(&plan.rendition_url)?;
+    let mut next_seq: Option<u64> = None;
     let mut pending = PendingCues::default();
-
     loop {
-        if stop.load(Ordering::Acquire) {
+        if stop.load(Ordering::Acquire) || plan.store.generation() != plan.generation {
             return Ok(());
         }
-        let mut packet = ffmpeg::codec::packet::Packet::empty();
-        match packet.read(&mut input) {
-            Ok(()) => {
-                if packet.stream() != stream_index {
+        let fetched = fetch_rendition_text(
+            &plan.rendition_url,
+            MAX_RENDITION_PLAYLIST_BYTES,
+            allowed,
+            &plan.http_headers,
+        )?;
+        let playlist = crate::vtt_rendition::RenditionPlaylist::parse(&fetched.body)
+            .ok_or_else(|| "rendition is not an HLS media playlist".to_owned())?;
+        let first = first_new_segment(&playlist, next_seq, plan.live);
+        for segment in playlist.segments.iter().skip(first) {
+            if stop.load(Ordering::Acquire) || plan.store.generation() != plan.generation {
+                return Ok(());
+            }
+            next_seq = Some(segment.sequence.saturating_add(1));
+            let url = resolve_rendition_uri(&fetched.url, &segment.uri);
+            let body = match fetch_rendition_text(
+                &url,
+                MAX_VTT_SEGMENT_BYTES,
+                allowed,
+                &plan.http_headers,
+            ) {
+                Ok(fetched) => fetched.body,
+                Err(reason) => {
+                    // One missing segment loses its cues, never the reader.
+                    tracing::debug!(source = %plan.id, %reason, "caption segment fetch failed; skipped");
                     continue;
                 }
-                // A decode error on one packet is logged and skipped — captions
-                // are intermittent and a malformed cue must never stall ingest.
-                match decoder.decode(&packet) {
-                    Ok(cues) => publish_cues(plan, &mut pending, cues, stop),
-                    Err(e) => {
-                        tracing::debug!(source = %plan.id, error = %e, "caption packet decode error");
-                    }
+            };
+            let Some(cues) = crate::vtt_rendition::parse_segment(&body) else {
+                tracing::debug!(source = %plan.id, "caption segment is not WebVTT; skipped");
+                continue;
+            };
+            // Feed the bounded pending window in chunks it always holds whole
+            // (a 5 s live segment carries ~25 cues; the window keeps 16), so a
+            // dense rolling-caption segment loses none to the cap.
+            for chunk in cues.chunks(PENDING_CUE_CAP / 2) {
+                // Map only once the video shows a picture: its anchor (raw
+                // container PTS <-> normalized PTS) is published with it.
+                if !wait_for_picture(plan, stop) {
+                    return Ok(());
                 }
+                let mapped = chunk.iter().filter_map(|cue| map_cue(plan, cue)).collect();
+                publish_cues(plan, &mut pending, mapped, stop);
             }
-            Err(ffmpeg::Error::Eof) => return Ok(()),
-            Err(other) => return Err(other.to_string()),
         }
+        if playlist.ended {
+            return Ok(());
+        }
+        let poll = std::time::Duration::from_secs(playlist.target_duration_s.clamp(2, 12) / 2);
+        crate::pipeline::sleep_interruptible(poll, stop);
     }
+}
+
+/// Live segments a fresh reader starts behind the playlist's edge (the video
+/// demux, like libav's default, also starts a few segments back).
+const LIVE_START_SEGMENTS: usize = 3;
+/// Byte bound of one rendition media playlist fetch.
+const MAX_RENDITION_PLAYLIST_BYTES: usize = 1024 * 1024;
+/// Byte bound of one `.vtt` segment fetch (a 5 s live segment is ~3 KiB).
+const MAX_VTT_SEGMENT_BYTES: usize = 512 * 1024;
+
+/// The index of the first segment of `playlist` not yet read: after
+/// `next_seq`, or (a fresh reader) [`LIVE_START_SEGMENTS`] behind a live edge /
+/// the start of a finished playlist. A media sequence that moved backwards past
+/// the whole window (an origin restart) restarts at the live edge.
+fn first_new_segment(
+    playlist: &crate::vtt_rendition::RenditionPlaylist,
+    next_seq: Option<u64>,
+    live: bool,
+) -> usize {
+    let edge = if live && !playlist.ended {
+        playlist.segments.len().saturating_sub(LIVE_START_SEGMENTS)
+    } else {
+        0
+    };
+    let Some(next) = next_seq else {
+        return edge;
+    };
+    let last = playlist.segments.last().map(|s| s.sequence);
+    if last.is_some_and(|last| last.saturating_add(1) < next) {
+        return edge;
+    }
+    playlist
+        .segments
+        .iter()
+        .position(|s| s.sequence >= next)
+        .unwrap_or(playlist.segments.len())
+}
+
+/// The libav protocols a rendition's playlist and segments may use: the
+/// network set for an `http(s)` rendition, `file` only for a local one (a
+/// local master). Anything else is refused.
+fn rendition_protocols(url: &str) -> Result<&'static str, String> {
+    let scheme = url.split_once("://").map(|(scheme, _)| scheme);
+    match scheme {
+        Some("http" | "https") => Ok(ALLOWED_PROTOCOLS),
+        Some("file") | None => Ok("file"),
+        Some(other) => Err(format!("rendition scheme {other:?} is not supported")),
+    }
+}
+
+/// Fetch one rendition text resource (bounded bytes, bounded time). A bare
+/// local path is read as `file:`.
+fn fetch_rendition_text(
+    url: &str,
+    max_bytes: usize,
+    allowed: &str,
+    headers: &multiview_ffmpeg::HttpHeaders,
+) -> Result<multiview_ffmpeg::FetchedText, String> {
+    let target = if has_scheme(url) {
+        std::borrow::Cow::Borrowed(url)
+    } else {
+        std::borrow::Cow::Owned(format!("file:{url}"))
+    };
+    multiview_ffmpeg::fetch_url_text_with_headers(&target, max_bytes, allowed, headers)
+        .map_err(|e| e.to_string())
+}
+
+/// Wait (interruptibly, off the output clock) until the source's video shows a
+/// picture of this plan's generation. `false` on stop or a newer generation.
+fn wait_for_picture(plan: &CaptionPlan, stop: &AtomicBool) -> bool {
+    loop {
+        if stop.load(Ordering::Acquire) || plan.store.generation() != plan.generation {
+            return false;
+        }
+        if plan
+            .displayed_time
+            .load()
+            .is_some_and(|t| t.generation == plan.generation)
+        {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Place a rendition cue on the video's normalized timeline: through the
+/// source's live video anchor (raw container PTS <-> normalized PTS) when the
+/// video has one, else at its time as written (a source with no live anchor:
+/// a file/VOD rendition, which plays from its own start).
+fn map_cue(plan: &CaptionPlan, cue: &crate::vtt_rendition::VttCue) -> Option<CaptionCue> {
+    let anchor = plan
+        .video_anchor
+        .load()
+        .and_then(|anchor| anchor.raw_pts0_ns.map(|raw0| (raw0, anchor.pts0)));
+    let (start, end) = match anchor {
+        Some((raw0, pts0)) => (
+            crate::vtt_rendition::project_raw(cue.raw_start, raw0, pts0),
+            crate::vtt_rendition::project_raw(cue.raw_end, raw0, pts0),
+        ),
+        None => (cue.local_start, cue.local_end),
+    };
+    CaptionCue::try_text(start, end, cue.lines.clone(), None).ok()
 }
 
 /// Hard caps for decoded cues retained between packets. A single libav decode
@@ -2015,6 +2126,85 @@ input_id = "cam_b"
         assert_eq!(stats.text_truncated(), 3, "a small cue is not counted");
     }
 
+    fn playlist(
+        seqs: std::ops::Range<u64>,
+        ended: bool,
+    ) -> crate::vtt_rendition::RenditionPlaylist {
+        let mut text = format!("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:{}\n", seqs.start);
+        for seq in seqs {
+            text.push_str(&format!("#EXTINF:5,\n{seq}.vtt\n"));
+        }
+        if ended {
+            text.push_str("#EXT-X-ENDLIST\n");
+        }
+        crate::vtt_rendition::RenditionPlaylist::parse(&text).expect("playlist")
+    }
+
+    /// #526: a fresh live reader starts a few segments behind the edge, then
+    /// reads each new segment once; an origin restart re-joins at the edge.
+    #[test]
+    fn the_rendition_reader_reads_each_live_segment_once() {
+        let live = playlist(100..110, false);
+        assert_eq!(first_new_segment(&live, None, true), 7);
+        assert_eq!(first_new_segment(&live, Some(108), true), 8);
+        assert_eq!(first_new_segment(&live, Some(110), true), 10, "nothing new");
+        assert_eq!(
+            first_new_segment(&playlist(0..3, false), Some(500), true),
+            0
+        );
+        assert_eq!(
+            first_new_segment(&playlist(0..10, true), None, true),
+            0,
+            "VOD from start"
+        );
+        assert_eq!(first_new_segment(&live, None, false), 0);
+    }
+
+    #[test]
+    fn rendition_fetches_keep_to_the_rendition_scheme() {
+        assert_eq!(
+            rendition_protocols("https://a/b.m3u8"),
+            Ok(ALLOWED_PROTOCOLS)
+        );
+        assert_eq!(rendition_protocols("file:///tmp/x.m3u8"), Ok("file"));
+        assert_eq!(rendition_protocols("/tmp/x.m3u8"), Ok("file"));
+        assert!(rendition_protocols("concat://a|b").is_err());
+    }
+
+    /// #526: a cue on the MPEG-TS clock maps through the video anchor; with
+    /// no anchor it keeps its written time.
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn a_rendition_cue_maps_through_the_video_anchor() {
+        let plan = CaptionPlan {
+            http_headers: multiview_ffmpeg::HttpHeaders::default(),
+            id: "map".to_owned(),
+            rendition_url: String::new(),
+            store: Arc::new(CueStore::new()),
+            live: true,
+            generation: 1,
+            displayed_time: Arc::new(multiview_framestore::SwapCell::empty()),
+            video_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
+        };
+        let cue = crate::vtt_rendition::parse_segment(
+            "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000\n\n00:00:01.000 --> 00:00:03.000\nx\n",
+        )
+        .and_then(|c| c.into_iter().next())
+        .expect("cue");
+        let unmapped = map_cue(&plan, &cue).expect("cue");
+        assert_eq!(unmapped.start(), MediaTime::from_nanos(1_000_000_000));
+        plan.video_anchor
+            .store(Some(Arc::new(crate::pipeline::LiveAnchor {
+                generation: 1,
+                out0: MediaTime::ZERO,
+                pts0: MediaTime::from_nanos(500_000_000),
+                raw_pts0_ns: Some(10_000_000_000),
+            })));
+        let mapped = map_cue(&plan, &cue).expect("cue");
+        assert_eq!(mapped.start(), MediaTime::from_nanos(1_500_000_000));
+        assert_eq!(mapped.end(), MediaTime::from_nanos(3_500_000_000));
+    }
+
     /// RT-10b: a per-source [`CueStore`] carrying one text cue, for the router
     /// tests. `lines` is non-empty so it renders.
     #[cfg(feature = "overlay")]
@@ -2076,6 +2266,7 @@ input_id = "cam_b"
             live: false,
             generation: 1,
             displayed_time: cursor,
+            video_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
         };
         let cues: Vec<_> = (0..800)
             .rev()
@@ -2172,6 +2363,7 @@ input_id = "cam_b"
             live: false,
             generation: 2,
             displayed_time: Arc::clone(&cursor),
+            video_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
         };
         let stop = AtomicBool::new(false);
         publish_cues(&plan, &mut PendingCues::default(), vec![fresh], &stop);
@@ -2208,6 +2400,7 @@ input_id = "cam_b"
             live: false,
             generation: 1,
             displayed_time: Arc::clone(&cursor),
+            video_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
         };
         let stop = Arc::new(AtomicBool::new(false));
         let writer_stop = Arc::clone(&stop);

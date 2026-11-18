@@ -163,7 +163,7 @@ pub use codec::{
 pub use codec::{probe_encoder_opens, select_audio_encoder, select_encoder, select_usable_encoder};
 
 #[cfg(feature = "ffmpeg")]
-pub use avio_fetch::{fetch_url_text, FetchedText};
+pub use avio_fetch::{fetch_url_text, fetch_url_text_with_headers, FetchedText};
 
 pub use bsf_select::{
     needs_keyframe_freq_option, plan_bsf_chain, BsfFraming, BsfPlan, InputFraming,

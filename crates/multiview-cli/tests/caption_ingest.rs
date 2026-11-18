@@ -168,6 +168,7 @@ fn plan_for(rendition_url: String, live: bool) -> CaptionPlan {
         live,
         generation: 1,
         displayed_time: Arc::new(multiview_framestore::SwapCell::empty()),
+        video_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
     }
 }
 
@@ -316,4 +317,115 @@ fn live_caption_reader_retries_after_transient_error() {
         "a live caption reader must stop promptly once the stop flag is raised"
     );
     let _ = reader.join();
+}
+
+/// Publish a picture of source time `pts_ns` (generation 1) as the reader's
+/// display cursor.
+fn show(plan: &CaptionPlan, pts_ns: i64) {
+    plan.displayed_time.store(Some(Arc::new(
+        multiview_framestore::tile::SourceFrameTime {
+            pts: MediaTime::from_nanos(pts_ns),
+            generation: 1,
+            event_clock: None,
+        },
+    )));
+}
+
+/// Set the plan's live video anchor: the picture with raw container PTS
+/// `raw0_ns` has normalized PTS `pts0_ns`.
+fn anchor(plan: &CaptionPlan, raw0_ns: i64, pts0_ns: i64) {
+    plan.video_anchor
+        .store(Some(Arc::new(multiview_cli::pipeline::LiveAnchor {
+            generation: 1,
+            out0: MediaTime::ZERO,
+            pts0: MediaTime::from_nanos(pts0_ns),
+            raw_pts0_ns: Some(raw0_ns),
+        })));
+}
+
+/// Run the reader until `store` has a cue active at `at_ns` (or 10 s), and
+/// return its joined text.
+fn cue_text_at(plan: CaptionPlan, at_ns: i64) -> Option<String> {
+    let store = Arc::clone(&plan.store);
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || caption_loop(&plan, &stop))
+    };
+    let at = MediaTime::from_nanos(at_ns);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut found = None;
+    while Instant::now() < deadline {
+        if let Some(CaptionCue::Text { text, .. }) = store.active_at(at) {
+            found = Some(text.lines.join(" "));
+            break;
+        }
+        if reader.is_finished() {
+            // A finished playlist published everything it will.
+            if let Some(CaptionCue::Text { text, .. }) = store.active_at(at) {
+                found = Some(text.lines.join(" "));
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    stop.store(true, Ordering::Release);
+    reader.join().expect("reader stops");
+    found
+}
+
+/// #526: the recorded pluto.tv rendition slice. Its cues carry no
+/// `X-TIMESTAMP-MAP` and sit on the video's raw MPEG-TS clock (13:26:15.143 =
+/// 48375.143 s), while the selected picture's time is the normalized one. With
+/// the video anchored (raw 48375.143 s = normalized 2.0 s), the cue written at
+/// 13:26:16.180-13:26:17.849 shows at normalized 3.037-4.706 s. Before the fix
+/// every cue was dropped as two minutes in the future.
+#[test]
+fn recorded_pluto_rendition_publishes_its_cues_on_the_video_timeline() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pluto-526");
+    let plan = plan_for(format!("file://{}/playlist.m3u8", dir.display()), false);
+    let raw0 = 48_375_143_000_000;
+    anchor(&plan, raw0, 2_000_000_000);
+    show(&plan, 3_500_000_000);
+    let text = cue_text_at(plan, 3_500_000_000).expect("a recorded cue lands in the store");
+    assert_eq!(text, "AND LASTS UNTIL THE PLAYER BEATS THE STORY.");
+}
+
+/// #526: a segment with a NONZERO `X-TIMESTAMP-MAP` (MPEGTS 900000 = 10 s at
+/// LOCAL 0): the cue written at 00:00:01-00:00:03 is at MPEG-TS 11-13 s; the
+/// video anchored raw 10 s = normalized 0.5 s puts it at 1.5-3.5 s. Ignoring
+/// the map (what libav does) would put it at 1-3 s relative to the raw clock,
+/// i.e. -8.5 s on the video's timeline: never shown.
+#[test]
+fn a_nonzero_timestamp_map_places_the_cue_against_the_video_anchor() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("s0.vtt"),
+        "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000\n\n\
+         00:00:01.000 --> 00:00:03.000\nmapped cue\n",
+    )
+    .expect("segment");
+    std::fs::write(
+        dir.path().join("subs.m3u8"),
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n\
+         #EXTINF:4,\ns0.vtt\n#EXT-X-ENDLIST\n",
+    )
+    .expect("playlist");
+    let plan = plan_for(format!("file://{}/subs.m3u8", dir.path().display()), false);
+    anchor(&plan, 10_000_000_000, 500_000_000);
+    show(&plan, 3_000_000_000);
+    assert_eq!(
+        cue_text_at(plan, 3_000_000_000).as_deref(),
+        Some("mapped cue"),
+        "at normalized 3.0 s (MPEG-TS 12.5 s) the mapped cue is on screen"
+    );
+    // And not where an unmapped reading would put it.
+    let plan = plan_for(format!("file://{}/subs.m3u8", dir.path().display()), false);
+    anchor(&plan, 10_000_000_000, 500_000_000);
+    show(&plan, 1_200_000_000);
+    assert_eq!(
+        cue_text_at(plan, 1_200_000_000),
+        None,
+        "1.2 s is before the mapped cue (1.5 s)"
+    );
 }
