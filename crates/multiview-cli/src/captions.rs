@@ -1290,29 +1290,48 @@ const SAME_CLOCK_NS: i64 = 60_000_000_000;
 const CLOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How a rendition chunk's cues map onto the video timeline: through a live
-/// anchor `(raw0, pts0)`, or (no live anchor: a file/VOD source) as written.
+/// anchor `(raw0, pts0)`, or (a file/VOD source, no live anchor) as written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CueAnchor {
     Raw { raw0: i64, pts0: MediaTime },
     AsWritten,
 }
 
-/// The reader's view of which discontinuity epoch it last mapped (#526
-/// review: a splice restarts the cue clock, and the reader and the picture
-/// cross it at different times).
+/// The reader's correlation of rendition discontinuity epochs with the video's
+/// anchors (#526 review). An `EXT-X-DISCONTINUITY` (an ad splice) restarts the
+/// cue clock, and the video re-anchors (a new [`LiveAnchor`] generation,
+/// raw <-> normalized) when its own raw clock jumps there. The reader and the
+/// picture cross the splice at different times, so a chunk maps:
+///
+/// * of the epoch already mapped: through THAT epoch's stored anchor, whatever
+///   the video's current one (a late old-side chunk never takes the new
+///   mapping);
+/// * of a newer epoch whose cue clock CONTINUES the previous one (its first
+///   cue starts at or after the previous epoch's last cue, by less than
+///   [`SAME_CLOCK_NS`]: a splice that kept the MPEG-TS clock, where the video
+///   does not re-anchor either): through the previous epoch's anchor;
+/// * of a newer epoch whose cue clock jumped: only through a video anchor
+///   published AFTER the one the previous epoch used (the video crossed a
+///   splice too) that also puts the chunk near the shown picture; it waits up
+///   to [`CLOCK_WAIT`] for that;
+/// * the first chunk: through the current anchor, when it puts the chunk near
+///   the shown picture.
+///
+/// [`LiveAnchor`]: crate::pipeline::LiveAnchor
 #[derive(Debug, Default)]
 struct ClockMatch {
-    /// The epoch of the last chunk that mapped onto the picture's clock.
-    mapped_epoch: Option<u64>,
+    /// The last mapped epoch, the video anchor generation it used, and how its
+    /// cues map.
+    mapped: Option<(u64, u64, CueAnchor)>,
+    /// The latest raw (MPEG-TS) cue end mapped so far.
+    last_raw_end: Option<i64>,
 }
 
 impl ClockMatch {
-    /// Wait (off the output clock, stop-checked) until the video shows a
-    /// picture whose anchor puts `chunk` on its clock, and return that anchor.
-    /// `None` drops the chunk: a stop/new generation, a chunk of an epoch the
-    /// reader already mapped whose clock the picture has left (the reader
-    /// lagged past a splice), or [`CLOCK_WAIT`] spent waiting for a newer
-    /// epoch the picture never reached.
+    /// Wait (off the output clock, stop-checked) for the mapping of `chunk`
+    /// of discontinuity epoch `epoch` (see [`ClockMatch`]). `None` drops the
+    /// chunk: stop / a new generation, an epoch older than the mapped one, or
+    /// [`CLOCK_WAIT`] spent without a matching video anchor.
     fn wait(
         &mut self,
         plan: &CaptionPlan,
@@ -1321,39 +1340,84 @@ impl ClockMatch {
         stop: &AtomicBool,
     ) -> Option<CueAnchor> {
         let first = chunk.first()?;
+        let chunk_end = chunk.iter().map(|cue| cue.raw_end).max();
+        match self.mapped {
+            Some((mapped, _, anchor)) if mapped == epoch => {
+                self.note_end(chunk_end);
+                return Some(anchor);
+            }
+            Some((mapped, _, _)) if epoch < mapped => return None,
+            Some((_, generation, anchor)) if self.continues(first.raw_start) => {
+                self.mapped = Some((epoch, generation, anchor));
+                self.note_end(chunk_end);
+                return Some(anchor);
+            }
+            _ => {}
+        }
+        let previous = self.mapped.map(|(_, generation, _)| generation);
         let started = std::time::Instant::now();
         loop {
             if stop.load(Ordering::Acquire) || plan.store.generation() != plan.generation {
                 return None;
             }
-            let shown = plan
-                .displayed_time
-                .load()
-                .filter(|t| t.generation == plan.generation);
-            if let Some(shown) = shown {
-                let anchor = plan
-                    .video_anchor
-                    .load()
-                    .and_then(|anchor| anchor.raw_pts0_ns.map(|raw0| (raw0, anchor.pts0)));
-                let Some((raw0, pts0)) = anchor else {
-                    return Some(CueAnchor::AsWritten);
-                };
-                let at = crate::vtt_rendition::project_raw(first.raw_start, raw0, pts0);
-                let distance = at.as_nanos().saturating_sub(shown.pts.as_nanos());
-                if distance.abs() <= SAME_CLOCK_NS {
-                    self.mapped_epoch = Some(epoch);
-                    return Some(CueAnchor::Raw { raw0, pts0 });
-                }
-                // An epoch already mapped: the picture left its clock.
-                if self.mapped_epoch.is_some_and(|mapped| epoch <= mapped) {
-                    return None;
-                }
+            if let Some((generation, anchor)) = Self::matching_anchor(plan, first, previous) {
+                self.mapped = Some((epoch, generation, anchor));
+                self.last_raw_end = None;
+                self.note_end(chunk_end);
+                return Some(anchor);
             }
             if started.elapsed() >= CLOCK_WAIT {
                 return None;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    /// Remember the latest raw cue end mapped.
+    fn note_end(&mut self, end: Option<i64>) {
+        if let Some(end) = end {
+            self.last_raw_end = Some(self.last_raw_end.map_or(end, |last| last.max(end)));
+        }
+    }
+
+    /// Whether a cue starting at raw `start` continues the mapped cue clock:
+    /// at most 1 s before the last mapped cue end (rolling captions overlap)
+    /// and less than [`SAME_CLOCK_NS`] after it.
+    fn continues(&self, start: i64) -> bool {
+        self.last_raw_end.is_some_and(|last| {
+            let gap = start.saturating_sub(last);
+            (-1_000_000_000..SAME_CLOCK_NS).contains(&gap)
+        })
+    }
+
+    /// The current video anchor `(generation, mapping)` when a picture of the
+    /// plan's generation is shown, the anchor is newer than `previous` (when
+    /// set), and it puts `first` within [`SAME_CLOCK_NS`] of that picture.
+    fn matching_anchor(
+        plan: &CaptionPlan,
+        first: &crate::vtt_rendition::VttCue,
+        previous: Option<u64>,
+    ) -> Option<(u64, CueAnchor)> {
+        let shown = plan
+            .displayed_time
+            .load()
+            .filter(|t| t.generation == plan.generation)?;
+        let anchor = plan.video_anchor.load();
+        let raw = anchor
+            .as_ref()
+            .and_then(|a| a.raw_pts0_ns.map(|raw0| (a.generation, raw0, a.pts0)));
+        let Some((generation, raw0, pts0)) = raw else {
+            // A live source waits for its video's real anchor (a lifecycle
+            // start publishes a placeholder without a raw PTS); a file/VOD
+            // rendition plays its cues as written.
+            return (!plan.live).then_some((0, CueAnchor::AsWritten));
+        };
+        if previous.is_some_and(|previous| generation <= previous) {
+            return None;
+        }
+        let at = crate::vtt_rendition::project_raw(first.raw_start, raw0, pts0);
+        let distance = at.as_nanos().saturating_sub(shown.pts.as_nanos());
+        (distance.abs() <= SAME_CLOCK_NS).then_some((generation, CueAnchor::Raw { raw0, pts0 }))
     }
 }
 
@@ -2284,10 +2348,12 @@ input_id = "cam_b"
         }
     }
 
+    /// Publish a video anchor of the next generation (as the video does).
     fn set_anchor(plan: &CaptionPlan, raw0_s: i64, pts0_s: i64) {
+        let generation = plan.video_anchor.load().map_or(0, |a| a.generation) + 1;
         plan.video_anchor
             .store(Some(Arc::new(crate::pipeline::LiveAnchor {
-                generation: 1,
+                generation,
                 out0: MediaTime::ZERO,
                 pts0: MediaTime::from_nanos(pts0_s * 1_000_000_000),
                 raw_pts0_ns: Some(raw0_s * 1_000_000_000),
@@ -2323,44 +2389,128 @@ input_id = "cam_b"
         assert_eq!(mapped.end(), MediaTime::from_nanos(3_500_000_000));
     }
 
-    /// #526 review: across an ad splice the cue clock restarts. A chunk of the
-    /// NEXT epoch read while the picture is still before the splice waits for
-    /// the video to cross it (and its new anchor), instead of being mapped
-    /// through the old anchor and dropped as stale.
-    #[test]
-    fn a_chunk_past_a_splice_waits_for_the_video_to_cross_it() {
-        let plan = Arc::new(reader_plan());
-        set_anchor(&plan, 1_000, 10);
-        show_at(&plan, 12);
-        let mut clock = ClockMatch::default();
-        let before = vtt_cues("WEBVTT\n\n00:16:41.000 --> 00:16:42.000\nold side\n");
-        let stop = AtomicBool::new(false);
-        assert!(matches!(
-            clock.wait(&plan, &before, 283, &stop),
-            Some(CueAnchor::Raw { .. })
-        ));
-        // The ad segment: its clock restarts near zero.
-        let after = vtt_cues("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nad side\n");
+    /// Run `wait` for `chunk` of `epoch` while, after 200 ms, the video crosses
+    /// the splice (a new anchor `raw0_s` = `pts0_s`, shown at `shown_s`).
+    fn wait_while_video_crosses(
+        plan: &Arc<CaptionPlan>,
+        clock: &mut ClockMatch,
+        chunk: &[crate::vtt_rendition::VttCue],
+        epoch: u64,
+        (raw0_s, pts0_s, shown_s): (i64, i64, i64),
+    ) -> Option<CueAnchor> {
         let crosser = {
-            let plan = Arc::clone(&plan);
+            let plan = Arc::clone(plan);
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(200));
-                // The video crosses the splice: a new anchor (raw 0 s at 20 s).
-                set_anchor(&plan, 0, 20);
-                show_at(&plan, 20);
+                set_anchor(&plan, raw0_s, pts0_s);
+                show_at(&plan, shown_s);
             })
         };
-        let anchor = clock
-            .wait(&plan, &after, 284, &stop)
-            .expect("maps after the crossing");
+        let anchor = clock.wait(plan, chunk, epoch, &AtomicBool::new(false));
         crosser.join().expect("crosser");
-        let cue = map_cue(anchor, after.first().expect("cue")).expect("cue");
-        assert_eq!(cue.start(), MediaTime::from_nanos(21_000_000_000));
-        // A late chunk of the OLD epoch now finds the picture off its clock:
-        // dropped at once, never mapped through the new anchor.
-        let started = std::time::Instant::now();
-        assert_eq!(clock.wait(&plan, &before, 283, &stop), None);
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        anchor
+    }
+
+    /// The first cue's mapped start in milliseconds.
+    fn start_ms(anchor: CueAnchor, cues: &[crate::vtt_rendition::VttCue]) -> i64 {
+        map_cue(anchor, cues.first().expect("cue"))
+            .expect("cue")
+            .start()
+            .as_nanos()
+            / 1_000_000
+    }
+
+    /// #526 review: a SHORT clock reset at an ad splice (raw 30 s -> 1 s, so
+    /// the new-side cue maps through the OLD anchor to only 31 s before the
+    /// picture). The new epoch must wait for the video's new anchor, never
+    /// take the old one; an older epoch after it is dropped.
+    #[test]
+    fn a_short_splice_reset_maps_each_epoch_through_its_own_anchor() {
+        let plan = Arc::new(reader_plan());
+        let stop = AtomicBool::new(false);
+        set_anchor(&plan, 30, 10);
+        show_at(&plan, 12);
+        let mut clock = ClockMatch::default();
+        let old = vtt_cues("WEBVTT\n\n00:00:32.000 --> 00:00:33.000\nold side\n");
+        let old_anchor = clock.wait(&plan, &old, 283, &stop).expect("old epoch maps");
+        assert_eq!(start_ms(old_anchor, &old), 12_000, "old cue at 12 s");
+        let new = vtt_cues("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nad side\n");
+        // The video crosses later: raw 0 s = normalized 20 s.
+        let new_anchor = wait_while_video_crosses(&plan, &mut clock, &new, 284, (0, 20, 20))
+            .expect("new epoch maps after the crossing");
+        assert_eq!(
+            start_ms(new_anchor, &new),
+            21_000,
+            "ad cue at 21 s, not -19 s"
+        );
+        // More chunks of epoch 284 keep its anchor.
+        assert_eq!(clock.wait(&plan, &new, 284, &stop), Some(new_anchor));
+        // An older epoch after a newer one is dropped, never remapped.
+        assert_eq!(clock.wait(&plan, &old, 283, &stop), None);
+    }
+
+    /// The other order: the reader lags, so a late chunk of the mapped epoch
+    /// arrives after the video already crossed (a new anchor whose projection
+    /// is within 60 s). It keeps its epoch's stored anchor.
+    #[test]
+    fn a_late_old_epoch_chunk_keeps_its_epoch_anchor() {
+        let plan = reader_plan();
+        let stop = AtomicBool::new(false);
+        set_anchor(&plan, 30, 10);
+        show_at(&plan, 12);
+        let mut clock = ClockMatch::default();
+        let old = vtt_cues("WEBVTT\n\n00:00:32.000 --> 00:00:33.000\nold side\n");
+        let first = clock.wait(&plan, &old, 283, &stop).expect("maps");
+        set_anchor(&plan, 0, 20);
+        show_at(&plan, 21);
+        let late = vtt_cues("WEBVTT\n\n00:00:34.000 --> 00:00:35.000\nlate old side\n");
+        let anchor = clock.wait(&plan, &late, 283, &stop).expect("maps");
+        assert_eq!(anchor, first);
+        assert_eq!(
+            start_ms(anchor, &late),
+            14_000,
+            "through the old anchor, not 54 s"
+        );
+    }
+
+    /// A splice that keeps the MPEG-TS clock (the new epoch continues the old
+    /// cue times; the video does not re-anchor either) maps at once through
+    /// the previous anchor.
+    #[test]
+    fn a_continuous_clock_splice_keeps_the_anchor() {
+        let plan = reader_plan();
+        let stop = AtomicBool::new(false);
+        set_anchor(&plan, 30, 10);
+        show_at(&plan, 12);
+        let mut clock = ClockMatch::default();
+        let old = vtt_cues("WEBVTT\n\n00:00:32.000 --> 00:00:33.000\nold\n");
+        let anchor = clock.wait(&plan, &old, 1, &stop).expect("maps");
+        let next = vtt_cues("WEBVTT\n\n00:00:35.000 --> 00:00:36.000\nnext\n");
+        assert_eq!(clock.wait(&plan, &next, 2, &stop), Some(anchor));
+        assert_eq!(start_ms(anchor, &next), 15_000);
+    }
+
+    /// A newer epoch whose video never re-anchors is not mapped through the
+    /// previous epoch's anchor (stop ends the bounded wait here).
+    #[test]
+    fn a_new_epoch_without_a_video_crossing_is_not_mapped_through_the_old_anchor() {
+        let plan = reader_plan();
+        set_anchor(&plan, 30, 10);
+        show_at(&plan, 12);
+        let mut clock = ClockMatch::default();
+        let old = vtt_cues("WEBVTT\n\n00:00:32.000 --> 00:00:33.000\nold\n");
+        clock
+            .wait(&plan, &old, 7, &AtomicBool::new(false))
+            .expect("maps");
+        let new = vtt_cues("WEBVTT\n\n00:00:31.000 --> 00:00:32.000\nnew\n");
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                stop.store(true, Ordering::Release);
+            });
+            assert_eq!(clock.wait(&plan, &new, 8, &stop), None);
+        });
     }
 
     /// The wait ends at once on stop.
