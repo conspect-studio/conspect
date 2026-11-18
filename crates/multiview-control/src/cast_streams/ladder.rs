@@ -810,7 +810,7 @@ mod tests {
         let probe = probe_with(Some(FrameCounter::Rvfc), &[]);
         assert_eq!(
             offer(&all, SERVED_RUNGS, Some(&probe)),
-            ("moq", vec!["hls"])
+            ("moq", vec!["webrtc", "hls"])
         );
         let no_frames = probe_with(None, &[]);
         assert_eq!(offer(&all, SERVED_RUNGS, Some(&no_frames)), ("hls", vec![]));

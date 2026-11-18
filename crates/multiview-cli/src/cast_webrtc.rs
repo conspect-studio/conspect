@@ -77,8 +77,8 @@ pub(crate) struct Viewers {
 }
 
 impl Viewers {
-    /// An open feed's viewers (tests).
-    #[cfg(test)]
+    /// An open feed's viewers (the pipeline tests).
+    #[cfg(all(test, feature = "gpl-codecs"))]
     pub(crate) fn of(list: Vec<Arc<CastAttachment>>) -> Self {
         Self {
             list,
@@ -354,7 +354,7 @@ impl CastWebRtc for CliCastWebRtc {
 
 /// TEST SEAM: run one cast output's feed (subscription, gate, Opus) into
 /// `sink` for `viewers`, on its own thread, without a WHEP transport.
-#[cfg(test)]
+#[cfg(all(test, feature = "gpl-codecs"))]
 pub(crate) fn spawn_feed_for_test(
     factory: &crate::output_window_registry::SubscriptionFactory,
     config_id: &str,
