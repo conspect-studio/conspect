@@ -52,6 +52,9 @@ pub struct Segment {
     /// `EXT-X-DISCONTINUITY` tags before it. Cue times of different epochs
     /// sit on unrelated clocks (an ad break restarts the MPEG-TS clock).
     pub discontinuity: u64,
+    /// Its `#EXTINF` duration in nanoseconds (0 when absent or malformed;
+    /// at most one hour).
+    pub duration_ns: i64,
 }
 
 /// A parsed rendition media playlist.
@@ -78,6 +81,7 @@ impl RenditionPlaylist {
         let mut out = Self::default();
         let mut sequence: u64 = 0;
         let mut discontinuity: u64 = 0;
+        let mut duration_ns: i64 = 0;
         for line in lines {
             if line.is_empty() {
                 continue;
@@ -90,6 +94,8 @@ impl RenditionPlaylist {
                 discontinuity = value.trim().parse().unwrap_or(0);
             } else if line == "#EXT-X-DISCONTINUITY" {
                 discontinuity = discontinuity.saturating_add(1);
+            } else if let Some(value) = line.strip_prefix("#EXTINF:") {
+                duration_ns = parse_extinf_ns(value);
             } else if line == "#EXT-X-ENDLIST" {
                 out.ended = true;
             } else if line.starts_with('#') {
@@ -100,13 +106,37 @@ impl RenditionPlaylist {
                         sequence,
                         uri: line.to_owned(),
                         discontinuity,
+                        duration_ns,
                     });
                 }
                 sequence = sequence.saturating_add(1);
+                duration_ns = 0;
             }
         }
         Some(out)
     }
+}
+
+/// Parse an `#EXTINF` value (`<seconds>[,title]`) into nanoseconds: decimal
+/// seconds, at most one hour, millisecond precision; 0 when malformed.
+fn parse_extinf_ns(value: &str) -> i64 {
+    let seconds = value.split(',').next().unwrap_or("").trim();
+    let (whole, frac) = seconds.split_once('.').unwrap_or((seconds, ""));
+    if whole.is_empty()
+        || whole.len() > 4
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !frac.bytes().all(|b| b.is_ascii_digit())
+    {
+        return 0;
+    }
+    let whole: i64 = whole.parse().unwrap_or(0);
+    // The first three fraction digits, right-padded: "1" -> 100 ms.
+    let padded: String = frac.chars().chain("000".chars()).take(3).collect();
+    let millis: i64 = padded.parse().unwrap_or(0);
+    whole
+        .min(3600)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(millis.saturating_mul(1_000_000))
 }
 
 /// One `WebVTT` cue of a rendition segment.
@@ -404,11 +434,13 @@ mod tests {
                     sequence: 6658,
                     uri: "a.vtt".to_owned(),
                     discontinuity: 283,
+                    duration_ns: 5_000_000_000,
                 },
                 Segment {
                     sequence: 6659,
                     uri: "b.vtt".to_owned(),
                     discontinuity: 284,
+                    duration_ns: 5_000_000_000,
                 },
             ]
         );
@@ -418,6 +450,16 @@ mod tests {
                 .unwrap()
                 .ended
         );
+    }
+
+    #[test]
+    fn extinf_durations_parse_bounded() {
+        assert_eq!(parse_extinf_ns("5,"), 5 * S);
+        assert_eq!(parse_extinf_ns("4.004,title"), 4 * S + 4_000_000);
+        assert_eq!(parse_extinf_ns("0.1,"), S / 10);
+        assert_eq!(parse_extinf_ns("99999,"), 0);
+        assert_eq!(parse_extinf_ns("-1,"), 0);
+        assert_eq!(parse_extinf_ns("abc"), 0);
     }
 
     #[test]
