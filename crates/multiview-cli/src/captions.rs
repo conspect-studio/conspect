@@ -2769,18 +2769,18 @@ input_id = "cam_b"
         show_at(&plan, 101);
         let mut clock = ClockMatch::default();
         let stop = AtomicBool::new(false);
-        // Segment 100 starts in [98, 100.5] (cue 103..105.5 starts before
-        // its end, 100.5..101 ends after its start): next in [103, 105.5].
+        // Segment 100 starts in (98, 101) (cue 103..105.5 starts before its
+        // end, 100.5..101 ends after its start): the next in (103, 106).
         let cues = vtt_cues(
             "WEBVTT\n\n00:01:43.000 --> 00:01:45.500\na\n\n00:01:40.500 --> 00:01:41.000\nb\n",
         );
         read_segment(&mut clock, &plan, &seg(100, 1), &cues, &stop).expect("maps");
         let next = vtt_cues("WEBVTT\n\n00:01:46.500 --> 00:01:49.000\nsame clock\n");
-        let start = read_while_video_moves(&mut clock, &plan, &seg(101, 2), &next, (0, 0, 106));
+        let start = read_while_video_moves(&mut clock, &plan, &seg(101, 2), &next, (0, 0, 107));
         assert_eq!(
             start,
             Some(106_500),
-            "in time for its window (106.5..109 s)"
+            "while its window (106.5..109 s) is open"
         );
     }
 
