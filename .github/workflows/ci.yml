@@ -62,6 +62,8 @@ jobs:
       code: ${{ steps.filter.outputs.code }}
       # 'true' when a file the cast playback proof covers changed (job cast-proof).
       cast: ${{ steps.filter.outputs.cast }}
+      # 'true' when the Android TV receiver app changed (job android-tv).
+      androidtv: ${{ steps.filter.outputs.androidtv }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
@@ -135,6 +137,8 @@ jobs:
             # filter, so several positive patterns would have to ALL match.
             cast:
               - '{crates/multiview-output/src/hls/**,crates/multiview-output/examples/cast_*,crates/multiview-cli/src/cast_output*,crates/multiview-cli/src/cast_output/**,crates/multiview-control/src/cast*,crates/multiview-control/src/cast*/**,crates/multiview-control/src/routes/cast*,tools/cast-proof/**,web/src/cast/**,.github/workflows/ci.yml}'
+            androidtv:
+              - '{clients/androidtv/**,.github/workflows/ci.yml}'
 
   lint:
     name: fmt + clippy
@@ -2077,3 +2081,46 @@ jobs:
       - name: test native-exchange-runtime
         # Wall-clock TLS scenarios with real 5 s epochs: one at a time.
         run: cargo test --locked --manifest-path tools/native-exchange-runtime/Cargo.toml -- --test-threads=1
+
+  # ── Android TV Cast Connect receiver (ADR-0114 slice 6, app half) ────────────
+  # Debug-signed only: no signing key and no secrets (the release key is operator step 8).
+  # Lint is part of the command; if it proves flaky on a runner, drop `lint` here and say so in the PR.
+  android-tv:
+    name: android tv app (assemble + unit tests + lint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.androidtv == 'true' }}
+    defaults:
+      run:
+        working-directory: clients/androidtv
+    steps:
+      - uses: actions/checkout@v7
+      # The wrapper jar is executable code in the repo: check it against Gradle's published checksums before use.
+      - uses: gradle/actions/wrapper-validation@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: install the SDK platform and build tools (runner SDK)
+        run: |
+          sdkm="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$sdkm" ] || sdkm="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)"
+          yes | "$sdkm" --licenses > /dev/null || true
+          "$sdkm" --install "platforms;android-37.0" "build-tools;36.0.0"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-androidtv-${{ hashFiles('clients/androidtv/**/*.gradle.kts', 'clients/androidtv/gradle/libs.versions.toml', 'clients/androidtv/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-androidtv-
+      - name: assemble, unit tests, lint
+        run: ./gradlew --no-daemon assembleDebug testDebugUnitTest lint
+      - name: Upload the debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: conspect-cast-tv-debug.apk
+          path: clients/androidtv/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14

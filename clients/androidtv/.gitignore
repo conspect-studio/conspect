@@ -1,0 +1,8 @@
+.gradle/
+build/
+local.properties
+.sdk/
+.jdk/
+.gradle-home/
+.build.log
+.install-platform.sh
