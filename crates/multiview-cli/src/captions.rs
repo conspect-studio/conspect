@@ -1189,8 +1189,9 @@ fn read_captions(plan: &CaptionPlan, stop: &AtomicBool) -> Result<(), String> {
             };
             let mapped: Vec<CaptionCue> =
                 cues.iter().filter_map(|cue| map_cue(anchor, cue)).collect();
-            let starts = mapped.iter().map(CaptionCue::start);
-            clock.advance(segment, starts.clone().min().zip(starts.max()));
+            let latest_start = mapped.iter().map(CaptionCue::start).max();
+            let earliest_end = mapped.iter().map(CaptionCue::end).min();
+            clock.advance(segment, latest_start.zip(earliest_end));
             // Feed the bounded pending window in chunks it always holds whole
             // (a 5 s live segment carries ~25 cues; the window keeps 16), so a
             // dense rolling-caption segment loses none to the cap.
@@ -1310,9 +1311,10 @@ enum CueAnchor {
 /// rendition's `#EXTINF` durations locate every segment's start on it.
 ///
 /// So the reader keeps an interval estimate `[lo, hi]` of the normalized start
-/// of the next segment it reads: calibrated by every mapped cue (a segment
-/// starts at or before its first cue, and at or after its last cue start minus
-/// its duration) and advanced by each segment's duration. A segment maps:
+/// of the next segment it reads: calibrated by every mapped cue (a cue of a
+/// segment starts before the segment ends and ends after it starts; it may
+/// start segments earlier) and advanced by each segment's duration. A segment
+/// maps:
 ///
 /// * of the epoch already mapped: through that epoch's stored mapping;
 ///   an older epoch: dropped;
@@ -1476,8 +1478,12 @@ impl ClockMatch {
     }
 
     /// Record a read segment: calibrate the start estimate with its mapped
-    /// cues (normalized `[start, end)` pairs, `None` when not mapped) and
-    /// advance it past the segment.
+    /// cues (`(latest cue start, earliest cue end)` on the normalized
+    /// timeline, `None` when not mapped) and advance it past the segment.
+    /// A segment carries every cue active in it, with full times (a cue may
+    /// start segments earlier): each cue starts before the segment ends and
+    /// ends after it starts, so `latest start - duration < segment start <
+    /// earliest end`.
     fn advance(
         &mut self,
         segment: &crate::vtt_rendition::Segment,
@@ -1485,11 +1491,9 @@ impl ClockMatch {
     ) {
         let duration = segment.duration_ns;
         let mut estimate = self.next_start;
-        if let Some((first_start, last_start)) = mapped {
-            // The segment starts at or before its first cue, and its last cue
-            // starts before the segment ends.
-            let lo = last_start.as_nanos().saturating_sub(duration);
-            let hi = first_start.as_nanos();
+        if let Some((latest_start, earliest_end)) = mapped {
+            let lo = latest_start.as_nanos().saturating_sub(duration);
+            let hi = earliest_end.as_nanos();
             estimate = match estimate {
                 Some((old_lo, old_hi)) if old_lo.max(lo) <= old_hi.min(hi) => {
                     Some((old_lo.max(lo), old_hi.min(hi)))
@@ -2534,8 +2538,9 @@ input_id = "cam_b"
             return None;
         };
         let mapped: Vec<CaptionCue> = cues.iter().filter_map(|c| map_cue(anchor, c)).collect();
-        let starts = mapped.iter().map(CaptionCue::start);
-        clock.advance(segment, starts.clone().min().zip(starts.max()));
+        let latest_start = mapped.iter().map(CaptionCue::start).max();
+        let earliest_end = mapped.iter().map(CaptionCue::end).min();
+        clock.advance(segment, latest_start.zip(earliest_end));
         mapped.first().map(|c| c.start().as_nanos() / 1_000_000)
     }
 
@@ -2700,6 +2705,32 @@ input_id = "cam_b"
             None
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// #526 review r6: a long cue carried over from segments earlier (it
+    /// starts at 90 s, the segment covers 100..105 s) must not pull the start
+    /// estimate back: the next epoch's segment (105 s) is not skipped as
+    /// stale while the picture (102 s) has not reached it.
+    #[test]
+    fn a_carried_over_cue_does_not_make_the_next_epoch_stale() {
+        let plan = Arc::new(reader_plan());
+        set_anchor(&plan, 0, 0);
+        show_at(&plan, 102);
+        let mut clock = ClockMatch::default();
+        let stop = AtomicBool::new(false);
+        let carried = vtt_cues("WEBVTT\n\n00:01:30.000 --> 00:01:44.000\nstill on screen\n");
+        assert_eq!(
+            read_segment(&mut clock, &plan, &seg(100, 1), &carried, &stop),
+            Some(90_000)
+        );
+        // Epoch 2 begins at 105 s: raw restarts at 0 s.
+        let next = vtt_cues("WEBVTT\n\n00:00:00.500 --> 00:00:02.000\nnew epoch\n");
+        let start = read_while_video_moves(&mut clock, &plan, &seg(101, 2), &next, (0, 105, 106));
+        assert_eq!(
+            start,
+            Some(105_500),
+            "mapped once the picture crossed, not skipped"
+        );
     }
 
     /// The wait ends at once on stop.
