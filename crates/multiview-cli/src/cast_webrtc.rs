@@ -355,6 +355,7 @@ impl CastWebRtc for CliCastWebRtc {
 /// TEST SEAM: run one cast output's feed (subscription, gate, Opus) into
 /// `sink` for `viewers`, on its own thread, without a WHEP transport.
 #[cfg(all(test, feature = "gpl-codecs"))]
+#[allow(clippy::unwrap_used)] // A test seam: a refused resolve is the test's failure.
 pub(crate) fn spawn_feed_for_test(
     factory: &crate::output_window_registry::SubscriptionFactory,
     config_id: &str,
