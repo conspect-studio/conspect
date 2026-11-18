@@ -1388,13 +1388,7 @@ impl ClockMatch {
         first: Option<&crate::vtt_rendition::VttCue>,
         stop: &AtomicBool,
     ) -> SegmentMapping {
-        if self.next_seq != Some(segment.sequence) {
-            // The first segment, or a sequence gap (the live window slid past
-            // segments never listed to this reader): no position estimate, so
-            // the reader re-synchronises as on its first segment.
-            self.next_start = None;
-            self.mapped = None;
-        }
+        self.continuity(segment);
         let Some(first) = first else {
             return SegmentMapping::Skip;
         };
@@ -1433,6 +1427,18 @@ impl ClockMatch {
                 return SegmentMapping::Skip;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// The first segment, or a sequence gap (the live window slid past
+    /// segments never listed to this reader, an origin restart): no position
+    /// estimate and no epoch mapping, so the reader re-synchronises as on its
+    /// first segment. Idempotent for the segment being processed.
+    fn continuity(&mut self, segment: &crate::vtt_rendition::Segment) {
+        if self.next_seq != Some(segment.sequence) {
+            self.next_start = None;
+            self.mapped = None;
+            self.next_seq = Some(segment.sequence);
         }
     }
 
@@ -1516,6 +1522,9 @@ impl ClockMatch {
         segment: &crate::vtt_rendition::Segment,
         mapped: Option<(MediaTime, MediaTime)>,
     ) {
+        // Every segment path (mapped, skipped, failed fetch, not WebVTT)
+        // records through here, so a gap is never concealed.
+        self.continuity(segment);
         let duration = segment.duration_ns;
         let mut estimate = self.next_start;
         if let Some((latest_start, earliest_end)) = mapped {
@@ -2884,6 +2893,24 @@ input_id = "cam_b"
                 "waits for the crossing, never maps through epoch 1's mapping"
             );
         });
+    }
+
+    /// #526 review r11: a window slide whose first listed segment FAILS to
+    /// fetch is still a gap: the estimate and the epoch mapping are reset.
+    #[test]
+    fn a_gap_hidden_behind_a_failed_fetch_still_resets() {
+        let plan = reader_plan();
+        set_anchor(&plan, 0, 0);
+        show_at(&plan, 102);
+        let mut clock = ClockMatch::default();
+        let stop = AtomicBool::new(false);
+        let cue = vtt_cues("WEBVTT\n\n00:01:41.000 --> 00:01:42.000\nepoch 1\n");
+        read_segment(&mut clock, &plan, &seg(100, 1), &cue, &stop).expect("maps");
+        // The window slid to 200; segment 200 fails to fetch.
+        clock.advance(&seg(200, 3), None);
+        assert_eq!(clock.mapped, None, "epoch mapping reset");
+        assert_eq!(clock.next_start, None, "estimate reset");
+        assert_eq!(clock.next_seq, Some(201));
     }
 
     /// The wait ends at once on stop.
