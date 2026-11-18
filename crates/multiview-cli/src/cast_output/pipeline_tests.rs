@@ -2470,3 +2470,202 @@ mod moq_rung {
         assert_unaffected_relative(&control, &run, &seen);
     }
 }
+
+/// ADR-0114 slice 5 on the real pipeline: the cast `WebRTC` feed (one
+/// registry subscription, ONE Opus encoder for every viewer) carries real
+/// H.264 and Opus with `R = floor(E * clock / 1e6) mod 2^32`, every sample
+/// stamped with the window its viewers passed; an unrequested move fences the
+/// viewers and nothing after it is marked passed.
+#[cfg(feature = "webrtc-native")]
+#[test]
+fn w_the_cast_webrtc_feed_is_one_opus_encoder_and_engine_time() {
+    use crate::cast_webrtc::{spawn_feed_for_test, CastWebRtcStats};
+    use crate::routing_aux::PictureBus;
+    use multiview_control::cast_streams::identity::{CastAttachment, Clearance};
+    use multiview_webrtc::egress::{egress_feed, EgressMedia};
+    drive("cast_w", Until::Stop, |ctl| {
+        ctl.wait_tick(2 * FPS);
+        let outcomes = ctl.routing.outcomes().expect("one outcome reader");
+        let factory = wait_for("the registry", Duration::from_secs(10), || {
+            ctl.windows.load()
+        });
+        let labels = Arc::clone(&ctl.cast.labels);
+        let viewer = |id: &str| {
+            Arc::new(CastAttachment::new(
+                id,
+                "cast-1",
+                "webrtc",
+                Arc::clone(&labels),
+                Clearance::of(&labels.current()),
+            ))
+        };
+        let handles = vec![viewer("a"), viewer("b"), viewer("c")];
+        let viewers = Arc::new(Mutex::new(crate::cast_webrtc::Viewers::of(handles.clone())));
+        let (sink, feed) = egress_feed();
+        let stats = Arc::new(CastWebRtcStats::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let join = spawn_feed_for_test(
+            &factory,
+            "cast-1",
+            sink,
+            Arc::clone(&viewers),
+            ctl.cast.epoch.clone(),
+            Arc::clone(&stats),
+            Arc::clone(&stop),
+        );
+        let mut video = Vec::new();
+        let mut audio = Vec::new();
+        let start = Instant::now();
+        while (video.len() < 25 || audio.len() < 25) && start.elapsed() < Duration::from_secs(20) {
+            while let Some(s) = feed.pop() {
+                let stamp = s.cast.expect("every cast sample is stamped");
+                assert!(handles.iter().all(|v| v.may_write(stamp.window)));
+                match s.media {
+                    EgressMedia::Video => video.push(s.rtp_timestamp),
+                    _ => audio.push(s.rtp_timestamp),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            video.len() >= 25 && audio.len() >= 25,
+            "{} video, {} audio",
+            video.len(),
+            audio.len()
+        );
+        // Three viewers, one encoder.
+        assert_eq!(stats.opus_opened.load(Ordering::Acquire), 1);
+        // Video: one frame is 3600 at 90 kHz (25 fps), in engine time.
+        for pair in video.windows(2) {
+            assert_eq!(pair[1].wrapping_sub(pair[0]), 3600, "{video:?}");
+        }
+        // Opus: 20 ms = 960 at 48 kHz, contiguous.
+        for pair in audio.windows(2) {
+            assert_eq!(pair[1].wrapping_sub(pair[0]), 960, "{audio:?}");
+        }
+        // Engine time: the video RTP of tick t is t * 3600 (no offset): the
+        // first one is a multiple of 3600 below the clock's tick count.
+        assert_eq!(video[0] % 3600, 0);
+        assert!(u64::from(video[0] / 3600) <= ctl.tick());
+        // Audio and video on one timeline: their engine times are within 1 s.
+        let v_us = i64::from(video[0]) * 1_000_000 / 90_000;
+        let a_us = i64::from(audio[0]) * 1_000_000 / 48_000;
+        assert!(
+            (v_us - a_us).abs() < 1_000_000,
+            "video {v_us} us, audio {a_us} us"
+        );
+        // An unrequested move fences every viewer.
+        take_to(
+            ctl,
+            &outcomes,
+            "to-b",
+            &PictureBus::Source("cast_w_b".to_owned()),
+        );
+        wait_for("the fence", Duration::from_secs(10), || {
+            handles.iter().all(|v| v.is_fenced()).then_some(())
+        });
+        let windows = stats.windows.load(Ordering::Acquire);
+        ctl.run_seconds(1);
+        assert_eq!(
+            stats.windows.load(Ordering::Acquire),
+            windows,
+            "nothing after the fence"
+        );
+        stop.store(true, Ordering::Release);
+        join.join().unwrap();
+        assert_eq!(stats.opus_closed.load(Ordering::Acquire), 1);
+        ctl.stop.stop();
+    });
+}
+
+/// R3 chaos for the `WebRTC` rung (ADR-0114 decision 6, "viewer stops
+/// reading", engine row): a cast `WebRTC` feed whose transport never reads
+/// (the egress feed is never drained) for the whole run, on the real
+/// pipeline. The egress feed holds its count, byte and age ceilings at every
+/// sample; resident memory ends within 16 MiB of where it started; the clock
+/// loses zero ticks and the HLS binding zero packets against the control run
+/// (the relative predicate whose negative control is
+/// `n_a_shared_stall_fails_the_relative_isolation_predicate`).
+#[cfg(all(feature = "webrtc-native", feature = "moq-output"))]
+#[test]
+fn x_a_cast_webrtc_viewer_that_stops_reading_costs_the_clock_nothing_and_stays_bounded() {
+    use crate::cast_webrtc::{spawn_feed_for_test, CastWebRtcStats};
+    use multiview_control::cast_streams::identity::{CastAttachment, Clearance};
+    use multiview_webrtc::egress::{egress_feed, MAX_EGRESS, MAX_EGRESS_BYTES};
+    let control = chaos_run("cast_x0", Setup::LIVE, None, None);
+    let seen = Arc::new(Mutex::new(ChaosSeen::default()));
+    let bounds = Arc::new(Mutex::new((0_usize, 0_usize, 0_u64, None::<(u64, u64)>)));
+    let (record, bound_record) = (Arc::clone(&seen), Arc::clone(&bounds));
+    let run = bounded(Duration::from_secs(90), move || {
+        drive_in(
+            "cast_x1",
+            Until::Ticks(CHAOS_TICKS),
+            Setup::LIVE,
+            |_| {},
+            move |ctl| {
+                ctl.wait_tick(CHAOS_AT);
+                let rss = || crate::system_metrics::read_self_rss();
+                let rss_before = rss();
+                let factory = ctl.windows.load().unwrap();
+                let labels = Arc::clone(&ctl.cast.labels);
+                let viewers = Arc::new(Mutex::new(crate::cast_webrtc::Viewers::of(
+                    (0..3)
+                        .map(|i| {
+                            Arc::new(CastAttachment::new(
+                                &format!("v{i}"),
+                                "cast-1",
+                                "webrtc",
+                                Arc::clone(&labels),
+                                Clearance::of(&labels.current()),
+                            ))
+                        })
+                        .collect::<Vec<_>>(),
+                )));
+                // The consumer end exists and is never read.
+                let (sink, feed) = egress_feed();
+                let stats = Arc::new(CastWebRtcStats::default());
+                let stop = Arc::new(AtomicBool::new(false));
+                let join = spawn_feed_for_test(
+                    &factory,
+                    "cast-1",
+                    sink,
+                    Arc::clone(&viewers),
+                    ctl.cast.epoch.clone(),
+                    Arc::clone(&stats),
+                    Arc::clone(&stop),
+                );
+                let sampler = {
+                    let (feed, stop) = (feed.clone(), Arc::clone(&stop));
+                    std::thread::spawn(move || {
+                        let (mut count, mut bytes) = (0, 0);
+                        while !stop.load(Ordering::Acquire) {
+                            count = count.max(feed.len());
+                            bytes = bytes.max(feed.buffered_bytes());
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        (count, bytes, feed.dropped())
+                    })
+                };
+                let progress = ctl.sample_progress(CHAOS_TICKS - 20);
+                stop.store(true, Ordering::Release);
+                let (count, bytes, dropped) = sampler.join().unwrap();
+                join.join().unwrap();
+                drop(feed);
+                *bound_record.lock().unwrap() = (count, bytes, dropped, rss_before.zip(rss()));
+                record.lock().unwrap().progress = progress;
+            },
+        )
+    });
+    let seen = std::mem::take(&mut *seen.lock().unwrap());
+    let (count, bytes, dropped, rss) = *bounds.lock().unwrap();
+    assert!(count <= MAX_EGRESS, "{count} samples buffered");
+    assert!(bytes <= MAX_EGRESS_BYTES, "{bytes} bytes buffered");
+    assert!(dropped > 0, "the never-read feed dropped, it did not grow");
+    if let Some((before, after)) = rss {
+        assert!(
+            after <= before + 16 * 1024 * 1024,
+            "resident memory grew from {before} to {after}"
+        );
+    }
+    assert_unaffected_relative(&control, &run, &seen);
+}

@@ -269,6 +269,7 @@ fn egress_sample_round_trips_video_and_audio() {
         rtp_timestamp: 90_000,
         keyframe: true,
         data: vec![1, 2, 3],
+        cast: None,
     };
     assert_eq!(v.media, EgressMedia::Video);
     assert!(v.keyframe);

@@ -463,6 +463,15 @@ pub struct CastAttachment {
     closer: Mutex<Option<Closer>>,
     passed: AtomicU64,
     refused: AtomicU64,
+    /// The highest window sequence number this attachment's gate passed
+    /// (one shared feed, several viewers: the converter judges each window
+    /// for every attachment and the writer hands a sample to a viewer only
+    /// when its window is at or below this mark). 0: none yet.
+    passed_through: AtomicU64,
+    /// The first window sequence number this attachment's gate passed (0:
+    /// none yet). Windows before it were never judged for this attachment
+    /// (it joined later) and are never written to it (PR 521 review).
+    passed_from: AtomicU64,
 }
 
 impl std::fmt::Debug for CastAttachment {
@@ -495,6 +504,8 @@ impl CastAttachment {
             closer: Mutex::new(None),
             passed: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            passed_through: AtomicU64::new(0),
+            passed_from: AtomicU64::new(0),
         }
     }
 
@@ -549,6 +560,29 @@ impl CastAttachment {
     #[must_use]
     pub fn labels(&self) -> &Arc<OutputLabels> {
         &self.labels
+    }
+
+    /// Record that the window with sequence number `seq` (from 1) passed
+    /// this attachment's gate (monotonic).
+    pub fn mark_passed(&self, seq: u64) {
+        let _ = self
+            .passed_from
+            .compare_exchange(0, seq, Ordering::AcqRel, Ordering::Acquire);
+        self.passed_through.fetch_max(seq, Ordering::AcqRel);
+    }
+
+    /// Whether a sample of window `seq` may be written to this attachment's
+    /// transport: not fenced and its window passed the gate.
+    #[must_use]
+    pub fn may_write(&self, seq: u64) -> bool {
+        // Every window from the first this attachment passed to the last was
+        // judged by its gate in order (a refusal fences it, a hold is never
+        // skipped), so the passed windows are exactly this interval.
+        let from = self.passed_from.load(Ordering::Acquire);
+        !self.is_fenced()
+            && from != 0
+            && seq >= from
+            && seq <= self.passed_through.load(Ordering::Acquire)
     }
 
     /// `(windows passed, windows refused)`.
@@ -746,6 +780,23 @@ mod tests {
             att.admit_window([(&Component::Video, 0)]),
             Err(GateRefusal::Fenced)
         );
+    }
+
+    #[test]
+    fn may_write_follows_the_passed_mark_and_the_fence() {
+        let l = labels(&[], 0);
+        let att = CastAttachment::new("s", "o", "webrtc", l, Clearance::default());
+        assert!(!att.may_write(1));
+        att.mark_passed(3);
+        assert!(
+            !att.may_write(1),
+            "joined at window 3: older windows were never judged for it"
+        );
+        assert!(att.may_write(3) && !att.may_write(4));
+        att.mark_passed(5);
+        assert!(att.may_write(4) && att.may_write(5) && !att.may_write(2));
+        att.fence();
+        assert!(!att.may_write(1));
     }
 
     #[test]

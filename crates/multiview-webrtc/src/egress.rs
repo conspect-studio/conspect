@@ -28,12 +28,20 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// The bound on buffered egress samples before the oldest is dropped (drop-oldest,
 /// invariant #10 / safety rule 5 — a slow viewer never grows memory). Sized to
 /// hold a few seconds of program GOPs so a brief network stall absorbs without
 /// growth, but bounded so a wedged consumer cannot leak.
 pub const MAX_EGRESS: usize = 512;
+/// The bound on buffered payload bytes (ADR-0114 decision 6, "Queues"): a
+/// sample is one access unit and a 1080p keyframe can be hundreds of KiB, so
+/// the count alone is no memory bound.
+pub const MAX_EGRESS_BYTES: usize = 8 * 1024 * 1024;
+/// The bound on the age of the oldest buffered sample (decision 6): media
+/// older than this is no use to a live viewer.
+pub const MAX_EGRESS_AGE: Duration = Duration::from_secs(2);
 
 /// Which elementary stream an [`EgressSample`] carries — and therefore which RTP
 /// clock its [`EgressSample::rtp_timestamp`] is expressed in (ADR-0049 §5).
@@ -101,16 +109,91 @@ pub struct EgressSample {
     pub keyframe: bool,
     /// The coded payload (an H.264 access unit or one Opus frame).
     pub data: Vec<u8>,
+    /// The cast rung only (ADR-0114 slice 5): the window sequence number this
+    /// sample belongs to (a viewer is written only windows its gate passed)
+    /// and the RTCP wallclock of its engine media time (the epoch's wall time,
+    /// as a monotonic instant). `None` on every other output.
+    pub cast: Option<CastStamp>,
+}
+
+/// The cast rung's per-sample stamp (see [`EgressSample::cast`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CastStamp {
+    /// The window sequence number (from 1).
+    pub window: u64,
+    /// The wall time of the sample's engine media time, mapped onto the
+    /// monotonic clock (the RTCP sender-report wallclock of both streams).
+    pub wallclock: Option<Instant>,
 }
 
 /// Shared bounded ring backing an [`EgressSink`]/[`EgressFeed`] pair.
+///
+/// Three ceilings, each enforced on push: [`MAX_EGRESS`] samples,
+/// [`MAX_EGRESS_BYTES`] payload bytes and [`MAX_EGRESS_AGE`] between the
+/// oldest sample and the one being pushed. The oldest samples are evicted
+/// until all three hold. A video sample evicted that way breaks the
+/// reference chain of the frames behind it, so after any video eviction the
+/// ring **re-gates**: every following video sample is discarded (never
+/// buffered) until the next keyframe (ADR-0114 decision 6: "oldest dropped,
+/// then video is held back until the next keyframe").
 #[derive(Debug, Default)]
 struct EgressRing {
-    queue: VecDeque<EgressSample>,
-    /// Total samples evicted as the oldest because the ring was full (telemetry).
+    queue: VecDeque<(EgressSample, Instant)>,
+    /// Payload bytes in `queue`.
+    bytes: usize,
+    /// Total samples evicted as the oldest or discarded by the re-gate
+    /// (telemetry).
     dropped: u64,
+    /// Video is held back until the next keyframe.
+    regate: bool,
     /// Whether the producer has signalled end-of-stream (the output stopped).
     closed: bool,
+}
+
+impl EgressRing {
+    fn evict_front(&mut self) -> bool {
+        let Some((sample, _)) = self.queue.pop_front() else {
+            return false;
+        };
+        self.bytes = self.bytes.saturating_sub(sample.data.len());
+        self.dropped = self.dropped.saturating_add(1);
+        if sample.media == EgressMedia::Video {
+            // The video frames queued before the next keyframe reference it:
+            // drop them too. A keyframe still queued starts a GOP that does
+            // not depend on what was lost; without one, hold video back
+            // until the next keyframe arrives.
+            let mut broken = true;
+            let before = self.queue.len();
+            let mut freed = 0;
+            self.queue.retain(|(s, _)| {
+                if s.media != EgressMedia::Video {
+                    return true;
+                }
+                if s.keyframe {
+                    broken = false;
+                }
+                if broken {
+                    freed += s.data.len();
+                }
+                !broken
+            });
+            self.regate = broken;
+            self.bytes = self.bytes.saturating_sub(freed);
+            self.dropped = self
+                .dropped
+                .saturating_add(u64::try_from(before - self.queue.len()).unwrap_or(0));
+        }
+        true
+    }
+
+    fn over(&self, incoming: usize, now: Instant) -> bool {
+        self.queue.len() >= MAX_EGRESS
+            || self.bytes.saturating_add(incoming) > MAX_EGRESS_BYTES
+            || self
+                .queue
+                .front()
+                .is_some_and(|(_, at)| now.saturating_duration_since(*at) > MAX_EGRESS_AGE)
+    }
 }
 
 /// The producer end of a bounded, drop-oldest egress feed.
@@ -159,19 +242,40 @@ impl EgressSink {
     /// it to `_`.
     #[must_use]
     pub fn push(&self, sample: EgressSample) -> bool {
+        self.push_at(sample, Instant::now())
+    }
+
+    /// [`Self::push`] at `now` (tests drive the age ceiling with it).
+    #[must_use]
+    pub fn push_at(&self, sample: EgressSample, now: Instant) -> bool {
         let Ok(mut ring) = self.inner.lock() else {
             return false;
         };
+        // A sample larger than the whole byte ceiling is never buffered.
+        if sample.data.len() > MAX_EGRESS_BYTES {
+            ring.dropped = ring.dropped.saturating_add(1);
+            if sample.media == EgressMedia::Video {
+                ring.regate = true;
+            }
+            return true;
+        }
         let mut evicted = false;
-        while ring.queue.len() >= MAX_EGRESS {
-            if ring.queue.pop_front().is_some() {
-                ring.dropped = ring.dropped.saturating_add(1);
-                evicted = true;
-            } else {
+        while ring.over(sample.data.len(), now) {
+            if !ring.evict_front() {
                 break;
             }
+            evicted = true;
         }
-        ring.queue.push_back(sample);
+        if sample.media == EgressMedia::Video {
+            if sample.keyframe {
+                ring.regate = false;
+            } else if ring.regate {
+                ring.dropped = ring.dropped.saturating_add(1);
+                return true;
+            }
+        }
+        ring.bytes = ring.bytes.saturating_add(sample.data.len());
+        ring.queue.push_back((sample, now));
         evicted
     }
 
@@ -198,7 +302,28 @@ impl EgressFeed {
     /// samples on its next [`EgressSink::push`]; it never back-pressures it.
     #[must_use]
     pub fn pop(&self) -> Option<EgressSample> {
-        self.inner.lock().ok().and_then(|mut r| r.queue.pop_front())
+        let mut ring = self.inner.lock().ok()?;
+        let (sample, _) = ring.queue.pop_front()?;
+        ring.bytes = ring.bytes.saturating_sub(sample.data.len());
+        Some(sample)
+    }
+
+    /// Payload bytes currently buffered (bounded by [`MAX_EGRESS_BYTES`]).
+    #[must_use]
+    pub fn buffered_bytes(&self) -> usize {
+        self.inner.lock().map_or(0, |r| r.bytes)
+    }
+
+    /// Discard everything buffered and hold video until the next keyframe
+    /// (a fenced attachment: nothing queued may reach a transport).
+    pub fn discard(&self) {
+        if let Ok(mut ring) = self.inner.lock() {
+            let n = u64::try_from(ring.queue.len()).unwrap_or(u64::MAX);
+            ring.queue.clear();
+            ring.bytes = 0;
+            ring.dropped = ring.dropped.saturating_add(n);
+            ring.regate = true;
+        }
     }
 
     /// The number of samples currently buffered (telemetry / bounded assertion).
@@ -242,6 +367,7 @@ mod tests {
             rtp_timestamp: ts,
             keyframe,
             data: vec![0x65, 0xAB],
+            cast: None,
         }
     }
 
@@ -330,6 +456,134 @@ mod tests {
                 .wrapping_sub(EgressMedia::Video.rtp_timestamp(-3000, tb)),
             3000
         );
+    }
+
+    fn sized(media: EgressMedia, keyframe: bool, len: usize) -> EgressSample {
+        EgressSample {
+            media,
+            rtp_timestamp: 0,
+            keyframe,
+            data: vec![0; len],
+            cast: None,
+        }
+    }
+
+    /// ADR-0114 decision 6: the byte ceiling holds whatever the count.
+    #[test]
+    fn the_byte_ceiling_holds_with_large_access_units() {
+        let (sink, feed) = egress_feed();
+        let now = Instant::now();
+        for i in 0..200 {
+            let _ = sink.push_at(sized(EgressMedia::Video, i % 30 == 0, 300 * 1024), now);
+            assert!(feed.buffered_bytes() <= MAX_EGRESS_BYTES, "{i}");
+            assert!(feed.len() <= MAX_EGRESS);
+        }
+        assert!(feed.dropped() > 0);
+        let over = sized(EgressMedia::Video, true, MAX_EGRESS_BYTES + 1);
+        assert!(sink.push_at(over, now));
+        assert!(feed.buffered_bytes() <= MAX_EGRESS_BYTES);
+    }
+
+    /// ADR-0114 decision 6: nothing older than 2 s stays buffered behind a
+    /// new sample.
+    #[test]
+    fn the_age_ceiling_evicts_stale_media() {
+        let (sink, feed) = egress_feed();
+        let t0 = Instant::now();
+        let _ = sink.push_at(sized(EgressMedia::Audio, false, 10), t0);
+        let _ = sink.push_at(
+            sized(EgressMedia::Audio, false, 10),
+            t0 + Duration::from_secs(1),
+        );
+        assert_eq!(feed.len(), 2);
+        let _ = sink.push_at(
+            sized(EgressMedia::Audio, false, 10),
+            t0 + MAX_EGRESS_AGE + Duration::from_millis(1),
+        );
+        assert_eq!(feed.len(), 2, "the 2 s old sample went");
+        assert_eq!(feed.dropped(), 1);
+    }
+
+    /// After a video eviction no delta frame whose reference was dropped is
+    /// handed to a viewer: video is held back until the next keyframe;
+    /// audio keeps flowing.
+    #[test]
+    fn a_video_eviction_regates_to_the_next_keyframe() {
+        let (sink, feed) = egress_feed();
+        let now = Instant::now();
+        let _ = sink.push_at(sized(EgressMedia::Video, true, 10), now);
+        for _ in 0..(MAX_EGRESS - 1) {
+            let _ = sink.push_at(sized(EgressMedia::Video, false, 10), now);
+        }
+        assert_eq!(feed.len(), MAX_EGRESS);
+        // One more: the keyframe is evicted, every delta behind it goes too.
+        assert!(sink.push_at(sized(EgressMedia::Video, false, 10), now));
+        assert_eq!(feed.len(), 0, "no delta of the broken GOP stays");
+        let _ = sink.push_at(sized(EgressMedia::Audio, false, 10), now);
+        let _ = sink.push_at(sized(EgressMedia::Video, false, 10), now);
+        assert_eq!(feed.len(), 1, "audio passes, video waits for a keyframe");
+        let _ = sink.push_at(sized(EgressMedia::Video, true, 10), now);
+        let _ = sink.push_at(sized(EgressMedia::Video, false, 10), now);
+        let mut kinds = Vec::new();
+        while let Some(s) = feed.pop() {
+            kinds.push((s.media, s.keyframe));
+        }
+        assert_eq!(
+            kinds,
+            [
+                (EgressMedia::Audio, false),
+                (EgressMedia::Video, true),
+                (EgressMedia::Video, false)
+            ]
+        );
+        assert_eq!(feed.buffered_bytes(), 0);
+    }
+
+    /// An eviction drops only the broken GOP's video: a later keyframe and
+    /// what follows it stay.
+    #[test]
+    fn an_eviction_keeps_the_next_whole_gop() {
+        let (sink, feed) = egress_feed();
+        let now = Instant::now();
+        let _ = sink.push_at(sized(EgressMedia::Video, true, 10), now);
+        let _ = sink.push_at(sized(EgressMedia::Video, false, 10), now);
+        let _ = sink.push_at(sized(EgressMedia::Video, true, 10), now);
+        let _ = sink.push_at(sized(EgressMedia::Video, false, 10), now);
+        let late = now + MAX_EGRESS_AGE + Duration::from_millis(1);
+        // Age evicts all four (pushed at `now`), then the new delta waits.
+        let _ = sink.push_at(sized(EgressMedia::Video, false, 10), late);
+        assert!(feed.is_empty());
+        let (sink, feed) = egress_feed();
+        let t = Instant::now();
+        let _ = sink.push_at(sized(EgressMedia::Video, true, 10), t);
+        let _ = sink.push_at(sized(EgressMedia::Video, false, 10), t);
+        let _ = sink.push_at(
+            sized(EgressMedia::Video, true, 10),
+            t + Duration::from_secs(1),
+        );
+        let _ = sink.push_at(
+            sized(EgressMedia::Video, false, 10),
+            t + Duration::from_secs(1),
+        );
+        // At 2.001 s the first GOP is too old; the second stays whole.
+        let _ = sink.push_at(
+            sized(EgressMedia::Video, false, 10),
+            t + MAX_EGRESS_AGE + Duration::from_millis(1),
+        );
+        let got: Vec<bool> = std::iter::from_fn(|| feed.pop())
+            .map(|s| s.keyframe)
+            .collect();
+        assert_eq!(got, [true, false, false]);
+    }
+
+    #[test]
+    fn discard_empties_and_regates() {
+        let (sink, feed) = egress_feed();
+        let _ = sink.push(sized(EgressMedia::Video, true, 10));
+        feed.discard();
+        assert!(feed.is_empty());
+        let _ = sink.push(sized(EgressMedia::Video, false, 10));
+        assert!(feed.is_empty());
     }
 
     #[test]

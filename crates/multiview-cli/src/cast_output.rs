@@ -939,6 +939,55 @@ pub fn install_cast_outputs(slot: Option<CastOutputsSlot>) {
     *installed().lock().unwrap_or_else(PoisonError::into_inner) = slot;
 }
 
+fn installed_windows(
+) -> &'static Mutex<Option<crate::output_window_registry::WindowSubscriptionSlot>> {
+    static SLOT: std::sync::OnceLock<
+        Mutex<Option<crate::output_window_registry::WindowSubscriptionSlot>>,
+    > = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Install (or with `None` clear) the run's effective-output registry slot
+/// for the cast push rungs (ADR-0114 slice 5: the `WebRTC` rung subscribes
+/// there).
+pub fn install_cast_windows(slot: Option<crate::output_window_registry::WindowSubscriptionSlot>) {
+    *installed_windows()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = slot;
+}
+
+/// The installed registry slot, if any.
+#[must_use]
+pub fn installed_cast_windows() -> Option<crate::output_window_registry::WindowSubscriptionSlot> {
+    installed_windows()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+fn installed_rtc() -> &'static Mutex<Option<multiview_control::cast_webrtc::SharedCastWebRtc>> {
+    static SLOT: std::sync::OnceLock<
+        Mutex<Option<multiview_control::cast_webrtc::SharedCastWebRtc>>,
+    > = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Install the cast `WebRTC` rung for the control plane (ADR-0114 slice 5).
+pub fn install_cast_webrtc(rung: Option<multiview_control::cast_webrtc::SharedCastWebRtc>) {
+    *installed_rtc()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = rung;
+}
+
+/// The installed cast `WebRTC` rung, if any.
+#[must_use]
+pub fn installed_cast_webrtc() -> Option<multiview_control::cast_webrtc::SharedCastWebRtc> {
+    installed_rtc()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
 /// The installed cast-outputs slot, if any.
 #[must_use]
 pub fn installed_cast_outputs() -> Option<CastOutputsSlot> {

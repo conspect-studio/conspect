@@ -1308,7 +1308,7 @@ impl<D: WindowDelivery> WindowDelivery for OutputWindowTap<D> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
@@ -1395,7 +1395,7 @@ mod tests {
         assert_eq!(descriptor.bitrate_bps, Some(500_000));
     }
 
-    fn binding(id: &str, index: usize) -> EffectiveBinding {
+    pub(crate) fn binding(id: &str, index: usize) -> EffectiveBinding {
         EffectiveBinding {
             program_id: "program".into(),
             bus_id: "program".into(),

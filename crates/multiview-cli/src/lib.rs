@@ -387,6 +387,9 @@ pub mod webrtc_ingest;
 #[cfg(feature = "webrtc-native")]
 pub mod webrtc_endpoint;
 
+/// The cast `WebRTC` rung's engine half (ADR-0114 slice 5).
+#[cfg(all(feature = "webrtc-native", feature = "ffmpeg"))]
+pub mod cast_webrtc;
 /// WHEP-serve + WHIP-push **output** wiring (ADR-0049): the program is encoded
 /// once (invariant #7) and a `webrtc` output WHEP-serves it to N browser viewers
 /// while a `whip_push` output publishes it to a remote WHIP ingest, both fed the

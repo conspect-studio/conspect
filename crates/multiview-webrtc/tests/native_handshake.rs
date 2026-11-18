@@ -787,3 +787,52 @@ fn only_the_nominated_peer_is_validated_never_a_spoofed_source() {
         "a spoofed source with valid MESSAGE-INTEGRITY is never validated"
     );
 }
+
+/// ADR-0114 decision 2, "WebRTC contract" item 2: str0m writes the RTP
+/// timestamp it is given, with no random offset, for video and Opus, on both
+/// sides of the 2^32 wrap, through the cast rung's `write_sample_at` (which
+/// also carries the RTCP wallclock). A test reads the sent packet: the
+/// receiver is an RTP-mode session that surfaces the raw header.
+#[test]
+fn the_cast_write_path_sends_the_given_rtp_timestamp_without_offset() {
+    let now = Instant::now();
+    let a_addr: SocketAddr = OFFERER_ADDR.parse().unwrap();
+    let b_addr: SocketAddr = ANSWERER_ADDR.parse().unwrap();
+    let mut a = Session::new(&SessionConfig::cast(), now);
+    let mut b = Session::new(&SessionConfig::ingest(), now);
+    a.add_host_candidate(a_addr).unwrap();
+    b.add_host_candidate(b_addr).unwrap();
+    let offer = a
+        .create_offer(&[MediaKind::Video, MediaKind::Audio])
+        .unwrap();
+    let answer = b.accept_offer(&offer).unwrap();
+    a.accept_answer(&answer).unwrap();
+    assert!(
+        pump_until(&mut a, a_addr, &mut b, b_addr, now, |a, b| a.is_connected()
+            && b.is_connected()),
+        "must connect first"
+    );
+    let mut idr = vec![0x00u8, 0x00, 0x00, 0x01, 0x65];
+    idr.extend(std::iter::repeat_n(0xABu8, 600));
+    let wall = now.checked_sub(Duration::from_millis(500)).unwrap_or(now);
+    for stamp in [u32::MAX - 2999, u32::MAX, 0, 2999] {
+        a.write_sample_at(MediaKind::Video, &idr, stamp, wall, now)
+            .unwrap();
+        a.write_sample_at(MediaKind::Audio, &[0xF8, 0xFF, 0xFE], stamp, wall, now)
+            .unwrap();
+    }
+    let mut seen = Vec::new();
+    assert!(pump_until(&mut a, a_addr, &mut b, b_addr, now, |_a, b| {
+        while let Some(pkt) = b.take_received_rtp() {
+            seen.push(pkt.timestamp);
+        }
+        seen.len() >= 8
+    }));
+    for stamp in [u32::MAX - 2999, u32::MAX, 0, 2999] {
+        assert_eq!(
+            seen.iter().filter(|t| **t == stamp).count(),
+            2,
+            "video and audio carry {stamp} exactly: {seen:?}"
+        );
+    }
+}

@@ -4138,3 +4138,195 @@ mod moq_rung {
         assert!(fake.admitted.lock().unwrap().is_empty());
     }
 }
+
+// ---------------------------------------------------------------- ADR-0114 slice 5: the WebRTC rung
+
+mod webrtc_rung {
+    use super::*;
+    use multiview_control::cast_streams::identity::{
+        engine_minted, identity, CastAttachment, Component,
+    };
+    use multiview_control::cast_webrtc::{CastWebRtc, CastWhepAnswer, CastWhepReject};
+
+    #[derive(Default)]
+    struct Fake {
+        offers: Mutex<Vec<(String, String)>>,
+        attachments: Mutex<Vec<Arc<CastAttachment>>>,
+        released: AtomicU64,
+        refuse: std::sync::atomic::AtomicBool,
+    }
+    impl CastWebRtc for Fake {
+        fn available(&self, _: &str) -> bool {
+            true
+        }
+        fn negotiate(
+            &self,
+            config_id: &str,
+            offer: &str,
+            attachment: Arc<CastAttachment>,
+        ) -> Result<CastWhepAnswer, CastWhepReject> {
+            if self.refuse.load(Ordering::SeqCst) {
+                return Err(CastWhepReject::Unavailable);
+            }
+            self.offers
+                .lock()
+                .unwrap()
+                .push((config_id.to_owned(), offer.to_owned()));
+            self.attachments.lock().unwrap().push(attachment);
+            Ok(CastWhepAnswer {
+                session_id: "sess-1".into(),
+                sdp: "v=0\r\nanswer".into(),
+            })
+        }
+        fn release(&self, _: &str, _: &str) -> bool {
+            self.released.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+    }
+
+    fn rtc_rig() -> (Rig, Arc<Fake>) {
+        let fake = Arc::new(Fake::default());
+        let rung: multiview_control::cast_webrtc::SharedCastWebRtc = fake.clone();
+        let rig = rig_with(move |state| {
+            state
+                .with_cast_webrtc(rung)
+                .with_cast_ladder(vec!["webrtc".into(), "hls".into()])
+        });
+        (rig, fake)
+    }
+
+    async fn scoped(rig: &Rig) -> (String, String) {
+        let (status, doc) = create(
+            rig,
+            SCOPED,
+            serde_json::json!({"output": "output-0", "feed": {"source": "a"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{doc}");
+        (doc["id"].as_str().unwrap().to_owned(), token_of(&doc))
+    }
+
+    fn offer(token: &str, body: Vec<u8>) -> Request<Body> {
+        public("POST", &format!("/cast/{token}/whep"))
+            .header(header::CONTENT_TYPE, "application/sdp")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    /// Decision 3: the ladder names WebRTC (the receiver then posts its
+    /// offer); the offer is answered `201 application/sdp`, `no-store`, the
+    /// attachment cleared for the present and registered with the token.
+    #[tokio::test]
+    async fn the_ladder_names_webrtc_and_the_offer_is_answered() {
+        let (rig, fake) = rtc_rig();
+        let (id, token) = scoped(&rig).await;
+        let (status, body, _) = ladder(&rig, &token, &probe_body()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["attach"],
+            serde_json::json!({"rung": "webrtc", "whep": "whep"})
+        );
+        assert_eq!(body["then"], serde_json::json!(["hls"]));
+        let r = send(&rig.router, offer(&token, b"v=0\r\noffer".to_vec())).await;
+        assert_eq!(r.status(), StatusCode::CREATED);
+        assert_eq!(r.headers()[header::CONTENT_TYPE], "application/sdp");
+        assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(body_bytes(r).await, b"v=0\r\nanswer");
+        assert_eq!(fake.offers.lock().unwrap()[0].0, "cast-1");
+        let attachment = fake.attachments.lock().unwrap()[0].clone();
+        assert_eq!(attachment.rung, "webrtc");
+        assert!(attachment
+            .clearance()
+            .clears(&Component::Video, identity(&Component::Video, "program")));
+        assert_eq!(rig.state.cast_streams.attachments(&id).len(), 1);
+    }
+
+    /// Bounds and the shared check: 64 KiB offer cap (413), a dead token is
+    /// the same 404, the per-token rate applies.
+    #[tokio::test]
+    async fn offer_bounds_dead_tokens_and_rate() {
+        let (rig, _) = rtc_rig();
+        let (id, token) = scoped(&rig).await;
+        let r = send(&rig.router, offer(&token, vec![b'a'; 64 * 1024 + 1])).await;
+        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let mut statuses = Vec::new();
+        for _ in 0..6 {
+            statuses.push(
+                send(&rig.router, offer(&token, b"v=0".to_vec()))
+                    .await
+                    .status(),
+            );
+        }
+        assert!(
+            statuses.contains(&StatusCode::TOO_MANY_REQUESTS),
+            "{statuses:?}"
+        );
+        rig.state.cast_streams.revoke(&id, "test").unwrap();
+        let r = send(&rig.router, offer(&token, b"v=0".to_vec())).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_bytes(r).await, b"not found\n");
+    }
+
+    /// Decision 5.2: DELETE fences the attachment (its closer ends the
+    /// session); a revoke does too.
+    #[tokio::test]
+    async fn delete_and_revoke_fence_the_webrtc_attachment() {
+        let (rig, fake) = rtc_rig();
+        let (id, token) = scoped(&rig).await;
+        let r = send(&rig.router, offer(&token, b"v=0".to_vec())).await;
+        assert_eq!(r.status(), StatusCode::CREATED);
+        let first = fake.attachments.lock().unwrap()[0].clone();
+        let r = send(
+            &rig.router,
+            public("DELETE", &format!("/cast/{token}/whep"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        assert!(first.is_fenced());
+        rig.now.fetch_add(2000, Ordering::SeqCst);
+        let r = send(&rig.router, offer(&token, b"v=0".to_vec())).await;
+        assert_eq!(r.status(), StatusCode::CREATED);
+        let second = fake.attachments.lock().unwrap()[1].clone();
+        rig.state.cast_streams.revoke(&id, "test").unwrap();
+        assert!(second.is_fenced());
+    }
+
+    /// Decision 5.4 / lens 2 of PR 516: no WebRTC attachment is cleared for
+    /// an engine-minted label; the engine refusing is `503`, not an error
+    /// that names the feed.
+    #[tokio::test]
+    async fn engine_minted_labels_and_refusals_are_503() {
+        let (rig, fake) = rtc_rig();
+        let (_, token) = scoped(&rig).await;
+        rig.cast.labels["cast-1"].record(
+            &Component::Video,
+            5,
+            engine_minted(identity(&Component::Video, "src:secret-cam")),
+        );
+        let r = send(&rig.router, offer(&token, b"v=0".to_vec())).await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(fake.offers.lock().unwrap().is_empty());
+        let (rig, fake) = rtc_rig();
+        let (_, token) = scoped(&rig).await;
+        fake.refuse.store(true, Ordering::SeqCst);
+        let r = send(&rig.router, offer(&token, b"v=0".to_vec())).await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The rung is off unless `[cast] ladder` enables it (the kill switch of
+    /// "Cast media status").
+    #[tokio::test]
+    async fn the_ladder_kill_switch_turns_webrtc_off() {
+        let fake = Arc::new(Fake::default());
+        let rung: multiview_control::cast_webrtc::SharedCastWebRtc = fake.clone();
+        let rig = rig_with(move |state| state.with_cast_webrtc(rung));
+        let (_, token) = scoped(&rig).await;
+        let (_, body, _) = ladder(&rig, &token, &probe_body()).await;
+        assert_eq!(body["attach"]["rung"], "hls");
+        let r = send(&rig.router, offer(&token, b"v=0".to_vec())).await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(fake.offers.lock().unwrap().is_empty());
+    }
+}
