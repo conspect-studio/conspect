@@ -1285,9 +1285,10 @@ const RENDITION_FETCH_BUDGET: std::time::Duration = std::time::Duration::from_se
 /// anchor, it lies within this distance of that picture (the reader runs at
 /// most a few segments ahead; an MPEG-TS clock reset moves it far away).
 const SAME_CLOCK_NS: i64 = 60_000_000_000;
-/// The longest a chunk of a new epoch waits for the video to cross the same
-/// clock jump (a new mapping) before the fallback of [`ClockMatch::wait`].
-const CLOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// The longest a chunk of a new epoch waits for the video to resolve its
+/// mapping ([`ClockMatch`]): the picture reaching it (at most
+/// [`SAME_CLOCK_NS`] ahead) or a rebase.
+const CLOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// How a rendition chunk's cues map onto the video timeline: through a live
 /// anchor `(raw0, pts0)`, or (a file/VOD source, no live anchor) as written.
@@ -1299,44 +1300,46 @@ enum CueAnchor {
 
 /// The reader's correlation of rendition discontinuity epochs with the video's
 /// raw <-> normalized mappings (#526 review). An `EXT-X-DISCONTINUITY` (an ad
-/// splice) may restart the cue clock; the video's normalizer rebases its
-/// mapping exactly when its raw clock jumps by more than
-/// [`VIDEO_REBASE_NS`] (`PtsNormalizer`'s threshold). A mapping is identified
-/// by its offset, never by the [`LiveAnchor`] generation (the video also
-/// republishes an unchanged mapping). The reader and the picture cross a
-/// splice at different times, so a chunk maps:
+/// splice) may restart the cue clock; the video's normalizer then rebases its
+/// mapping when its own raw clock jumps there. A mapping is identified by its
+/// offset ([`same_mapping`]), never by the [`LiveAnchor`] generation (the
+/// video also republishes an unchanged mapping). Cue spacing proves nothing (a
+/// caption silence can cancel a reset), so the decision follows the video:
 ///
-/// * of the epoch already mapped: through THAT epoch's stored mapping, whatever
-///   the video's current one (a late old-side chunk never takes a new one);
-/// * of an older epoch: dropped;
-/// * of a newer epoch whose first cue starts within [`VIDEO_REBASE_NS`] of the
-///   mapped cue clock (cue gaps bound media gaps from above, so the video did
-///   not rebase either): through the previous mapping;
-/// * of a newer epoch otherwise (a clock jump, or a long caption silence):
-///   through a video mapping DIFFERENT from the previous one that puts the
-///   chunk near the shown picture (the video crossed the jump too), waiting up
-///   to [`CLOCK_WAIT`]; when none appears, the previous mapping if it puts the
-///   chunk near the picture (a silence on a continuous clock), else dropped;
-/// * the first chunk: through the current mapping, when it puts the chunk near
-///   the shown picture.
+/// * a chunk of the epoch already mapped: THAT epoch's stored mapping,
+///   whatever the video's current one (a late old-side chunk never takes a
+///   new one); an older epoch: dropped;
+/// * a newer epoch, the video's mapping CHANGED since the previous epoch (the
+///   video crossed a rebase): the current mapping, when it puts the chunk
+///   near the shown picture;
+/// * a newer epoch, mapping unchanged: accepted once the shown picture
+///   reaches the chunk under that mapping (the video played up to it without
+///   a rebase: a continuous clock); a chunk that maps into the picture's past
+///   waits for the video's rebase instead (a reset the reader reached first);
+/// * the first chunk: the current mapping, when it puts it near the picture.
+///
+/// A live source whose anchor slot holds only the lifecycle placeholder (no
+/// raw PTS yet) waits; a reader with an empty anchor slot (a file/VOD
+/// rendition) plays its cues as written.
+///
+/// Every wait is bounded ([`CLOCK_WAIT`]) and stop-checked; an unresolved
+/// chunk is dropped.
 ///
 /// [`LiveAnchor`]: crate::pipeline::LiveAnchor
 #[derive(Debug, Default)]
 struct ClockMatch {
     /// The last mapped epoch and its mapping.
     mapped: Option<(u64, CueAnchor)>,
-    /// The latest raw (MPEG-TS) cue end mapped so far.
-    last_raw_end: Option<i64>,
 }
 
-/// `PtsNormalizer`'s rebase threshold (a raw jump beyond it re-anchors the
-/// video's mapping).
-const VIDEO_REBASE_NS: i64 = 10_000_000_000;
+/// How far into the picture's past a newer epoch's first cue may map, under an
+/// unchanged mapping, and still count as the same clock (reader lag).
+const CONTINUOUS_SLACK_NS: i64 = 5_000_000_000;
 
 impl ClockMatch {
-    /// Wait (off the output clock, stop-checked) for the mapping of `chunk`
-    /// of discontinuity epoch `epoch` (see [`ClockMatch`]). `None` drops the
-    /// chunk.
+    /// Wait (off the output clock, stop-checked, bounded) for the mapping of
+    /// `chunk` of discontinuity epoch `epoch` (see [`ClockMatch`]). `None`
+    /// drops the chunk.
     fn wait(
         &mut self,
         plan: &CaptionPlan,
@@ -1345,16 +1348,9 @@ impl ClockMatch {
         stop: &AtomicBool,
     ) -> Option<CueAnchor> {
         let first = chunk.first()?;
-        let chunk_end = chunk.iter().map(|cue| cue.raw_end).max();
         let previous = match self.mapped {
-            Some((mapped, anchor)) if mapped == epoch => {
-                self.note_end(chunk_end);
-                return Some(anchor);
-            }
+            Some((mapped, anchor)) if mapped == epoch => return Some(anchor),
             Some((mapped, _)) if epoch < mapped => return None,
-            Some((_, anchor)) if self.continues(first.raw_start) => {
-                return Some(self.accept(epoch, anchor, chunk_end));
-            }
             Some((_, anchor)) => Some(anchor),
             None => None,
         };
@@ -1363,88 +1359,50 @@ impl ClockMatch {
             if stop.load(Ordering::Acquire) || plan.store.generation() != plan.generation {
                 return None;
             }
-            if let Some(anchor) = Self::current(plan, first) {
-                // A newer epoch takes only a mapping the video changed to.
-                if previous.is_none_or(|previous| !same_mapping(previous, anchor)) {
-                    return Some(self.accept(epoch, anchor, chunk_end));
-                }
+            if let Some(anchor) = Self::decide(plan, first, previous) {
+                self.mapped = Some((epoch, anchor));
+                return Some(anchor);
             }
             if started.elapsed() >= CLOCK_WAIT {
-                // No new mapping: a long silence on a continuous clock maps
-                // through the previous one when it lands near the picture.
-                let previous =
-                    previous.filter(|&previous| Self::near_shown(plan, first, previous))?;
-                return Some(self.accept(epoch, previous, chunk_end));
+                return None;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 
-    fn accept(&mut self, epoch: u64, anchor: CueAnchor, end: Option<i64>) -> CueAnchor {
-        if self
-            .mapped
-            .is_none_or(|(_, mapped)| !same_mapping(mapped, anchor))
-        {
-            self.last_raw_end = None;
-        }
-        self.mapped = Some((epoch, anchor));
-        self.note_end(end);
-        anchor
-    }
-
-    /// Remember the latest raw cue end mapped.
-    fn note_end(&mut self, end: Option<i64>) {
-        if let Some(end) = end {
-            self.last_raw_end = Some(self.last_raw_end.map_or(end, |last| last.max(end)));
-        }
-    }
-
-    /// Whether a cue starting at raw `start` provably continues the mapped
-    /// cue clock: within [`VIDEO_REBASE_NS`] of the last mapped cue end.
-    fn continues(&self, start: i64) -> bool {
-        self.last_raw_end
-            .is_some_and(|last| start.saturating_sub(last).abs() <= VIDEO_REBASE_NS)
-    }
-
-    /// The video's current mapping, when a picture of the plan's generation
-    /// is shown and the mapping puts `first` within [`SAME_CLOCK_NS`] of it.
-    /// A live source waits for its video's real (raw-PTS) anchor (a lifecycle
-    /// start publishes a placeholder without one); a file/VOD rendition plays
-    /// its cues as written.
-    fn current(plan: &CaptionPlan, first: &crate::vtt_rendition::VttCue) -> Option<CueAnchor> {
-        let anchor = plan.video_anchor.load().and_then(|a| {
-            a.raw_pts0_ns
-                .map(|raw0| CueAnchor::Raw { raw0, pts0: a.pts0 })
-        });
-        let Some(anchor) = anchor else {
-            let shown = plan
-                .displayed_time
-                .load()
-                .is_some_and(|t| t.generation == plan.generation);
-            return (shown && !plan.live).then_some(CueAnchor::AsWritten);
-        };
-        Self::near_shown(plan, first, anchor).then_some(anchor)
-    }
-
-    /// Whether `anchor` puts `first` within [`SAME_CLOCK_NS`] of the shown
-    /// picture of the plan's generation.
-    fn near_shown(
+    /// One look at the video: the mapping for `first` now, or `None` to keep
+    /// waiting.
+    fn decide(
         plan: &CaptionPlan,
         first: &crate::vtt_rendition::VttCue,
-        anchor: CueAnchor,
-    ) -> bool {
-        let Some(shown) = plan
+        previous: Option<CueAnchor>,
+    ) -> Option<CueAnchor> {
+        let shown = plan
             .displayed_time
             .load()
-            .filter(|t| t.generation == plan.generation)
-        else {
-            return false;
+            .filter(|t| t.generation == plan.generation)?;
+        let Some(anchor) = plan.video_anchor.load() else {
+            // No live anchor (a file/VOD rendition, or a reader not wired to
+            // a live video): cues play as written.
+            return Some(CueAnchor::AsWritten);
         };
-        let CueAnchor::Raw { raw0, pts0 } = anchor else {
-            return true;
-        };
+        // A live source's lifecycle start publishes a placeholder without a
+        // raw PTS: wait for the video's real anchor.
+        let raw0 = anchor.raw_pts0_ns?;
+        let pts0 = anchor.pts0;
+        let current = CueAnchor::Raw { raw0, pts0 };
         let at = crate::vtt_rendition::project_raw(first.raw_start, raw0, pts0);
-        at.as_nanos().saturating_sub(shown.pts.as_nanos()).abs() <= SAME_CLOCK_NS
+        let ahead = at.as_nanos().saturating_sub(shown.pts.as_nanos());
+        let near = ahead.abs() <= SAME_CLOCK_NS;
+        match previous {
+            Some(previous) if same_mapping(previous, current) => {
+                // Unchanged: only once the picture reached the chunk.
+                (-CONTINUOUS_SLACK_NS..=CUE_AHEAD_NS)
+                    .contains(&ahead)
+                    .then_some(current)
+            }
+            _ => near.then_some(current),
+        }
     }
 }
 
@@ -2531,6 +2489,8 @@ input_id = "cam_b"
         let mut clock = ClockMatch::default();
         let old = vtt_cues("WEBVTT\n\n00:00:32.000 --> 00:00:33.000\nold\n");
         let anchor = clock.wait(&plan, &old, 1, &stop).expect("maps");
+        // The picture plays on to the next epoch's first cue (15 s).
+        show_at(&plan, 14);
         let next = vtt_cues("WEBVTT\n\n00:00:35.000 --> 00:00:36.000\nnext\n");
         assert_eq!(clock.wait(&plan, &next, 2, &stop), Some(anchor));
         assert_eq!(start_ms(anchor, &next), 15_000);
@@ -2591,6 +2551,42 @@ input_id = "cam_b"
         let anchor = wait_while_video_crosses(&plan, &mut clock, &reset, 2, (0, 20, 20))
             .expect("maps after the real crossing");
         assert_eq!(start_ms(anchor, &reset), 21_000, "21 s, not -19 s");
+    }
+
+    /// #526 review r4: a backward reset after a caption SILENCE (the cue gap
+    /// looks continuous: 33 s -> 36 s). The video rebased (raw 35 s = 40 s);
+    /// the new epoch takes that mapping, both when the reader reaches the
+    /// splice first and when the rebase is already published.
+    #[test]
+    fn a_reset_after_a_caption_silence_takes_the_rebased_mapping() {
+        let old = vtt_cues("WEBVTT\n\n00:00:32.000 --> 00:00:33.000\nold\n");
+        let new = vtt_cues("WEBVTT\n\n00:00:36.000 --> 00:00:37.000\nafter silence\n");
+        // Reader first: the picture is at 39 s (raw 59 s) on the old mapping.
+        let plan = Arc::new(reader_plan());
+        set_anchor(&plan, 30, 10);
+        show_at(&plan, 12);
+        let mut clock = ClockMatch::default();
+        clock
+            .wait(&plan, &old, 1, &AtomicBool::new(false))
+            .expect("maps");
+        show_at(&plan, 39);
+        let anchor = wait_while_video_crosses(&plan, &mut clock, &new, 2, (35, 40, 40))
+            .expect("maps after the rebase");
+        assert_eq!(start_ms(anchor, &new), 41_000, "41 s, not 16 s");
+        // Rebase already published.
+        let plan = reader_plan();
+        set_anchor(&plan, 30, 10);
+        show_at(&plan, 12);
+        let mut clock = ClockMatch::default();
+        clock
+            .wait(&plan, &old, 1, &AtomicBool::new(false))
+            .expect("maps");
+        set_anchor(&plan, 35, 40);
+        show_at(&plan, 40);
+        let anchor = clock
+            .wait(&plan, &new, 2, &AtomicBool::new(false))
+            .expect("maps");
+        assert_eq!(start_ms(anchor, &new), 41_000);
     }
 
     /// A newer epoch whose video never re-anchors is not mapped through the
