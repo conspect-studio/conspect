@@ -1,0 +1,220 @@
+package studio.conspect.cast.tv
+
+/**
+ * Detects a gap in the MPEG-TS continuity counter of the video PID (ADR-0114 "Receiver buffers", recovery).
+ * Feed whole 188-byte packets in order. A gap means loss.
+ */
+class TsContinuityDetector {
+    var videoPid = -1
+        private set
+    private var last = -1
+
+    /** Number of gaps seen. */
+    var gaps = 0
+        private set
+
+    /** Feeds a buffer of whole TS packets; returns true if a gap was found in this buffer. */
+    fun feed(buf: ByteArray, offset: Int, length: Int): Boolean {
+        var gap = false
+        var i = offset
+        val end = offset + length
+        while (i + PACKET <= end) {
+            if (buf[i] != SYNC) {
+                i += 1 // resync byte by byte
+                continue
+            }
+            if (packet(buf, i)) gap = true
+            i += PACKET
+        }
+        return gap
+    }
+
+    /** One packet at [i]. True when it is a video packet that follows a gap. */
+    fun packet(buf: ByteArray, i: Int): Boolean {
+        val pid = pidOf(buf, i)
+        val afc = (buf[i + 3].toInt() shr 4) and 3
+        val cc = buf[i + 3].toInt() and 0x0f
+        val payloadStart = (buf[i + 1].toInt() and 0x40) != 0
+        if (videoPid < 0 && payloadStart && pid >= 0x20 && afc and 1 != 0 && isVideoPesStart(buf, i, afc)) {
+            videoPid = pid
+        }
+        if (pid != videoPid || afc and 1 == 0) return false // CC increments only on packets with payload
+        val gap = last >= 0 && cc != (last + 1) and 0x0f && cc != last
+        if (gap) gaps += 1
+        last = cc
+        return gap
+    }
+
+    private fun isVideoPesStart(buf: ByteArray, i: Int, afc: Int): Boolean {
+        val p = payloadOffset(buf, i, afc)
+        if (p + 4 > i + PACKET) return false
+        if (buf[p].toInt() != 0 || buf[p + 1].toInt() != 0 || buf[p + 2].toInt() != 1) return false
+        return (buf[p + 3].toInt() and 0xf0) == 0xe0 // video stream ids 0xE0..0xEF
+    }
+
+    fun reset() {
+        videoPid = -1
+        last = -1
+    }
+
+    companion object {
+        const val PACKET = 188
+        const val SYNC = 0x47.toByte()
+
+        fun pidOf(buf: ByteArray, i: Int): Int = ((buf[i + 1].toInt() and 0x1f) shl 8) or (buf[i + 2].toInt() and 0xff)
+
+        fun payloadOffset(buf: ByteArray, i: Int, afc: Int): Int {
+            var p = i + 4
+            if (afc and 2 != 0) p += 1 + (buf[p].toInt() and 0xff)
+            return p
+        }
+    }
+}
+
+/**
+ * In-connection loss recovery with discard-to-IDR (ADR-0114 "Receiver buffers", recovery; the socket and its
+ * one-time sid are kept). Sits between the SRT socket and the TS extractor, on whole packets.
+ *
+ * Video packets are held per access unit (PES): the unit is released when the next unit starts. That costs no
+ * latency, because TsExtractor and H264Reader emit a sample only when the next unit starts too. A unit that had a
+ * continuity gap inside it is never released. After a gap, every video unit is dropped until one contains an IDR
+ * slice (NAL type 5); that unit and everything after it flow again. Audio and other PIDs always pass: every
+ * audio frame is independently decodable. The extractor therefore never sees a frame that depends on lost data.
+ * The held unit is bounded by [MAX_UNIT_BYTES]; a unit larger than that is passed on without further holding.
+ */
+class TsIdrFilter {
+    private val detector = TsContinuityDetector()
+    private var dropping = false
+    private val pending = java.io.ByteArrayOutputStream()
+    private val payload = java.io.ByteArrayOutputStream() // payload bytes only: a start code can straddle TS headers
+    private var scanFrom = 0
+    private var idrSeen = false
+    private var passRest = false
+
+    /** Gaps that started a recovery. */
+    var recoveries = 0
+        private set
+
+    val recovering: Boolean get() = dropping
+
+    /** Starts a recovery without a continuity gap (libsrt's receive-drop counter rose). */
+    fun resync() {
+        if (detector.videoPid >= 0 && !dropping) beginDropping()
+    }
+
+    private fun beginDropping() {
+        dropping = true
+        recoveries += 1
+        clearPending()
+    }
+
+    private fun clearPending() {
+        pending.reset()
+        payload.reset()
+        scanFrom = 0
+        idrSeen = false
+        passRest = false
+    }
+
+    /**
+     * Filters [len] bytes of whole TS packets at [off]. Input that is not packet aligned passes through
+     * unchanged. Returns the bytes to hand to the extractor (may be empty).
+     */
+    fun process(buf: ByteArray, off: Int, len: Int): ByteArray {
+        val out = java.io.ByteArrayOutputStream(len + TsContinuityDetector.PACKET)
+        if (len % TsContinuityDetector.PACKET != 0 || len == 0) {
+            out.write(buf, off, len)
+            return out.toByteArray()
+        }
+        var i = off
+        while (i < off + len) {
+            if (buf[i] != TsContinuityDetector.SYNC) { // lost alignment: pass the rest as it is
+                out.write(buf, i, off + len - i)
+                break
+            }
+            packet(buf, i, out)
+            i += TsContinuityDetector.PACKET
+        }
+        return out.toByteArray()
+    }
+
+    private fun packet(buf: ByteArray, i: Int, out: java.io.ByteArrayOutputStream) {
+        val gap = detector.packet(buf, i)
+        val pid = TsContinuityDetector.pidOf(buf, i)
+        if (pid != detector.videoPid) {
+            out.write(buf, i, TsContinuityDetector.PACKET)
+            return
+        }
+        val pusi = (buf[i + 1].toInt() and 0x40) != 0
+        if (gap) {
+            // The unit in progress lost data: it is never released. Recovery starts (or restarts inside a candidate).
+            if (!dropping) {
+                beginDropping()
+            } else {
+                clearPending()
+            }
+        }
+        if (pusi) {
+            if (!dropping) pending.writeTo(out) // the previous unit is complete and intact
+            clearPending()
+        }
+        if (passRest) {
+            out.write(buf, i, TsContinuityDetector.PACKET)
+            return
+        }
+        if (!pusi && pending.size() == 0) {
+            // the tail of a unit that was never released (a gap, or a unit dropped in recovery)
+            if (!dropping) out.write(buf, i, TsContinuityDetector.PACKET) // before the first unit: nothing to hold
+            return
+        }
+        pending.write(buf, i, TsContinuityDetector.PACKET)
+        if (dropping) {
+            val afc = (buf[i + 3].toInt() shr 4) and 3
+            if (afc and 1 != 0) {
+                val q = TsContinuityDetector.payloadOffset(buf, i, afc)
+                if (q < i + TsContinuityDetector.PACKET) payload.write(buf, q, i + TsContinuityDetector.PACKET - q)
+            }
+            scanForIdr()
+            if (idrSeen) { // the candidate unit becomes the held unit of normal flow
+                dropping = false
+                payload.reset()
+                scanFrom = 0
+                idrSeen = false
+            }
+        }
+        if (pending.size() > MAX_UNIT_BYTES) {
+            if (dropping) {
+                clearPending() // an unbounded candidate is no use
+            } else {
+                pending.writeTo(out)
+                pending.reset()
+                passRest = true
+            }
+        }
+    }
+
+    /** IDR slice: start code 00 00 01 followed by a NAL header with type 5. */
+    private fun scanForIdr() {
+        val b = payload.toByteArray()
+        var k = maxOf(scanFrom - 3, 0)
+        while (k + 3 < b.size) {
+            if (b[k].toInt() == 0 && b[k + 1].toInt() == 0 && b[k + 2].toInt() == 1 && (b[k + 3].toInt() and 0x1f) == 5) {
+                idrSeen = true
+                return
+            }
+            k += 1
+        }
+        scanFrom = b.size
+    }
+
+    fun reset() {
+        detector.reset()
+        dropping = false
+        clearPending()
+        recoveries = 0
+    }
+
+    companion object {
+        const val MAX_UNIT_BYTES = 1024 * 1024
+    }
+}
