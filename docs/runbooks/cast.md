@@ -55,7 +55,10 @@ Design: [ADR-0111](../decisions/ADR-0111-cast-output.md), [cast-output.md](../ar
    the default. `["moq", "hls"]` also offers MoQ (engine side only: the receiver's MoQ player is a later slice, so
    leave the default until it ships). MoQ is offered only while the engine's MoQ listener runs and a registry
    subscription is free (16 per run, shared with the desk's MoQ viewers); otherwise the receiver gets HLS.
-   `webrtc` and `srt` are not built yet and fail validation. The receiver probes the device on every cast; the
+   `"webrtc"` offers the WebRTC rung on the WHEP-serve lane of the shared UDP 443 socket (ICE-TCP on TCP 443 when
+   enabled); it needs the `webrtc-native` build and adds one Opus encoder per cast output while it has viewers.
+   Leave it out until the receiver's `rtc.js` ships; removing it is the kill switch. `srt` is not built yet and
+   fails validation. The receiver probes the device on every cast; the
    probe is stored with the stream.
 
 ## 2. Cast

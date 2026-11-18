@@ -1342,6 +1342,72 @@ transport session that only the receiver opens: the engine-side bound it would s
 subscription and 64 MiB in total, asserted by the chaos test above. The `clock` the ladder answers is unchanged;
 the lease's own `clock_wall_micros` stays `null`, as decision 2 allows (the receiver uses the ladder's `clock`).
 
+### 12. Slice 5 engine (design note, as built)
+
+The engine half of the WebRTC rung. The receiver's `rtc.js`, its media-element hook and its harness pin are a
+later pull request. Where this part differs from the text above, this section is what runs.
+
+**Routes.** The ladder names WebRTC (`{"rung": "webrtc", "whep": "whep"}`) when `[cast] ladder` enables it and the
+engine runs the rung; it admits nothing itself, because the offer is the receiver's. `POST /cast/<token>/whep`
+(`application/sdp`, at most 64 KiB): the shared check; the per-token ladder rate (an offer costs a ladder call);
+the body; the shared check again; the clearance of the present state, refused while any current label is
+engine-minted (section 11); the engine's negotiation; registration with the token at the admitted generation; the
+barrier and the labels checked once more. `201` with the answer SDP, `no-store`, CORS as the ladder. A refused
+offer is `503`, a malformed one `400`, a dead token the cast `404`. `DELETE /cast/<token>/whep` fences the token's
+WebRTC attachments (`204`). `[cast] ladder` is the kill switch: without `webrtc` neither the ladder nor the route
+serves it.
+
+**One feed per cast output** (`multiview-cli` `cast_webrtc`). The first viewer of a cast output starts it: one
+effective-output registry subscription, one off-clock thread, ONE Opus encoder (96 kbit/s, `PROGRAM_OPUS_BIT_RATE`)
+and one egress feed registered on the shared WHEP-serve lane (the UDP 443 socket and its ICE-TCP candidates, as a
+`webrtc` output's viewers). The feed thread retires itself 2 s after its last viewer was fenced (DELETE, revoke, a
+dead session), releasing the subscription, the encoder and only its own lane registration (a generation number).
+An offer reserves the feed before it negotiates, so a retiring feed is never handed a new viewer. The registry cost is therefore one
+subscription per cast output with viewers, as decision 6 says, shared with the desk's 16.
+
+**Audio.** The Opus encoder is fed by decoding the output's own program AAC (the encoded slot every other rung
+carries), not from a second audio tap. Two reasons: the AAC packet carries the engine timestamp of its samples
+(the open question of decision 2, item 3, is settled without new engine code), and the content identity of the
+audio WebRTC carries is the one the gate already judges. The decoded blocks wait in a tap of at most 8 blocks
+(decision 6); the encoder is seeded with the engine time of its first block and stamps from its own sample counter
+after it, so its RTP time is `floor(E * 48000 / 1e6) mod 2^32`. A gap in the audio (a dropped window, a decode error, a
+block dropped from the tap) re-seeds the encoder at the next block's own engine time, so the Opus timeline never
+compresses a gap. Discrete tracks are not carried on this rung.
+
+**The gate at the driver's write.** The feed thread judges each window with every viewer's attachment
+(`CastAttachment::admit_window`, the same gate as MoQ, audio packets at their first and last sample) and marks the
+window passed per viewer. Every sample pushed to the egress feed carries its window's sequence number; the driver
+writes a sample to a viewer only when that viewer's attachment passed that window: the attachment records the first
+and the last window it passed, and a viewer that joined later is never written an older queued window
+(`CastAttachment::may_write`, two atomic loads). An Opus packet carries the OLDEST window any of its input samples
+came from (staging and codec look-ahead included), so a new viewer is never written audio of a window it did not
+judge. A fenced viewer's session is disconnected at the next driver tick
+(DTLS close, not drained); a dead session fences its attachment. One viewer refused does not stop the others.
+
+**RTP and RTCP.** Video `R = floor(E * 90000 / 1e6) mod 2^32` with `E` the tick-derived PTS in µs, floored (so at
+29.97 fps tick 1 is `R = 3002`, the value the receiver's inverse map expects); str0m adds no offset (test
+`the_cast_write_path_sends_the_given_rtp_timestamp_without_offset` reads the sent packet, across 2^32, and fails
+with a one-tick offset injected). The RTCP sender-report wallclock of both streams is the epoch's wall time of the
+sample's `E`, mapped onto the monotonic clock str0m takes (`Session::write_sample_at`); without a validated epoch it
+is the time of writing (review note R2-N3: the receiver's latency is then `unavailable` by its own rule, never a
+guess). A viewer's PLI/FIR is counted and ignored.
+
+**Bounds.** The egress feed (this also hardens the `webrtc` output and `whip_push`): 512 samples, 8 MiB and 2 s
+between the oldest and the newest; reaching any one evicts the oldest, and a video eviction drops the rest of the
+broken GOP's video and holds video back until the next keyframe (audio keeps flowing). str0m's send buffers are
+set explicitly for cast viewers (1 000 video, 50 audio packets). At most 64 viewers per cast output (one token
+holds at most two WebRTC attachments; 32 tokens).
+
+**Invariants #1 and #10.** No work on the clock or the bake consumer. The feed thread polls the registry's
+bounded hand-off and never blocks on a viewer; the driver's per-viewer check is an atomic load. The chaos test
+`x_a_cast_webrtc_viewer_that_stops_reading_costs_the_clock_nothing_and_stays_bounded` runs a cast WebRTC feed whose
+transport never reads for the whole run on the real pipeline: the feed stays within 512 samples and 8 MiB and drops
+instead of growing, resident memory ends within 16 MiB, and the relative isolation predicate holds against a
+control run (its negative control is `n_a_shared_stall_fails_the_relative_isolation_predicate`).
+
+**Not built here.** The receiver's `rtc.js` and the hook; a live-socket WebRTC session in a test (the transport
+tests drive str0m sans-IO); the device tests.
+
 ## Rationale
 
 - **Why a ladder decided by the receiver's report, not by the sender.** The sender cannot see what the device's
@@ -1414,14 +1480,14 @@ the lease's own `clock_wall_micros` stays `null`, as decision 2 allows (the rece
 | Whether UDP 443 and UDP 9010 pass from the network the Cast devices are on | slices 4 and 6 device tests |
 | How libsrt 1.5.7 reaches the container images and CI | slice S, lane `srtfloor`. Its plan as told to this team: build 1.5.7 from the pinned upstream tarball in the images |
 | Minimum Android API of Media3 and the Cast TV library | slice 6 |
-| Whether the audio tap carries the engine timestamp of each block (needed to stamp Opus with engine time) | slice 5 |
+| Whether the audio tap carries the engine timestamp of each block (needed to stamp Opus with engine time) | Closed by section 12: the rung decodes the output's own AAC, whose packets carry it |
 | Whether the engine's SRT output writes `PTS = engine time` exactly (libav adds twice `max_delay`, default 0) | slice 6: demux the engine's own output and compare |
 | Whether Media3 reports the extractor's sample time unchanged to the frame listener for a progressive source | slice 6 instrumented test; until it passes, SRT latency is `unavailable` |
 | Whether libsrt discards, and neither grows nor blocks, when the app stops reading | slice 6 test, before the rung is enabled |
 | Whether `jitterBufferTarget` exists on a Cast device and what the jitter buffer then holds | slice 5 device test |
 | Existing `webrtc` output: RTP time becomes 0 for every frame after 2^32 (video after 13 h 15 min, audio after 24 h 51 min; read in code, not reproduced) | issue #492, ship lane `rtpwrap`; outside this ADR |
 | What the app does when ladder calls for a fresh SRT selector run into the rate limit during rapid reconnects: step down, or retry (review note R2-N2) | slice 2 design note. Not decided here |
-| Which RTCP wall clock the WebRTC rung uses when the run has no validated epoch (review note R2-N3) | slice 5, as a test requirement. Not decided here |
+| Which RTCP wall clock the WebRTC rung uses when the run has no validated epoch (review note R2-N3) | Closed by section 12: the time of writing, and latency is `unavailable` |
 | That the ladder answers with the next rung, and not with an error, when no registry subscription is left for MoQ (review note R2-N4; decision 6 already says the receiver gets the next rung) | Closed by section 11 (route test `no_subscription_left_offers_the_next_rung`) |
 
 ## Appendix: slice 3 spike (2026-11-15)

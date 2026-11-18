@@ -38,6 +38,9 @@ pub struct UnifiedWebrtc {
     pub whip: Option<multiview_control::SharedWhip>,
     /// The WHEP-serve **output** provider (`POST /api/v1/whep/{output}`).
     pub whep_output: Option<multiview_control::SharedWhepOutput>,
+    /// The cast `WebRTC` rung (ADR-0114 slice 5; `POST /cast/<token>/whep`),
+    /// on the same serve lane; `None` without a cast output.
+    pub cast_webrtc: Option<multiview_control::cast_webrtc::SharedCastWebRtc>,
 }
 
 /// Bind the one shared socket, adopt every configured WebRTC role onto it, spawn
@@ -103,6 +106,7 @@ pub fn spawn_unified_webrtc(
                 whep: None,
                 whip: None,
                 whep_output: None,
+                cast_webrtc: None,
             };
         }
     };
@@ -129,16 +133,32 @@ pub fn spawn_unified_webrtc(
         (builder, None)
     };
 
-    // 2. WHEP-serve output lane (only when there are `webrtc` outputs).
-    let want_serve = crate::webrtc_outputs::has_whep_outputs(egress_registry);
-    let (builder, whep_output) = if want_serve {
+    // 2. WHEP-serve output lane (when there are `webrtc` outputs, or a cast
+    //    output whose WebRTC rung serves viewers on the same lane).
+    let want_cast = config
+        .outputs
+        .iter()
+        .any(|o| matches!(o, multiview_config::Output::Cast { .. }));
+    let want_serve = crate::webrtc_outputs::has_whep_outputs(egress_registry) || want_cast;
+    let (builder, whep_output, cast_webrtc) = if want_serve {
         let (builder, handle) = builder.with_serve();
+        let cast_webrtc = want_cast.then(|| {
+            let windows = crate::cast_output::installed_cast_windows();
+            let outputs = crate::cast_output::installed_cast_outputs();
+            windows.zip(outputs).map(|(windows, outputs)| {
+                let rung: multiview_control::cast_webrtc::SharedCastWebRtc = Arc::new(
+                    crate::cast_webrtc::CliCastWebRtc::new(handle.clone(), windows, outputs),
+                );
+                rung
+            })
+        });
         (
             builder,
             crate::webrtc_outputs::provider_for_handle(egress_registry, handle),
+            cast_webrtc.flatten(),
         )
     } else {
-        (builder, None)
+        (builder, None, None)
     };
 
     // 3. The native preview egress (always wired when the socket bound — preview is
@@ -221,6 +241,7 @@ pub fn spawn_unified_webrtc(
         whep: Some(gated),
         whip,
         whep_output,
+        cast_webrtc,
     }
 }
 

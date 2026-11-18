@@ -10604,6 +10604,7 @@ fn run_webrtc_output(
             rtp_timestamp,
             keyframe: matches!(packet.kind(), StreamKind::Video) && packet.is_keyframe(),
             data: bytes.to_vec(),
+            cast: None,
         };
         if sink.push(sample) {
             dropped = dropped.saturating_add(1);

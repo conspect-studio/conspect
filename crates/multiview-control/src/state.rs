@@ -879,6 +879,8 @@ pub struct AppState {
     /// viewer is a real-output consumer fed the encode-once program over a bounded
     /// drop-oldest ring and can never back-pressure the engine.
     pub whep_output: crate::whep_output::SharedWhepOutput,
+    /// The cast `WebRTC` rung (ADR-0114 slice 5); never available by default.
+    pub cast_webrtc: crate::cast_webrtc::SharedCastWebRtc,
     /// Whether authentication is **disabled** (every request runs as a local
     /// admin). Off by default — the control plane requires a verified API key.
     /// An operator turns this on **explicitly** (config/env) for a trusted/local
@@ -1188,6 +1190,7 @@ impl AppState {
             tls: None,
             whip: crate::whip::no_whip(),
             whep_output: crate::whep_output::no_whep_output(),
+            cast_webrtc: std::sync::Arc::new(crate::cast_webrtc::NoCastWebRtc),
             // Secure default: authentication is REQUIRED. An operator opts out
             // explicitly via `with_auth_disabled` (config/env), never silently.
             auth_disabled: false,
@@ -1758,6 +1761,13 @@ impl AppState {
     #[must_use]
     pub fn with_public_scheme(mut self, public_scheme: Option<String>) -> Self {
         self.public_scheme = public_scheme.map(Arc::from);
+        self
+    }
+
+    /// Install the engine's cast `WebRTC` rung (ADR-0114 slice 5).
+    #[must_use]
+    pub fn with_cast_webrtc(mut self, rung: crate::cast_webrtc::SharedCastWebRtc) -> Self {
+        self.cast_webrtc = rung;
         self
     }
 
