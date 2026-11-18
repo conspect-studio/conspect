@@ -1323,7 +1323,9 @@ enum CueAnchor {
 ///   crossed the splice; a rebase or not, it is the mapping of the picture's
 ///   epoch), or, for the very next epoch, as soon as the picture is past its
 ///   earliest possible start (`lo`) with a mapping CHANGED from the previous
-///   epoch's (the video rebased: it crossed). A picture already past the
+///   epoch's (the video rebased: it crossed), or at once when the mapping is
+///   unchanged and puts its first cue inside the segment's possible span (a
+///   splice that kept the clock). A picture already past the
 ///   segment's end skips it (its cues are stale, and the mapping may belong
 ///   to a later epoch);
 /// * the first one, or after a gap in the sequence (no estimate): through the
@@ -1463,7 +1465,19 @@ impl ClockMatch {
             let rebased = adjacent
                 && shown >= lo.saturating_sub(EPOCH_SLACK_NS)
                 && !same_mapping(previous, current);
-            return if surely || rebased {
+            // A splice that kept the clock: under the unchanged mapping the
+            // cue lands where this segment can be. (A reset projects away from
+            // that window unless its offset is identical, i.e. the mapping
+            // really is the same.)
+            let at =
+                crate::vtt_rendition::project_raw(first.raw_start, raw0, anchor.pts0).as_nanos();
+            let kept = same_mapping(previous, current)
+                && (lo.saturating_sub(EPOCH_SLACK_NS)
+                    ..=hi
+                        .saturating_add(duration_ns)
+                        .saturating_add(EPOCH_SLACK_NS))
+                    .contains(&at);
+            return if surely || rebased || kept {
                 Look::Take(current)
             } else {
                 Look::Wait
@@ -2730,6 +2744,30 @@ input_id = "cam_b"
             start,
             Some(105_500),
             "mapped once the picture crossed, not skipped"
+        );
+    }
+
+    /// #526 review r7: the same carried-over cue, but the splice KEEPS the
+    /// clock (no rebase): the new epoch's cue (105.5..107 s) is published in
+    /// time, with the picture still at 102 s.
+    #[test]
+    fn a_clock_keeping_splice_after_a_carried_over_cue_maps_at_once() {
+        let plan = reader_plan();
+        set_anchor(&plan, 0, 0);
+        show_at(&plan, 102);
+        let mut clock = ClockMatch::default();
+        let stop = AtomicBool::new(false);
+        let carried = vtt_cues("WEBVTT\n\n00:01:30.000 --> 00:01:44.000\nstill on screen\n");
+        read_segment(&mut clock, &plan, &seg(100, 1), &carried, &stop).expect("maps");
+        let next = vtt_cues("WEBVTT\n\n00:01:45.500 --> 00:01:47.000\nsame clock\n");
+        let started = std::time::Instant::now();
+        assert_eq!(
+            read_segment(&mut clock, &plan, &seg(101, 2), &next, &stop),
+            Some(105_500)
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "no wait: published before its window opens"
         );
     }
 
