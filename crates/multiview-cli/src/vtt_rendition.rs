@@ -319,13 +319,13 @@ fn parse_block(block: &[&str], offset: i64) -> Option<VttCue> {
 pub const MPEGTS_WRAP_NS: i64 = 95_443_717_688_889;
 
 /// Project a raw MPEG-TS instant `raw_ns` onto the video's normalized
-/// timeline, given the video anchor `(raw0_ns, pts0)`: the anchor frame's raw
+/// timeline, given the video anchor `(anchor_raw_ns, pts0)`: the anchor frame's raw
 /// container PTS (in `[0, 2^33)` ticks, as ns) and its normalized PTS. The
 /// occurrence of `raw_ns` modulo the 33-bit wrap nearest the anchor is used.
 #[must_use]
-pub fn project_raw(raw_ns: i64, raw0_ns: i64, pts0: MediaTime) -> MediaTime {
+pub fn project_raw(raw_ns: i64, anchor_raw_ns: i64, pts0: MediaTime) -> MediaTime {
     let wrap = i128::from(MPEGTS_WRAP_NS);
-    let mut delta = (i128::from(raw_ns) - i128::from(raw0_ns)).rem_euclid(wrap);
+    let mut delta = (i128::from(raw_ns) - i128::from(anchor_raw_ns)).rem_euclid(wrap);
     if delta > wrap / 2 {
         delta -= wrap;
     }
@@ -402,7 +402,10 @@ mod tests {
     fn hostile_segments_stay_bounded() {
         let mut doc = String::from("WEBVTT\n\n");
         for i in 0..(MAX_CUES_PER_SEGMENT + 100) {
-            doc.push_str(&format!("00:00:01.000 --> 00:00:02.000\n{i}\n"));
+            let _ = std::fmt::Write::write_fmt(
+                &mut doc,
+                format_args!("00:00:01.000 --> 00:00:02.000\n{i}\n"),
+            );
             for _ in 0..24 {
                 doc.push_str(&"y".repeat(600));
                 doc.push('\n');

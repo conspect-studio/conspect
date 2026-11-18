@@ -1318,15 +1318,15 @@ enum CueAnchor {
 ///
 /// * of the epoch already mapped: through that epoch's stored mapping;
 ///   an older epoch: dropped;
-/// * of a newer epoch: through the video's mapping once the shown picture is
-///   past the segment's latest possible start (`hi`: the video has surely
-///   crossed the splice; a rebase or not, it is the mapping of the picture's
-///   epoch), or, for the very next epoch, as soon as the picture is past its
-///   earliest possible start (`lo`) with a mapping CHANGED from the previous
-///   epoch's (the video rebased: it crossed; an epoch never rebases inside
-///   itself, its timestamps are continuous). A picture already past the
-///   segment's end skips it (its cues are stale, and the mapping may belong
-///   to a later epoch);
+/// * of a newer epoch: through the SHOWN picture's own mapping (the latest
+///   anchor, once it is not ahead of the picture), and only while the picture
+///   is provably in the segment's epoch: before the segment's earliest
+///   possible end (`lo + duration`, so not in a later epoch) and either past
+///   its latest possible start (`hi`) or, for the very next epoch, past `lo`
+///   with a mapping CHANGED from the previous epoch's (the video rebased: it
+///   crossed; an epoch's timestamps are continuous, so it never rebases
+///   inside one). A picture past the segment's earliest end skips it (fail
+///   closed: its epoch is unknown);
 /// * the first one, or after a gap in the sequence (no estimate): through the
 ///   current mapping when it puts the cues near the shown picture.
 ///
@@ -1447,6 +1447,12 @@ impl ClockMatch {
         let Some(raw0) = anchor.raw_pts0_ns else {
             return Look::Wait;
         };
+        // The latest anchor is the SHOWN picture's mapping only when it is
+        // not ahead of that picture (anchors are published in normalized
+        // order, up to the jitter hold before their picture is shown).
+        if anchor.pts0.as_nanos() > shown {
+            return Look::Wait;
+        }
         let current = CueAnchor::Raw {
             raw0,
             pts0: anchor.pts0,
@@ -1458,16 +1464,17 @@ impl ClockMatch {
             adjacent,
         }) = crossing
         {
-            // Past the segment's latest possible end: its cues are stale.
-            if shown
-                >= hi
-                    .saturating_add(duration_ns)
-                    .saturating_add(EPOCH_SLACK_NS)
-            {
+            // The picture may already be past the segment (its earliest
+            // possible end): its epoch is unknown, fail closed.
+            let earliest_end = lo.saturating_add(duration_ns);
+            if shown >= earliest_end {
                 return Look::Stale;
             }
-            // Surely in the new epoch, or possibly in it and the video
-            // rebased since the previous (adjacent) epoch: the crossing.
+            // Before the segment's earliest end, the picture is in this
+            // segment's epoch or an earlier one. It is surely in this one when
+            // past the segment's latest start, or (the very next epoch) when
+            // the video rebased since the previous epoch's mapping: an epoch's
+            // timestamps are continuous, so it rebases only at a splice.
             let surely = shown >= hi.saturating_add(EPOCH_SLACK_NS);
             let rebased = adjacent
                 && shown >= lo.saturating_sub(EPOCH_SLACK_NS)
@@ -2427,7 +2434,7 @@ input_id = "cam_b"
     ) -> crate::vtt_rendition::RenditionPlaylist {
         let mut text = format!("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:{}\n", seqs.start);
         for seq in seqs {
-            text.push_str(&format!("#EXTINF:5,\n{seq}.vtt\n"));
+            let _ = std::fmt::Write::write_fmt(&mut text, format_args!("#EXTINF:5,\n{seq}.vtt\n"));
         }
         if ended {
             text.push_str("#EXT-X-ENDLIST\n");
@@ -2641,15 +2648,15 @@ input_id = "cam_b"
     #[test]
     fn short_resets_and_forward_jumps_take_the_crossed_mapping() {
         for (cue, (raw0, pts0), expect) in [
-            ("00:00:01.000", (0, 17), 18_000),
-            ("00:01:01.000", (60, 17), 18_000),
+            ("00:00:01.000", (0, 15), 16_000),
+            ("00:01:01.000", (60, 15), 16_000),
         ] {
             let plan = Arc::new(reader_plan());
             let mut clock = opened_epoch(&plan);
             let next = vtt_cues(&format!("WEBVTT\n\n{cue} --> 00:59:00.000\nnew epoch\n"));
-            // Epoch 2 starts at most at 12 + 5 = 17 s.
+            // Epoch 2 starts in [12, 18] s and ends no earlier than 17 s.
             let start =
-                read_while_video_moves(&mut clock, &plan, &seg(101, 2), &next, (raw0, pts0, 18));
+                read_while_video_moves(&mut clock, &plan, &seg(101, 2), &next, (raw0, pts0, 16));
             assert_eq!(start, Some(expect), "{cue}");
         }
     }
@@ -2664,8 +2671,8 @@ input_id = "cam_b"
         set_anchor(&plan, 35, 15);
         show_at(&plan, 13);
         let reset = vtt_cues("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nad\n");
-        let start = read_while_video_moves(&mut clock, &plan, &seg(101, 2), &reset, (0, 18, 18));
-        assert_eq!(start, Some(19_000), "19 s, not -19 s");
+        let start = read_while_video_moves(&mut clock, &plan, &seg(101, 2), &reset, (0, 16, 16));
+        assert_eq!(start, Some(17_000), "17 s, not -19 s");
     }
 
     /// Late chunks of the mapped epoch keep its stored mapping after the
@@ -2716,13 +2723,14 @@ input_id = "cam_b"
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
-    /// #526 review r6: a long cue carried over from segments earlier (it
-    /// starts at 90 s, the segment covers 100..105 s) must not pull the start
-    /// estimate back: the next epoch's segment (105 s) is not skipped as
-    /// stale while the picture (102 s) has not reached it.
+    /// #526 review r6/r9: a long cue carried over from segments earlier (it
+    /// starts at 90 s, the segment covers 100..105 s) widens the position
+    /// estimate. The reader then fails closed on epoch 2 segments whose epoch
+    /// the picture's position cannot prove (never a wrong mapping), and
+    /// resumes on the first segment it can place: here the 4th (120..125 s).
     #[test]
-    fn a_carried_over_cue_does_not_make_the_next_epoch_stale() {
-        let plan = Arc::new(reader_plan());
+    fn a_carried_over_cue_fails_closed_then_recovers() {
+        let plan = reader_plan();
         set_anchor(&plan, 0, 0);
         show_at(&plan, 102);
         let mut clock = ClockMatch::default();
@@ -2732,23 +2740,35 @@ input_id = "cam_b"
             read_segment(&mut clock, &plan, &seg(100, 1), &carried, &stop),
             Some(90_000)
         );
-        // Epoch 2 begins at 105 s: raw restarts at 0 s.
-        let next = vtt_cues("WEBVTT\n\n00:00:00.500 --> 00:00:02.000\nnew epoch\n");
-        let start = read_while_video_moves(&mut clock, &plan, &seg(101, 2), &next, (0, 105, 106));
-        assert_eq!(
-            start,
-            Some(105_500),
-            "mapped once the picture crossed, not skipped"
-        );
+        // Epoch 2 resets raw 105 -> 90 s; the video crossed (raw 90 s = 105 s).
+        set_anchor(&plan, 90, 105);
+        show_at(&plan, 106);
+        let mut results = Vec::new();
+        for (sequence, raw) in [
+            (101, "01:30.500"),
+            (102, "01:35.500"),
+            (103, "01:40.500"),
+            (104, "01:45.500"),
+        ] {
+            let cue = vtt_cues(&format!("WEBVTT\n\n00:{raw} --> 00:59:00.000\nepoch 2\n"));
+            results.push(read_segment(
+                &mut clock,
+                &plan,
+                &seg(sequence, 2),
+                &cue,
+                &stop,
+            ));
+        }
+        assert_eq!(results, vec![None, None, None, Some(120_500)]);
     }
 
     /// #526 review r8: after the carried-over cue (segment 100..105 s), the
-    /// next epoch RESETS the raw clock 105 -> 90 s (the video rebases: raw 90 s
-    /// = 105 s). Its cue (raw 90.5 s) projects inside the segment's possible
-    /// span under the OLD mapping, but must wait for the video's rebase.
+    /// next epoch RESETS the raw clock 105 -> 90 s. Its cue (raw 90.5 s)
+    /// projects inside the segment's possible span under the OLD mapping; it
+    /// is never mapped there (90.5 s).
     #[test]
-    fn a_reset_into_the_possible_span_waits_for_the_rebase() {
-        let plan = Arc::new(reader_plan());
+    fn a_reset_into_the_possible_span_is_never_mapped_through_the_old_clock() {
+        let plan = reader_plan();
         set_anchor(&plan, 0, 0);
         show_at(&plan, 102);
         let mut clock = ClockMatch::default();
@@ -2756,8 +2776,10 @@ input_id = "cam_b"
         let carried = vtt_cues("WEBVTT\n\n00:01:30.000 --> 00:01:44.000\nstill on screen\n");
         read_segment(&mut clock, &plan, &seg(100, 1), &carried, &stop).expect("maps");
         let next = vtt_cues("WEBVTT\n\n00:01:30.500 --> 00:01:32.000\nafter reset\n");
-        let start = read_while_video_moves(&mut clock, &plan, &seg(101, 2), &next, (90, 105, 105));
-        assert_eq!(start, Some(105_500), "105.5 s, not 90.5 s");
+        assert_eq!(
+            read_segment(&mut clock, &plan, &seg(101, 2), &next, &stop),
+            None
+        );
     }
 
     /// A splice that KEEPS the clock maps through the unchanged mapping once
@@ -2782,6 +2804,43 @@ input_id = "cam_b"
             Some(106_500),
             "while its window (106.5..109 s) is open"
         );
+    }
+
+    /// #526 review r9: a LAGGING reader reaches epoch 2's segment (105..110 s
+    /// after the carried-over cue) when the picture (111 s) is already in
+    /// epoch 3 (anchor raw 0 s = 110 s). It must skip the segment, never map
+    /// it through epoch 3's mapping.
+    #[test]
+    fn a_lagging_reader_never_maps_an_epoch_through_a_later_one() {
+        let plan = reader_plan();
+        set_anchor(&plan, 0, 0);
+        show_at(&plan, 102);
+        let mut clock = ClockMatch::default();
+        let stop = AtomicBool::new(false);
+        let carried = vtt_cues("WEBVTT\n\n00:01:30.000 --> 00:01:44.000\nstill on screen\n");
+        read_segment(&mut clock, &plan, &seg(100, 1), &carried, &stop).expect("maps");
+        set_anchor(&plan, 0, 110);
+        show_at(&plan, 111);
+        let epoch2 = vtt_cues("WEBVTT\n\n00:01:30.500 --> 00:01:32.000\nepoch 2\n");
+        assert_eq!(
+            read_segment(&mut clock, &plan, &seg(101, 2), &epoch2, &stop),
+            None
+        );
+    }
+
+    /// An anchor published ahead of the shown picture (the jitter hold) is
+    /// not the picture's mapping: the reader waits for the picture to reach
+    /// it.
+    #[test]
+    fn an_anchor_ahead_of_the_picture_is_not_taken() {
+        let plan = Arc::new(reader_plan());
+        let mut clock = opened_epoch(&plan);
+        show_at(&plan, 15);
+        // Rebase published for a picture at 16 s, not yet shown.
+        set_anchor(&plan, 0, 16);
+        let reset = vtt_cues("WEBVTT\n\n00:00:00.500 --> 00:00:03.000\nad\n");
+        let start = read_while_video_moves(&mut clock, &plan, &seg(101, 2), &reset, (0, 16, 16));
+        assert_eq!(start, Some(16_500));
     }
 
     /// The wait ends at once on stop.
