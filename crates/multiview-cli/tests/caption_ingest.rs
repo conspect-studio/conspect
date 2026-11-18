@@ -429,3 +429,26 @@ fn a_nonzero_timestamp_map_places_the_cue_against_the_video_anchor() {
         "1.2 s is before the mapped cue (1.5 s)"
     );
 }
+
+/// #526 review: a bare local rendition path (a local master) with RELATIVE
+/// segment URIs resolves and reads its segments.
+#[test]
+fn a_bare_path_rendition_reads_its_relative_segments() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("s0.vtt"),
+        "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nbare path cue\n",
+    )
+    .expect("segment");
+    std::fs::write(
+        dir.path().join("subs.m3u8"),
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\ns0.vtt\n#EXT-X-ENDLIST\n",
+    )
+    .expect("playlist");
+    let plan = plan_for(format!("{}/subs.m3u8", dir.path().display()), false);
+    show(&plan, 1_500_000_000);
+    assert_eq!(
+        cue_text_at(plan, 1_500_000_000).as_deref(),
+        Some("bare path cue")
+    );
+}

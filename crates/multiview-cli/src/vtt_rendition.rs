@@ -48,6 +48,10 @@ pub struct Segment {
     pub sequence: u64,
     /// The segment URI as written (resolve against the playlist URL).
     pub uri: String,
+    /// Its discontinuity epoch: `EXT-X-DISCONTINUITY-SEQUENCE` plus the
+    /// `EXT-X-DISCONTINUITY` tags before it. Cue times of different epochs
+    /// sit on unrelated clocks (an ad break restarts the MPEG-TS clock).
+    pub discontinuity: u64,
 }
 
 /// A parsed rendition media playlist.
@@ -73,6 +77,7 @@ impl RenditionPlaylist {
         }
         let mut out = Self::default();
         let mut sequence: u64 = 0;
+        let mut discontinuity: u64 = 0;
         for line in lines {
             if line.is_empty() {
                 continue;
@@ -81,6 +86,10 @@ impl RenditionPlaylist {
                 sequence = value.trim().parse().unwrap_or(0);
             } else if let Some(value) = line.strip_prefix("#EXT-X-TARGETDURATION:") {
                 out.target_duration_s = value.trim().parse().unwrap_or(0);
+            } else if let Some(value) = line.strip_prefix("#EXT-X-DISCONTINUITY-SEQUENCE:") {
+                discontinuity = value.trim().parse().unwrap_or(0);
+            } else if line == "#EXT-X-DISCONTINUITY" {
+                discontinuity = discontinuity.saturating_add(1);
             } else if line == "#EXT-X-ENDLIST" {
                 out.ended = true;
             } else if line.starts_with('#') {
@@ -90,6 +99,7 @@ impl RenditionPlaylist {
                     out.segments.push(Segment {
                         sequence,
                         uri: line.to_owned(),
+                        discontinuity,
                     });
                 }
                 sequence = sequence.saturating_add(1);
@@ -380,7 +390,8 @@ mod tests {
     #[test]
     fn the_media_playlist_lists_sequences_and_end() {
         let playlist = RenditionPlaylist::parse(
-            "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXT-X-MEDIA-SEQUENCE:6658\n\
+            "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXT-X-DISCONTINUITY-SEQUENCE:283\n\
+             #EXT-X-MEDIA-SEQUENCE:6658\n\
              #EXTINF:5,\na.vtt\n#EXT-X-DISCONTINUITY\n#EXTINF:5,\nb.vtt\n",
         )
         .unwrap();
@@ -391,11 +402,13 @@ mod tests {
             vec![
                 Segment {
                     sequence: 6658,
-                    uri: "a.vtt".to_owned()
+                    uri: "a.vtt".to_owned(),
+                    discontinuity: 283,
                 },
                 Segment {
                     sequence: 6659,
-                    uri: "b.vtt".to_owned()
+                    uri: "b.vtt".to_owned(),
+                    discontinuity: 284,
                 },
             ]
         );

@@ -887,6 +887,15 @@ fn resolve_caption_plan(
     // requested one (RFC 3986 §5 / RFC 8216). For a non-redirecting fetch the
     // effective URL equals the requested URL, so this is unchanged.
     let rendition_url = resolve_rendition_uri(&playlist.url, uri);
+    // #526 review: a network master may only name a network rendition. A
+    // remote playlist must never steer the reader onto a local file.
+    if is_network_url(&playlist.url) && !is_network_url(&rendition_url) {
+        tracing::warn!(
+            source = %id,
+            "HLS master names a non-network subtitle rendition; no captions"
+        );
+        return None;
+    }
     tracing::info!(
         source = %id,
         language = ?rendition.language,
@@ -1108,10 +1117,21 @@ pub fn caption_loop(plan: &CaptionPlan, stop: &AtomicBool) {
 /// on the MPEG-TS clock by its segment's `X-TIMESTAMP-MAP`
 /// ([`crate::vtt_rendition`]) and projected onto the video's normalized
 /// timeline through the source's [`video anchor`](CaptionPlan::video_anchor).
-/// Every fetch is bounded in bytes and time; the segment schemes are limited to
-/// the rendition's own (`http(s)` for a network rendition).
+/// Every fetch is bounded in bytes and in total time and aborts on stop; the
+/// segment schemes are limited to the rendition's own (`http(s)` for a network
+/// rendition, which a network master always names: [`resolve_caption_plan`]
+/// refuses a local one). Cues are mapped only through a video anchor on their
+/// own clock ([`ClockMatch`]): a splice restarts the cue clock.
 fn read_captions(plan: &CaptionPlan, stop: &AtomicBool) -> Result<(), String> {
-    let allowed = rendition_protocols(&plan.rendition_url)?;
+    // A bare local path (a local master) becomes a `file://` URL once, so
+    // relative segment URIs resolve and fetch in the same form.
+    let rendition_url = if has_scheme(&plan.rendition_url) {
+        plan.rendition_url.clone()
+    } else {
+        format!("file://{}", plan.rendition_url)
+    };
+    let allowed = rendition_protocols(&rendition_url)?;
+    let mut clock = ClockMatch::default();
     let mut next_seq: Option<u64> = None;
     let mut pending = PendingCues::default();
     loop {
@@ -1119,10 +1139,11 @@ fn read_captions(plan: &CaptionPlan, stop: &AtomicBool) -> Result<(), String> {
             return Ok(());
         }
         let fetched = fetch_rendition_text(
-            &plan.rendition_url,
+            &rendition_url,
             MAX_RENDITION_PLAYLIST_BYTES,
             allowed,
             &plan.http_headers,
+            stop,
         )?;
         let playlist = crate::vtt_rendition::RenditionPlaylist::parse(&fetched.body)
             .ok_or_else(|| "rendition is not an HLS media playlist".to_owned())?;
@@ -1138,6 +1159,7 @@ fn read_captions(plan: &CaptionPlan, stop: &AtomicBool) -> Result<(), String> {
                 MAX_VTT_SEGMENT_BYTES,
                 allowed,
                 &plan.http_headers,
+                stop,
             ) {
                 Ok(fetched) => fetched.body,
                 Err(reason) => {
@@ -1154,12 +1176,23 @@ fn read_captions(plan: &CaptionPlan, stop: &AtomicBool) -> Result<(), String> {
             // (a 5 s live segment carries ~25 cues; the window keeps 16), so a
             // dense rolling-caption segment loses none to the cap.
             for chunk in cues.chunks(PENDING_CUE_CAP / 2) {
-                // Map only once the video shows a picture: its anchor (raw
-                // container PTS <-> normalized PTS) is published with it.
-                if !wait_for_picture(plan, stop) {
-                    return Ok(());
-                }
-                let mapped = chunk.iter().filter_map(|cue| map_cue(plan, cue)).collect();
+                // Map only through a video anchor on the chunk's own clock:
+                // across an ad splice (EXT-X-DISCONTINUITY) the reader may
+                // run ahead of the picture, or lag behind it.
+                let Some(anchor) = clock.wait(plan, chunk, segment.discontinuity, stop) else {
+                    if stop.load(Ordering::Acquire) || plan.store.generation() != plan.generation {
+                        return Ok(());
+                    }
+                    pending.dropped = pending
+                        .dropped
+                        .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+                    pending.report_drops(&plan.id);
+                    continue;
+                };
+                let mapped = chunk
+                    .iter()
+                    .filter_map(|cue| map_cue(anchor, cue))
+                    .collect();
                 publish_cues(plan, &mut pending, mapped, stop);
             }
         }
@@ -1207,6 +1240,14 @@ fn first_new_segment(
         .unwrap_or(playlist.segments.len())
 }
 
+/// Whether `url` is an `http(s)` URL.
+fn is_network_url(url: &str) -> bool {
+    matches!(
+        url.split_once("://").map(|(scheme, _)| scheme),
+        Some("http" | "https")
+    )
+}
+
 /// The libav protocols a rendition's playlist and segments may use: the
 /// network set for an `http(s)` rendition, `file` only for a local one (a
 /// local master). Anything else is refused.
@@ -1226,49 +1267,104 @@ fn fetch_rendition_text(
     max_bytes: usize,
     allowed: &str,
     headers: &multiview_ffmpeg::HttpHeaders,
+    stop: &AtomicBool,
 ) -> Result<multiview_ffmpeg::FetchedText, String> {
-    let target = if has_scheme(url) {
-        std::borrow::Cow::Borrowed(url)
-    } else {
-        std::borrow::Cow::Owned(format!("file:{url}"))
+    let limits = multiview_ffmpeg::FetchLimits {
+        budget: Some(RENDITION_FETCH_BUDGET),
+        stop: Some(stop),
     };
-    multiview_ffmpeg::fetch_url_text_with_headers(&target, max_bytes, allowed, headers)
+    multiview_ffmpeg::fetch_url_text_with_headers(url, max_bytes, allowed, headers, &limits)
         .map_err(|e| e.to_string())
 }
 
-/// Wait (interruptibly, off the output clock) until the source's video shows a
-/// picture of this plan's generation. `false` on stop or a newer generation.
-fn wait_for_picture(plan: &CaptionPlan, stop: &AtomicBool) -> bool {
-    loop {
-        if stop.load(Ordering::Acquire) || plan.store.generation() != plan.generation {
-            return false;
+/// Total time budget of one rendition playlist/segment fetch (a trickling
+/// server cannot hold the reader past it; a raised stop aborts at once).
+const RENDITION_FETCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// A cue is on the displayed picture's clock when, mapped through the video
+/// anchor, it lies within this distance of that picture (the reader runs at
+/// most a few segments ahead; an MPEG-TS clock reset moves it far away).
+const SAME_CLOCK_NS: i64 = 60_000_000_000;
+/// The longest a chunk waits for the video to reach its clock (the video
+/// crossing the same splice) before its cues are dropped.
+const CLOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How a rendition chunk's cues map onto the video timeline: through a live
+/// anchor `(raw0, pts0)`, or (no live anchor: a file/VOD source) as written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CueAnchor {
+    Raw { raw0: i64, pts0: MediaTime },
+    AsWritten,
+}
+
+/// The reader's view of which discontinuity epoch it last mapped (#526
+/// review: a splice restarts the cue clock, and the reader and the picture
+/// cross it at different times).
+#[derive(Debug, Default)]
+struct ClockMatch {
+    /// The epoch of the last chunk that mapped onto the picture's clock.
+    mapped_epoch: Option<u64>,
+}
+
+impl ClockMatch {
+    /// Wait (off the output clock, stop-checked) until the video shows a
+    /// picture whose anchor puts `chunk` on its clock, and return that anchor.
+    /// `None` drops the chunk: a stop/new generation, a chunk of an epoch the
+    /// reader already mapped whose clock the picture has left (the reader
+    /// lagged past a splice), or [`CLOCK_WAIT`] spent waiting for a newer
+    /// epoch the picture never reached.
+    fn wait(
+        &mut self,
+        plan: &CaptionPlan,
+        chunk: &[crate::vtt_rendition::VttCue],
+        epoch: u64,
+        stop: &AtomicBool,
+    ) -> Option<CueAnchor> {
+        let first = chunk.first()?;
+        let started = std::time::Instant::now();
+        loop {
+            if stop.load(Ordering::Acquire) || plan.store.generation() != plan.generation {
+                return None;
+            }
+            let shown = plan
+                .displayed_time
+                .load()
+                .filter(|t| t.generation == plan.generation);
+            if let Some(shown) = shown {
+                let anchor = plan
+                    .video_anchor
+                    .load()
+                    .and_then(|anchor| anchor.raw_pts0_ns.map(|raw0| (raw0, anchor.pts0)));
+                let Some((raw0, pts0)) = anchor else {
+                    return Some(CueAnchor::AsWritten);
+                };
+                let at = crate::vtt_rendition::project_raw(first.raw_start, raw0, pts0);
+                let distance = at.as_nanos().saturating_sub(shown.pts.as_nanos());
+                if distance.abs() <= SAME_CLOCK_NS {
+                    self.mapped_epoch = Some(epoch);
+                    return Some(CueAnchor::Raw { raw0, pts0 });
+                }
+                // An epoch already mapped: the picture left its clock.
+                if self.mapped_epoch.is_some_and(|mapped| epoch <= mapped) {
+                    return None;
+                }
+            }
+            if started.elapsed() >= CLOCK_WAIT {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        if plan
-            .displayed_time
-            .load()
-            .is_some_and(|t| t.generation == plan.generation)
-        {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
 
-/// Place a rendition cue on the video's normalized timeline: through the
-/// source's live video anchor (raw container PTS <-> normalized PTS) when the
-/// video has one, else at its time as written (a source with no live anchor:
-/// a file/VOD rendition, which plays from its own start).
-fn map_cue(plan: &CaptionPlan, cue: &crate::vtt_rendition::VttCue) -> Option<CaptionCue> {
-    let anchor = plan
-        .video_anchor
-        .load()
-        .and_then(|anchor| anchor.raw_pts0_ns.map(|raw0| (raw0, anchor.pts0)));
+/// Place a rendition cue on the video's normalized timeline through `anchor`.
+fn map_cue(anchor: CueAnchor, cue: &crate::vtt_rendition::VttCue) -> Option<CaptionCue> {
     let (start, end) = match anchor {
-        Some((raw0, pts0)) => (
+        CueAnchor::Raw { raw0, pts0 } => (
             crate::vtt_rendition::project_raw(cue.raw_start, raw0, pts0),
             crate::vtt_rendition::project_raw(cue.raw_end, raw0, pts0),
         ),
-        None => (cue.local_start, cue.local_end),
+        CueAnchor::AsWritten => (cue.local_start, cue.local_end),
     };
     CaptionCue::try_text(start, end, cue.lines.clone(), None).ok()
 }
@@ -2171,12 +2267,12 @@ input_id = "cam_b"
         assert!(rendition_protocols("concat://a|b").is_err());
     }
 
-    /// #526: a cue on the MPEG-TS clock maps through the video anchor; with
-    /// no anchor it keeps its written time.
-    #[cfg(feature = "overlay")]
-    #[test]
-    fn a_rendition_cue_maps_through_the_video_anchor() {
-        let plan = CaptionPlan {
+    fn vtt_cues(doc: &str) -> Vec<crate::vtt_rendition::VttCue> {
+        crate::vtt_rendition::parse_segment(doc).expect("segment")
+    }
+
+    fn reader_plan() -> CaptionPlan {
+        CaptionPlan {
             http_headers: multiview_ffmpeg::HttpHeaders::default(),
             id: "map".to_owned(),
             rendition_url: String::new(),
@@ -2185,24 +2281,121 @@ input_id = "cam_b"
             generation: 1,
             displayed_time: Arc::new(multiview_framestore::SwapCell::empty()),
             video_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
-        };
-        let cue = crate::vtt_rendition::parse_segment(
-            "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000\n\n00:00:01.000 --> 00:00:03.000\nx\n",
-        )
-        .and_then(|c| c.into_iter().next())
-        .expect("cue");
-        let unmapped = map_cue(&plan, &cue).expect("cue");
-        assert_eq!(unmapped.start(), MediaTime::from_nanos(1_000_000_000));
+        }
+    }
+
+    fn set_anchor(plan: &CaptionPlan, raw0_s: i64, pts0_s: i64) {
         plan.video_anchor
             .store(Some(Arc::new(crate::pipeline::LiveAnchor {
                 generation: 1,
                 out0: MediaTime::ZERO,
-                pts0: MediaTime::from_nanos(500_000_000),
-                raw_pts0_ns: Some(10_000_000_000),
+                pts0: MediaTime::from_nanos(pts0_s * 1_000_000_000),
+                raw_pts0_ns: Some(raw0_s * 1_000_000_000),
             })));
-        let mapped = map_cue(&plan, &cue).expect("cue");
+    }
+
+    fn show_at(plan: &CaptionPlan, pts_s: i64) {
+        plan.displayed_time.store(Some(Arc::new(
+            multiview_framestore::tile::SourceFrameTime {
+                pts: MediaTime::from_nanos(pts_s * 1_000_000_000),
+                generation: 1,
+                event_clock: None,
+            },
+        )));
+    }
+
+    /// #526: a cue on the MPEG-TS clock maps through the video anchor; with
+    /// no live anchor (a file/VOD source) it keeps its written time.
+    #[test]
+    fn a_rendition_cue_maps_through_the_video_anchor() {
+        let cues = vtt_cues(
+            "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000\n\n00:00:01.000 --> 00:00:03.000\nx\n",
+        );
+        let cue = cues.first().expect("cue");
+        let written = map_cue(CueAnchor::AsWritten, cue).expect("cue");
+        assert_eq!(written.start(), MediaTime::from_nanos(1_000_000_000));
+        let anchor = CueAnchor::Raw {
+            raw0: 10_000_000_000,
+            pts0: MediaTime::from_nanos(500_000_000),
+        };
+        let mapped = map_cue(anchor, cue).expect("cue");
         assert_eq!(mapped.start(), MediaTime::from_nanos(1_500_000_000));
         assert_eq!(mapped.end(), MediaTime::from_nanos(3_500_000_000));
+    }
+
+    /// #526 review: across an ad splice the cue clock restarts. A chunk of the
+    /// NEXT epoch read while the picture is still before the splice waits for
+    /// the video to cross it (and its new anchor), instead of being mapped
+    /// through the old anchor and dropped as stale.
+    #[test]
+    fn a_chunk_past_a_splice_waits_for_the_video_to_cross_it() {
+        let plan = Arc::new(reader_plan());
+        set_anchor(&plan, 1_000, 10);
+        show_at(&plan, 12);
+        let mut clock = ClockMatch::default();
+        let before = vtt_cues("WEBVTT\n\n00:16:41.000 --> 00:16:42.000\nold side\n");
+        let stop = AtomicBool::new(false);
+        assert!(matches!(
+            clock.wait(&plan, &before, 283, &stop),
+            Some(CueAnchor::Raw { .. })
+        ));
+        // The ad segment: its clock restarts near zero.
+        let after = vtt_cues("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nad side\n");
+        let crosser = {
+            let plan = Arc::clone(&plan);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                // The video crosses the splice: a new anchor (raw 0 s at 20 s).
+                set_anchor(&plan, 0, 20);
+                show_at(&plan, 20);
+            })
+        };
+        let anchor = clock
+            .wait(&plan, &after, 284, &stop)
+            .expect("maps after the crossing");
+        crosser.join().expect("crosser");
+        let cue = map_cue(anchor, after.first().expect("cue")).expect("cue");
+        assert_eq!(cue.start(), MediaTime::from_nanos(21_000_000_000));
+        // A late chunk of the OLD epoch now finds the picture off its clock:
+        // dropped at once, never mapped through the new anchor.
+        let started = std::time::Instant::now();
+        assert_eq!(clock.wait(&plan, &before, 283, &stop), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// The wait ends at once on stop.
+    #[test]
+    fn a_clock_wait_ends_on_stop() {
+        let plan = reader_plan();
+        let cues = vtt_cues("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nx\n");
+        assert_eq!(
+            ClockMatch::default().wait(&plan, &cues, 0, &AtomicBool::new(true)),
+            None
+        );
+    }
+
+    /// #526 review: a network master can never point the reader at a local
+    /// file, whatever its subtitle rendition URI says.
+    #[test]
+    fn a_network_master_cannot_name_a_local_rendition() {
+        struct Remote;
+        impl PlaylistFetcher for Remote {
+            fn fetch(&self, _url: &str) -> Result<FetchedPlaylist, String> {
+                Ok(FetchedPlaylist {
+                    url: "https://cdn.example/live/master.m3u8".to_owned(),
+                    body: "#EXTM3U\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"s\",NAME=\"en\",\
+                           LANGUAGE=\"en\",DEFAULT=YES,URI=\"file:///etc/subs.m3u8\"\n\
+                           #EXT-X-STREAM-INF:BANDWIDTH=1,SUBTITLES=\"s\"\nv.m3u8\n"
+                        .to_owned(),
+                })
+            }
+        }
+        assert!(
+            resolve_caption_plan("cam", "https://cdn.example/live/master.m3u8", None, &Remote)
+                .is_none()
+        );
+        assert!(is_network_url("https://a/b"));
+        assert!(!is_network_url("file:///a/b"));
     }
 
     /// RT-10b: a per-source [`CueStore`] carrying one text cue, for the router
