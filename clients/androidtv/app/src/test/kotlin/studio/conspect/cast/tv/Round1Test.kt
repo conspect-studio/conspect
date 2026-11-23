@@ -330,25 +330,34 @@ class NetWorkerTest {
         w.dispose()
     }
 
-    // R2-B: continuous slow reports must not starve control work.
-    @Test fun controlWorkStartsWhileSlowReportsKeepComing() {
+    // R2-B: control work preempts the pending report after the in-flight report completes.
+    @Test fun controlWorkPreemptsPendingReportAfterOneInFlightCompletes() {
         val gate = GenerationGate()
-        val http = SlowHttp().also { it.postDelayMs = 400 }
+        val posts = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val reportStarted = CountDownLatch(1)
+        val releaseReport = CountDownLatch(1)
+        val http = object : Http {
+            override fun get(url: String, scope: CallScope) = HttpResult(200, "", null)
+            override fun post(url: String, json: String, scope: CallScope): HttpResult {
+                posts.add(json)
+                if (json == "IN_FLIGHT") {
+                    reportStarted.countDown()
+                    releaseReport.await(2, TimeUnit.SECONDS)
+                }
+                return HttpResult(200, "", null)
+            }
+        }
         val w = NetWorker(gate, http)
         val g = gate.next()
-        val ran = CountDownLatch(1)
-        val stop = java.util.concurrent.atomic.AtomicBoolean(false)
-        val feeder = Thread { var i = 0; while (!stop.get()) { w.report(g, "u", "r${i++}"); Thread.sleep(20) } }
-        feeder.start()
-        Thread.sleep(100) // a report is in flight and another is pending
-        val before = http.posts.size
-        w.run(g) { http.posts.add("CONTROL"); ran.countDown() } // a token check or failure ladder call
-        assertTrue(ran.await(10, TimeUnit.SECONDS))
-        // Ordering, not wall time (a loaded runner): once control work is queued, no report that
-        // was not already in flight starts before it, however many keep arriving.
-        val at = http.posts.indexOf("CONTROL")
-        assertTrue("reports started ahead of control: ${at - before}", at >= before && at - before <= 1)
-        stop.set(true); feeder.join(); w.dispose()
+        val controlRan = CountDownLatch(1)
+        w.report(g, "u", "IN_FLIGHT")
+        assertTrue("first report started", reportStarted.await(2, TimeUnit.SECONDS))
+        w.report(g, "u", "PENDING")
+        assertTrue(w.run(g) { posts.add("CONTROL"); controlRan.countDown() })
+        releaseReport.countDown()
+        assertTrue("control runs before pending report", controlRan.await(2, TimeUnit.SECONDS))
+        assertEquals(listOf("IN_FLIGHT", "CONTROL"), posts.take(2))
+        w.dispose()
     }
 
     // R2-D: cancelAll removes obsolete tasks, so a burst of replacement LOADs always admits the newest negotiation.
