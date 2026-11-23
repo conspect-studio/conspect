@@ -13,6 +13,9 @@ publish = false
 
 [dependencies]
 multiview-core = { workspace = true }
+# Recording handoff uses the bounded, allocation-free SPSC leaf crate; all raw
+# slot access remains there so this crate keeps forbidding unsafe code.
+multiview-spsc = { workspace = true }
 # GP-5 packet-liveness watchdog (`PacketLiveness`): a pure-Rust, native-dep-free
 # crate (it depends only on `multiview-core`), so the GP-7 guarded-passthrough
 # splice seam reuses the watchdog with NO native escalation. Dependency direction
