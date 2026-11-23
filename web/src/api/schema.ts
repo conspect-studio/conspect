@@ -14470,7 +14470,8 @@ export interface operations {
             query?: {
                 /**
                  * @description Keep only active (`true`, the default) or include cleared (`false`)
-                 *     warnings.
+                 *     warnings. Current wanted source failures are also included; those are
+                 *     live projections, not retained historical entries after recovery.
                  */
                 active?: boolean | null;
             };

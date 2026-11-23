@@ -4382,7 +4382,7 @@
           {
             "name": "active",
             "in": "query",
-            "description": "Keep only active (`true`, the default) or include cleared (`false`)\nwarnings.",
+            "description": "Keep only active (`true`, the default) or include cleared (`false`)\nwarnings. Current wanted source failures are also included; those are\nlive projections, not retained historical entries after recovery.",
             "required": false,
             "schema": {
               "type": [
