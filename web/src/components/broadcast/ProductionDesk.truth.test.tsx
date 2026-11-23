@@ -45,7 +45,8 @@ describe('ProductionDesk truthful wall, indices and meters', () => {
     const { container } = page();
     await screen.findByText('CAM D', { selector: '.bd-wall-tile b' });
     const tile = (n: string): HTMLElement => [...container.querySelectorAll<HTMLElement>('.bd-wall-tile')].find((e) => e.querySelector('b')?.textContent === n) ?? document.body;
-    expect(tile('CAM A')).toHaveTextContent('Live');
+    expect(tile('CAM A')).toHaveTextContent('Input receiving');
+    expect(tile('CAM A')).not.toHaveTextContent('Live');
     expect(tile('CAM B')).toHaveTextContent('Starting');
     expect(tile('CAM C')).toHaveTextContent('No signal');
     expect(tile('CAM D')).toHaveTextContent('Signal unconfirmed');
