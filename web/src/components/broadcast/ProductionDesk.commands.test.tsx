@@ -66,6 +66,20 @@ describe('ProductionDesk single-authority completion', { timeout: 15000 }, () =>
     await userEvent.click(screen.getByRole('button', { name: 'CUT' }));
     expect(commandCount).toBe(0);
   });
+  it('allows transition configuration while locked because it does not change Program', async () => {
+    takeLock.locked = true;
+    let configured = 0;
+    server.use(http.post('*/api/v1/switcher/commands/set_transition', () => {
+      configured += 1;
+      return HttpResponse.json({ operation_id: 'config-1', kind: 'set_transition' }, { status: 202 });
+    }));
+    page();
+    const wipe = screen.getByRole('button', { name: 'WIPE' });
+    await waitFor(() => { expect(wipe).toBeEnabled(); }, { timeout: 6000 });
+    await userEvent.click(wipe);
+    await waitFor(() => { expect(configured).toBe(1); });
+    expect(commandCount).toBe(0);
+  });
   it('enables MIX/WIPE/DIP before the dominant CUT in DOM order; AUTO works', async () => {
     const { container } = page();
     await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); }, { timeout: 6000 });

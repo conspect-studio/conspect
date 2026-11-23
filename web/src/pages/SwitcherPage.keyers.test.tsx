@@ -3,7 +3,8 @@
 // gate, realtime refresh on `switcher.keyer`, stream freshness, the ramp clock.
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 // Outcome tests exercise an explicitly unlocked desk; lock behavior has separate coverage.
-vi.mock('../components/broadcast/BroadcastShell', () => ({ useTakeLock: () => ({ locked: false }) }));
+const takeLock = vi.hoisted(() => ({ locked: false }));
+vi.mock('../components/broadcast/BroadcastShell', () => ({ useTakeLock: () => takeLock }));
 import type { Envelope } from '../realtime/envelope';
 import type { RealtimeStatus } from '../realtime/connection';
 
@@ -73,6 +74,7 @@ const server = setupServer(
 beforeAll(() => { server.listen(); });
 afterEach(() => {
   server.resetHandlers();
+  takeLock.locked = false;
   calls = [];
   planAnswer = { can_take: true, class: 'class1', keyer: 'main/dsk1', on_air: false };
   planGate = undefined;
@@ -100,6 +102,18 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 describe('SwitcherPage keyer desk (K5)', () => {
+  it('blocks keyer Cut and Auto on the page while locked without posting', async () => {
+    takeLock.locked = true;
+    page();
+    const strip = await screen.findByTestId('keyer-strip-dsk1');
+    for (const name of ['Cut', 'Auto']) {
+      const action = within(strip).getByRole('button', { name });
+      expect(action).toBeDisabled();
+      await userEvent.click(action);
+    }
+    expect(calls).toEqual([]);
+    expect(within(strip).getByText('Takes locked — unlock in the header')).toBeVisible();
+  });
   it('CUT plans before it commands keyer_cut, with an Idempotency-Key', async () => {
     page();
     const strip = await screen.findByTestId('keyer-strip-dsk1');

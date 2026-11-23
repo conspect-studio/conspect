@@ -325,7 +325,7 @@ function ProductionDeskBody(): JSX.Element {
   // Held from before mutate until the command is terminal; released by the effect below or on error.
   const lock = useRef(false);
   const send = (command: DeskCommand): void => {
-    if (lock.current || disabled || (locked && command.action !== 'select_preview')) return;
+    if (lock.current || disabled || (locked && command.action !== 'select_preview' && command.action !== 'set_transition')) return;
     lock.current = true;
     setGuard(SENDING);
     mutate.mutate(command);
