@@ -123,7 +123,7 @@ fn rtsp_server_serves_describe_setup_play_to_tcp_client() {
         0,
         0,
         3000,
-        Arc::from(vec![0, 0, 0, 1, 0x67].into_boxed_slice()),
+        vec![0, 0, 0, 1, 0x67].into_boxed_slice(),
     ));
     sink.deliver(&packet);
     drop(handle);
