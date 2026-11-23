@@ -270,6 +270,20 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_cursors_with_multiple_items_in_flight() {
+        let (mut tx, mut rx) = channel(3).unwrap();
+        assert_eq!(tx.push(0), Ok(()));
+        assert_eq!(tx.push(1), Ok(()));
+        for value in 2..302 {
+            assert_eq!(tx.push(value), Ok(()));
+            assert_eq!(rx.pop(), Some(value - 2));
+        }
+        assert_eq!(rx.pop(), Some(300));
+        assert_eq!(rx.pop(), Some(301));
+        assert_eq!(rx.pop(), None);
+    }
+
+    #[test]
     fn concurrent_order_and_capacity_one() {
         let (mut tx, mut rx) = channel(1).unwrap();
         let writer = std::thread::spawn(move || {
