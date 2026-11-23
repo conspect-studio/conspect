@@ -17,7 +17,7 @@ import { useOperationFeedback, useSubmitTrackedOperation } from '../components/b
 import { OperationFeedback } from '../components/broadcast/OperationFeedback';
 import { switcherOperationEvidence } from '../realtime/operationEvidence';
 import { isBackendUnavailable, newIdempotencyKey } from '../api/operations';
-import { useJpegPreview } from '../preview/useJpegPreview';
+import { useJpegStill } from '../preview/useJpegPreview';
 import { getPatch, planPatch, takePatch } from '../api/patch';
 import type { PatchRequest } from '../api/patch';
 import { MixerInputBank } from '../components/switcher/MixerInputBank';
@@ -34,13 +34,14 @@ const PATCH_KEY = ['patch'] as const;
 /** A select or take; a select by mixer input carries `input`, not `source`. */
 type Intent = SwitcherAction | { readonly action: 'select_preview' | 'select_program'; readonly input: number };
 function SwitcherMonitor({ bus, path }: { readonly bus: string; readonly path: string }): JSX.Element {
-  const src = useJpegPreview(path, 1000, bus === 'PGM');
+  const { url: src, state, requestFailed } = useJpegStill(path, 1000);
   return (
     <section className="space-y-2 rounded-md border p-3" aria-label={bus}>
       <h2 className="font-semibold">{bus}</h2>
       {src === undefined
-        ? <div role="img" aria-label={`${bus} unavailable`} className="flex aspect-video items-center justify-center bg-black text-sm text-white"><Trans>Waiting for a real frame</Trans></div>
+        ? <div role="img" aria-label={`${bus} unavailable`} className="flex aspect-video items-center justify-center bg-black text-sm text-white">{requestFailed ? <Trans>Preview request failed — retrying</Trans> : <Trans>Waiting for a real frame</Trans>}</div>
         : <img src={src} alt={`${bus} monitor`} className="aspect-video w-full bg-black object-contain" />}
+      {src !== undefined && (requestFailed || state === 'stale') && <p role="status"><Trans>Last received image — live video cannot be verified</Trans></p>}
     </section>
   );
 }
