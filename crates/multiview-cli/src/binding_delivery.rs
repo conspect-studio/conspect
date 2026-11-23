@@ -379,6 +379,12 @@ impl WindowDelivery for BindingDelivery {
         BindingDelivery::statuses(self)
     }
 
+    fn pump(&mut self, now: Instant) {
+        for binding in &mut self.bindings {
+            Self::pump_binding(binding, now);
+        }
+    }
+
     fn finish(&mut self) {
         BindingDelivery::finish(self);
     }
@@ -1363,18 +1369,7 @@ mod tests {
         // Binding 0's sink never drains: its pump fills the one-packet handoff
         // and blocks. Binding 1 drains normally on its own thread.
         let healthy_rx = receivers.remove(1);
-        let (consumed_tx, consumed_rx) = std::sync::mpsc::channel();
-        let collector = std::thread::spawn(move || {
-            let mut out = Vec::new();
-            while let Ok(packet) = healthy_rx.recv() {
-                out.push(packet.packet);
-                drop(packet.permit);
-                if consumed_tx.send(out.len()).is_err() {
-                    break;
-                }
-            }
-            out
-        });
+        let collector = std::thread::spawn(move || drain(&healthy_rx));
         let wedged_rx = receivers.remove(0);
         for _ in 0..20 {
             delivery.stage(&[packet(2)]);
@@ -1385,28 +1380,17 @@ mod tests {
                 "admission must never wait on a wedged sink"
             );
         }
-        // Observe the collector's progress after the entire burst. This keeps
-        // the producer independent of both sinks while making the backlog
-        // comparison conditional on the healthy sink actually having drained.
+        // The producer owns the queue: keep driving the per-tick tail pump
+        // until the healthy sink has actually consumed its entire backlog.
         let deadline = Instant::now() + Duration::from_secs(10);
-        for expected in 1..=20 {
-            assert_eq!(
-                consumed_rx
-                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    .expect("healthy sink must drain"),
-                expected,
-            );
-        }
-        // The pump can retain its lease briefly after the sink acknowledges.
-        // Keep the original deadline and comparison for that final handoff.
         loop {
+            delivery.pump(Instant::now());
             let statuses = delivery.statuses();
-            let wedged = statuses[0].reserved_packets + statuses[0].queued_windows;
             let healthy = statuses[1].reserved_packets + statuses[1].queued_windows;
-            if healthy < wedged || Instant::now() >= deadline {
+            if healthy == 0 || Instant::now() >= deadline {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(1));
         }
         let statuses = delivery.statuses();
         assert_eq!(statuses[1].admitted_batches, 20);
