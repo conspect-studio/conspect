@@ -323,12 +323,14 @@ mod tests {
         let (mut source, mut recycler) = buffer_pool(2, 16).unwrap();
         let mut first = source.take().unwrap();
         let other = source.take().unwrap();
-        first.bytes().first_mut().map(|byte| *byte = 42);
+        if let Some(byte) = first.bytes().first_mut() {
+            *byte = 42;
+        }
         assert!(recycler.recycle(first).is_ok());
-        let mut recycled = source.take().unwrap();
-        assert_eq!(recycled.bytes().first(), Some(&42));
+        let mut reused = source.take().unwrap();
+        assert_eq!(reused.bytes().first(), Some(&42));
         drop(other);
-        drop(recycled);
+        drop(reused);
         assert_eq!(source.leaked_buffers(), 2);
         assert_eq!(recycler.leaked_buffers(), 2);
         assert!(source.take().is_none());
