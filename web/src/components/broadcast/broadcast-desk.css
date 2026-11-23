@@ -536,3 +536,14 @@
  .production-desk[data-dense=true] .bd-wall-tile>span:last-child{top:2px;bottom:auto;right:2px;font-size:8px;line-height:10px;padding:0 2px;max-width:65px}
  .production-desk[data-dense=true] .bd-wall-tile .bd-source-picture{height:calc(100% - 20px)}
 }
+
+/* Narrow production desks retain readable controls instead of clipped labels. */
+@media(max-width:639px){
+ .production-desk .bd-wall-heading{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:12px}
+ .production-desk .bd-wall-heading h2,.production-desk .bd-wall-heading>span{grid-column:1/-1}
+ .production-desk .bd-wall-heading a{margin:0;min-width:0;padding:6px;justify-content:center;white-space:normal}
+ .production-desk .bd-bus>div{grid-template-columns:repeat(3,minmax(0,1fr))}
+ .production-desk .bd-more{flex-wrap:wrap}
+ .production-desk .bd-more .bd-transition-menu{flex-basis:100%}
+ .production-desk .bd-more .bd-transition-menu>summary{white-space:normal;min-height:44px}
+}
