@@ -31,8 +31,6 @@ schema_version = 1
 # headless (HLS/file output only, no listener).
 [control]
 listen = "[::]:8080"
-# Resume the accepted state stored on the compose state volume.
-start = "resume"
 
 [canvas]
 width = 1280

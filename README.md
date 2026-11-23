@@ -62,7 +62,10 @@ Then open:
 - **The multiview** — `vlc http://[::1]:8888/multiview.m3u8` (or any HLS player)
 
 Edit [`deploy/config/multiview.toml`](deploy/config/multiview.toml) to point a tile at your own
-source and re-run `up -d`. Tear down with `docker compose -f deploy/compose.yaml down -v`.
+source before the first start. Accepted API changes persist in the `multiview-state` volume and
+supersede boot-file edits made while the service is stopped. Use the API to change accepted state.
+`docker compose -f deploy/compose.yaml down` preserves it; `down -v` deletes it and the HLS volume.
+Existing state in an old container's writable layer is not automatically copied to the new volume.
 
 > The default image is LGPL-clean and encodes **MPEG-2** (open it in VLC/ffplay). For
 > browser-friendly **H.264**, use the `-gpl` image. GPU one-liners (NVIDIA / VAAPI) and the full
