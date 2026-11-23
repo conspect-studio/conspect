@@ -1390,7 +1390,6 @@ mod tests {
             cadence: CADENCE,
             gop: 10,
             bit_rate: 100_000,
-            color: multiview_core::color::ColorInfo::default(),
             audio: None,
             cuda_ordinal: None,
         };
@@ -1921,7 +1920,6 @@ mod tests {
             cadence: FPS,
             gop: 30,
             bit_rate: 300_000,
-            color: multiview_core::color::ColorInfo::default(),
             audio: None,
             cuda_ordinal: None,
         };

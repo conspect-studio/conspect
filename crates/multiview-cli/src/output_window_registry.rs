@@ -1378,7 +1378,6 @@ pub(crate) mod tests {
             time_base: Rational::new(1, 25),
             bit_rate: 500_000,
             gop: 12,
-            color: multiview_core::color::ColorInfo::default(),
             cuda_device: None,
         })
         .expect("opened encoder");
@@ -1979,8 +1978,7 @@ pub(crate) mod tests {
                 time_base: Rational::new(1, 25),
                 bit_rate: 100_000,
                 gop: 25,
-                color: multiview_core::color::ColorInfo::default(),
-                cuda_device: None,
+                    cuda_device: None,
             },
             &options,
         )
