@@ -1488,6 +1488,55 @@ mod tests {
     }
 
     #[test]
+    fn quiet_expiry_counts_pending_and_queue_once() {
+        let drops = Arc::new(AtomicU64::new(0));
+        let (mut delivery, receivers) = BindingDelivery::new(
+            vec![BindingPolicy::DropCounted(Arc::clone(&drops))],
+            DeliveryLimits {
+                max_packets: 64,
+                max_bytes: 1024 * 1024,
+                max_age: Duration::from_millis(10),
+            },
+            vec![None],
+        );
+        let start = Instant::now();
+        let span = tick_span(Rational::new(30_000, 1001));
+        for _ in 0..20 {
+            delivery.stage(&[packet(2)]);
+            delivery.flush_tick(start, span);
+        }
+        assert!(delivery.bindings[0].pending.is_some());
+        let expected = 1 + delivery.statuses()[0].queued_windows as u64;
+        assert!(expected >= 2);
+        delivery.pump(start + Duration::from_millis(11));
+        assert_eq!(drops.load(Ordering::Acquire), expected);
+        delivery.pump(start + Duration::from_millis(12));
+        assert_eq!(drops.load(Ordering::Acquire), expected);
+        drop(receivers);
+        delivery.finish();
+    }
+
+    #[test]
+    fn quiet_pending_rejects_reversed_clock() {
+        let (mut delivery, receivers) =
+            BindingDelivery::new(vec![BindingPolicy::Bounded], limits(64), vec![None]);
+        let start = Instant::now();
+        let span = tick_span(Rational::new(30_000, 1001));
+        for _ in 0..20 {
+            delivery.stage(&[packet(2)]);
+            delivery.flush_tick(start, span);
+        }
+        assert!(delivery.bindings[0].pending.is_some());
+        delivery.pump(start - Duration::from_nanos(1));
+        let status = delivery.statuses()[0];
+        assert_eq!(status.last_rejection, Some(RejectionReason::ClockReversed));
+        assert!(status.generation > 0);
+        assert!(delivery.bindings[0].pending.is_none());
+        drop(receivers);
+        delivery.finish();
+    }
+
+    #[test]
     fn stale_queued_window_is_flushed_with_an_age_reason() {
         let (mut delivery, receivers) = BindingDelivery::new(
             vec![BindingPolicy::Bounded],
