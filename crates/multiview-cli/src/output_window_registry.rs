@@ -1296,6 +1296,7 @@ impl<D: WindowDelivery> WindowDelivery for OutputWindowTap<D> {
         // One output tick has passed: hand any admitted tail to its transport even
         // though no new window was offered (a quiet encoder must not strand it).
         self.registry.pump(now);
+        self.delivery.pump(now);
     }
     fn finish(&mut self) {
         self.registry.close();
