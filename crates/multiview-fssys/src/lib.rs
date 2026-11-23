@@ -13,7 +13,7 @@ pub struct DiskSpace {
 /// # Errors
 /// Returns an I/O error for invalid paths or a failed filesystem query.
 #[cfg(unix)]
-#[allow(unsafe_code)]
+#[allow(unsafe_code, clippy::useless_conversion)] // libc field widths vary by target.
 pub fn statvfs_avail(path: &Path) -> io::Result<DiskSpace> {
     use std::{ffi::CString, mem::MaybeUninit, os::unix::ffi::OsStrExt};
     let path = CString::new(path.as_os_str().as_bytes())
