@@ -111,12 +111,11 @@ the task, not just after an ENOSPC failure.
   Otherwise do not start another large build, dependency install or fan-out. Reclaim verified
   disposable task artifacts, reduce concurrency, or arrange capacity first. Recheck during long
   runs and between waves.
-- The local push gate (`bin/check`) enforces its own hard floor, `MIN_FREE` = 75 GiB free, and a
+- The local push gate (`bin/check`) samples a floor, `MIN_FREE` = 60 GiB free, and enforces a
   15 GiB cap on its own targets. That floor is deliberately lower than the planning rule above
-  (owner decision, 2026-11-11; 300 to 150 GiB on 2026-11-13; 150 to 75 GiB on 2026-11-23).
-  Review recommended 75 GiB for a 60 GiB swing plus the 15 GiB target cap. The floor does not
-  reserve space: the build host disk is shared with other repositories, whose
-  activity moved free space by more than 60 GiB within an hour and aborted gates mid-run. The
+  (owner decision, 2026-11-11; 300 to 150 GiB on 2026-11-13; 150 to 75 and then 60 GiB on
+  2026-11-23). Review rejected 45 GiB because concurrent writers are not bounded by this gate;
+  60 GiB is a compromise, not a reservation. Other writers can cause ENOSPC between samples. The
   planning rule still applies before any fan-out or several concurrent build lanes; run gates
   one at a time.
 - Keep Cargo's per-worktree `target/` isolation. Never override `CARGO_TARGET_DIR`, share a sibling's
