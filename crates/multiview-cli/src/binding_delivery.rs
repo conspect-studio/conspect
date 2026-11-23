@@ -1506,7 +1506,7 @@ mod tests {
             delivery.flush_tick(start, span);
         }
         assert!(delivery.bindings[0].pending.is_some());
-        let expected = 1 + delivery.statuses()[0].queued_windows as u64;
+        let expected = 1 + u64::try_from(delivery.statuses()[0].queued_windows).unwrap();
         assert!(expected >= 2);
         delivery.pump(start + Duration::from_millis(11));
         assert_eq!(drops.load(Ordering::Acquire), expected);
@@ -1527,7 +1527,7 @@ mod tests {
             delivery.flush_tick(start, span);
         }
         assert!(delivery.bindings[0].pending.is_some());
-        delivery.pump(start - Duration::from_nanos(1));
+        delivery.pump(start.checked_sub(Duration::from_nanos(1)).unwrap());
         let status = delivery.statuses()[0];
         assert_eq!(status.last_rejection, Some(RejectionReason::ClockReversed));
         assert!(status.generation > 0);
