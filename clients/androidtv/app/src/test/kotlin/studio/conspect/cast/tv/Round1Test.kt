@@ -341,11 +341,13 @@ class NetWorkerTest {
         val feeder = Thread { var i = 0; while (!stop.get()) { w.report(g, "u", "r${i++}"); Thread.sleep(20) } }
         feeder.start()
         Thread.sleep(100) // a report is in flight and another is pending
-        val t0 = System.nanoTime()
-        w.run(g) { ran.countDown() } // a token check or failure ladder call
-        assertTrue(ran.await(2, TimeUnit.SECONDS))
-        // At most the one report in flight (400 ms) is waited for, never the stream of reports.
-        assertTrue((System.nanoTime() - t0) < 900_000_000L)
+        val before = http.posts.size
+        w.run(g) { http.posts.add("CONTROL"); ran.countDown() } // a token check or failure ladder call
+        assertTrue(ran.await(10, TimeUnit.SECONDS))
+        // Ordering, not wall time (a loaded runner): once control work is queued, no report that
+        // was not already in flight starts before it, however many keep arriving.
+        val at = http.posts.indexOf("CONTROL")
+        assertTrue("reports started ahead of control: ${at - before}", at >= before && at - before <= 1)
         stop.set(true); feeder.join(); w.dispose()
     }
 
