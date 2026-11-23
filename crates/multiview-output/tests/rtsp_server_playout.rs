@@ -36,7 +36,7 @@ use multiview_output::rtsp_server::{BoundedPacketQueue, RtspCodec, RtspMount, Rt
 
 /// The server binds and accepts a real RTSP/1.0 client request sequence. The
 /// client uses only `TcpStream`, so request dispatch is asserted independently
-/// of any GStreamer client library.
+/// of any `GStreamer` client library.
 ///
 /// Ignored by default: requires `GStreamer` + `gst-rtsp-server` plugins + a free
 /// port. CI has no GStreamer-equipped leg yet (#141).
@@ -62,7 +62,7 @@ fn rtsp_server_serves_describe_setup_play_to_tcp_client() {
         .set_write_timeout(Some(Duration::from_secs(3)))
         .unwrap();
     let mut cseq = 1;
-    let options = send_request(&mut client, &handle.served_url(), "OPTIONS", cseq, None);
+    let options = send_request(&mut client, handle.served_url(), "OPTIONS", cseq, None);
     assert!(
         options.starts_with("RTSP/1.0 200"),
         "OPTIONS response: {options}"
@@ -71,7 +71,7 @@ fn rtsp_server_serves_describe_setup_play_to_tcp_client() {
 
     let describe = send_request(
         &mut client,
-        &handle.served_url(),
+        handle.served_url(),
         "DESCRIBE",
         cseq,
         Some("Accept: application/sdp\r\n"),
@@ -89,7 +89,7 @@ fn rtsp_server_serves_describe_setup_play_to_tcp_client() {
 
     let setup = send_request(
         &mut client,
-        &handle.served_url(),
+        handle.served_url(),
         "SETUP",
         cseq,
         Some("Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n"),
@@ -100,7 +100,7 @@ fn rtsp_server_serves_describe_setup_play_to_tcp_client() {
 
     let play = send_request(
         &mut client,
-        &handle.served_url(),
+        handle.served_url(),
         "PLAY",
         cseq,
         Some(&format!("Session: {session}\r\n")),
@@ -156,12 +156,11 @@ fn send_request(
                 return String::from_utf8_lossy(&response).into_owned();
             }
         }
-        if Instant::now() >= deadline {
-            panic!(
-                "timed out waiting for {method} response: {}",
-                String::from_utf8_lossy(&response)
-            );
-        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {method} response: {}",
+            String::from_utf8_lossy(&response)
+        );
         let count = match client.read(&mut buf) {
             Ok(count) => count,
             Err(error)
