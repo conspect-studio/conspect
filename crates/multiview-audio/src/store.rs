@@ -2414,6 +2414,17 @@ mod resync_tests {
                     Duration::from_secs(20),
                 );
             });
+            // Model startup prefetch before the output starts consuming. The
+            // store guarantees rebuffering after a dry read, not that a 300 ms
+            // cushion bridges an 800 ms fetch. Keep the fetch stall itself.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while store.buffered_frames() < 14_400 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                store.buffered_frames() >= 14_400,
+                "startup cushion not filled"
+            );
             let start = Instant::now();
             let tick = Duration::from_nanos(1_000_000_000 / 30);
             let mut started = false;
