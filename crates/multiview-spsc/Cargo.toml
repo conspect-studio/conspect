@@ -1,0 +1,39 @@
+[package]
+name = "multiview-spsc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Bounded single-producer/single-consumer recording queue and reusable frame buffers"
+
+# This leaf crate isolates the raw slot storage from crates which forbid unsafe.
+# Keep the local exception and clippy policy aligned with multiview-clocksys.
+[lints.rust]
+unsafe_code = "deny"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "deny", priority = -2 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+get_unwrap = "deny"
+indexing_slicing = "deny"
+as_conversions = "deny"
+exit = "deny"
+mem_forget = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+str_to_string = "deny"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+must_use_candidate = "warn"
