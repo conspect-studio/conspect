@@ -4394,7 +4394,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Active health warnings, code-sorted.",
+            "description": "Active health warnings, code-sorted. Wanted failed sources appear individually as source-failed warnings scoped to authorized source IDs; they clear on recovery without changing liveness.",
             "content": {
               "application/json": {
                 "schema": {
@@ -29192,7 +29192,8 @@
           "catalogue-link-attention",
           "accepted-state-rejected",
           "tls-certificate",
-          "config-file-removed-accepted"
+          "config-file-removed-accepted",
+          "source-failed"
         ]
       },
       "WarningSeverityDoc": {
