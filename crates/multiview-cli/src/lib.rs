@@ -366,6 +366,11 @@ pub mod audio;
 #[cfg(feature = "ffmpeg")]
 pub mod captions;
 
+/// Pure-Rust parsing of an HLS `WebVTT` subtitle rendition (#526): the media
+/// playlist, the `.vtt` segments and their `X-TIMESTAMP-MAP`, bounded.
+#[cfg(feature = "ffmpeg")]
+pub mod vtt_rendition;
+
 /// WHIP **ingest** wiring (ADR-T014): the `WhipProvider` implementation over the
 /// `multiview-webrtc` native endpoint, the per-source publisher rendezvous
 /// registry, and the supervised `drive_webrtc` loop that decodes a publisher's

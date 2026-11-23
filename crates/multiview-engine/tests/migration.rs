@@ -234,6 +234,8 @@ impl RenditionEncoder for EncodeSpy {
         EncodedPacket {
             rendition: rendition.clone(),
             kind: PacketKind::VideoKeyframe,
+            stream_kind: multiview_core::encoded_packet::StreamKind::Video,
+            parameter_sets: false,
             pts: i64::try_from(tick).unwrap_or(0),
             dts: i64::try_from(tick).unwrap_or(0),
             duration: 1,

@@ -432,13 +432,13 @@ impl BoundedBatchQueue {
         self.pop_at(Instant::now()).ok().flatten()
     }
 
-    /// Take a window at `now`; a stale or reversed clock invalidates the GOP.
+    /// Invalidate the backlog if its oldest window is stale or time reversed.
     /// In-flight windows still own their reservations after invalidation.
     ///
     /// # Errors
     /// Returns [`OfferError::OldestAge`] for expired data or
     /// [`OfferError::ClockReversed`] for an invalid monotonic timestamp.
-    pub fn pop_at(&mut self, now: Instant) -> Result<Option<BatchLease>, OfferError> {
+    pub fn expire_at(&mut self, now: Instant) -> Result<(), OfferError> {
         if let Some(oldest) = self.entries.front() {
             let Some(age) = now.checked_duration_since(oldest.offered_at) else {
                 self.invalidate(OfferError::ClockReversed);
@@ -449,7 +449,17 @@ impl BoundedBatchQueue {
                 return Err(OfferError::OldestAge);
             }
         }
+        Ok(())
+    }
+
+    /// Pop the oldest non-expired window at the supplied monotonic time.
+    ///
+    /// # Errors
+    /// Returns an error if the oldest queued window is stale or time reversed.
+    pub fn pop_at(&mut self, now: Instant) -> Result<Option<BatchLease>, OfferError> {
+        self.expire_at(now)?;
         Ok(self.entries.pop_front().map(|entry| BatchLease {
+            offered_at: entry.offered_at,
             batch: entry.batch,
             generation: entry.generation,
             decoder_config_changed: entry.decoder_config_changed,
@@ -676,6 +686,7 @@ impl Drop for BoundedBatchQueue {
 
 /// An in-flight whole window. Dropping it releases packet and byte capacity.
 pub struct BatchLease {
+    offered_at: Instant,
     batch: Arc<PacketBatch>,
     generation: u64,
     decoder_config_changed: bool,
@@ -684,6 +695,12 @@ pub struct BatchLease {
 }
 
 impl BatchLease {
+    /// Monotonic admission time, including while awaiting handoff.
+    #[must_use]
+    pub fn offered_at(&self) -> Instant {
+        self.offered_at
+    }
+
     /// Access the immutable window with all of its audio/video packets.
     #[must_use]
     pub fn batch(&self) -> &PacketBatch {

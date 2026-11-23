@@ -583,6 +583,8 @@ mod tests {
         let packet = Arc::new(EncodedPacket {
             rendition: RenditionId::new("r"),
             kind: multiview_output::fanout::PacketKind::Audio,
+            stream_kind: multiview_core::encoded_packet::StreamKind::Audio,
+            parameter_sets: false,
             pts: 0,
             dts: 0,
             duration: 1,

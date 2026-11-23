@@ -83,6 +83,45 @@ const RW_TIMEOUT_US: &str = "30000000";
 /// open fails (bad URL, network error), the body exceeds `max_bytes`, or the
 /// body is not valid UTF-8.
 pub fn fetch_url_text(url: &str, max_bytes: usize, allowed_protocols: &str) -> Result<FetchedText> {
+    fetch_url_text_with_headers(
+        url,
+        max_bytes,
+        allowed_protocols,
+        &crate::HttpHeaders::default(),
+        &FetchLimits::default(),
+    )
+}
+
+/// Wall-clock bounds of one [`fetch_url_text_with_headers`] call, enforced by
+/// an `AVIOInterruptCB` libav polls while it connects and reads (and checked
+/// between reads): the fetch aborts once `budget` has elapsed since it started
+/// (a TOTAL deadline — `rw_timeout` alone only bounds inactivity, so a
+/// trickling server could otherwise hold a reader indefinitely) or once `stop`
+/// is raised.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FetchLimits<'a> {
+    /// Total time budget; `None` keeps only the inactivity timeout.
+    pub budget: Option<std::time::Duration>,
+    /// Abort as soon as this flag is raised (a reader's stop flag).
+    pub stop: Option<&'a std::sync::atomic::AtomicBool>,
+}
+
+/// [`fetch_url_text`] that also sends the source's operator HTTP headers
+/// (`user_agent`/`referer` open options; values are never logged) and honours
+/// `limits`. The caption rendition reader (#526) fetches its media playlist and
+/// `.vtt` segments with the same headers the video demux sends.
+///
+/// # Errors
+///
+/// As [`fetch_url_text`]; a header value with an interior NUL is refused, and
+/// an exhausted budget or a raised stop flag aborts the fetch.
+pub fn fetch_url_text_with_headers(
+    url: &str,
+    max_bytes: usize,
+    allowed_protocols: &str,
+    headers: &crate::HttpHeaders,
+    limits: &FetchLimits<'_>,
+) -> Result<FetchedText> {
     // Hard, Rust-side scheme guarantee (independent of libav's own enforcement).
     let scheme = url.split(':').next().unwrap_or("");
     if scheme.is_empty() || !allowed_protocols.split(',').any(|p| p == scheme) {
@@ -101,12 +140,64 @@ pub fn fetch_url_text(url: &str, max_bytes: usize, allowed_protocols: &str) -> R
         .map_err(|_| fetch_err(url, format_args!("protocol list has an interior NUL")))?;
     let to_key = c_string("rw_timeout", url)?;
     let to_val = c_string(RW_TIMEOUT_US, url)?;
+    let mut extra: Vec<(CString, CString)> = Vec::new();
+    for (key, value) in headers.open_options() {
+        let value = CString::new(value)
+            .map_err(|_| fetch_err(url, format_args!("header {key} has an interior NUL")))?;
+        extra.push((c_string(key, url)?, value));
+    }
 
     // SAFETY: all pointers handed to libav below are either a fresh null
     // out-param libav fills (`opts`, `ctx`) or a `CString` we own for the whole
     // call; the options dict and the AVIOContext are freed on every return path
     // inside `fetch_inner`.
-    unsafe { fetch_inner(url, &curl, &wl_key, &wl_val, &to_key, &to_val, max_bytes) }
+    let interrupt = FetchInterrupt {
+        started: std::time::Instant::now(),
+        budget: limits.budget,
+        stop: limits.stop,
+    };
+    // SAFETY: as above; `interrupt` outlives the call, and `fetch_inner` closes
+    // the context (the only holder of the callback pointer) before returning.
+    unsafe {
+        fetch_inner(
+            url,
+            &curl,
+            &[(&wl_key, &wl_val), (&to_key, &to_val)],
+            &extra,
+            max_bytes,
+            &interrupt,
+        )
+    }
+}
+
+/// The state [`fetch_interrupt_cb`] polls: a total deadline and a stop flag.
+struct FetchInterrupt<'a> {
+    started: std::time::Instant,
+    budget: Option<std::time::Duration>,
+    stop: Option<&'a std::sync::atomic::AtomicBool>,
+}
+
+impl FetchInterrupt<'_> {
+    /// Whether the fetch must abort now. Never panics (it runs inside libav).
+    fn should_abort(&self) -> bool {
+        self.stop
+            .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Acquire))
+            || self
+                .budget
+                .is_some_and(|budget| self.started.elapsed() >= budget)
+    }
+}
+
+/// libav's interrupt callback for a text fetch: nonzero aborts the blocked I/O.
+extern "C" fn fetch_interrupt_cb(opaque: *mut core::ffi::c_void) -> core::ffi::c_int {
+    if opaque.is_null() {
+        return 0;
+    }
+    // SAFETY: `opaque` is the `&FetchInterrupt` `fetch_inner` installed; it
+    // lives on the caller's stack for the whole fetch, and the AVIOContext
+    // holding this pointer is closed before `fetch_inner` returns.
+    let interrupt = unsafe { &*opaque.cast::<FetchInterrupt<'_>>() };
+    core::ffi::c_int::from(interrupt.should_abort())
 }
 
 /// `AVOption` name for the HTTP(S) protocol's current/final URL after redirects.
@@ -119,23 +210,28 @@ fn c_string(s: &str, url: &str) -> Result<CString> {
 
 /// Open `url` read-only with the allowlist + timeout options, read to EOF into a
 /// bounded buffer, and close the context on every path.
-#[allow(clippy::too_many_arguments)]
 unsafe fn fetch_inner(
     url: &str,
     curl: &CString,
-    wl_key: &CString,
-    wl_val: &CString,
-    to_key: &CString,
-    to_val: &CString,
+    base: &[(&CString, &CString)],
+    extra: &[(CString, CString)],
     max_bytes: usize,
+    interrupt: &FetchInterrupt<'_>,
 ) -> Result<FetchedText> {
     let mut opts: *mut ffi::AVDictionary = ptr::null_mut();
-    // SAFETY: `opts` starts null; av_dict_set allocates and links entries into it.
-    // We free it (whether or not avio_open2 consumes it) before returning.
-    let r = ffi::av_dict_set(&raw mut opts, wl_key.as_ptr(), wl_val.as_ptr(), 0);
-    if r >= 0 {
-        // SAFETY: same live dict; second key.
-        ffi::av_dict_set(&raw mut opts, to_key.as_ptr(), to_val.as_ptr(), 0);
+    let pairs = base
+        .iter()
+        .copied()
+        .chain(extra.iter().map(|(key, value)| (key, value)));
+    let mut r = 0;
+    for (key, value) in pairs {
+        // SAFETY: `opts` starts null; av_dict_set allocates and links entries
+        // into it (copying both strings, which we own for this call). We free
+        // it (whether or not avio_open2 consumes it) before returning.
+        r = ffi::av_dict_set(&raw mut opts, key.as_ptr(), value.as_ptr(), 0);
+        if r < 0 {
+            break;
+        }
     }
     if r < 0 {
         // SAFETY: frees and nulls whatever av_dict_set allocated.
@@ -144,13 +240,21 @@ unsafe fn fetch_inner(
     }
 
     let mut ctx: *mut ffi::AVIOContext = ptr::null_mut();
+    let int_cb = ffi::AVIOInterruptCB {
+        callback: Some(fetch_interrupt_cb),
+        opaque: ptr::from_ref(interrupt)
+            .cast::<core::ffi::c_void>()
+            .cast_mut(),
+    };
     // SAFETY: `ctx` out-param starts null; `curl` is a valid CString; `opts` is
-    // our live dict. libav fills `ctx` on success (checked below).
+    // our live dict; `int_cb` (copied by libav into the URLContext) points at
+    // `interrupt`, which outlives the context closed below. libav fills `ctx`
+    // on success (checked below).
     let open = ffi::avio_open2(
         &raw mut ctx,
         curl.as_ptr(),
         ffi::AVIO_FLAG_READ,
-        ptr::null(),
+        &raw const int_cb,
         &raw mut opts,
     );
     // SAFETY: av_dict_free is null-safe and frees any entries avio_open2 left.
@@ -159,7 +263,7 @@ unsafe fn fetch_inner(
         return Err(fetch_err(url, ffmpeg::Error::from(open)));
     }
 
-    let body = read_to_end(url, ctx, max_bytes);
+    let body = read_to_end(url, ctx, max_bytes, interrupt);
 
     // Read the effective (final, post-redirect) URL from the http context's
     // `location` option *before* closing the context. This is best-effort: a
@@ -211,11 +315,24 @@ unsafe fn effective_url(url: &str, ctx: *mut ffi::AVIOContext) -> String {
 }
 
 /// Drain `ctx` into a `String`, bounded by `max_bytes`.
-unsafe fn read_to_end(url: &str, ctx: *mut ffi::AVIOContext, max_bytes: usize) -> Result<String> {
+unsafe fn read_to_end(
+    url: &str,
+    ctx: *mut ffi::AVIOContext,
+    max_bytes: usize,
+    interrupt: &FetchInterrupt<'_>,
+) -> Result<String> {
     let chunk_len = i32::try_from(READ_CHUNK).unwrap_or(1).max(1);
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0_u8; READ_CHUNK];
     loop {
+        // A protocol that never polls the interrupt (`file:`) still honours
+        // the budget and the stop flag between chunks.
+        if interrupt.should_abort() {
+            return Err(fetch_err(
+                url,
+                format_args!("fetch budget spent or stopped"),
+            ));
+        }
         // SAFETY: `ctx` is live; we read at most `chunk_len` bytes into our own
         // stack buffer of `READ_CHUNK`.
         let n = ffi::avio_read(ctx, chunk.as_mut_ptr(), chunk_len);
@@ -384,6 +501,116 @@ mod tests {
         let url = format!("file:{}", path.display());
         let result = fetch_url_text(&url, 1024, "file");
         assert!(result.is_err(), "a non-UTF-8 body must be rejected");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn operator_headers_ride_the_text_fetch() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("[::1]:0").expect("bind loopback");
+        let port = listener.local_addr().expect("addr").port();
+        let seen = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut head = String::new();
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                head.push_str(&line);
+                line.clear();
+            }
+            let body = "#EXTM3U\n";
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            head
+        });
+        let headers = crate::HttpHeaders::new(Some("Opera/Test 9"), Some("https://ref.example/"));
+        let fetched = super::fetch_url_text_with_headers(
+            &format!("http://[::1]:{port}/subs.m3u8"),
+            4096,
+            "http,tcp",
+            &headers,
+            &super::FetchLimits::default(),
+        )
+        .expect("fetch");
+        assert_eq!(fetched.body, "#EXTM3U\n");
+        let head = seen.join().expect("server");
+        assert!(head.contains("User-Agent: Opera/Test 9"), "{head}");
+        assert!(head.contains("Referer: https://ref.example/"), "{head}");
+    }
+
+    /// #526 review: a server trickling one byte at a time never trips the
+    /// inactivity timeout; the total budget still ends the fetch.
+    #[test]
+    fn a_trickling_server_is_cut_off_by_the_total_budget() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("[::1]:0").expect("bind loopback");
+        let port = listener.local_addr().expect("addr").port();
+        let server_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = {
+            let server_stop = std::sync::Arc::clone(&server_stop);
+            std::thread::spawn(move || {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                    line.clear();
+                }
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n");
+                while !server_stop.load(std::sync::atomic::Ordering::Acquire)
+                    && stream.write_all(b"x").is_ok()
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            })
+        };
+        let started = std::time::Instant::now();
+        let result = super::fetch_url_text_with_headers(
+            &format!("http://[::1]:{port}/subs.m3u8"),
+            1 << 20,
+            "http,tcp",
+            &crate::HttpHeaders::default(),
+            &super::FetchLimits {
+                budget: Some(std::time::Duration::from_secs(1)),
+                stop: None,
+            },
+        );
+        let took = started.elapsed();
+        server_stop.store(true, std::sync::atomic::Ordering::Release);
+        let _ = server.join();
+        assert!(
+            result.is_err(),
+            "a trickled body must not complete: {result:?}"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(20),
+            "the budget ends the fetch long before the trickle would ({took:?})"
+        );
+    }
+
+    /// A raised stop flag aborts a fetch at once.
+    #[test]
+    fn a_raised_stop_flag_aborts_the_fetch() {
+        let path = temp("multiview_avio_fetch_stop.m3u8");
+        std::fs::write(&path, b"#EXTM3U\n").expect("write fixture");
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        let result = super::fetch_url_text_with_headers(
+            &format!("file:{}", path.display()),
+            1024,
+            "file",
+            &crate::HttpHeaders::default(),
+            &super::FetchLimits {
+                budget: None,
+                stop: Some(&stop),
+            },
+        );
+        assert!(result.is_err(), "{result:?}");
         let _ = std::fs::remove_file(&path);
     }
 }
