@@ -26,18 +26,20 @@ use multiview_output::rtsp_server::{
 };
 
 fn packet(pts: i64, byte: u8) -> Arc<EncodedPacket> {
-    Arc::new(EncodedPacket {
-        rendition: RenditionId::new("program"),
-        kind: if pts == 0 {
+    Arc::new(EncodedPacket::new(
+        RenditionId::new("program"),
+        if pts == 0 {
             PacketKind::VideoKeyframe
         } else {
             PacketKind::VideoDelta
         },
+        multiview_core::encoded_packet::StreamKind::Video,
+        false,
         pts,
-        dts: pts,
-        duration: 1500,
-        data: Arc::from(vec![byte].into_boxed_slice()),
-    })
+        pts,
+        1500,
+        Arc::<[u8]>::from(vec![byte].into_boxed_slice()),
+    ))
 }
 
 // ----------------------------------------------------------------------------

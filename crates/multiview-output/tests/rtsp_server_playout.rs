@@ -115,14 +115,16 @@ fn rtsp_server_serves_describe_setup_play_to_tcp_client() {
     // validates client-visible RTSP setup/play; actual interleaved RTP delivery
     // requires valid SPS/PPS/IDR NAL units and remains part of the future media
     // acceptance, not this server-context regression test.
-    let packet = Arc::new(EncodedPacket {
-        rendition: RenditionId::new("program"),
-        kind: PacketKind::VideoKeyframe,
-        pts: 0,
-        dts: 0,
-        duration: 3000,
-        data: Arc::from(vec![0, 0, 0, 1, 0x67].into_boxed_slice()),
-    });
+    let packet = Arc::new(EncodedPacket::new(
+        RenditionId::new("program"),
+        PacketKind::VideoKeyframe,
+        multiview_core::encoded_packet::StreamKind::Video,
+        false,
+        0,
+        0,
+        3000,
+        Arc::from(vec![0, 0, 0, 1, 0x67].into_boxed_slice()),
+    ));
     sink.deliver(&packet);
     drop(handle);
 }

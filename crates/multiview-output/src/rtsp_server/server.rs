@@ -374,9 +374,9 @@ fn build_buffer(packet: &Arc<EncodedPacket>, timebase: (u32, u32)) -> gstreamer:
         // `get_mut` succeeds: the buffer was just constructed and is uniquely
         // owned here.
         if let Some(buffer_ref) = buffer.get_mut() {
-            buffer_ref.set_pts(clock_time_from_units(packet.pts, timebase));
-            buffer_ref.set_dts(clock_time_from_units(packet.dts, timebase));
-            buffer_ref.set_duration(clock_time_from_units(packet.duration, timebase));
+            buffer_ref.set_pts(clock_time_from_units(packet.pts(), timebase));
+            buffer_ref.set_dts(clock_time_from_units(packet.dts(), timebase));
+            buffer_ref.set_duration(clock_time_from_units(packet.duration(), timebase));
         }
     }
     buffer
@@ -389,7 +389,7 @@ struct PacketBytes(Arc<EncodedPacket>);
 
 impl AsRef<[u8]> for PacketBytes {
     fn as_ref(&self) -> &[u8] {
-        &self.0.data
+        self.0.payload()
     }
 }
 

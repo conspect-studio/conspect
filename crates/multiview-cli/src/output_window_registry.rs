@@ -1296,6 +1296,7 @@ impl<D: WindowDelivery> WindowDelivery for OutputWindowTap<D> {
         // One output tick has passed: hand any admitted tail to its transport even
         // though no new window was offered (a quiet encoder must not strand it).
         self.registry.pump(now);
+        self.delivery.pump(now);
     }
     fn finish(&mut self) {
         self.registry.close();
@@ -1922,6 +1923,7 @@ pub(crate) mod tests {
     struct Spy {
         offers: Vec<(usize, usize, usize)>,
         finished: bool,
+        pumps: usize,
     }
     impl WindowDelivery for Spy {
         fn offer_window(
@@ -1952,6 +1954,9 @@ pub(crate) mod tests {
         }
         fn statuses(&self) -> Vec<crate::binding_delivery::BindingStatus> {
             Vec::new()
+        }
+        fn pump(&mut self, _now: Instant) {
+            self.pumps += 1;
         }
         fn finish(&mut self) {
             self.finished = true;
@@ -2009,6 +2014,7 @@ pub(crate) mod tests {
             Spy {
                 offers: Vec::new(),
                 finished: false,
+                pumps: 0,
             },
             vec![pending],
             GENERATION,
@@ -2065,10 +2071,13 @@ pub(crate) mod tests {
             Spy {
                 offers: Vec::new(),
                 finished: false,
+                pumps: 0,
             },
             vec![invalid],
             GENERATION,
         );
+        bounded.pump(Instant::now());
+        assert_eq!(bounded.delivery.pumps, 1);
         for _ in 0..40 {
             bounded
                 .offer_window(
@@ -2100,6 +2109,7 @@ pub(crate) mod tests {
             Spy {
                 offers: Vec::new(),
                 finished: false,
+                pumps: 0,
             },
             vec![binding("out", 0)],
             GENERATION,
