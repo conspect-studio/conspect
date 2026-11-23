@@ -2396,8 +2396,11 @@ mod resync_tests {
         let block_frames = 4_800; // 100 ms
         let mut n: i64 = 0;
         let next = || {
+            // Model a segment-boundary fetch stall, followed by ten 100 ms
+            // blocks that cover 1 s of media. The first call stalls for the
+            // initial fetch; later calls stall once at each 1 s boundary.
             if n % 10 == 0 {
-                std::thread::sleep(Duration::from_millis(800)); // fetch the next segment
+                std::thread::sleep(Duration::from_millis(800)); // fetch segment
             }
             let pts = multiview_core::time::MediaTime::from_nanos(n * 100_000_000);
             n += 1;
