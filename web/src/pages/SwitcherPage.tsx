@@ -5,6 +5,7 @@ import type { JSX } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { PageHeader } from '../components/PageHeader';
+import { useTakeLock } from '../components/broadcast/BroadcastShell';
 import { Button } from '../components/ui/button';
 import { Label } from '../components/ui/label';
 import { Input } from '../components/ui/input';
@@ -48,6 +49,7 @@ function SwitcherMonitor({ bus, path }: { readonly bus: string; readonly path: s
 export function SwitcherPage(): JSX.Element {
   const { t } = useLingui();
   const queryClient = useQueryClient();
+  const { locked } = useTakeLock();
   const submitTracked = useSubmitTrackedOperation();
   const state = useQuery({ queryKey: STATE_KEY, queryFn: () => getSwitcher(), retry: false });
   const sources = useSources();
@@ -143,7 +145,7 @@ export function SwitcherPage(): JSX.Element {
   });
   // Unknown (including unobserved/replay) is not permission to take again.
   const settled = operation?.phase === 'applied' || operation?.phase === 'failed';
-  const ready = state.data !== undefined && (operationId === undefined || settled) && !submitting;
+  const ready = !locked && state.data !== undefined && (operationId === undefined || settled) && !submitting;
   // Review K5-R2-02: the arm set and the keyer drafts are built from the
   // snapshot, so after an outcome they stay gated until a snapshot read
   // AFTER the outcome arrives. The engine publishes the snapshot before the
@@ -206,7 +208,7 @@ export function SwitcherPage(): JSX.Element {
     },
   });
   const arm = (next: ArmSet): void => { void gated(() => armMutate.mutateAsync(next)).catch(() => undefined); };
-  const take = (intent: Intent): void => { void gated(() => mutate.mutateAsync(intent)).catch(() => undefined); };
+  const take = (intent: Intent): void => { if (locked) return; void gated(() => mutate.mutateAsync(intent)).catch(() => undefined); };
   // The output tick now, extrapolated from the snapshot at the exact cadence
   // so a ramp's progress advances between (change-only) snapshots.
   const ramping = (state.data?.keyers ?? []).some((row) => row.ramp !== null && row.ramp !== undefined);
@@ -235,7 +237,7 @@ export function SwitcherPage(): JSX.Element {
     ...fields, me: 'me1', program: 'main', action: 'keyer_set', keyer, ...(allow ? { on_air: 'allow' } : {}),
   });
   return (
-    <main className="space-y-5 p-4">
+    <section className="space-y-5 p-4">
       <PageHeader title={t`Program / Preview switcher`} />
       {state.isError && <p role="status" className="rounded border border-amber-600 p-3">{isBackendUnavailable(state.error) ? <Trans>Switcher unavailable: this server does not provide it yet (backend not deployed). Controls are disabled.</Trans> : <Trans>Switcher unavailable: no real Program/Preview bus is attached. Controls are disabled.</Trans>}</p>}
       {state.isLoading && <p role="status"><Trans>Checking switcher engine…</Trans></p>}
@@ -266,13 +268,14 @@ export function SwitcherPage(): JSX.Element {
             {sources.data?.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}
           </select>
         </div>
-        <Button disabled={!ready || selected === ''} onClick={() => { take('select_preview'); }}><Trans>Select PVW</Trans></Button>
-        <Button disabled={!ready || selected === ''} onClick={() => { take('select_program'); }}><Trans>Punch PGM</Trans></Button>
+        <Button disabled={!ready || selected === ''} onClick={() => { take('select_preview'); }}><Trans>Preview selected source</Trans></Button>
+        <Button disabled={!ready || selected === ''} onClick={() => { take('select_program'); }}><Trans>Send selected source to air</Trans></Button>
       </div>}
-      <div className="flex flex-wrap items-end gap-3">
-        <Button disabled={!ready} onClick={() => { take('cut'); }}><Trans>Cut</Trans></Button>
+      {locked && <p role="status"><Trans>Takes are locked. Use the Takes locked control in the header to unlock. A confirmed engine state is also required.</Trans></p>}
+      <div className="flex flex-wrap items-end gap-3 rounded-lg border p-3">
+        <Button disabled={!ready} onClick={() => { take('cut'); }}><Trans>Cut preview to air</Trans></Button>
         <div className="space-y-1"><Label htmlFor="switcher-duration"><Trans>Auto frames</Trans></Label><Input id="switcher-duration" type="number" min="1" max="1000" value={duration} onChange={(event) => { setDuration(event.target.value); }} /></div>
-        <Button disabled={!ready || !Number.isInteger(Number(duration)) || Number(duration) < 1} onClick={() => { take('auto'); }}><Trans>Auto</Trans></Button>
+        <Button disabled={!ready || !Number.isInteger(Number(duration)) || Number(duration) < 1} onClick={() => { take('auto'); }}><Trans>Transition preview to air</Trans></Button>
       </div>
       {refreshFailed && (
         <div role="alert" className="flex items-center gap-2" data-testid="switcher-refresh-failed">
@@ -335,7 +338,6 @@ export function SwitcherPage(): JSX.Element {
           ))}
         </section>
       )}
-      <p className="text-xs text-muted-foreground"><Trans>Aux buses and multi-M/E remain future switcher stages.</Trans></p>
-    </main>
+    </section>
   );
 }
