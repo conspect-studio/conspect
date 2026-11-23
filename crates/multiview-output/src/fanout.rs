@@ -12,34 +12,12 @@
 //! sinks (the RTSP server, the LL-HLS origin, the NDI sender, the push clients)
 //! are feature-gated and implement [`PacketSink`]; they are out of scope here.
 //!
-//! ## Two `EncodedPacket` notions — what "encode once" means in practice
+//! ## Shared carrier
 //!
-//! Inv #7 is **"encode the canvas once per rendition, then fan the same coded
-//! packets to N muxers."** There are two concrete carriers for "the coded
-//! packet", and they are *not* the same allocation strategy:
-//!
-//! * This module's [`EncodedPacket`] wraps the payload in `Arc<[u8]>` and is
-//!   handed out as one `Arc<EncodedPacket>` — a **single allocation shared by
-//!   reference** across every sink. The [`EncodeOnceDriver`] +
-//!   [`RenditionEncoder`] here drive exactly that: one
-//!   [`RenditionEncoder::encode_frame`] call per rendition-with-sinks per tick,
-//!   then a by-reference fan-out (see the call-count proof in
-//!   `tests/encode_once_sink_mover.rs`).
-//! * The **production** fan-out (the `FFmpeg` path, `multiview-cli`'s pipeline)
-//!   carries a `multiview_ffmpeg::EncodedPacket` (an `AVPacket` wrapper). The
-//!   *encode* still happens **once** per rendition; the per-muxer hand-off is a
-//!   ref-counted `av_packet_ref` + per-sink `av_packet_make_writable` copy
-//!   (`to_owned_packet`), **not** one shared `Arc<[u8]>`, because each muxer
-//!   rescales timestamps in place and must not alias another sink's packet.
-//!
-//! So inv #7's load-bearing claim — **encode once, mux many** — holds in both:
-//! the *encoder* runs once per rendition per tick regardless. The two types do
-//! **not** share one allocation today, and converging them (backing the
-//! production `multiview_ffmpeg::EncodedPacket` with this module's
-//! `Arc<[u8]>` carrier) would require changes inside `multiview-ffmpeg`, which is
-//! out of scope for RT-12. This doc therefore states the reality honestly rather
-//! than overclaiming a single shared buffer for the `FFmpeg` path; the type
-//! convergence is tracked as the RT-13 follow-up.
+//! There is one immutable [`EncodedPacket`] carrier for the routing model and
+//! production `FFmpeg` path. The `FFmpeg` adapter copies coded bytes once into an
+//! `Arc<[u8]>`; all fan-out sinks retain the same allocation. Muxers receive
+//! separate mutable packet headers that reference this read-only payload.
 //!
 //! ## Isolation (invariant #10)
 //!
@@ -51,86 +29,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Stable identifier for an output rendition (one encode at a given
-/// codec/resolution/bitrate).
-///
-/// Renditions are the unit of fan-out: all sinks registered under the same
-/// [`RenditionId`] receive that rendition's packets.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RenditionId(String);
-
-impl RenditionId {
-    /// Construct a rendition id from any string-like value.
-    #[must_use]
-    pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-
-    /// Borrow the underlying identifier string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for RenditionId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// The kind of coded payload an [`EncodedPacket`] carries.
-///
-/// The router treats every kind identically (it fans references out
-/// unconditionally); the kind is metadata for sinks that need it (e.g. a
-/// segmenter that starts a new CMAF part on a keyframe).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum PacketKind {
-    /// A video keyframe (IDR) — a valid segment/part boundary.
-    VideoKeyframe,
-    /// A non-keyframe video packet (P/B frame).
-    VideoDelta,
-    /// An audio packet.
-    Audio,
-}
-
-impl PacketKind {
-    /// Whether this packet is a keyframe (a valid segment boundary).
-    #[must_use]
-    pub const fn is_keyframe(self) -> bool {
-        matches!(self, Self::VideoKeyframe)
-    }
-}
-
-/// One encoded packet emitted by a rendition's encoder.
-///
-/// Carries timestamps **already re-stamped from the output tick counter**
-/// (invariant #3 — raw input PTS never reaches a muxer) and the coded payload
-/// as a shared, immutable byte slice. Wrapped in an [`Arc`] by the caller so a
-/// single allocation fans out to many sinks without copying.
-///
-/// This is the **routing-model** carrier (`Arc<[u8]>`, truly shared by
-/// reference). It is distinct from the production `multiview_ffmpeg::EncodedPacket`
-/// (an `AVPacket` wrapper, copied per muxer via `to_owned_packet`); see the
-/// module-level "Two `EncodedPacket` notions" note for the honest reconciliation
-/// of what "encode once" means in each.
-#[derive(Debug, Clone)]
-pub struct EncodedPacket {
-    /// The rendition that produced this packet.
-    pub rendition: RenditionId,
-    /// The payload kind.
-    pub kind: PacketKind,
-    /// Presentation timestamp, in the output timebase (re-stamped from the
-    /// tick counter).
-    pub pts: i64,
-    /// Decode timestamp, in the output timebase.
-    pub dts: i64,
-    /// Packet duration, in the output timebase.
-    pub duration: i64,
-    /// Coded payload. Shared and immutable so the same bytes serve every sink.
-    pub data: Arc<[u8]>,
-}
+pub use multiview_core::encoded_packet::{EncodedPacket, PacketKind, RenditionId};
 
 /// A transport that consumes a rendition's encoded packets.
 ///

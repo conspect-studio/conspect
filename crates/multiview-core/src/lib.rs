@@ -9,6 +9,7 @@
 pub mod alarm;
 pub mod alpha;
 pub mod color;
+pub mod encoded_packet;
 pub mod error;
 pub mod event_overlay;
 pub mod frame;
