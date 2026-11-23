@@ -1213,6 +1213,7 @@ pub fn generate_player_clip(path: &Path, spec: &PlayerClipSpec) -> Result<()> {
         time_base: period,
         bit_rate: 0,
         gop: spec.gop.max(1),
+        color: multiview_core::color::ColorInfo::default(),
         cuda_device: None,
     })?;
     let mut mux = Muxer::create_as(path, "mov")?;

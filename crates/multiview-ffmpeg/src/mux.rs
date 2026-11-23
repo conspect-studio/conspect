@@ -1175,6 +1175,7 @@ mod shared_mux_input_tests {
             time_base: Rational::new(1, 25),
             bit_rate: 500_000,
             gop: 12,
+            color: multiview_core::color::ColorInfo::default(),
             cuda_device: None,
         })
         .expect("open encoder");

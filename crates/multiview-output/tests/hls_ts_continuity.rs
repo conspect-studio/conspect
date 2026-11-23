@@ -636,6 +636,7 @@ fn hls_discrete_audio_segments_carry_no_cc_discontinuity_across_boundaries() {
         time_base: Rational::new(1, 30),
         bit_rate: 2_000_000,
         gop: 30,
+        color: multiview_core::color::ColorInfo::default(),
         cuda_device: None,
     };
     let mut video_encoder = VideoEncoder::new(&video_target).expect("open video encoder");
@@ -875,6 +876,7 @@ fn run_mux_reopen_fault_test(persistent: bool) {
         time_base: Rational::new(1, 30),
         bit_rate: 2_000_000,
         gop: 30,
+        color: multiview_core::color::ColorInfo::default(),
         cuda_device: None,
     };
     let mut encoder = VideoEncoder::new(&target).expect("video encoder");

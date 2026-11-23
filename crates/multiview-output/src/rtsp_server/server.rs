@@ -119,22 +119,18 @@ impl RtspServerHandle {
 
         let served_url = config.served_url();
 
-        // The `GStreamer`/`RTSPServer` objects are constructed, attached, and run
-        // on the serving thread: their sources must dispatch on the thread whose
-        // default context they were attached to, and the RTSP server objects are
-        // not `Send`. Only the `MainLoop` (which is `Send + Sync`) is created here
-        // and cloned into the thread, so the handle can `quit()` it from the
-        // caller's thread. The thread reports the bind outcome back over a sync
-        // channel so `start` surfaces a port-in-use/permission failure as a typed
-        // error rather than a silently-dead server.
-        let main_loop = glib::MainLoop::new(None, false);
+        // Attach the server source to the exact context the loop iterates.
+        // GStreamer/RTSPServer objects stay on the serving thread; only the
+        // MainContext and MainLoop cross the boundary so the handle can quit.
+        let context = glib::MainContext::new();
+        let main_loop = glib::MainLoop::new(Some(&context), false);
         let loop_for_thread = main_loop.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
         let pump_queue = Arc::clone(&queue);
         let thread = std::thread::Builder::new()
             .name("mv-rtsp-server".to_owned())
             .spawn(move || {
-                serve(&config, &loop_for_thread, &pump_queue, &ready_tx);
+                serve(&config, &context, &loop_for_thread, &pump_queue, &ready_tx);
             })
             .map_err(|e| Error::Output(format!("could not spawn rtsp serving thread: {e}")))?;
 
@@ -203,23 +199,20 @@ const DEFAULT_CAPACITY: usize = 8;
 /// thread-default `GLib` context, attach (bind) it, report the bind outcome over
 /// `ready_tx`, then run `main_loop` until the handle quits it.
 ///
-/// All `RTSPServer`/factory/`MainContext` objects are thread-local here (they are
-/// not `Send`); only `main_loop` (and the queue) crossed the thread boundary. A
-/// failure at any construction/bind step is reported once over `ready_tx` and the
-/// thread returns without running the loop.
+/// All `RTSPServer`/factory objects are thread-local here; the `MainContext`
+/// and matching `MainLoop` cross the boundary together. A failure at any
+/// construction/bind step is reported once over `ready_tx`.
 fn serve(
     config: &RtspServerConfig,
+    context: &glib::MainContext,
     main_loop: &glib::MainLoop,
     queue: &Arc<BoundedPacketQueue>,
     ready_tx: &std::sync::mpsc::SyncSender<Result<()>>,
 ) {
-    // A fresh main context for this thread; the `MainLoop` was created with the
-    // default `None` context, so make this one the thread-default (via the
-    // panic-safe `with_thread_default` guard/closure API — glib 0.22 removed the
-    // old push/pop pair) before building, attaching and running on it.
-    let context = glib::MainContext::new();
+    // Make the loop's own context thread-default for construction and attach;
+    // `MainLoop::new(None)` would instead iterate the process-default context.
     let push_result = context.with_thread_default(|| {
-        let result = build_and_attach(config, &context, queue);
+        let result = build_and_attach(config, context, queue);
         let attached = match result {
             Ok(source_id) => {
                 // Signal success; keep `source_id` alive for the loop's lifetime so

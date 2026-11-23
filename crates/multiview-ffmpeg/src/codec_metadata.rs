@@ -471,6 +471,7 @@ mod tests {
             time_base: multiview_core::time::Rational::new(1, 25),
             bit_rate: 100_000,
             gop: 25,
+            color: multiview_core::color::ColorInfo::default(),
             cuda_device: None,
         })
         .expect("actual native libx264 encoder opens");

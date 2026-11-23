@@ -43,6 +43,7 @@ fn encoder() -> VideoEncoder {
         time_base: Rational::new(1, 25),
         bit_rate: 20_000_000,
         gop: 1,
+        color: multiview_core::color::ColorInfo::default(),
         cuda_device: None,
     })
     .expect("mpeg2video")
