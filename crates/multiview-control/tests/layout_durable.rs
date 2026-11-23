@@ -207,6 +207,14 @@ async fn api_layout_survives_router_reconstruction_with_accepted_envelope() {
     let body = support::body_json(response).await;
     assert_eq!(body["name"], "News");
     assert_eq!(body["body"], request["body"]);
+    let listed = send(&restarted, get("/api/v1/layouts", OPERATOR_TOKEN)).await;
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed = support::body_json(listed).await;
+    assert!(listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|layout| layout["id"] == "news"));
 }
 
 /// A stored layout authored with only canvas geometry (the shape the web UI
