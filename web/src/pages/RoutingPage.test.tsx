@@ -55,13 +55,14 @@ afterAll(() => {
 
 describe('RoutingPage', () => {
   it('keeps a failed plan reason visible and offers retry without taking', async () => {
-    server.use(http.post('http://localhost:3000/api/v1/routing/plan', () => HttpResponse.json({ title: 'Invalid route', detail: 'Destination is unavailable' }, { status: 422 })));
+    server.use(http.post('http://localhost:3000/api/v1/routing/plan', () => HttpResponse.json({ type: 'about:blank', status: 422, title: 'Invalid route', detail: 'Destination is unavailable' }, { status: 422 })));
     const user = userEvent.setup();
     renderWithProviders(<MemoryRouter><RoutingPage /></MemoryRouter>);
     await user.type(screen.getByLabelText('Source input id'), 'cam-north');
     await user.type(screen.getByLabelText('Target video cell'), 'cell-a');
     await user.click(screen.getByRole('button', { name: /Plan/i }));
     expect(await screen.findByText('Plan failed — no valid plan was obtained. Nothing was sent to the output.')).toBeVisible();
+    expect(screen.getByText('Destination is unavailable')).toBeVisible();
     expect(screen.getByRole('button', { name: 'Retry plan' })).toBeEnabled();
     expect(lastTakeIdempotency).toBeNull();
   });
