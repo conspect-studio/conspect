@@ -1,6 +1,8 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../realtime/shared', () => ({ subscribeRealtime: () => () => undefined }));
+const takeLock = vi.hoisted(() => ({ locked: false }));
+vi.mock('./BroadcastShell', () => ({ useTakeLock: () => takeLock }));
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
@@ -37,7 +39,7 @@ const server = setupServer(
   }),
 );
 beforeAll(() => { server.listen(); });
-afterEach(() => { server.resetHandlers(); commandCount = 0; polls = 0; frozenTick = false; vi.useRealTimers(); });
+afterEach(() => { server.resetHandlers(); commandCount = 0; polls = 0; frozenTick = false; takeLock.locked = false; vi.useRealTimers(); });
 afterAll(() => { server.close(); });
 
 function page() {
@@ -55,6 +57,15 @@ function outcome(id: string, completed: boolean, error?: string) {
 // Tracker events are supplied as the shell-owned socket supplies them; no second socket.
 // Confirmation needs two polls with an advancing tick (2 s refetch), hence the longer waits.
 describe('ProductionDesk single-authority completion', { timeout: 15000 }, () => {
+  it('keeps Cut and Auto disabled with a recovery instruction while takes are locked', async () => {
+    takeLock.locked = true;
+    page();
+    await screen.findByText('Takes locked — unlock in the header before sending video to air.');
+    expect(screen.getByRole('button', { name: 'CUT' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'AUTO' })).toBeDisabled();
+    await userEvent.click(screen.getByRole('button', { name: 'CUT' }));
+    expect(commandCount).toBe(0);
+  });
   it('enables MIX/WIPE/DIP before the dominant CUT in DOM order; AUTO works', async () => {
     const { container } = page();
     await waitFor(() => { expect(screen.getByRole('button', { name: 'CUT' })).not.toBeDisabled(); }, { timeout: 6000 });

@@ -14,16 +14,18 @@ export interface MixerInputBankProps {
   readonly mixer: MixerPatchView;
   readonly sources: readonly { readonly id: string; readonly name: string }[];
   readonly disabled: boolean;
+  readonly takesLocked?: boolean;
   readonly onSelect: (action: 'select_preview' | 'select_program', input: number) => void;
   /** Plan then take; resolves when the take was accepted (202). */
   readonly onRepatch: (request: PatchRequest) => Promise<void>;
 }
 
-function InputRow({ me, input, sources, disabled, onSelect, onRepatch }: {
+function InputRow({ me, input, sources, disabled, takesLocked = false, onSelect, onRepatch }: {
   readonly me: string;
   readonly input: MixerInputView;
   readonly sources: MixerInputBankProps['sources'];
   readonly disabled: boolean;
+  readonly takesLocked?: boolean;
   readonly onSelect: MixerInputBankProps['onSelect'];
   readonly onRepatch: MixerInputBankProps['onRepatch'];
 }): JSX.Element {
@@ -35,6 +37,7 @@ function InputRow({ me, input, sources, disabled, onSelect, onRepatch }: {
   const sourceLabel = input.video === null ? t`Unpatched` : inputSource(input) ?? t`Restricted source`;
   const tally = input.on_program ? 'PGM' : input.on_preview ? 'PVW' : undefined;
   const send = async (onAir: OnAir): Promise<void> => {
+    if (disabled || takesLocked || busy) return;
     setBusy(true);
     try {
       await onRepatch({ crosspoints: [mixerCrosspoint(me, input.number, choice)], on_air: onAir });
@@ -61,17 +64,17 @@ function InputRow({ me, input, sources, disabled, onSelect, onRepatch }: {
       <span className="text-muted-foreground">· {sourceLabel}</span>
       {tally !== undefined && <span role="status" aria-label={tally === 'PGM' ? t`On Program` : t`On Preview`} className={`rounded px-1 text-xs text-white ${tally === 'PGM' ? 'bg-red-600' : 'bg-green-600'}`}>{tally}</span>}
       <Button size="sm" disabled={disabled || !patched || input.on_preview || input.on_program} onClick={() => { onSelect('select_preview', input.number); }}><Trans>PVW</Trans></Button>
-      <Button size="sm" disabled={disabled || !patched || input.on_program || input.on_preview} onClick={() => { onSelect('select_program', input.number); }}><Trans>PGM</Trans></Button>
+      <Button size="sm" disabled={disabled || takesLocked || !patched || input.on_program || input.on_preview} onClick={() => { onSelect('select_program', input.number); }}><Trans>PGM</Trans></Button>
       <label className="sr-only" htmlFor={`repatch-${String(input.number)}`}><Trans>Patch source for input {input.number}</Trans></label>
-      <select id={`repatch-${String(input.number)}`} className="rounded border bg-background p-1" value={choice} disabled={disabled || busy} onChange={(event) => { setChoice(event.target.value); }}>
+      <select id={`repatch-${String(input.number)}`} className="rounded border bg-background p-1" value={choice} disabled={disabled || takesLocked || busy} onChange={(event) => { setChoice(event.target.value); }}>
         <option value="">{t`Re-patch…`}</option>
         {sources.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}
       </select>
-      <Button size="sm" disabled={disabled || busy || choice === '' || choice === inputSource(input)} onClick={repatch}><Trans>Patch</Trans></Button>
+      <Button size="sm" disabled={disabled || takesLocked || busy || choice === '' || choice === inputSource(input)} onClick={repatch}><Trans>Patch</Trans></Button>
       {confirming && (
         <div role="alertdialog" aria-label={t`Confirm on-air re-patch`} className="flex items-center gap-2 rounded border border-red-600 p-2">
           <span><Trans>Input {input.number} is on Program: re-patching cuts Program to the new source.</Trans></span>
-          <Button size="sm" variant="destructive" disabled={busy} onClick={() => { void send('allow'); }}><Trans>Cut Program</Trans></Button>
+          <Button size="sm" variant="destructive" disabled={disabled || takesLocked || busy} onClick={() => { void send('allow'); }}><Trans>Cut Program</Trans></Button>
           <Button size="sm" variant="outline" disabled={busy} onClick={() => { setConfirming(false); }}><Trans>Cancel</Trans></Button>
         </div>
       )}
@@ -80,14 +83,14 @@ function InputRow({ me, input, sources, disabled, onSelect, onRepatch }: {
 }
 
 /** The live numbered input bank of one M/E. */
-export function MixerInputBank({ mixer, sources, disabled, onSelect, onRepatch }: MixerInputBankProps): JSX.Element {
+export function MixerInputBank({ mixer, sources, disabled, takesLocked = false, onSelect, onRepatch }: MixerInputBankProps): JSX.Element {
   const { t } = useLingui();
   return (
     <section className="space-y-2" aria-label={t`Mixer inputs`}>
       <h2 className="font-semibold"><Trans>Mixer inputs</Trans></h2>
       <ul className="space-y-1">
         {mixer.inputs.map((input) => (
-          <InputRow key={input.number} me={mixer.me} input={input} sources={sources} disabled={disabled} onSelect={onSelect} onRepatch={onRepatch} />
+          <InputRow key={input.number} me={mixer.me} input={input} sources={sources} disabled={disabled} takesLocked={takesLocked} onSelect={onSelect} onRepatch={onRepatch} />
         ))}
       </ul>
     </section>

@@ -1443,7 +1443,7 @@ msgstr ""
 msgid "Another slot already uses this menu label (name, else language); give this slot a distinct name or language."
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:333
+#: src/pages/SwitcherPage.tsx:336
 msgid "Another switcher request is in flight"
 msgstr ""
 
@@ -1827,7 +1827,7 @@ msgid "AUTO {kindLabel} over {autoFrames} frames"
 msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:369
-#: src/pages/SwitcherPage.tsx:277
+#: src/pages/SwitcherPage.tsx:279
 msgid "Auto frames"
 msgstr ""
 
@@ -2199,7 +2199,7 @@ msgstr ""
 #: src/components/broadcast/BroadcastShell.tsx:46
 #: src/components/broadcast/ProductionDesk.tsx:392
 #: src/components/switcher/KeyerPanel.tsx:358
-#: src/components/switcher/MixerInputBank.tsx:75
+#: src/components/switcher/MixerInputBank.tsx:78
 #: src/events/AutomationPanel.tsx:135
 #: src/iptv/AddSourceDialog.tsx:79
 #: src/iptv/BulkAddDialog.tsx:192
@@ -2644,7 +2644,7 @@ msgstr ""
 msgid "Checking permission…"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:243
+#: src/pages/SwitcherPage.tsx:244
 msgid "Checking switcher engine…"
 msgstr ""
 
@@ -2674,7 +2674,7 @@ msgid "Choose a salvo…"
 msgstr ""
 
 #: src/components/switcher/KeyerPanel.tsx:240
-#: src/pages/SwitcherPage.tsx:267
+#: src/pages/SwitcherPage.tsx:269
 msgid "Choose a source"
 msgstr ""
 
@@ -3219,7 +3219,7 @@ msgstr ""
 msgid "Confirm on-air keyer change"
 msgstr ""
 
-#: src/components/switcher/MixerInputBank.tsx:72
+#: src/components/switcher/MixerInputBank.tsx:75
 msgid "Confirm on-air re-patch"
 msgstr ""
 
@@ -4064,16 +4064,12 @@ msgstr ""
 msgid "CUT — Preview and Program carry the same source"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:276
+#: src/pages/SwitcherPage.tsx:278
 msgid "Cut preview to air"
 msgstr ""
 
-#: src/components/switcher/MixerInputBank.tsx:74
+#: src/components/switcher/MixerInputBank.tsx:77
 msgid "Cut Program"
-msgstr ""
-
-#: src/components/broadcast/BroadcastShell.tsx:46
-msgid "CUT will execute without another confirmation. AUTO remains unavailable. Direct program selection remains guarded."
 msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:368
@@ -6429,13 +6425,13 @@ msgid "Input (route {row})"
 msgstr ""
 
 #. placeholder {0}: input.number
-#: src/components/switcher/MixerInputBank.tsx:57
-#: src/components/switcher/MixerInputBank.tsx:59
+#: src/components/switcher/MixerInputBank.tsx:60
+#: src/components/switcher/MixerInputBank.tsx:62
 msgid "Input {0}"
 msgstr ""
 
 #. placeholder {0}: input.number
-#: src/components/switcher/MixerInputBank.tsx:73
+#: src/components/switcher/MixerInputBank.tsx:76
 msgid "Input {0} is on Program: re-patching cuts Program to the new source."
 msgstr ""
 
@@ -6637,8 +6633,8 @@ msgstr ""
 msgid "Keyer {0} strip"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:301
-#: src/pages/SwitcherPage.tsx:302
+#: src/pages/SwitcherPage.tsx:303
+#: src/pages/SwitcherPage.tsx:304
 msgid "Keyers"
 msgstr ""
 
@@ -7804,8 +7800,8 @@ msgstr ""
 msgid "Mix bank"
 msgstr ""
 
-#: src/components/switcher/MixerInputBank.tsx:86
-#: src/components/switcher/MixerInputBank.tsx:87
+#: src/components/switcher/MixerInputBank.tsx:89
+#: src/components/switcher/MixerInputBank.tsx:90
 msgid "Mixer inputs"
 msgstr ""
 
@@ -9046,11 +9042,11 @@ msgstr ""
 msgid "On PGM out now"
 msgstr ""
 
-#: src/components/switcher/MixerInputBank.tsx:62
+#: src/components/switcher/MixerInputBank.tsx:65
 msgid "On Preview"
 msgstr ""
 
-#: src/components/switcher/MixerInputBank.tsx:62
+#: src/components/switcher/MixerInputBank.tsx:65
 msgid "On Program"
 msgstr ""
 
@@ -9265,7 +9261,7 @@ msgstr ""
 msgid "outcome unknown; do not repeat"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:250
+#: src/pages/SwitcherPage.tsx:251
 msgid "Outcome unknown; refresh the engine state before taking again"
 msgstr ""
 
@@ -9427,7 +9423,7 @@ msgstr ""
 msgid "patch"
 msgstr ""
 
-#: src/components/switcher/MixerInputBank.tsx:70
+#: src/components/switcher/MixerInputBank.tsx:73
 msgid "Patch"
 msgstr ""
 
@@ -9443,7 +9439,7 @@ msgid "Patch a source to a destination. Plan classifies the take without applyin
 msgstr ""
 
 #. placeholder {0}: input.number
-#: src/components/switcher/MixerInputBank.tsx:65
+#: src/components/switcher/MixerInputBank.tsx:68
 msgid "Patch source for input {0}"
 msgstr ""
 
@@ -9520,7 +9516,7 @@ msgstr ""
 msgid "Permission unavailable (retrying)"
 msgstr ""
 
-#: src/components/switcher/MixerInputBank.tsx:64
+#: src/components/switcher/MixerInputBank.tsx:67
 #: src/pages/AudioPage.tsx:477
 #: src/pages/graphics/PlayoutView.tsx:240
 #: src/pages/graphics/PlayoutView.tsx:402
@@ -9845,7 +9841,7 @@ msgstr ""
 msgid "Preview request failed — retrying"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:271
+#: src/pages/SwitcherPage.tsx:273
 msgid "Preview selected source"
 msgstr ""
 
@@ -9981,7 +9977,7 @@ msgstr ""
 msgid "Program (follows the switcher)"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:241
+#: src/pages/SwitcherPage.tsx:242
 msgid "Program / Preview switcher"
 msgstr ""
 
@@ -10143,7 +10139,7 @@ msgstr ""
 msgid "Push to/from streaming platforms"
 msgstr ""
 
-#: src/components/switcher/MixerInputBank.tsx:63
+#: src/components/switcher/MixerInputBank.tsx:66
 #: src/pages/graphics/PlayoutView.tsx:234
 #: src/pages/graphics/PlayoutView.tsx:403
 #: src/pages/OutputFeedRow.tsx:309
@@ -10243,7 +10239,7 @@ msgstr ""
 msgid "Re-capture"
 msgstr ""
 
-#: src/components/switcher/MixerInputBank.tsx:67
+#: src/components/switcher/MixerInputBank.tsx:70
 msgid "Re-patch…"
 msgstr ""
 
@@ -10293,7 +10289,7 @@ msgstr ""
 msgid "Realtime streams"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:305
+#: src/pages/SwitcherPage.tsx:307
 msgid "Realtime updates are not connected: keyer lamps and tally may be stale."
 msgstr ""
 
@@ -10762,7 +10758,7 @@ msgstr ""
 msgid "Restoring…"
 msgstr ""
 
-#: src/components/switcher/MixerInputBank.tsx:35
+#: src/components/switcher/MixerInputBank.tsx:37
 msgid "Restricted source"
 msgstr ""
 
@@ -10803,7 +10799,7 @@ msgstr ""
 msgid "Retry load"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:284
+#: src/pages/SwitcherPage.tsx:286
 msgid "Retry reading the switcher state"
 msgstr ""
 
@@ -11442,7 +11438,7 @@ msgstr ""
 msgid "Send reply"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:272
+#: src/pages/SwitcherPage.tsx:274
 msgid "Send selected source to air"
 msgstr ""
 
@@ -11688,7 +11684,7 @@ msgstr ""
 #: src/pages/approved/SourcesSurface.tsx:365
 #: src/pages/IptvPage.tsx:232
 #: src/pages/OutputFormatFields.tsx:321
-#: src/pages/SwitcherPage.tsx:265
+#: src/pages/SwitcherPage.tsx:267
 msgid "Source"
 msgstr ""
 
@@ -12300,12 +12296,12 @@ msgstr ""
 
 #: src/app/navigation.tsx:63
 #: src/components/broadcast/ProductionDesk.tsx:361
-#: src/pages/SwitcherPage.tsx:247
+#: src/pages/SwitcherPage.tsx:248
 msgid "Switcher"
 msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:361
-#: src/pages/SwitcherPage.tsx:249
+#: src/pages/SwitcherPage.tsx:250
 msgid "Switcher operation rejected"
 msgstr ""
 
@@ -12317,11 +12313,11 @@ msgstr ""
 msgid "Switcher unavailable"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:242
+#: src/pages/SwitcherPage.tsx:243
 msgid "Switcher unavailable: no real Program/Preview bus is attached. Controls are disabled."
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:242
+#: src/pages/SwitcherPage.tsx:243
 msgid "Switcher unavailable: this server does not provide it yet (backend not deployed). Controls are disabled."
 msgstr ""
 
@@ -12436,6 +12432,10 @@ msgstr ""
 msgid "Take vamp exit on {0}"
 msgstr ""
 
+#: src/components/broadcast/ProductionDesk.tsx:360
+msgid "Takes are disabled while locked. Unlock in the header, then confirm the named source before changing Program."
+msgstr ""
+
 #: src/pages/OutputFeedRow.tsx:445
 msgid "Takes are locked and {outputName} currently carries Program. Confirm to change its feed."
 msgstr ""
@@ -12452,7 +12452,7 @@ msgstr ""
 msgid "Takes are locked and this set changes a crosspoint that currently carries Program. Confirm to apply it."
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:274
+#: src/pages/SwitcherPage.tsx:276
 msgid "Takes are locked. Use the Takes locked control in the header to unlock. A confirmed engine state is also required."
 msgstr ""
 
@@ -12466,6 +12466,12 @@ msgstr ""
 msgid "Takes locked"
 msgstr ""
 
+#: src/pages/SwitcherPage.tsx:178
+#: src/pages/SwitcherPage.tsx:264
+#: src/pages/SwitcherPage.tsx:332
+msgid "Takes locked — unlock in the header"
+msgstr ""
+
 #: src/components/broadcast/ProductionDesk.tsx:368
 msgid "Takes locked — unlock in the header before sending video to air."
 msgstr ""
@@ -12473,10 +12479,6 @@ msgstr ""
 #: src/components/broadcast/BroadcastShell.tsx:47
 #: src/components/broadcast/BroadcastShell.tsx:47
 msgid "Takes unlocked"
-msgstr ""
-
-#: src/components/broadcast/ProductionDesk.tsx:360
-msgid "Takes: when locked, CUT confirms once, naming both sources. PGM bus taps always confirm."
 msgstr ""
 
 #: src/app/navigation.tsx:65
@@ -12711,11 +12713,11 @@ msgstr ""
 msgid "The applied event was not observed on the realtime stream. The command may or may not have been applied."
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:294
+#: src/pages/SwitcherPage.tsx:296
 msgid "The arm set cannot change during a transition"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:201
+#: src/pages/SwitcherPage.tsx:202
 msgid "The arm set was refused"
 msgstr ""
 
@@ -13628,7 +13630,7 @@ msgstr ""
 msgid "This would capture {nominalFrames} frames, above the server's cap of {MAX_NOMINAL_FRAMES}. Lower max steps, frame duration or end hold."
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:252
+#: src/pages/SwitcherPage.tsx:253
 msgid "Tick"
 msgstr ""
 
@@ -13854,11 +13856,11 @@ msgstr ""
 msgid "Transition parameters"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:278
+#: src/pages/SwitcherPage.tsx:280
 msgid "Transition preview to air"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:252
+#: src/pages/SwitcherPage.tsx:253
 msgid "Transition running"
 msgstr ""
 
@@ -14098,6 +14100,10 @@ msgid "Unload"
 msgstr ""
 
 #: src/components/broadcast/BroadcastShell.tsx:46
+msgid "Unlock enables on-air controls when engine state is confirmed. Desk transitions still ask you to confirm the source before changing Program."
+msgstr ""
+
+#: src/components/broadcast/BroadcastShell.tsx:46
 msgid "Unlock takes"
 msgstr ""
 
@@ -14124,7 +14130,7 @@ msgstr ""
 msgid "Unpatch {0} slot {1}"
 msgstr ""
 
-#: src/components/switcher/MixerInputBank.tsx:35
+#: src/components/switcher/MixerInputBank.tsx:37
 #: src/pages/OutputFormatFields.tsx:326
 msgid "Unpatched"
 msgstr ""
