@@ -483,8 +483,8 @@ impl EncodeConfig {
             // NVENC device-affinity pin (Tier-2 P1a): inert for software codecs;
             // the encoder gates the bind on the `*_nvenc` codec-name suffix.
             cuda_device: self.cuda_ordinal.clone(),
-            // #161: the canvas colour, written onto the encoder context and
-            // every frame so the coded stream carries CICP tags.
+            // #161: the canvas colour, written onto the encoder context before
+            // it opens so the coded stream carries CICP tags.
             color: self.color,
         }
     }
