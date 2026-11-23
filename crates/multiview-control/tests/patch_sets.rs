@@ -979,18 +979,6 @@ async fn a_failed_second_enqueue_refuses_the_arm_and_releases_the_key() {
     );
 }
 
-/// Wait (bounded) until the aggregator task has settled every set: counts,
-/// not timings.
-async fn settled(rig: &Rig) {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while rig.state.patch_sets.pending_len() > 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-}
-
 async fn patch_takes_until_marker(
     stream: &mut SessionStream,
 ) -> Vec<multiview_events::PatchTakeEvent> {
@@ -1070,10 +1058,10 @@ async fn patch_take_aggregates_and_is_delivered_per_destination() {
         let mut destinations = std::collections::HashSet::new();
         while destinations.len() < 2 {
             let item = published.recv().await.unwrap();
-            if let Event::PatchTake(event) = item.event {
+            if let Event::PatchTake(event) = item.event.as_ref() {
                 if event.operation_id == op2 {
-                    if let Some(output) = event.destination.output {
-                        destinations.insert(output);
+                    if let Some(output) = &event.destination.output {
+                        destinations.insert(output.clone());
                     }
                 }
             }
