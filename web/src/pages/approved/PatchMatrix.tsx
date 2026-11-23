@@ -243,7 +243,7 @@ function MatrixGrid({
   }
   const groupHeaders = rows.map((row, index) => index === 0 || row.group !== rows[index - 1]?.group);
   return (
-    <div className="patch-wrap" data-testid={`matrix-grid-${plane}`}>
+    <div className="patch-wrap" role="region" aria-label={t`Source to output routing matrix`} tabIndex={0} data-testid={`matrix-grid-${plane}`}>
       <table className="patch-table">
         <thead>
           <tr>

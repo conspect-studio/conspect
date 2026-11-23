@@ -11780,6 +11780,10 @@ msgstr "Source preview"
 msgid "Source still preview"
 msgstr "Source still preview"
 
+#: src/pages/approved/PatchMatrix.tsx:246
+msgid "Source to output routing matrix"
+msgstr "Source to output routing matrix"
+
 #: src/components/broadcast/ProductionDesk.tsx:368
 msgid "source unknown"
 msgstr "source unknown"
