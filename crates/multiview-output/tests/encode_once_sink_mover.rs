@@ -67,14 +67,16 @@ impl RenditionEncoder for SpyEncoder {
             .unwrap()
             .entry(rendition.as_str().to_owned())
             .or_insert(0) += 1;
-        EncodedPacket {
-            rendition: rendition.clone(),
-            kind: PacketKind::VideoKeyframe,
-            pts: i64::try_from(tick).unwrap_or(i64::MAX),
-            dts: i64::try_from(tick).unwrap_or(i64::MAX),
-            duration: 1500,
-            data: Arc::from(vec![0u8, 1, 2, 3].into_boxed_slice()),
-        }
+        EncodedPacket::new(
+            rendition.clone(),
+            PacketKind::VideoKeyframe,
+            multiview_core::encoded_packet::StreamKind::Video,
+            false,
+            i64::try_from(tick).unwrap_or(i64::MAX),
+            i64::try_from(tick).unwrap_or(i64::MAX),
+            1500,
+            Arc::<[u8]>::from(vec![0u8, 1, 2, 3].into_boxed_slice()),
+        )
     }
 }
 

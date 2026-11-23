@@ -5,6 +5,7 @@ import type { JSX } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { PageHeader } from '../components/PageHeader';
+import { useTakeLock } from '../components/broadcast/BroadcastShell';
 import { Button } from '../components/ui/button';
 import { Label } from '../components/ui/label';
 import { Input } from '../components/ui/input';
@@ -48,6 +49,7 @@ function SwitcherMonitor({ bus, path }: { readonly bus: string; readonly path: s
 export function SwitcherPage(): JSX.Element {
   const { t } = useLingui();
   const queryClient = useQueryClient();
+  const { locked } = useTakeLock();
   const submitTracked = useSubmitTrackedOperation();
   const state = useQuery({ queryKey: STATE_KEY, queryFn: () => getSwitcher(), retry: false });
   const sources = useSources();
@@ -173,7 +175,7 @@ export function SwitcherPage(): JSX.Element {
     : t`The switcher state could not be refreshed after the last operation; keyer and arm controls stay disabled until it is`;
   const refreshFailed = operationId !== undefined && settled && refreshed?.op === operationId
     && !refreshed.ok && state.dataUpdatedAt <= refreshed.at;
-  const keyerReason = ready ? refreshReason : !state.data ? t`Switcher unavailable` : submitting ? t`A switcher request is in flight` : t`Operation in flight or outcome pending`;
+  const keyerReason = locked ? t`Takes locked — unlock in the header` : ready ? refreshReason : !state.data ? t`Switcher unavailable` : submitting ? t`A switcher request is in flight` : t`Operation in flight or outcome pending`;
   const [keyerError, setKeyerError] = useState<string | undefined>();
   const keyerMutate = useMutation({
     mutationFn: async (fields: Omit<KeyerRequest, 'me' | 'program'>) => {
@@ -187,6 +189,7 @@ export function SwitcherPage(): JSX.Element {
     onError: (reason: Error) => { setKeyerError(reason.message); },
   });
   const keyerVerb = (fields: Omit<KeyerRequest, 'me' | 'program'>): void => {
+    if (locked) return;
     void gated(() => keyerMutate.mutateAsync(fields)).catch(() => undefined);
   };
   // `arm` (K3): the full next-transition set, planned then commanded behind
@@ -205,8 +208,8 @@ export function SwitcherPage(): JSX.Element {
       setArmError(reason instanceof OperationApiError && reason.detail !== undefined ? `${reason.message}: ${reason.detail}` : reason.message);
     },
   });
-  const arm = (next: ArmSet): void => { void gated(() => armMutate.mutateAsync(next)).catch(() => undefined); };
-  const take = (intent: Intent): void => { void gated(() => mutate.mutateAsync(intent)).catch(() => undefined); };
+  const arm = (next: ArmSet): void => { if (locked) return; void gated(() => armMutate.mutateAsync(next)).catch(() => undefined); };
+  const take = (intent: Intent): void => { if (locked && (typeof intent === 'string' ? intent : intent.action) !== 'select_preview') return; void gated(() => mutate.mutateAsync(intent)).catch(() => undefined); };
   // The output tick now, extrapolated from the snapshot at the exact cadence
   // so a ramp's progress advances between (change-only) snapshots.
   const ramping = (state.data?.keyers ?? []).some((row) => row.ramp !== null && row.ramp !== undefined);
@@ -235,7 +238,7 @@ export function SwitcherPage(): JSX.Element {
     ...fields, me: 'me1', program: 'main', action: 'keyer_set', keyer, ...(allow ? { on_air: 'allow' } : {}),
   });
   return (
-    <main className="space-y-5 p-4">
+    <section className="space-y-5 p-4">
       <PageHeader title={t`Program / Preview switcher`} />
       {state.isError && <p role="status" className="rounded border border-amber-600 p-3">{isBackendUnavailable(state.error) ? <Trans>Switcher unavailable: this server does not provide it yet (backend not deployed). Controls are disabled.</Trans> : <Trans>Switcher unavailable: no real Program/Preview bus is attached. Controls are disabled.</Trans>}</p>}
       {state.isLoading && <p role="status"><Trans>Checking switcher engine…</Trans></p>}
@@ -256,8 +259,9 @@ export function SwitcherPage(): JSX.Element {
         mixer={mixer}
         sources={sources.data ?? []}
         disabled={!ready}
+        takesLocked={locked}
         onSelect={(action, input) => { take({ action, input }); }}
-        onRepatch={async (request) => { await gated(() => repatch.mutateAsync(request)).catch(() => undefined); }}
+        onRepatch={async (request) => { if (locked) throw new Error(t`Takes locked — unlock in the header`); await gated(() => repatch.mutateAsync(request)).catch(() => undefined); }}
       />}
       {mixer === undefined && <div className="flex flex-wrap items-end gap-3">
         <div className="space-y-1"><Label htmlFor="switcher-source"><Trans>Source</Trans></Label>
@@ -266,13 +270,14 @@ export function SwitcherPage(): JSX.Element {
             {sources.data?.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}
           </select>
         </div>
-        <Button disabled={!ready || selected === ''} onClick={() => { take('select_preview'); }}><Trans>Select PVW</Trans></Button>
-        <Button disabled={!ready || selected === ''} onClick={() => { take('select_program'); }}><Trans>Punch PGM</Trans></Button>
+        <Button disabled={!ready || selected === ''} onClick={() => { take('select_preview'); }}><Trans>Preview selected source</Trans></Button>
+        <Button disabled={!ready || locked || selected === ''} onClick={() => { take('select_program'); }}><Trans>Send selected source to air</Trans></Button>
       </div>}
-      <div className="flex flex-wrap items-end gap-3">
-        <Button disabled={!ready} onClick={() => { take('cut'); }}><Trans>Cut</Trans></Button>
+      {locked && <p role="status"><Trans>Takes are locked. Use the Takes locked control in the header to unlock. A confirmed engine state is also required.</Trans></p>}
+      <div className="flex flex-wrap items-end gap-3 rounded-lg border p-3">
+        <Button disabled={!ready || locked} onClick={() => { take('cut'); }}><Trans>Cut preview to air</Trans></Button>
         <div className="space-y-1"><Label htmlFor="switcher-duration"><Trans>Auto frames</Trans></Label><Input id="switcher-duration" type="number" min="1" max="1000" value={duration} onChange={(event) => { setDuration(event.target.value); }} /></div>
-        <Button disabled={!ready || !Number.isInteger(Number(duration)) || Number(duration) < 1} onClick={() => { take('auto'); }}><Trans>Auto</Trans></Button>
+        <Button disabled={!ready || locked || !Number.isInteger(Number(duration)) || Number(duration) < 1} onClick={() => { take('auto'); }}><Trans>Transition preview to air</Trans></Button>
       </div>
       {refreshFailed && (
         <div role="alert" className="flex items-center gap-2" data-testid="switcher-refresh-failed">
@@ -324,6 +329,7 @@ export function SwitcherPage(): JSX.Element {
               canvas={canvas}
               onPlan={async (fields) => gated(() => planKeyer(keyerSet(row.id, fields, false)))}
               onApply={async (fields, allow) => {
+                if (locked) throw new Error(t`Takes locked — unlock in the header`);
                 // The reviewed draft, submitted as reviewed; refusals reject.
                 const result = await gated(() => submitTracked(() => commandKeyer('keyer_set', keyerSet(row.id, fields, allow), { idempotencyKey: newIdempotencyKey() }),
                   { topic: 'switcher', resource: 'me1', event: 'switcher.operation', terminal: { kind: 'switcher-operation', me: 'me1' } }));
@@ -335,7 +341,6 @@ export function SwitcherPage(): JSX.Element {
           ))}
         </section>
       )}
-      <p className="text-xs text-muted-foreground"><Trans>Aux buses and multi-M/E remain future switcher stages.</Trans></p>
-    </main>
+    </section>
   );
 }

@@ -959,7 +959,7 @@ export function PatchMatrix(): JSX.Element {
         {actDisabledReason !== undefined ? <p data-testid="matrix-act-reason" className="text-xs">{actDisabledReason}</p> : null}
         {currentPlanError !== undefined ? <p role="alert" className="text-destructive text-xs">{currentPlanError}</p> : null}
         {planLine !== undefined ? <p data-testid="matrix-plan-line" className="text-xs">{planLine}</p> : null}
-        <div className="flex items-center gap-2">
+        <div className="matrix-actions flex flex-wrap items-center gap-2">
           <TouchAction
             onPress={(): void => { void runPlan(); }}
             disabled={planDisabledReason !== undefined}
@@ -1013,7 +1013,7 @@ export function PatchMatrix(): JSX.Element {
 
       <div className="plan-panel" data-testid="matrix-recall-panel">
         <h3><Trans>Recall a stored salvo</Trans></h3>
-        <div className="flex items-end gap-2">
+        <div className="matrix-actions flex flex-wrap items-end gap-2">
           <div className="grid gap-1.5">
             <Label htmlFor="recall-salvo"><Trans>Salvo</Trans></Label>
             <Select
