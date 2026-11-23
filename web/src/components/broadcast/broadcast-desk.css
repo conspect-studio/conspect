@@ -547,3 +547,22 @@
  .production-desk .bd-more .bd-transition-menu{flex-basis:100%}
  .production-desk .bd-more .bd-transition-menu>summary{white-space:normal;min-height:44px}
 }
+
+/* The lock explanation is its own row, never a fourth transition-grid cell. */
+.production-desk .bd-lock-reason{grid-column:1/-1;flex-basis:100%;font-size:12px;line-height:16px;margin:0;color:var(--bd-muted)}
+@media(min-width:1280px) and (min-height:600px){
+ .production-desk .bd-takes{position:relative}
+ .production-desk .bd-lock-reason{transform:translateY(-16px)}
+ .production-desk .bd-lock-reason{position:absolute;top:0;left:0;right:0}
+}
+
+@media(min-width:1280px) and (min-height:600px){
+ .production-desk .bd-wall-tile>span:last-child{top:3px;bottom:auto;right:3px;max-width:calc(100% - 6px);font-size:9px;line-height:11px}
+ .production-desk .bd-wall-tile>small{top:17px;left:3px;max-width:calc(100% - 6px);font-size:9px;line-height:11px}
+ .production-desk .bd-lock-reason{font-size:11px;line-height:14px}
+}
+
+@media(min-width:1280px) and (min-height:600px){
+ .production-desk[data-dense=true] .bd-wall-tile>small,
+ .production-desk[data-dense=true] .bd-wall-tile>span:last-child{height:auto;min-height:14px;line-height:12px;padding:1px 3px;white-space:nowrap}
+}
