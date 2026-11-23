@@ -536,6 +536,7 @@ pub fn merge_file_edit(
         graphics: p_graphics,
         events: p_events,
         cast: p_cast,
+        program_recordings: p_program_recordings,
     } = prev_file;
     let n = next_file;
     let a = accepted;
@@ -633,6 +634,15 @@ pub fn merge_file_edit(
         }),
         events: section(p_events, &n.events, &a.events),
         cast: section(p_cast, &n.cast, &a.cast),
+        // Keyed by the output id, the same way outputs themselves merge: a
+        // file edit of one output's recording does not clobber an accepted
+        // edit of another's (ADR-0037).
+        program_recordings: keyed(
+            p_program_recordings,
+            &n.program_recordings,
+            &a.program_recordings,
+            |entry| entry.output.clone(),
+        ),
     }
 }
 

@@ -1150,6 +1150,11 @@ pub struct Source {
     /// from (IPTV-ORG, ADR-M015). Purely informational to the engine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<SourceOrigin>,
+    /// Isolated per-source recording (ADR-0037). Absent ⇒ this source is not
+    /// recorded. Declaring it does not start a write: `armed` defaults to
+    /// `false`, and arming is a separate operational command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iso: Option<crate::recording::IsoRecording>,
 }
 
 /// Per-source event observation configuration (ADR-0183).
@@ -1281,6 +1286,9 @@ impl Source {
             playlist_metadata: _,
             // Catalogue provenance/follow metadata (IPTV-ORG), never media.
             origin: _,
+            // Recording is a best-effort sink (ADR-0037): arming it never
+            // touches the producer, so it is policy, not media.
+            iso: _,
         } = self;
         *id == other.id
             && *display_name == other.display_name
@@ -3167,6 +3175,26 @@ impl Output {
             // stage of the H.264 rendition it consumes.
             | Output::Cast { gpu_pin, .. } => gpu_pin.as_ref(),
         }
+    }
+
+    /// The Program recording attached to this output, if the document declared
+    /// one (ADR-0037).
+    ///
+    /// Recording is not a field of this enum. It lives in
+    /// [`crate::MultiviewConfig::program_recordings`], keyed by [`Output::id`],
+    /// because a field on every variant would break every constructor for a
+    /// value that is absent on every existing document. This is the accessor
+    /// the recording brief asks for.
+    #[must_use]
+    pub fn program<'a>(
+        &self,
+        recordings: &'a [crate::recording::ProgramRecordingEntry],
+    ) -> Option<&'a crate::recording::ProgramRecording> {
+        let id = self.id();
+        recordings
+            .iter()
+            .find(|entry| entry.output == id)
+            .map(|entry| &entry.recording)
     }
 
     /// The per-output audio selection, if any. `None` ⇒ the engine carries the

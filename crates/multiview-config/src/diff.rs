@@ -211,6 +211,7 @@ impl ConfigDiff {
             graphics: running_graphics,
             events: running_events,
             cast: running_cast,
+            program_recordings: running_program_recordings,
         } = running;
         let MultiviewConfig {
             schema_version: next_schema_version,
@@ -248,6 +249,7 @@ impl ConfigDiff {
             graphics: next_graphics,
             events: next_events,
             cast: next_cast,
+            program_recordings: next_program_recordings,
         } = next;
 
         // Canvas: the pinned signal is geometry + cadence BY VALUE (the
@@ -283,7 +285,7 @@ impl ConfigDiff {
         let media_changed = running_media_library != next_media_library
             || running_media_players != next_media_players;
         let mut changed_sections = BTreeSet::new();
-        let sectioned: [(&'static str, bool); 30] = [
+        let sectioned: [(&'static str, bool); 31] = [
             (
                 "schema_version",
                 running_schema_version != next_schema_version,
@@ -358,6 +360,14 @@ impl ConfigDiff {
             // Read when the control plane starts (the ladder route's rung
             // set), so a change waits for a restart.
             ("cast", running_cast != next_cast),
+            // Program recording is a best-effort sink (ADR-0037, Class-1):
+            // surfaced so a file edit is never dropped. The arm itself is an
+            // operational command; a changed declaration waits for the
+            // recorder to re-read it.
+            (
+                "program_recordings",
+                running_program_recordings != next_program_recordings,
+            ),
         ];
         for (name, changed) in sectioned {
             if changed {

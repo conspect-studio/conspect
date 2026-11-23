@@ -57,6 +57,7 @@ pub mod placement;
 pub mod playback;
 pub mod probe;
 pub mod program;
+pub mod recording;
 pub mod rendition;
 pub mod routing;
 pub mod salvo;
@@ -139,6 +140,10 @@ pub use playback::{
 };
 pub use probe::{DetectionZone, Dwell, LoudnessTarget, Probe, ProbeKind};
 pub use program::{ProgramId, ProgramKind, ProgramSpec};
+pub use recording::{
+    validate_iso, validate_program, DiskPolicy, IsoContainer, IsoRecording, ProgramFeed,
+    ProgramRecording, ProgramRecordingEntry, RemuxFormat, RetentionPolicy, SegmentPolicy,
+};
 pub use rendition::{
     plan_from_config, AudioRenditionKey, AudioTrackId, EncodeCapabilities, MuxBinding,
     OutputTransport, RenditionAudioCodec, RenditionColorKey, RenditionPlan, RenditionPlanError,
@@ -632,6 +637,16 @@ pub struct MultiviewConfig {
     /// section does not serialize.
     #[serde(default, skip_serializing_if = "cast::CastConfig::is_default")]
     pub cast: cast::CastConfig,
+    /// Program recordings, one per output, keyed by the output's resolved id
+    /// (ADR-0037). Authored as `[[program_recordings]]` rather than a field of
+    /// every [`Output`] variant: see [`recording`]. Absent ⇒ no output is
+    /// recorded.
+    #[serde(
+        default,
+        rename = "program_recordings",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub program_recordings: Vec<ProgramRecordingEntry>,
 }
 
 /// Shape-check the id a weather / graphics source references.
@@ -876,6 +891,7 @@ impl MultiviewConfig {
             timing.validate()?;
         }
         self.cast.validate()?;
+        self.validate_program_recordings()?;
 
         // Solving + the core structural check covers geometry (rects in 0..1,
         // positive extent, valid cadence) and grid wiring (areas resolve).
@@ -897,6 +913,33 @@ impl MultiviewConfig {
     /// Returns [`ConfigError::Validation`] naming the first violated invariant.
     pub fn validate_with_now(&self, now: DateTime<Utc>) -> Result<(), ConfigError> {
         self.validate_with(None, Some(now))
+    }
+
+    /// Program recordings name a declared output, at most once, and honour the
+    /// same bounds an ISO recording does (ADR-0037).
+    fn validate_program_recordings(&self) -> Result<(), ConfigError> {
+        let mut seen: HashSet<String> = HashSet::with_capacity(self.program_recordings.len());
+        for entry in &self.program_recordings {
+            if entry.output.is_empty() {
+                return Err(ConfigError::Validation(
+                    "a program recording names an empty output id".to_owned(),
+                ));
+            }
+            if !self.outputs.iter().any(|output| output.id() == entry.output) {
+                return Err(ConfigError::Validation(format!(
+                    "program recording names undeclared output {:?}",
+                    entry.output
+                )));
+            }
+            if !seen.insert(entry.output.clone()) {
+                return Err(ConfigError::Validation(format!(
+                    "output {:?} has more than one program recording",
+                    entry.output
+                )));
+            }
+            recording::validate_program(&entry.output, &entry.recording)?;
+        }
+        Ok(())
     }
 
     /// Validate per-source kind-specific fields so a config that validates cannot
@@ -2415,6 +2458,9 @@ impl Source {
         }
         self.validate_automation()?;
         self.validate_origin_and_headers()?;
+        if let Some(iso) = &self.iso {
+            recording::validate_iso(&self.id, iso, &self.kind)?;
+        }
         match &self.kind {
             SourceKind::Solid { color } => {
                 if parse_hex_color(color).is_none() {
