@@ -261,7 +261,7 @@ mod tests {
         let mut first = source.take().unwrap();
         let second = source.take().unwrap();
         first.bytes()[0] = 42;
-        recycler.recycle(first).unwrap();
+        assert!(recycler.recycle(first).is_ok());
         let mut recycled = source.take().unwrap();
         assert_eq!(recycled.bytes()[0], 42);
         drop(second);
