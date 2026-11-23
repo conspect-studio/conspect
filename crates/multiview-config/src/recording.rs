@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn toml_and_json_round_trip() {
-        let recording = iso(true);
+        let mut recording = iso(true);
         let toml_text = toml::to_string(&recording).unwrap();
         let back: IsoRecording = toml::from_str(&toml_text).unwrap();
         assert_eq!(back, recording);
