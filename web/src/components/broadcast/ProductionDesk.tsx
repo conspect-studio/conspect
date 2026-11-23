@@ -67,7 +67,7 @@ function ProgramLevels(): JSX.Element {
 /** Truthful wall label from the live tile lifecycle; no tile means unconfirmed. */
 function TileLabel({ tile }: { readonly tile: LiveTile | undefined }): JSX.Element {
   if (!tile) return <Trans>Signal unconfirmed</Trans>;
-  return tile.state === 'LIVE' ? <Trans>Live</Trans> : tile.state === 'RECONNECTING' ? <Trans>Starting</Trans> : tile.state === 'STALE' ? <Trans>Stale</Trans> : <Trans>No signal</Trans>;
+  return tile.state === 'LIVE' ? <Trans>Input receiving</Trans> : tile.state === 'RECONNECTING' ? <Trans>Starting</Trans> : tile.state === 'STALE' ? <Trans>Stale</Trans> : <Trans>No signal</Trans>;
 }
 
 /** Tally text + glyph (never colour alone); unknown stays unknown. */
@@ -118,7 +118,7 @@ function SourcePicture({ id, demand }: { readonly id: string; readonly demand: S
   // holds its 5 s preview demand, and dropping it would lapse the lease and flip
   // the tile to "Idle" (a scoped viewer, or a wall without that cell, has no other
   // demand keeper). The route answers the typed problem instead of a frame.
-  const { url, state } = useJpegStill(`/api/v1/preview/inputs/${encodeURIComponent(id)}.jpg`, 2000, !wall.live);
+  const { url, state, requestFailed } = useJpegStill(`/api/v1/preview/inputs/${encodeURIComponent(id)}.jpg`, 2000, !wall.live);
   if (wall.live) return <WallCrop source={id} label={t`Source live preview`} className="bd-source-picture" />;
   const reason = tileDetail(demand?.detail);
   if (phase === 'failed') return <span role="status" className="bd-slate" data-testid="tile-failed"><span className="bd-slate-title"><Trans>No signal</Trans></span>{reason !== undefined ? <span className="bd-slate-detail" data-testid="tile-failed-detail">{reason}</span> : null}</span>;
@@ -126,6 +126,7 @@ function SourcePicture({ id, demand }: { readonly id: string; readonly demand: S
     ? <><img className="bd-source-picture" src={url} alt={t`Source still preview`} data-still-state={state} /><em className="bd-tile-overlay" data-testid="tile-starting"><Trans>Starting</Trans></em></>
     : <span role="status" className="bd-slate" data-testid="tile-starting"><span className="bd-slate-title"><Trans>Starting</Trans></span></span>;
   if (url !== undefined) return <><img className="bd-source-picture" src={url} alt={t`Source still preview`} data-still-state={state} />{state === 'stale' ? <em className="bd-stale" data-testid="tile-stale"><Trans>Stale frame</Trans></em> : null}</>;
+  if (requestFailed) return <span role="status" className="bd-slate" data-testid="tile-preview-failed"><Trans>Preview request failed — retrying</Trans></span>;
   if (phase === 'idle') return <span role="status" className="bd-slate" data-testid="tile-idle"><span className="bd-slate-title"><Trans>Idle — not in use</Trans></span></span>;
   return <span data-testid="tile-no-frame"><Trans>No confirmed frame</Trans></span>;
 }

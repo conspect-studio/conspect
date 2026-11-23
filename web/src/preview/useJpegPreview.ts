@@ -22,6 +22,8 @@ export interface JpegStill {
   readonly url: string | undefined;
   /** loading: no frame yet; fresh; stale: last frame older than the bound; unavailable: route not served. */
   readonly state: StillState;
+  /** A failed request is not evidence that the input itself has no video. */
+  readonly requestFailed: boolean;
 }
 
 /** Re-probe interval for a route found not served (HTML 200 / 404 / 405 / 501). */
@@ -45,6 +47,7 @@ export function useJpegStill(path: string, refreshMs: number, enabled = true): J
   const [frame, setFrame] = useState<{ path: string; url: string }>();
   const [status, setStatus] = useState<{ path: string; state: StillState }>();
   const current = useRef<string | undefined>(undefined);
+  const [failedPath, setFailedPath] = useState<string>();
 
   useEffect(() => {
     if (!enabled) return;
@@ -94,6 +97,7 @@ export function useJpegStill(path: string, refreshMs: number, enabled = true): J
           setFrame({ path, url: next });
           unavailableAt = undefined;
           setStatus({ path, state: 'fresh' });
+          setFailedPath(undefined);
           window.clearTimeout(staleTimer);
           staleTimer = window.setTimeout(() => {
             setStatus((s) => (s?.path === path && s.state === 'fresh' ? { path, state: 'stale' } : s));
@@ -102,6 +106,7 @@ export function useJpegStill(path: string, refreshMs: number, enabled = true): J
         }
         // 2xx non-image (SPA index) or 404/405/501: the route is not served.
         if (controller !== requestController) return;
+        setFailedPath(path);
         if (resp.ok || resp.status === 404 || resp.status === 405 || resp.status === 501) {
           window.clearTimeout(staleTimer);
           revoke();
@@ -111,7 +116,8 @@ export function useJpegStill(path: string, refreshMs: number, enabled = true): J
         }
         // Any other failure (503, 5xx, 401…) is transient: keep the last frame.
       } catch {
-        // Best-effort preview; a failed fetch just keeps the last frame.
+        // Preserve the last frame, but expose the failure independently of age.
+        if (controller === requestController && !requestController.signal.aborted) setFailedPath(path);
       } finally {
         if (controller === requestController) {
           controller = undefined;
@@ -133,7 +139,7 @@ export function useJpegStill(path: string, refreshMs: number, enabled = true): J
 
   const url = frame?.path === path ? frame.url : undefined;
   const state = status?.path === path ? status.state : 'loading';
-  return { url, state };
+  return { url, state, requestFailed: failedPath === path };
 }
 
 /** Compatibility wrapper: the frame URL only (undefined while loading/unavailable). */

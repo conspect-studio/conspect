@@ -25,7 +25,7 @@
 .bd-top-actions{display:flex;align-items:center;gap:8px;margin-left:auto}
 .bd-icon,.bd-lock{display:inline-flex;justify-content:center;align-items:center;gap:8px;min-width:48px;padding:0 12px;border:1px solid var(--bd-line2);border-radius:8px;background:var(--bd-bg2);color:var(--bd-text);font-size:12px;white-space:nowrap}
 .bd-lock{border-radius:999px;font-weight:800;gap:6px}
-.bd-lock[aria-pressed=true]{background:#3dd68c;border-color:#3dd68c;color:#062015}
+.bd-lock[aria-pressed=true]{background:var(--bd-bg2);border-color:var(--bd-line2);color:var(--bd-text)}
 .bd-lock[aria-pressed=false]{background:var(--bd-bg2);color:var(--bd-text);border-color:var(--bd-amber)}
 .bd-icon{position:relative}
 .bd-badge{position:absolute;top:4px;right:4px;min-width:18px;height:18px;padding:0 4px;border-radius:9px;background:var(--bd-red);color:#1c0509;font:800 12px/18px monospace;text-align:center}
@@ -243,7 +243,7 @@
 .bd-meters em{display:block;height:100%;background:#3dd68c}
 .bd-meters b{min-width:80px;text-align:right;font-weight:400}
 .bd-screen-title{display:none}
-.bd-wall-tile[data-tile-state=LIVE]>span{color:#3dd68c}
+.bd-wall-tile[data-tile-state=LIVE]>span{color:var(--bd-text)}
 .bd-wall-tile[data-tile-state=NO_SIGNAL]>span,.bd-wall-tile[data-tile-state=STALE]>span{color:var(--bd-amber)}
 @media(max-width:767px){
 .bd-brand{width:auto;flex:none;gap:8px;padding:0 4px}

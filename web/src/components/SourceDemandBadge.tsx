@@ -75,7 +75,7 @@ export function SourceDemandBadge({ demand }: { readonly demand: SourceDemand | 
   switch (phase) {
     case 'ready':
       return (
-        <Badge variant="live" title={title}>
+        <Badge variant="secondary" title={title}>
           <CircleDot className="size-3.5" aria-hidden="true" />
           <span><Trans>Ready</Trans></span>
           <span className="sr-only">{title}</span>
