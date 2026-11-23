@@ -4356,6 +4356,7 @@ dependencies = [
  "multiview-input",
  "multiview-ndi-sys",
  "multiview-rist-sys",
+ "multiview-spsc",
  "multiview-srt-sys",
  "multiview-telemetry",
  "proptest",
@@ -4408,6 +4409,10 @@ dependencies = [
  "multiview-telemetry",
  "thiserror 2.0.18",
 ]
+
+[[package]]
+name = "multiview-spsc"
+version = "0.1.0"
 
 [[package]]
 name = "multiview-srt-sys"
