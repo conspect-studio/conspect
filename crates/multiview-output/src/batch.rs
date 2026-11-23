@@ -432,7 +432,7 @@ impl BoundedBatchQueue {
         self.pop_at(Instant::now()).ok().flatten()
     }
 
-    /// Take a window at `now`; a stale or reversed clock invalidates the GOP.
+    /// Invalidate the backlog if its oldest window is stale or time reversed.
     /// In-flight windows still own their reservations after invalidation.
     ///
     /// # Errors
