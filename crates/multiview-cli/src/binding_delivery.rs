@@ -1459,6 +1459,35 @@ mod tests {
     }
 
     #[test]
+    fn quiet_full_handoff_expires_pending_and_queued_windows() {
+        let (mut delivery, receivers) = BindingDelivery::new(
+            vec![BindingPolicy::Bounded],
+            DeliveryLimits {
+                max_packets: 64,
+                max_bytes: 1024 * 1024,
+                max_age: Duration::from_millis(10),
+            },
+            vec![None],
+        );
+        let start = Instant::now();
+        let span = tick_span(Rational::new(30_000, 1001));
+        for _ in 0..20 {
+            delivery.stage(&[packet(2)]);
+            delivery.flush_tick(start, span);
+        }
+        assert!(delivery.bindings[0].pending.is_some());
+        assert!(delivery.statuses()[0].queued_windows > 0);
+        delivery.pump(start + Duration::from_millis(11));
+        let status = delivery.statuses()[0];
+        assert_eq!(status.last_rejection, Some(RejectionReason::OldestAge));
+        assert!(status.generation > 0);
+        assert_eq!(status.queued_windows, 0);
+        assert!(delivery.bindings[0].pending.is_none());
+        drop(receivers);
+        delivery.finish();
+    }
+
+    #[test]
     fn stale_queued_window_is_flushed_with_an_age_reason() {
         let (mut delivery, receivers) = BindingDelivery::new(
             vec![BindingPolicy::Bounded],
