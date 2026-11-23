@@ -2441,6 +2441,9 @@ pub enum Output {
         /// with the output's codec and one program audio slot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         slots: Option<OutputSlots>,
+        /// Program recording policy. Absent means this output is not recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<crate::recording::ProgramRecording>,
     },
     /// Low-latency HLS packager.
     LlHls {
@@ -2483,6 +2486,9 @@ pub enum Output {
         /// with the output's codec and one program audio slot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         slots: Option<OutputSlots>,
+        /// Program recording policy. Absent means this output is not recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<crate::recording::ProgramRecording>,
     },
     /// HLS packager.
     Hls {
@@ -2525,6 +2531,9 @@ pub enum Output {
         /// with the output's codec and one program audio slot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         slots: Option<OutputSlots>,
+        /// Program recording policy. Absent means this output is not recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<crate::recording::ProgramRecording>,
     },
     /// NDI output.
     Ndi {
@@ -2563,6 +2572,9 @@ pub enum Output {
         /// with the output's codec and one program audio slot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         slots: Option<OutputSlots>,
+        /// Program recording policy. Absent means this output is not recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<crate::recording::ProgramRecording>,
     },
     /// RTMP push.
     Rtmp {
@@ -2613,6 +2625,9 @@ pub enum Output {
         /// with the output's codec and one program audio slot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         slots: Option<OutputSlots>,
+        /// Program recording policy. Absent means this output is not recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<crate::recording::ProgramRecording>,
     },
     /// SRT push.
     ///
@@ -2660,6 +2675,9 @@ pub enum Output {
         /// with the output's codec and one program audio slot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         slots: Option<OutputSlots>,
+        /// Program recording policy. Absent means this output is not recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<crate::recording::ProgramRecording>,
         /// Optional typed SRT options: mode, latency, `AES` encryption via a
         /// passphrase reference, stream id, listener, `oheadbw_pct`, `maxbw`,
         /// the peer-idle/connect timeouts, and `backend`. Runtime wiring is
@@ -2708,6 +2726,9 @@ pub enum Output {
         /// with the output's codec and one program audio slot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         slots: Option<OutputSlots>,
+        /// Program recording policy. Absent means this output is not recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<crate::recording::ProgramRecording>,
         /// Optional typed RIST options (profile, buffer, pkt size, PSK
         /// encryption, bonding peers).
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2789,6 +2810,9 @@ pub enum Output {
         /// with the output's codec and one program audio slot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         slots: Option<OutputSlots>,
+        /// Program recording policy. Absent means this output is not recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<crate::recording::ProgramRecording>,
     },
     /// WHIP push (RFC 9725 **client**): publishes the program to a remote WHIP
     /// endpoint — the WebRTC sibling of the `rtmp`/`srt` push variants
@@ -2853,6 +2877,9 @@ pub enum Output {
         /// with the output's codec and one program audio slot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         slots: Option<OutputSlots>,
+        /// Program recording policy. Absent means this output is not recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<crate::recording::ProgramRecording>,
     },
     /// AES67 / SMPTE ST 2110-30 PCM-audio RTP output (open-audio over IP).
     ///
@@ -2910,6 +2937,9 @@ pub enum Output {
         /// with the output's codec and one program audio slot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         slots: Option<OutputSlots>,
+        /// Program recording policy. Absent means this output is not recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<crate::recording::ProgramRecording>,
     },
     /// Local DRM/KMS display-head output (HDMI/DisplayPort glass) — ADR-0044.
     ///
@@ -2973,6 +3003,9 @@ pub enum Output {
         /// with the output's codec and one program audio slot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         slots: Option<OutputSlots>,
+        /// Program recording policy. Absent means this output is not recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<crate::recording::ProgramRecording>,
     },
     /// Cast output (ADR-0111): an HLS + CMAF fMP4 stream for a Google Cast
     /// receiver, written to a private directory **only while a cast stream is
@@ -3029,6 +3062,9 @@ pub enum Output {
         /// video slot with the output's codec and one program audio slot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         slots: Option<OutputSlots>,
+        /// Program recording policy. Absent means this output is not recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<crate::recording::ProgramRecording>,
     },
 }
 
@@ -3177,24 +3213,24 @@ impl Output {
         }
     }
 
-    /// The Program recording attached to this output, if the document declared
-    /// one (ADR-0037).
-    ///
-    /// Recording is not a field of this enum. It lives in
-    /// [`crate::MultiviewConfig::program_recordings`], keyed by [`Output::id`],
-    /// because a field on every variant would break every constructor for a
-    /// value that is absent on every existing document. This is the accessor
-    /// the recording brief asks for.
+    /// The Program recording policy attached directly to this output, if any.
+    /// `None` means the output cannot record until a policy is declared.
     #[must_use]
-    pub fn program<'a>(
-        &self,
-        recordings: &'a [crate::recording::ProgramRecordingEntry],
-    ) -> Option<&'a crate::recording::ProgramRecording> {
-        let id = self.id();
-        recordings
-            .iter()
-            .find(|entry| entry.output == id)
-            .map(|entry| &entry.recording)
+    pub const fn program(&self) -> Option<&crate::recording::ProgramRecording> {
+        match self {
+            Output::RtspServer { program, .. }
+            | Output::LlHls { program, .. }
+            | Output::Hls { program, .. }
+            | Output::Ndi { program, .. }
+            | Output::Rtmp { program, .. }
+            | Output::Srt { program, .. }
+            | Output::Rist { program, .. }
+            | Output::Webrtc { program, .. }
+            | Output::WhipPush { program, .. }
+            | Output::Aes67 { program, .. }
+            | Output::Display { program, .. }
+            | Output::Cast { program, .. } => program.as_ref(),
+        }
     }
 
     /// The per-output audio selection, if any. `None` ⇒ the engine carries the

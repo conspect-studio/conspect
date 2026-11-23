@@ -142,7 +142,7 @@ pub use probe::{DetectionZone, Dwell, LoudnessTarget, Probe, ProbeKind};
 pub use program::{ProgramId, ProgramKind, ProgramSpec};
 pub use recording::{
     validate_iso, validate_program, DiskPolicy, IsoContainer, IsoRecording, ProgramFeed,
-    ProgramRecording, ProgramRecordingEntry, RemuxFormat, RetentionPolicy, SegmentPolicy,
+    ProgramRecording, RemuxFormat, RetentionPolicy, SegmentPolicy,
 };
 pub use rendition::{
     plan_from_config, AudioRenditionKey, AudioTrackId, EncodeCapabilities, MuxBinding,
@@ -637,16 +637,6 @@ pub struct MultiviewConfig {
     /// section does not serialize.
     #[serde(default, skip_serializing_if = "cast::CastConfig::is_default")]
     pub cast: cast::CastConfig,
-    /// Program recordings, one per output, keyed by the output's resolved id
-    /// (ADR-0037). Authored as `[[program_recordings]]` rather than a field of
-    /// every [`Output`] variant: see [`recording`]. Absent ⇒ no output is
-    /// recorded.
-    #[serde(
-        default,
-        rename = "program_recordings",
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    pub program_recordings: Vec<ProgramRecordingEntry>,
 }
 
 /// Shape-check the id a weather / graphics source references.
@@ -915,29 +905,12 @@ impl MultiviewConfig {
         self.validate_with(None, Some(now))
     }
 
-    /// Program recordings name a declared output, at most once, and honour the
-    /// same bounds an ISO recording does (ADR-0037).
+    /// A Program recording belongs to one output by construction.
     fn validate_program_recordings(&self) -> Result<(), ConfigError> {
-        let mut seen: HashSet<String> = HashSet::with_capacity(self.program_recordings.len());
-        for entry in &self.program_recordings {
-            if entry.output.is_empty() {
-                return Err(ConfigError::Validation(
-                    "a program recording names an empty output id".to_owned(),
-                ));
+        for output in &self.outputs {
+            if let Some(program) = output.program() {
+                recording::validate_program(&output.id(), program)?;
             }
-            if !self.outputs.iter().any(|output| output.id() == entry.output) {
-                return Err(ConfigError::Validation(format!(
-                    "program recording names undeclared output {:?}",
-                    entry.output
-                )));
-            }
-            if !seen.insert(entry.output.clone()) {
-                return Err(ConfigError::Validation(format!(
-                    "output {:?} has more than one program recording",
-                    entry.output
-                )));
-            }
-            recording::validate_program(&entry.output, &entry.recording)?;
         }
         Ok(())
     }

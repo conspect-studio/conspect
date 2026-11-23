@@ -89,10 +89,10 @@ fn base_document_is_valid() {
 fn recording_is_additive_and_its_rules_reject_bad_input() {
     let cfg = MultiviewConfig::load_from_toml(BASE).unwrap();
     assert!(cfg.sources.iter().all(|source| source.iso.is_none()));
-    assert!(cfg.program_recordings.is_empty());
+    assert!(cfg.outputs.iter().all(|output| output.program().is_none()));
     let rewritten = toml::to_string(&cfg).unwrap();
     assert!(
-        !rewritten.contains("program_recordings"),
+        !rewritten.contains("[outputs.program]"),
         "an unrecorded document must not grow a recording section: {rewritten}"
     );
 
@@ -113,14 +113,13 @@ fn recording_is_additive_and_its_rules_reject_bad_input() {
          min_free_gib = 10\n\
          stop_at_pct = 80\n\
          \n\
-         [[program_recordings]]\n\
-         output = \"rtsp_server /multiview\"\n\
+         [outputs.program]\n\
          armed = true\n\
-         [program_recordings.segment]\n\
+         [outputs.program.segment]\n\
          duration_seconds = 6\n\
-         [program_recordings.retention]\n\
+         [outputs.program.retention]\n\
          keep_size_gib = 50\n\
-         [program_recordings.disk]\n\
+         [outputs.program.disk]\n\
          min_free_gib = 10\n\
          stop_at_pct = 80\n"
     );
@@ -128,12 +127,12 @@ fn recording_is_additive_and_its_rules_reject_bad_input() {
     cfg.validate().expect("a well-formed recording validates");
     let cam = cfg.sources.iter().find(|s| s.id == "cam1").unwrap();
     assert!(cam.iso.as_ref().unwrap().armed);
-    let program = cfg.outputs[0].program(&cfg.program_recordings);
+    let program = cfg.outputs[0].program();
     assert!(program.unwrap().armed);
 
     let json = serde_json::to_string(&cfg).unwrap();
     let back = MultiviewConfig::load_from_json(&json).unwrap();
-    assert_eq!(back.program_recordings, cfg.program_recordings);
+    assert_eq!(back.outputs[0].program(), cfg.outputs[0].program());
     assert_eq!(
         back.sources.iter().find(|s| s.id == "cam1").unwrap().iso,
         cam.iso
@@ -161,15 +160,13 @@ fn recording_is_additive_and_its_rules_reject_bad_input() {
     cfg.validate()
         .expect("byte_exact is legal on an srt source");
 
-    let bars_exact = byte_exact.replace("kind = \"srt\"\nurl = \"srt://[::1]:9000\"\n", "kind = \"bars\"\n");
+    let bars_exact = byte_exact.replace(
+        "kind = \"srt\"\nurl = \"srt://[::1]:9000\"\n",
+        "kind = \"bars\"\n",
+    );
     let cfg = MultiviewConfig::load_from_toml(&bars_exact).unwrap();
     let err = cfg.validate().expect_err("byte_exact on bars");
     assert!(err.to_string().contains("byte_exact"), "{err}");
-
-    let missing = good.replace("output = \"rtsp_server /multiview\"", "output = \"no-such\"");
-    let cfg = MultiviewConfig::load_from_toml(&missing).unwrap();
-    let err = cfg.validate().expect_err("undeclared output");
-    assert!(err.to_string().contains("no-such"), "{err}");
 }
 
 #[test]

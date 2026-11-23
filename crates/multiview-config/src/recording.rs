@@ -4,13 +4,9 @@
 //! and re-serialises exactly as before. Every union is internally tagged by
 //! `kind` (never `untagged`, ADR-0010).
 //!
-//! Where the brief attaches `program` as a field of every [`crate::Output`]
-//! variant, this crate keeps it in [`crate::MultiviewConfig::program_recordings`]
-//! keyed by the output's resolved id. `Output` is a twelve-variant enum whose
-//! fields are private and constructed at hundreds of sites; a new field on
-//! every variant would be a breaking constructor change for a value that is
-//! `None` on every document that exists today. [`crate::Output::program`] still
-//! exists and reads the map, which is the accessor the brief asks for.
+//! `program` is an optional field on every [`crate::Output`] variant.
+//! An absent block leaves recording off; the field is serde-default and
+//! omitted on serialization so existing documents remain unchanged.
 
 use std::time::Duration;
 
@@ -141,7 +137,11 @@ impl DiskPolicy {
     pub const fn resume_pct(self) -> u8 {
         let band = self.resume_hysteresis_pct;
         let stop = self.stop_at_pct;
-        if band >= stop { 1 } else { stop - band }
+        if band >= stop {
+            1
+        } else {
+            stop - band
+        }
     }
 
     /// Minimum free bytes (`f_bavail`), saturating.
@@ -285,20 +285,6 @@ impl ProgramFeed {
     }
 }
 
-/// One Program recording attached to an output by its resolved id.
-///
-/// Authored as `[[program_recordings]]` because `Output` cannot grow a field
-/// without touching every constructor (see the module docs).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct ProgramRecordingEntry {
-    /// The output's resolved id ([`crate::Output::id`]).
-    pub output: String,
-    /// The recording.
-    #[serde(flatten)]
-    pub recording: ProgramRecording,
-}
-
 /// Reject an ISO block that cannot be honoured.
 ///
 /// `owner` is the source id, used only in the error text.
@@ -382,6 +368,15 @@ fn validate_common(
              (keep_duration_seconds, keep_size_gib, or max_segments)"
         )));
     }
+    if retention.keep_duration_seconds == Some(0)
+        || retention.keep_size_gib == Some(0)
+        || retention.max_segments == Some(0)
+        || disk.min_free_gib == 0
+    {
+        return Err(ConfigError::Validation(format!(
+            "{what}: retention bounds and disk.min_free_gib must be positive"
+        )));
+    }
     if let Some(path) = location {
         if path.is_empty() || !path.starts_with('/') {
             return Err(ConfigError::Validation(format!(
@@ -429,7 +424,10 @@ mod tests {
         let mut recording = iso(true);
         recording.retention = RetentionPolicy::default();
         let err = validate_iso("cam1", &recording, &SourceKind::Bars).unwrap_err();
-        assert!(err.to_string().contains("at least one retention bound"), "{err}");
+        assert!(
+            err.to_string().contains("at least one retention bound"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -438,6 +436,23 @@ mod tests {
         recording.segment = SegmentPolicy::new(0);
         let err = validate_iso("cam1", &recording, &SourceKind::Bars).unwrap_err();
         assert!(err.to_string().contains("duration_seconds"), "{err}");
+    }
+
+    #[test]
+    fn zero_retention_or_disk_budget_is_rejected() {
+        let kind = SourceKind::Bars;
+        let mut recording = iso(true);
+        recording.retention.keep_duration_seconds = Some(0);
+        assert!(validate_iso("cam1", &recording, &kind).is_err());
+        recording.retention.keep_duration_seconds = Some(3600);
+        recording.retention.keep_size_gib = Some(0);
+        assert!(validate_iso("cam1", &recording, &kind).is_err());
+        recording.retention.keep_size_gib = None;
+        recording.retention.max_segments = Some(0);
+        assert!(validate_iso("cam1", &recording, &kind).is_err());
+        recording.retention.max_segments = None;
+        recording.disk.min_free_gib = 0;
+        assert!(validate_iso("cam1", &recording, &kind).is_err());
     }
 
     #[test]
