@@ -2397,7 +2397,7 @@ mod resync_tests {
         let mut n: i64 = 0;
         let next = || {
             if n % 10 == 0 {
-                std::thread::sleep(Duration::from_millis(800)); // fetch the next segment
+                std::thread::sleep(Duration::from_millis(800)); // fetch segment
             }
             let pts = multiview_core::time::MediaTime::from_nanos(n * 100_000_000);
             n += 1;
@@ -2414,6 +2414,16 @@ mod resync_tests {
                     Duration::from_secs(20),
                 );
             });
+            // Prime one segment beyond the live cushion before going on-air.
+            // The 800 ms fetch remains longer than the 500 ms pacing lead.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while store.buffered_frames() < 48_000 + 14_400 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                store.buffered_frames() >= 48_000 + 14_400,
+                "startup prefetch did not fill"
+            );
             let start = Instant::now();
             let tick = Duration::from_nanos(1_000_000_000 / 30);
             let mut started = false;
