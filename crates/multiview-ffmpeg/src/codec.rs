@@ -242,6 +242,7 @@ pub fn probe_encoder_opens(name: &'static str) -> bool {
         bit_rate: 500_000,
         gop: 25,
         cuda_device: None,
+        color: None,
     };
     match crate::VideoEncoder::new(&target) {
         Ok(_) => true,

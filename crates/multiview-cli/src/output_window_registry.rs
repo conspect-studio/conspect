@@ -1379,6 +1379,7 @@ pub(crate) mod tests {
             bit_rate: 500_000,
             gop: 12,
             cuda_device: None,
+            color: None,
         })
         .expect("opened encoder");
         let params = StreamCodecParameters::from_encoder(&encoder);
@@ -1979,6 +1980,7 @@ pub(crate) mod tests {
                 bit_rate: 100_000,
                 gop: 25,
                 cuda_device: None,
+                color: None,
             },
             &options,
         )

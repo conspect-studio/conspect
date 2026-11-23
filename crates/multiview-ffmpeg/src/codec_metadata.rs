@@ -472,6 +472,7 @@ mod tests {
             bit_rate: 100_000,
             gop: 25,
             cuda_device: None,
+            color: None,
         })
         .expect("actual native libx264 encoder opens");
         let mut frame = Video::new(Pixel::YUV420P, 64, 64);

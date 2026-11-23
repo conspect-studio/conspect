@@ -1214,6 +1214,7 @@ pub fn generate_player_clip(path: &Path, spec: &PlayerClipSpec) -> Result<()> {
         bit_rate: 0,
         gop: spec.gop.max(1),
         cuda_device: None,
+        color: None,
     })?;
     let mut mux = Muxer::create_as(path, "mov")?;
     let vindex = mux.add_stream(venc.as_codec_context(), period)?;

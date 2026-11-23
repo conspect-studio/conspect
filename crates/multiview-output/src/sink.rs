@@ -356,6 +356,10 @@ pub struct EncodeConfig {
     /// codec (the encoder gates the bind on the codec-name suffix). A bind
     /// failure degrades gracefully to a default-device open, never a panic.
     pub cuda_ordinal: Option<String>,
+    /// The canvas colour tagged onto the encoded stream (CICP, #161). `None`
+    /// leaves the stream untagged. The program pipeline sets this from the
+    /// canvas profile; tagging only labels, it does not convert pixels.
+    pub color: Option<multiview_core::color::ColorInfo>,
 }
 
 /// Configuration for the optional program-audio encoder (AUD-4).
@@ -438,6 +442,14 @@ impl EncodeConfig {
             // No device pin by default — behaviour is unchanged from before the
             // NVENC affinity seam (Tier-2 P1a); the pin is opt-in.
             cuda_ordinal: None,
+            // The SDR BT.709 limited canvas (ADR-C001): the tag every program
+            // encode carries unless a caller names another profile (#161).
+            color: Some(multiview_core::color::ColorInfo {
+                primaries: multiview_core::color::ColorPrimaries::Bt709,
+                transfer: multiview_core::color::TransferCharacteristic::Bt709,
+                matrix: multiview_core::color::MatrixCoefficients::Bt709,
+                range: multiview_core::color::ColorRange::Limited,
+            }),
         }
     }
 
@@ -471,6 +483,9 @@ impl EncodeConfig {
             // NVENC device-affinity pin (Tier-2 P1a): inert for software codecs;
             // the encoder gates the bind on the `*_nvenc` codec-name suffix.
             cuda_device: self.cuda_ordinal.clone(),
+            // #161: the canvas colour, written onto the encoder context and
+            // every frame so the coded stream carries CICP tags.
+            color: self.color,
         }
     }
 

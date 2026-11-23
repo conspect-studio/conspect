@@ -143,6 +143,7 @@ fn target() -> VideoEncodeTarget {
         bit_rate: 2_000_000,
         gop: GOP,
         cuda_device: None,
+        color: None,
     }
 }
 

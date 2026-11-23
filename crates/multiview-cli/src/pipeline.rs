@@ -3499,6 +3499,12 @@ impl Pipeline {
             // pick threads the chosen ordinal in (separate integration); behaviour
             // is unchanged from before the seam existed.
             cuda_ordinal: None,
+            color: Some(multiview_core::color::ColorInfo {
+                primaries: multiview_core::color::ColorPrimaries::Bt709,
+                transfer: multiview_core::color::TransferCharacteristic::Bt709,
+                matrix: multiview_core::color::MatrixCoefficients::Bt709,
+                range: multiview_core::color::ColorRange::Limited,
+            }),
         };
 
         // The shared outbound presentation epoch (DEV-C1 / ADR-M010): one cell

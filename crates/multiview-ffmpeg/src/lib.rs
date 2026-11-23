@@ -315,7 +315,7 @@ pub use caption_decode::{extract_a53_cc, CaptionDecoder, CaptionSource, CcChanne
 
 #[cfg(feature = "ffmpeg")]
 pub use convert::{
-    color_from_ff, from_ff_rational, pixel_to_ff, pixel_to_multiview,
+    color_from_ff, color_to_ff, from_ff_rational, pixel_to_ff, pixel_to_multiview,
     stream_kind_from_media_and_codec, to_ff_rational, MediaKind,
 };
 

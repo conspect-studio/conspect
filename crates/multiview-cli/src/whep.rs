@@ -263,6 +263,7 @@ impl PreviewVideoEncoder {
             bit_rate: PREVIEW_BITRATE,
             gop: preview_gop_frames(fps),
             cuda_device: None,
+            color: None,
         };
         VideoEncoder::new_with_options(&target, &options).ok()
     }

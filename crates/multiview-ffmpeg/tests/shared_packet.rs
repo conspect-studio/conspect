@@ -45,6 +45,7 @@ fn target(codec: &str) -> VideoEncodeTarget {
         bit_rate: 500_000,
         gop: 12,
         cuda_device: None,
+        color: None,
     }
 }
 

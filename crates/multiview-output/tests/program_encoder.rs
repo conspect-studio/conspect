@@ -51,6 +51,12 @@ fn config(fps: i64, gop: u32) -> EncodeConfig {
         bit_rate: 2_000_000,
         audio: None,
         cuda_ordinal: None,
+        color: Some(multiview_core::color::ColorInfo {
+            primaries: multiview_core::color::ColorPrimaries::Bt709,
+            transfer: multiview_core::color::TransferCharacteristic::Bt709,
+            matrix: multiview_core::color::MatrixCoefficients::Bt709,
+            range: multiview_core::color::ColorRange::Limited,
+        }),
     }
 }
 
@@ -275,4 +281,50 @@ fn video_pts_follows_the_tick_index_across_dropped_ticks() {
     pts.sort_unstable();
     let expected: Vec<i64> = ticks.iter().map(|&t| i64::try_from(t).unwrap()).collect();
     assert_eq!(pts, expected, "video PTS must equal the output tick index");
+}
+
+/// #161: the encoded program carries the canvas colour tags. The SDR BT.709
+/// limited canvas (`EncodeConfig::mpeg2`'s default, the profile every program
+/// encode tags) must read back as limited range and BT.709 primaries, transfer
+/// and matrix — never `unknown`. Verified by ffprobe on a muxed segment, the
+/// same read a player does.
+#[test]
+fn encoded_program_carries_bt709_limited_colour_tags() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clip = dir.path().join("src.ts");
+    generate_clip(&clip, 1, 10);
+    let cfg = config(10, 10);
+    let (packets, encoder) = encode_clip(&clip, &cfg);
+    assert!(!packets.is_empty(), "the clip encoded");
+    let out = dir.path().join("tagged.ts");
+    let mut src = VecPackets::new(packets);
+    PacketMuxSink::file(&out)
+        .run(&mut src, encoder.codec_params(), encoder.time_base())
+        .expect("mux");
+
+    let probe = Command::new("ffprobe")
+        .args([
+            "-hide_banner",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=color_range,color_space,color_transfer,color_primaries",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(&out)
+        .output()
+        .expect("ffprobe");
+    assert!(probe.status.success(), "ffprobe failed: {probe:?}");
+    let text = String::from_utf8_lossy(&probe.stdout);
+    let line = text.lines().next().unwrap_or("").trim();
+    assert!(
+        line.contains("tv")
+            && line.contains("bt709")
+            && !line.contains("unknown")
+            && line.matches("bt709").count() == 3,
+        "expected range=tv and bt709 primaries/transfer/matrix, got {line:?}"
+    );
 }

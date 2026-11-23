@@ -637,6 +637,7 @@ fn hls_discrete_audio_segments_carry_no_cc_discontinuity_across_boundaries() {
         bit_rate: 2_000_000,
         gop: 30,
         cuda_device: None,
+        color: None,
     };
     let mut video_encoder = VideoEncoder::new(&video_target).expect("open video encoder");
     let video_time_base = video_encoder.time_base();
@@ -876,6 +877,7 @@ fn run_mux_reopen_fault_test(persistent: bool) {
         bit_rate: 2_000_000,
         gop: 30,
         cuda_device: None,
+        color: None,
     };
     let mut encoder = VideoEncoder::new(&target).expect("video encoder");
     let time_base = encoder.time_base();

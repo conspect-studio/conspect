@@ -145,6 +145,7 @@ fn decode_reencode_mux_reopen_round_trips() {
         bit_rate: 1_000_000,
         gop: 12,
         cuda_device: None,
+        color: None,
     };
     let mut encoder = VideoEncoder::new(&target).expect("open mpeg2video encoder");
 

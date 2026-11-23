@@ -101,6 +101,7 @@ impl LiveSource {
             bit_rate: 500_000,
             gop: 10,
             cuda_device: None,
+            color: None,
         })
         .expect("encoder");
         Self {
