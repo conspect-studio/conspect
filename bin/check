@@ -30,7 +30,8 @@ GIB = 1024 ** 3
 # target cap. Later measurements attributed much of the swing to our own bounded
 # concurrent targets (~23 GiB during one run); five gates failed at 71–74 GiB.
 # Independent review rejected 45 GiB: that single sample is not a bound on other
-# writers. A 60 GiB running floor retains 45 GiB beyond this gate's 15 GiB target
+# writers. On 2026-11-23, review recommended a 60 GiB running floor. This retains
+# 45 GiB beyond this gate's 15 GiB target
 # cap, but remains only a sample: a dip between checks can still cause ENOSPC.
 # Other writers must remain bounded and space must be monitored.
 MIN_FREE = 60 * GIB
