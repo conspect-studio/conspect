@@ -4343,6 +4343,7 @@ dependencies = [
  "httpdate",
  "multiview-audio",
  "multiview-core",
+ "multiview-spsc",
  "multiview-events",
  "multiview-ffmpeg",
  "multiview-framestore",
@@ -4410,6 +4411,10 @@ dependencies = [
  "libloading 0.9.0",
  "thiserror 2.0.18",
 ]
+
+[[package]]
+name = "multiview-spsc"
+version = "0.1.0"
 
 [[package]]
 name = "multiview-telemetry"

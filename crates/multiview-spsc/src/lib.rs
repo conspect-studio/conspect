@@ -98,7 +98,8 @@ impl<T> Drop for Ring<T> {
     fn drop(&mut self) {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Relaxed);
-        for pos in head..tail {
+        for offset in 0..tail.wrapping_sub(head) {
+            let pos = head.wrapping_add(offset);
             // SAFETY: both endpoints have been dropped before the final Arc
             // releases Ring. Exactly these published slots remain initialized.
             #[allow(unsafe_code)]
@@ -258,13 +259,15 @@ mod tests {
     fn pool_recycles_and_counts_bounded_leaks() {
         let (mut source, mut recycler) = buffer_pool(2, 16).unwrap();
         let mut first = source.take().unwrap();
+        let second = source.take().unwrap();
         first.bytes()[0] = 42;
         recycler.recycle(first).unwrap();
-        let mut second = source.take().unwrap();
-        assert_eq!(second.bytes()[0], 42);
+        let mut recycled = source.take().unwrap();
+        assert_eq!(recycled.bytes()[0], 42);
         drop(second);
-        assert_eq!(source.leaked_buffers(), 1);
-        assert_eq!(recycler.leaked_buffers(), 1);
+        drop(recycled);
+        assert_eq!(source.leaked_buffers(), 2);
+        assert_eq!(recycler.leaked_buffers(), 2);
         assert!(source.take().is_none());
     }
 }
