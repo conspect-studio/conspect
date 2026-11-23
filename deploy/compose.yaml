@@ -15,7 +15,8 @@
 # Then open:     http://[::1]:8080/              the web UI (manage the engine)
 #                http://[::1]:8080/docs          the Scalar API playground
 #                http://[::1]:8888/multiview.m3u8 the multiview (VLC / ffplay)
-# Tear it down:  docker compose -f deploy/compose.yaml down -v
+# Tear it down:  docker compose -f deploy/compose.yaml down
+# Delete saved state and HLS too: docker compose -f deploy/compose.yaml down -v
 #
 # The web UI + /api/v1 + /docs are served because the published image is built
 # with the `web` feature (multiview-control/embed-web), so the SPA is embedded,
