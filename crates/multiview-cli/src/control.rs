@@ -458,7 +458,7 @@ where
     // Stored layouts persist across restarts (#176): seeding installs a fresh
     // in-memory store holding the config's working layout; move that layout into
     // the persistent store (if any) and serve from it.
-    state.repository = persist_layouts(&state.repository, boot_model.as_deref()).await;
+    state.repository = persist_layouts(&state.repository, boot_model.as_deref()).await?;
     if let Some(model) = boot_model.as_ref() {
         // `accepted()` loads the envelope once and keeps it as the in-memory
         // snapshot every later read serves (review R3-03).
@@ -4257,9 +4257,8 @@ fn restore_desired_layouts(
 /// With the `sqlite` feature and a config-file run (a boot model), layouts are
 /// persisted to `<config-dir>/.multiview/layouts.db`. Before the first desired
 /// commit that database is the legacy library; afterwards it is a projection of
-/// the envelope. Otherwise — or if the database cannot be opened — layouts live
-/// in memory for the life of the process (logged, never fatal: the control
-/// plane must still come up).
+/// the envelope. A configured persistent store that cannot open fails startup
+/// rather than accepting layout writes that would disappear on restart.
 #[cfg_attr(
     not(feature = "sqlite"),
     allow(clippy::unused_async, reason = "awaits only the sqlite open")
@@ -4267,13 +4266,12 @@ fn restore_desired_layouts(
 async fn persist_layouts(
     seeded: &Arc<dyn multiview_control::repository::Repository>,
     boot_model: Option<&multiview_control::boot_model::BootModel>,
-) -> Arc<dyn multiview_control::repository::Repository> {
+) -> std::io::Result<Arc<dyn multiview_control::repository::Repository>> {
     #[cfg(feature = "sqlite")]
     if let Some(model) = boot_model {
         let dir = model.state_dir();
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            tracing::warn!(error = %e, dir = %dir.display(), "cannot create the layout store dir; layouts are in-memory only");
-        } else {
+        std::fs::create_dir_all(&dir)?;
+        {
             let path = dir.join("layouts.db");
             let url = format!("sqlite://{}?mode=rwc", path.display());
             match multiview_control::sqlite::SqliteRepository::connect(&url).await {
@@ -4286,11 +4284,11 @@ async fn persist_layouts(
                     // (not `desired.json`) decides: after a fallback (#324) it is
                     // the last-good envelope the engine runs.
                     if !matches!(model.accepted(), Ok(None)) {
-                        return Arc::new(repo);
+                        return Ok(Arc::new(repo));
                     }
                     // A legacy library: seed ONLY absent ids. Never overwrite an
                     // operator-authored saved definition at boot.
-                    for entry in seeded.list_layouts().unwrap_or_default() {
+                    for entry in seeded.list_layouts().map_err(std::io::Error::other)? {
                         let id = entry.layout.id;
                         let input = multiview_control::repository::LayoutInput {
                             name: entry.layout.name,
@@ -4308,24 +4306,25 @@ async fn persist_layouts(
                                 }
                                 Err(error) => Err(error),
                             };
-                        if let Err(error) = result {
-                            tracing::error!(%error, layout = %id, "cannot seed the working layout");
-                        }
+                        result.map_err(std::io::Error::other)?;
                     }
-                    return Arc::new(repo);
+                    return Ok(Arc::new(repo));
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, path = %path.display(), "cannot open the layout store; layouts are in-memory only");
+                    return Err(std::io::Error::other(format!(
+                        "cannot open layout store {}: {e}",
+                        path.display()
+                    )));
                 }
             }
         }
     }
     if let Some(model) = boot_model {
         if let Some(restored) = restore_desired_layouts(model) {
-            return restored;
+            return Ok(restored);
         }
     }
-    Arc::clone(seeded)
+    Ok(Arc::clone(seeded))
 }
 
 /// Whether a decoded (non-synthetic) source kind is live-appliable in this
@@ -5840,6 +5839,49 @@ input_id = "in_b"
         joined
             .expect("serve task panicked")
             .expect("serve returned an I/O error");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn selected_layout_store_survives_restart_and_rejects_unusable_directory() {
+        use multiview_control::repository::{LayoutInput, Repository};
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config();
+        let model = multiview_control::boot_model::BootModel::new(
+            dir.path().join("config.toml"),
+            config.clone(),
+            config.clone(),
+            multiview_config::StartMode::Boot,
+            false,
+            None,
+        );
+        let seeded: Arc<dyn Repository> = Arc::new(InMemoryRepository::new());
+        {
+            let store = persist_layouts(&seeded, Some(&model)).await.unwrap();
+            store
+                .create_layout(
+                    "saved",
+                    LayoutInput {
+                        name: "Saved".into(),
+                        body: serde_json::json!({}),
+                    },
+                )
+                .unwrap();
+        }
+        let store = persist_layouts(&seeded, Some(&model)).await.unwrap();
+        assert_eq!(store.get_layout("saved").unwrap().layout.name, "Saved");
+        drop(store);
+        let bad = tempfile::tempdir().unwrap();
+        std::fs::write(bad.path().join(".multiview"), b"not a directory").unwrap();
+        let model = multiview_control::boot_model::BootModel::new(
+            bad.path().join("config.toml"),
+            config.clone(),
+            config,
+            multiview_config::StartMode::Boot,
+            false,
+            None,
+        );
+        assert!(persist_layouts(&seeded, Some(&model)).await.is_err());
     }
 
     /// ADR-W024 MAJOR-C1 (startup TOCTOU): for a config-file run (a boot model
