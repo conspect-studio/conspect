@@ -33,7 +33,7 @@ pub struct Consumer<T> {
 /// capacity or when allocating the fixed slot array fails.
 #[must_use]
 pub fn channel<T>(capacity: usize) -> Option<(Producer<T>, Consumer<T>)> {
-    if capacity == 0 || capacity > isize::MAX.cast_unsigned() {
+    if capacity == 0 || capacity > (usize::MAX / 2) {
         return None;
     }
     let mut slots = Vec::new();
@@ -56,20 +56,26 @@ impl<T> Producer<T> {
     pub fn push(&mut self, item: T) -> Result<(), T> {
         let tail = self.ring.tail.load(Ordering::Relaxed);
         let head = self.ring.head.load(Ordering::Acquire);
-        if tail.wrapping_sub(head) >= self.ring.capacity {
+        let used = if tail >= head {
+            tail - head
+        } else {
+            self.ring.capacity * 2 - head + tail
+        };
+        if used >= self.ring.capacity {
             return Err(item);
         }
         let index = tail % self.ring.capacity;
-        // SAFETY: this sole producer writes the slot only after the acquire-load
-        // head check proves it empty. The release-store of tail below publishes
-        // the completed write; the consumer cannot observe it beforehand.
+        // SAFETY: index is the cursor modulo the nonzero, fixed slot count.
+        // This sole producer writes the slot only after the acquire-load head
+        // check proves it empty. The release-store of tail below publishes the
+        // completed write; the consumer cannot observe it beforehand.
         #[allow(unsafe_code)]
         unsafe {
-            (*self.ring.slots[index].0.get()).write(item);
+            (*self.ring.slots.get_unchecked(index).0.get()).write(item);
         }
         self.ring
             .tail
-            .store(tail.wrapping_add(1), Ordering::Release);
+            .store((tail + 1) % (self.ring.capacity * 2), Ordering::Release);
         Ok(())
     }
 }
@@ -83,13 +89,14 @@ impl<T> Consumer<T> {
             return None;
         }
         let index = head % self.ring.capacity;
-        // SAFETY: acquire-loading tail observes the producer's published slot.
-        // Only this consumer reads it; release-storing head frees it for reuse.
+        // SAFETY: index is the cursor modulo the nonzero slot count. Acquiring
+        // tail observes the published slot. Only this consumer reads it; the
+        // release-store of head frees it for reuse.
         #[allow(unsafe_code)]
-        let item = unsafe { (*self.ring.slots[index].0.get()).assume_init_read() };
+        let item = unsafe { (*self.ring.slots.get_unchecked(index).0.get()).assume_init_read() };
         self.ring
             .head
-            .store(head.wrapping_add(1), Ordering::Release);
+            .store((head + 1) % (self.ring.capacity * 2), Ordering::Release);
         Some(item)
     }
 }
@@ -98,13 +105,20 @@ impl<T> Drop for Ring<T> {
     fn drop(&mut self) {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Relaxed);
-        for offset in 0..tail.wrapping_sub(head) {
-            let pos = head.wrapping_add(offset);
+        let remaining = if tail >= head {
+            tail - head
+        } else {
+            self.capacity * 2 - head + tail
+        };
+        for offset in 0..remaining {
+            let index = (head + offset) % self.capacity;
             // SAFETY: both endpoints have been dropped before the final Arc
-            // releases Ring. Exactly these published slots remain initialized.
+            // releases Ring. Exactly these published slots remain initialized;
+            // no operation between the slot write and cursor publication panics.
+            // The index is reduced modulo the nonzero number of slots.
             #[allow(unsafe_code)]
             unsafe {
-                (*self.slots[pos % self.capacity].0.get()).assume_init_drop();
+                (*self.slots.get_unchecked(index).0.get()).assume_init_drop();
             }
         }
     }
@@ -133,7 +147,7 @@ impl Buffer {
         // SAFETY: the non-Clone Buffer uniquely owns this index until recycled.
         #[allow(unsafe_code)]
         unsafe {
-            &mut *(*self.storage.buffers[self.index].get())
+            (*self.storage.buffers.get_unchecked(self.index).get()).as_mut()
         }
     }
 }
@@ -256,15 +270,64 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_order_and_capacity_one() {
+        let (mut tx, mut rx) = channel(1).unwrap();
+        let writer = std::thread::spawn(move || {
+            for value in 0..100_000 {
+                let mut item = value;
+                loop {
+                    match tx.push(item) {
+                        Ok(()) => break,
+                        Err(returned) => {
+                            item = returned;
+                            std::thread::yield_now();
+                        }
+                    }
+                }
+            }
+        });
+        for expected in 0..100_000 {
+            loop {
+                if let Some(actual) = rx.pop() {
+                    assert_eq!(actual, expected);
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn unconsumed_items_drop_exactly_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        struct Counted(Arc<AtomicUsize>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (mut tx, mut rx) = channel(2).unwrap();
+        tx.push(Counted(dropped.clone())).ok();
+        tx.push(Counted(dropped.clone())).ok();
+        drop(rx.pop());
+        drop(rx);
+        drop(tx);
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn pool_recycles_and_counts_bounded_leaks() {
         let (mut source, mut recycler) = buffer_pool(2, 16).unwrap();
         let mut first = source.take().unwrap();
-        let second = source.take().unwrap();
-        first.bytes()[0] = 42;
+        let other = source.take().unwrap();
+        first.bytes().first_mut().map(|byte| *byte = 42);
         assert!(recycler.recycle(first).is_ok());
         let mut recycled = source.take().unwrap();
-        assert_eq!(recycled.bytes()[0], 42);
-        drop(second);
+        assert_eq!(recycled.bytes().first(), Some(&42));
+        drop(other);
         drop(recycled);
         assert_eq!(source.leaked_buffers(), 2);
         assert_eq!(recycler.leaked_buffers(), 2);
