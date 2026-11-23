@@ -154,3 +154,15 @@
 /* Final-fix2: plan form actions wrap inside the panel instead of running past its edge. */
 [data-approved-page="routing"] .route-form .route-actions{flex-wrap:wrap;min-width:0;max-width:100%}
 [data-approved-page="routing"] .route-form .route-actions>*{max-width:100%}
+
+/* Plan controls belong to their panel at every viewport width. */
+[data-approved-page="routing"] .plan-panel,
+[data-approved-page="routing"] .matrix-actions,
+[data-approved-page="routing"] .matrix-actions > * { min-width:0; max-width:100%; }
+[data-approved-page="routing"] .matrix-actions button { white-space:normal; height:auto; min-height:48px; }
+@media (max-width:639px) {
+  [data-approved-page="routing"] .matrix-actions { display:grid; grid-template-columns:minmax(0,1fr); }
+  [data-approved-page="routing"] .matrix-actions > *,
+  [data-approved-page="routing"] .matrix-actions button { width:100%; }
+  [data-approved-page="routing"] .route-form { grid-template-columns:minmax(0,1fr); }
+}

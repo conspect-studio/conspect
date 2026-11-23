@@ -137,7 +137,7 @@ function useColumns(
           const blocked = blockedBySwitcher(switcherOn);
           const reasonId = `apply-blocked-${layout.id}`;
           return (
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <Button
                 variant="outline"
                 size="sm"
@@ -696,7 +696,7 @@ export function LayoutsPage(): JSX.Element {
           </Button>
         </div>
       ) : (
-        <Table>
+        <Table className="layout-list">
           <TableCaption>{t`All configured layouts.`}</TableCaption>
           <TableHeader>
             {table.getHeaderGroups().map((group) => (
@@ -718,7 +718,7 @@ export function LayoutsPage(): JSX.Element {
             {table.getRowModel().rows.map((row) => (
               <TableRow key={row.id}>
                 {row.getVisibleCells().map((cell) => (
-                  <TableCell key={cell.id}>
+                  <TableCell key={cell.id} data-column={cell.column.id} data-label={typeof cell.column.columnDef.header === 'string' ? cell.column.columnDef.header : undefined}>
                     {flexRender(cell.column.columnDef.cell, cell.getContext())}
                   </TableCell>
                 ))}
