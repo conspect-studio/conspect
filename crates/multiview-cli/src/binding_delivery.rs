@@ -1363,7 +1363,18 @@ mod tests {
         // Binding 0's sink never drains: its pump fills the one-packet handoff
         // and blocks. Binding 1 drains normally on its own thread.
         let healthy_rx = receivers.remove(1);
-        let collector = std::thread::spawn(move || drain(&healthy_rx));
+        let (consumed_tx, consumed_rx) = std::sync::mpsc::channel();
+        let collector = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            while let Ok(packet) = healthy_rx.recv() {
+                out.push(packet.packet);
+                drop(packet.permit);
+                if consumed_tx.send(out.len()).is_err() {
+                    break;
+                }
+            }
+            out
+        });
         let wedged_rx = receivers.remove(0);
         for _ in 0..20 {
             delivery.stage(&[packet(2)]);
@@ -1374,33 +1385,30 @@ mod tests {
                 "admission must never wait on a wedged sink"
             );
         }
-        // The flush loop above runs far faster than real ticks, so both queues
-        // are briefly behind their sinks. With the same producer and the same
-        // elapsed time the wedged binding's backlog must be strictly larger:
-        // its pump is blocked on a sink that never reads, while its sibling's
-        // pump keeps handing whole windows to a sink that does. The wait
-        // ends as soon as that holds; its bound only covers a loaded host's
-        // scheduling of the healthy pump and collector threads (#385).
+        // Observe the collector's progress after the entire burst. This keeps
+        // the producer independent of both sinks while making the backlog
+        // comparison conditional on the healthy sink actually having drained.
         let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let statuses = delivery.statuses();
-            let wedged = statuses[0].reserved_packets + statuses[0].queued_windows;
-            let healthy = statuses[1].reserved_packets + statuses[1].queued_windows;
-            if healthy < wedged || Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
+        for expected in 1..=20 {
+            assert_eq!(
+                consumed_rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .expect("healthy sink must drain"),
+                expected,
+            );
         }
         let statuses = delivery.statuses();
         assert_eq!(statuses[1].admitted_batches, 20);
         assert_eq!(statuses[1].rejected_batches, 0);
         assert!(!statuses[1].failed);
+        assert_eq!(
+            statuses[1].reserved_packets + statuses[1].queued_windows,
+            0,
+            "healthy sibling must be drained after each acknowledged handoff"
+        );
         assert!(
-            statuses[0].reserved_packets + statuses[0].queued_windows
-                > statuses[1].reserved_packets + statuses[1].queued_windows,
-            "wedged={:?} healthy={:?}",
-            statuses[0],
-            statuses[1]
+            statuses[0].reserved_packets + statuses[0].queued_windows > 0,
+            "wedged sink must retain outstanding work"
         );
         // Hanging the wedged sink up fails only that binding: the healthy
         // sibling keeps being admitted afterwards.

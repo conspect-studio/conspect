@@ -2381,8 +2381,9 @@ mod resync_tests {
     }
 
     /// A live HLS source: each 1 s "segment" takes 0.8 s to fetch (a slow
-    /// origin; real time is kept on average). The decoder must start the next
-    /// fetch while the previous segment is still being paced out, so the bus
+    /// origin; real time is kept on average). The initial segment fills the
+    /// source's live cushion before it goes on-air. The decoder must start the
+    /// next fetch while the previous segment is being paced out, so the bus
     /// never runs dry. (Regression: pacing sleeps on the decode thread deferred
     /// every fetch until playback was within the lead of the end, so a fetch
     /// longer than the lead was heard as a gap.)
@@ -2395,11 +2396,15 @@ mod resync_tests {
         let stop = AtomicBool::new(false);
         let block_frames = 4_800; // 100 ms
         let mut n: i64 = 0;
+        let mut initial_prefetch = true;
         let next = || {
-            // Model a segment-boundary fetch stall, followed by ten 100 ms
-            // blocks that cover 1 s of media. The first call stalls for the
-            // initial fetch; later calls stall once at each 1 s boundary.
-            if n % 10 == 0 {
+            if initial_prefetch {
+                // The first decoded segment fills the source's live cushion
+                // before it becomes on-air, as a real HLS source does.
+                initial_prefetch = false;
+            } else if n % 10 == 0 {
+                // Later fetch stalls occur between segments, while the previous
+                // segment is already in the cushion and playback stays paced.
                 std::thread::sleep(Duration::from_millis(800)); // fetch segment
             }
             let pts = multiview_core::time::MediaTime::from_nanos(n * 100_000_000);
