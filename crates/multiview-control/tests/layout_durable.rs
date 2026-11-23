@@ -162,6 +162,53 @@ async fn committed_layout_survives_projection_failure() {
     );
 }
 
+#[tokio::test]
+async fn api_layout_survives_router_reconstruction_with_accepted_envelope() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("boot.toml");
+    std::fs::write(&path, BOOT).unwrap();
+    let config = MultiviewConfig::load_from_toml(BOOT).unwrap();
+    let make_router = || {
+        let seeded = multiview_control::seed_resources(&config).unwrap();
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(64));
+        let (sender, _receiver) = command_bus(64);
+        let state = AppState::new(
+            publisher,
+            sender,
+            Arc::new(InMemoryRepository::new()),
+            Arc::new(support::seeded_keys()),
+        )
+        .with_seeded_resources(seeded)
+        .with_base_document(serde_json::to_value(&config).unwrap())
+        .with_boot_model(Arc::new(BootModel::new(
+            path.clone(),
+            config.clone(),
+            config.clone(),
+            StartMode::Resume,
+            true,
+            None,
+        )));
+        multiview_control::router(state)
+    };
+    let initial = make_router();
+    let request = serde_json::json!({"name":"News", "body":{"canvas":{"width":64,"height":64,"fps":"25/1"},"layout":{"kind":"grid","columns":["1fr"],"rows":["1fr"],"areas":["a"]},"cells":[{"id":"cell_a","area":"a","source":{"input_id":"in_a"}}]}});
+    let created = send(
+        &initial,
+        support::post_json("/api/v1/layouts/news", OPERATOR_TOKEN, &request),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let etag = support::etag(&created).unwrap();
+    drop(initial);
+    let restarted = make_router();
+    let response = send(&restarted, get("/api/v1/layouts/news", OPERATOR_TOKEN)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(support::etag(&response), Some(etag));
+    let body = support::body_json(response).await;
+    assert_eq!(body["name"], "News");
+    assert_eq!(body["body"], request["body"]);
+}
+
 /// A stored layout authored with only canvas geometry (the shape the web UI
 /// saves) applies onto the running canvas: omitted canvas fields keep their
 /// running values instead of failing the apply with a 422.

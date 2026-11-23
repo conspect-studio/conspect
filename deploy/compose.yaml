@@ -86,6 +86,8 @@ services:
     volumes:
       # The quick-start config (read-only) and the HLS output (named volume).
       - ./config/multiview.toml:/etc/multiview/multiview.toml:ro
+      # Accepted layouts and configuration survive container recreation.
+      - multiview-state:/etc/multiview/.multiview
       - multiview-hls:/var/lib/multiview/hls
     healthcheck:
       # Real liveness: the HLS playlist must have been written in the last 30s
@@ -133,3 +135,4 @@ services:
 
 volumes:
   multiview-hls:
+  multiview-state:
