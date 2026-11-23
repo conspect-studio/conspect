@@ -622,7 +622,14 @@ mod tests {
 
     #[test]
     fn a_panicking_convert_raises_failed_and_publishes_nothing_more() {
-        let hook: ConvertHook = Arc::new(|tick| assert!(tick < 3, "injected convert panic"));
+        let panic_seen = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&panic_seen);
+        let hook: ConvertHook = Arc::new(move |tick| {
+            if tick == 3 {
+                seen.store(true, Ordering::Release);
+            }
+            assert!(tick < 3, "injected convert panic");
+        });
         let mut stage = ConvertStage::spawn(vertical(), Some(hook)).unwrap();
         let slot = stage.slot();
         for tick in 0..3 {
@@ -635,6 +642,10 @@ mod tests {
         // its RaiseOnExit guard ran before inspecting the failed flag.
         stage.tx = None;
         stage.join.take().unwrap().join().unwrap();
+        assert!(
+            panic_seen.load(Ordering::Acquire),
+            "panic hook ran at tick 3"
+        );
         assert!(slot.failed.load(Ordering::Acquire));
         assert_eq!(slot.published.load(Ordering::Relaxed), 3);
     }
