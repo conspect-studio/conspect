@@ -42,7 +42,8 @@ use crate::warning_store::WarningFilter;
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
 pub struct HealthQuery {
     /// Keep only active (`true`, the default) or include cleared (`false`)
-    /// warnings.
+    /// warnings. Current wanted source failures are also included; those are
+    /// live projections, not retained historical entries after recovery.
     #[serde(default)]
     pub active: Option<bool>,
 }
@@ -106,7 +107,7 @@ pub(crate) async fn list_health(
             message: format!("Source {id} is wanted but has failed to produce media."),
             remediation: "Inspect the source status and repair its media input or connection."
                 .to_owned(),
-            since: 0, // Current snapshot; no fabricated transition timestamp.
+            since: 0, // Unknown; current snapshot has no failure timestamp.
             active: true,
         });
     }

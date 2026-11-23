@@ -216,13 +216,13 @@ async fn failed_wanted_source_is_visible_on_health_and_clears_on_recovery_withou
     impl SourceDemandProvider for Demand {
         fn status(&self, id: &str) -> SourceDemandView {
             let mut view = SourceDemandView::idle(id);
-            view.phase = if id == "cam" {
+            view.phase = if id == "cam" || id == "scoped-layout" {
                 *self.0.lock().unwrap()
             } else {
                 SourceDemandPhase::Idle
             };
-            view.video_wanted = id == "cam";
-            view.video_running = id == "cam";
+            view.video_wanted = id == "cam" || id == "scoped-layout";
+            view.video_running = view.video_wanted;
             view.detail = Some("secret URL must never leak".into());
             view
         }
@@ -243,6 +243,7 @@ async fn failed_wanted_source_is_visible_on_health_and_clears_on_recovery_withou
                    "background": "#000000", "color": {"profile": "sdr-bt709-limited"}},
         "layout": {"kind": "grid", "columns": ["1fr"], "rows": ["1fr"], "areas": ["a"]},
         "sources": [{"id": "cam", "kind": "bars"},
+                    {"id": "scoped-layout", "kind": "bars"},
                     {"id": "idle", "kind": "hls", "url": "https://example.test/i.m3u8",
                      "activation": "on_demand"}],
         "cells": [{"id": "cell", "area": "a", "source": {"input_id": "cam"}}],
@@ -266,22 +267,47 @@ async fn failed_wanted_source_is_visible_on_health_and_clears_on_recovery_withou
     let resp = send(&h.router, read(OPERATOR_TOKEN)).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let failed = body_json(resp).await;
-    assert_eq!(failed.as_array().unwrap().len(), 1);
+    assert_eq!(failed.as_array().unwrap().len(), 2);
     assert_eq!(failed[0]["code"], "source-failed");
     assert_eq!(failed[0]["severity"], "critical");
     assert_eq!(failed[0]["subsystem"], "source:cam");
+    assert_eq!(failed[1]["subsystem"], "source:scoped-layout");
     assert!(failed[0]["message"].as_str().unwrap().contains("cam"));
     assert!(!failed.to_string().contains("secret URL"));
-    // The same scoped principal cannot enumerate cam via the source status or
-    // health surfaces; an intentional on-demand idle source never raises one.
+    // The scoped principal sees its authorized failed source, not cam; the
+    // intentionally idle on-demand source contributes no entry to either view.
+    let scoped = body_json(send(&h.router, read(SCOPED_TOKEN)).await).await;
+    assert_eq!(scoped.as_array().unwrap().len(), 1);
+    assert_eq!(scoped[0]["subsystem"], "source:scoped-layout");
+    assert!(!scoped.to_string().contains("source:cam"));
+    let historical = body_json(
+        send(
+            &h.router,
+            get("/api/v1/health?active=false", OPERATOR_TOKEN),
+        )
+        .await,
+    )
+    .await;
     assert_eq!(
-        body_json(send(&h.router, read(SCOPED_TOKEN)).await).await,
-        json!([])
+        historical, failed,
+        "historical view also includes live failures"
     );
     *demand.0.lock().unwrap() = SourceDemandPhase::Ready;
     assert_eq!(
         body_json(send(&h.router, read(OPERATOR_TOKEN)).await).await,
         json!([])
+    );
+    assert_eq!(
+        body_json(
+            send(
+                &h.router,
+                get("/api/v1/health?active=false", OPERATOR_TOKEN)
+            )
+            .await
+        )
+        .await,
+        json!([]),
+        "a recovered source is not fabricated as history without a timestamp"
     );
 }
 
