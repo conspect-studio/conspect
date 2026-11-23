@@ -29,8 +29,14 @@
 //! allocated `AVCodecParameters` (no borrowed `Rc` owner), so moving it across
 //! threads is genuinely sound, not merely permitted by the marker.
 
+use std::sync::Arc;
+
 use ffmpeg::codec;
 use ffmpeg_next as ffmpeg;
+
+pub use multiview_core::encoded_packet::{
+    EncodedPacket as SharedEncodedPacket, PacketKind, RenditionId, StreamKind as SharedStreamKind,
+};
 
 /// Which elementary stream an [`EncodedPacket`] belongs to.
 ///
@@ -124,6 +130,47 @@ impl EncodedPacket {
         if let Some(pts) = self.packet.pts() {
             self.packet.set_dts(Some(pts));
         }
+    }
+
+    /// Convert this FFmpeg-owned packet into the shared immutable egress carrier.
+    /// This copies coded bytes once into a shared payload. Clones thereafter only
+    /// increment the Arc count and never duplicate the bytes.
+    #[must_use]
+    pub fn into_shared(self, rendition: RenditionId, parameter_sets: bool) -> SharedEncodedPacket {
+        let (pts, dts) = match (self.pts(), self.dts()) {
+            (Some(pts), Some(dts)) => (pts, dts),
+            (Some(pts), None) => (pts, pts),
+            (None, Some(dts)) => (dts, dts),
+            (None, None) => (0, 0),
+        };
+        let stream_kind = match self.kind() {
+            StreamKind::Video => SharedStreamKind::Video,
+            StreamKind::Audio => SharedStreamKind::Audio,
+            StreamKind::AudioTrack(index) => SharedStreamKind::AudioTrack(index),
+        };
+        let kind = match (self.kind(), self.is_keyframe()) {
+            (StreamKind::Audio, _) => PacketKind::Audio,
+            (StreamKind::AudioTrack(index), _) => PacketKind::AudioTrack(index),
+            (StreamKind::Video, true) => PacketKind::VideoKeyframe,
+            (StreamKind::Video, false) => PacketKind::VideoDelta,
+        };
+        let payload: Arc<[u8]> = Arc::from(self.payload().unwrap_or_default());
+        SharedEncodedPacket::new(
+            rendition,
+            kind,
+            stream_kind,
+            parameter_sets,
+            pts,
+            dts,
+            self.duration(),
+            payload,
+        )
+    }
+
+    /// Packet duration in encoder time-base units.
+    #[must_use]
+    pub fn duration(&self) -> i64 {
+        self.packet.duration()
     }
 
     /// Whether this packet is a keyframe (carries `AV_PKT_FLAG_KEY`). The
@@ -729,6 +776,43 @@ mod shared_packet_ref_tests {
         drop(a);
         assert_eq!(c.payload().unwrap(), &[0, 0, 0, 1, 0x65, 0x88, 0x77]);
         assert_eq!(mux_c.data().unwrap().as_ptr(), address);
+    }
+}
+
+#[cfg(test)]
+mod shared_carrier_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use std::sync::Arc;
+
+    use super::{EncodedPacket, PacketKind, RenditionId, SharedStreamKind, StreamKind};
+    use ffmpeg_next::codec::packet::{Flags, Packet};
+
+    #[test]
+    fn ffmpeg_adapter_copies_once_then_clones_share_payload_identity() {
+        let mut raw = Packet::copy(&[0_u8, 1, 2, 3, 4]);
+        raw.set_pts(Some(120));
+        raw.set_dts(Some(120));
+        raw.set_duration(1);
+        raw.set_flags(Flags::KEY);
+        let source_ptr = raw.data().unwrap().as_ptr();
+        let shared = EncodedPacket::with_kind(raw, StreamKind::Video)
+            .into_shared(RenditionId::new("program"), true);
+        let clone = shared.clone();
+        assert!(Arc::ptr_eq(&shared.data, &clone.data));
+        assert_ne!(
+            shared.data.as_ptr(),
+            source_ptr,
+            "adapter creates the one shared payload allocation"
+        );
+        assert_eq!(shared.payload(), &[0, 1, 2, 3, 4]);
+        assert_eq!(
+            (shared.pts(), shared.dts(), shared.duration()),
+            (120, 120, 1)
+        );
+        assert_eq!(shared.kind, PacketKind::VideoKeyframe);
+        assert_eq!(shared.stream_kind, SharedStreamKind::Video);
+        assert!(shared.has_parameter_sets());
     }
 }
 

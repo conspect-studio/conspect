@@ -62,14 +62,16 @@ fn rtsp_server_binds_and_feeds_from_sink() {
     // The engine routes encoded packets to the sink; the serving side drains the
     // shared queue. A real run feeds tick-stamped NALs; here we prove the seam is
     // wired (deliver enqueues into the queue the server pops from).
-    let packet = Arc::new(EncodedPacket {
-        rendition: RenditionId::new("program"),
-        kind: PacketKind::VideoKeyframe,
-        pts: 0,
-        dts: 0,
-        duration: 3000,
-        data: Arc::from(vec![0u8, 0, 0, 1, 0x67].into_boxed_slice()),
-    });
+    let packet = Arc::new(EncodedPacket::new(
+        RenditionId::new("program"),
+        PacketKind::VideoKeyframe,
+        multiview_core::encoded_packet::StreamKind::Video,
+        false,
+        0,
+        0,
+        3000,
+        Arc::from(vec![0u8, 0, 0, 1, 0x67].into_boxed_slice()),
+    ));
     sink.deliver(&packet);
     assert_eq!(sink.queued(), 1);
 
