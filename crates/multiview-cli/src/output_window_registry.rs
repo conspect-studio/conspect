@@ -1978,7 +1978,7 @@ pub(crate) mod tests {
                 time_base: Rational::new(1, 25),
                 bit_rate: 100_000,
                 gop: 25,
-                    cuda_device: None,
+                cuda_device: None,
             },
             &options,
         )
