@@ -294,7 +294,8 @@ function MatrixGrid({
                             onToggle(row, col);
                           }}
                         >
-                          {glyphOf(cell)}{pathGlyph(cell)}
+                          <span aria-hidden="true">{glyphOf(cell)}{pathGlyph(cell)}</span>
+                          <span>{cell.state === 'unknown' ? t`Cannot verify` : cell.state === 'available' ? t`Not routed` : cell.state === 'on-air' ? label : stateLabel(cell)}</span>
                         </button>
                       </td>
                     );
@@ -862,6 +863,7 @@ export function PatchMatrix(): JSX.Element {
 
   return (
     <div className="space-y-4">
+      <p className="text-sm"><Trans>Select a source → select an output → review the route → send to output. A crosspoint is one source-to-output connection. A salvo is a saved group of routes.</Trans></p>
       <p role="status" data-testid="matrix-page-state" aria-live="polite">
         {pageStateLabel()}
         {selections.length > 0 ? <span data-testid="matrix-arming"> · {t`Salvo arming (${String(selections.length)} selected)`}</span> : null}
@@ -966,7 +968,7 @@ export function PatchMatrix(): JSX.Element {
             disabledReason={planDisabledReason}
             pending={planning}
           >
-            <Trans>Classify selection</Trans>
+            <Trans>Review selected routes</Trans>
           </TouchAction>
           <TouchAction
             onPress={onTakeAll}
