@@ -2414,16 +2414,15 @@ mod resync_tests {
                     Duration::from_secs(20),
                 );
             });
-            // Model startup prefetch before the output starts consuming. The
-            // store guarantees rebuffering after a dry read, not that a 300 ms
-            // cushion bridges an 800 ms fetch. Keep the fetch stall itself.
+            // Prime one segment beyond the live cushion before going on-air.
+            // The 800 ms fetch remains longer than the 500 ms pacing lead.
             let deadline = Instant::now() + Duration::from_secs(10);
-            while store.buffered_frames() < 14_400 && Instant::now() < deadline {
+            while store.buffered_frames() < 48_000 + 14_400 && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }
             assert!(
-                store.buffered_frames() >= 14_400,
-                "startup cushion not filled"
+                store.buffered_frames() >= 48_000 + 14_400,
+                "startup prefetch did not fill"
             );
             let start = Instant::now();
             let tick = Duration::from_nanos(1_000_000_000 / 30);

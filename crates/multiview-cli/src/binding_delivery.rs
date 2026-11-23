@@ -418,6 +418,7 @@ struct Binding {
     lease_tx: SyncSender<BatchLease>,
     /// A lease popped but not yet handed to the pump (at most one).
     pending: Option<BatchLease>,
+    max_age: Duration,
     #[cfg(test)]
     staged: Vec<EncodedPacket>,
     wedged: Arc<AtomicBool>,
@@ -599,6 +600,7 @@ impl BindingDelivery {
                 queue,
                 lease_tx,
                 pending: None,
+                max_age: limits.max_age.min(MAX_QUEUE_AGE),
                 #[cfg(test)]
                 staged: Vec::new(),
                 wedged,
@@ -829,6 +831,27 @@ impl BindingDelivery {
     /// queued window to the binding's pump without waiting. A full lease
     /// handoff leaves the window queued (and age-bounded) rather than blocking.
     fn pump_binding(binding: &mut Binding, now: Instant) {
+        if let Some(lease) = binding.pending.as_ref() {
+            let error = match now.checked_duration_since(lease.offered_at()) {
+                None => Some(OfferError::ClockReversed),
+                Some(age) if age > binding.max_age => Some(OfferError::OldestAge),
+                Some(_) => None,
+            };
+            if let Some(error) = error {
+                if let Some(lease) = binding.pending.take() {
+                    count_discarded_lease(&binding.policy, &lease);
+                }
+                binding.queue.report_loss(error);
+                binding.last_rejection = Some(RejectionReason::from_offer(error));
+                sync_drop_counted_flushed(binding);
+                return;
+            }
+        }
+        if let Err(error) = binding.queue.expire_at(now) {
+            binding.last_rejection = Some(RejectionReason::from_offer(error));
+            sync_drop_counted_flushed(binding);
+            return;
+        }
         if binding.failed {
             // The pump is gone (abandoned or disconnected): every window
             // popped here is discarded without ever reaching the sink. Count
@@ -1393,6 +1416,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let statuses = delivery.statuses();
+        assert_eq!(
+            statuses[1].reserved_packets + statuses[1].queued_windows,
+            0,
+            "healthy binding must drain before comparing backlogs"
+        );
         assert_eq!(statuses[1].admitted_batches, 20);
         assert_eq!(statuses[1].rejected_batches, 0);
         assert!(!statuses[1].failed);
