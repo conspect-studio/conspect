@@ -237,6 +237,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let table = Arc::new(RouteTable::new());
         let client = Client::start(addr, Protocol::Swp08, Arc::clone(&table));
+        let stub_table = Arc::clone(&table);
         let stub = thread::spawn(move || {
             for source in [7, 8] {
                 let (mut socket, _) = listener.accept().unwrap();
@@ -271,7 +272,7 @@ mod tests {
                 socket.write_all(&report.bytes[..split]).unwrap();
                 thread::sleep(Duration::from_millis(10));
                 socket.write_all(&report.bytes[split..]).unwrap();
-                until(|| table.source_of(1, 42) == Some(source));
+                until(|| stub_table.source_of(1, 42) == Some(source));
                 // Dropping the socket is a real EOF, not a test-internal event.
             }
         });
