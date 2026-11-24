@@ -19,13 +19,13 @@
 .bd-brand small{font-size:12px;font-weight:400;letter-spacing:.12em;color:var(--bd-muted);text-transform:uppercase}
 .bd-mark{width:14px;height:14px;border-radius:2px;background:conic-gradient(#e5484d 0 25%,#e8a33d 0 50%,#3dd68c 0 75%,#6aa6ff 0)}
 .bd-tabs{display:flex;gap:4px;flex:1}
-.bd-tabs a{display:flex;align-items:center;gap:8px;padding:0 14px;border-radius:8px;color:var(--bd-muted);font-size:14px;font-weight:600;white-space:nowrap}
+.bd-tabs a{display:flex;align-items:center;gap:8px;padding:0 14px;border-radius:8px;color:#c2cbd6;font-size:14px;font-weight:600;white-space:nowrap}
 .bd-tabs a span{border:1px solid var(--bd-line2);border-radius:3px;padding:1px 5px;font:12px monospace}
 .bd-tabs a[aria-current]{background:var(--bd-bg3);color:var(--bd-text);box-shadow:inset 0 -2px #6aa6ff}
 .bd-top-actions{display:flex;align-items:center;gap:8px;margin-left:auto}
 .bd-icon,.bd-lock{display:inline-flex;justify-content:center;align-items:center;gap:8px;min-width:48px;padding:0 12px;border:1px solid var(--bd-line2);border-radius:8px;background:var(--bd-bg2);color:var(--bd-text);font-size:12px;white-space:nowrap}
 .bd-lock{border-radius:999px;font-weight:800;gap:6px}
-.bd-lock[aria-pressed=true]{background:#3dd68c;border-color:#3dd68c;color:#062015}
+.bd-lock[aria-pressed=true]{background:var(--bd-bg2);border-color:var(--bd-line2);color:var(--bd-text)}
 .bd-lock[aria-pressed=false]{background:var(--bd-bg2);color:var(--bd-text);border-color:var(--bd-amber)}
 .bd-icon{position:relative}
 .bd-badge{position:absolute;top:4px;right:4px;min-width:18px;height:18px;padding:0 4px;border-radius:9px;background:var(--bd-red);color:#1c0509;font:800 12px/18px monospace;text-align:center}
@@ -243,7 +243,7 @@
 .bd-meters em{display:block;height:100%;background:#3dd68c}
 .bd-meters b{min-width:80px;text-align:right;font-weight:400}
 .bd-screen-title{display:none}
-.bd-wall-tile[data-tile-state=LIVE]>span{color:#3dd68c}
+.bd-wall-tile[data-tile-state=LIVE]>span{color:var(--bd-text)}
 .bd-wall-tile[data-tile-state=NO_SIGNAL]>span,.bd-wall-tile[data-tile-state=STALE]>span{color:var(--bd-amber)}
 @media(max-width:767px){
 .bd-brand{width:auto;flex:none;gap:8px;padding:0 4px}
@@ -535,4 +535,34 @@
  .production-desk[data-dense=true] .bd-wall-tile>small{top:2px;left:2px;font-size:9px;line-height:12px;padding:0 2px}
  .production-desk[data-dense=true] .bd-wall-tile>span:last-child{top:2px;bottom:auto;right:2px;font-size:8px;line-height:10px;padding:0 2px;max-width:65px}
  .production-desk[data-dense=true] .bd-wall-tile .bd-source-picture{height:calc(100% - 20px)}
+}
+
+/* Narrow production desks retain readable controls instead of clipped labels. */
+@media(max-width:639px){
+ .production-desk .bd-wall-heading{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:12px}
+ .production-desk .bd-wall-heading h2,.production-desk .bd-wall-heading>span{grid-column:1/-1}
+ .production-desk .bd-wall-heading a{margin:0;min-width:0;padding:6px;justify-content:center;white-space:normal}
+ .production-desk .bd-bus>div{grid-template-columns:repeat(3,minmax(0,1fr))}
+ .production-desk .bd-more{flex-wrap:wrap}
+ .production-desk .bd-more .bd-transition-menu{flex-basis:100%}
+ .production-desk .bd-more .bd-transition-menu>summary{white-space:normal;min-height:44px}
+}
+
+/* The lock explanation is its own row, never a fourth transition-grid cell. */
+.production-desk .bd-lock-reason{grid-column:1/-1;flex-basis:100%;font-size:12px;line-height:16px;margin:0;color:var(--bd-muted)}
+@media(min-width:1280px) and (min-height:600px){
+ .production-desk .bd-takes{position:relative}
+ .production-desk .bd-lock-reason{transform:translateY(-16px)}
+ .production-desk .bd-lock-reason{position:absolute;top:0;left:0;right:0}
+}
+
+@media(min-width:1280px) and (min-height:600px){
+ .production-desk .bd-wall-tile>span:last-child{top:3px;bottom:auto;right:3px;max-width:calc(100% - 6px);font-size:9px;line-height:11px}
+ .production-desk .bd-wall-tile>small{top:17px;left:3px;max-width:calc(100% - 6px);font-size:9px;line-height:11px}
+ .production-desk .bd-lock-reason{font-size:11px;line-height:14px}
+}
+
+@media(min-width:1280px) and (min-height:600px){
+ .production-desk[data-dense=true] .bd-wall-tile>small,
+ .production-desk[data-dense=true] .bd-wall-tile>span:last-child{height:auto;min-height:14px;line-height:12px;padding:1px 3px;white-space:nowrap}
 }

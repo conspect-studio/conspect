@@ -4044,6 +4044,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "sha2 0.11.0",
+ "socket2 0.6.4",
  "sqlx",
  "subtle",
  "tempfile",
@@ -4177,6 +4178,13 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "multiview-fssys"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -4349,6 +4357,7 @@ dependencies = [
  "multiview-input",
  "multiview-ndi-sys",
  "multiview-rist-sys",
+ "multiview-spsc",
  "multiview-srt-sys",
  "multiview-telemetry",
  "proptest",
@@ -4401,6 +4410,10 @@ dependencies = [
  "multiview-telemetry",
  "thiserror 2.0.18",
 ]
+
+[[package]]
+name = "multiview-spsc"
+version = "0.1.0"
 
 [[package]]
 name = "multiview-srt-sys"

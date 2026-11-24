@@ -151,17 +151,17 @@ class GateTests(unittest.TestCase):
                 gate.resources()
 
     def test_disk_floor_value_and_message(self):
-        self.assertEqual(gate.MIN_FREE, 75 * gate.GIB)
+        self.assertEqual(gate.MIN_FREE, 60 * gate.GIB)
         with patch.object(gate.shutil, 'disk_usage') as usage:
-            usage.return_value.free = 74 * gate.GIB
-            with self.assertRaisesRegex(RuntimeError, 'below 75 GiB floor'):
+            usage.return_value.free = 59 * gate.GIB
+            with self.assertRaisesRegex(RuntimeError, 'below 60 GiB floor'):
                 gate.resources()
 
     def test_large_target_fails_closed(self):
         with tempfile.TemporaryDirectory(dir=gate.ROOT / 'target') as tmp:
             with patch.object(gate.shutil, 'disk_usage') as usage, patch.object(gate, 'target_bytes', return_value=gate.MAX_TARGET + 1):
                 usage.return_value.free = gate.MIN_FREE
-                with self.assertRaisesRegex(RuntimeError, '15 GiB'):
+                with self.assertRaisesRegex(RuntimeError, 'bytes exceed .*20 GiB cap'): 
                     gate.resources()
 
     def test_target_walk_disappearing_file_is_the_only_ignored_error(self):

@@ -73,11 +73,12 @@ fn minimal_cast_output_defaults_to_h264_and_no_dir() {
         metadata,
         format,
         slots,
+        program,
     } = &out
     else {
         panic!("expected Cast, got {out:?}");
     };
-    assert!(format.is_none() && slots.is_none());
+    assert!(format.is_none() && slots.is_none() && program.is_none());
     assert_eq!(id, "cast-1");
     assert_eq!(codec, "h264");
     assert!(dir.is_none() && gpu_pin.is_none() && audio.is_none() && metadata.is_none());

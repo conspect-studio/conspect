@@ -1,6 +1,8 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../realtime/shared', () => ({ subscribeRealtime: () => () => undefined }));
+const takeLock = vi.hoisted(() => ({ locked: false }));
+vi.mock('../components/broadcast/BroadcastShell', () => ({ useTakeLock: () => takeLock }));
 import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
@@ -29,7 +31,7 @@ const server = setupServer(
   }),
 );
 beforeAll(() => { server.listen(); });
-afterEach(() => { server.resetHandlers(); commandCount = 0; vi.useRealTimers(); });
+afterEach(() => { server.resetHandlers(); commandCount = 0; takeLock.locked = false; vi.useRealTimers(); });
 afterAll(() => { server.close(); });
 
 function page() {
@@ -46,9 +48,21 @@ function outcome(id: string, completed: boolean, error?: string) {
 
 // Tracker events are supplied as the shell-owned socket supplies them; no second socket.
 describe('SwitcherPage single-authority completion', () => {
+  it('disables every on-air transition while the global take lock is set', async () => {
+    takeLock.locked = true;
+    page();
+    await screen.findByText(/PGM: cam-1/);
+    const cut = screen.getByRole('button', { name: 'Cut preview to air' });
+    expect(cut).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Transition preview to air' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Send selected source to air' })).toBeDisabled();
+    expect(screen.getByText(/Use the Takes locked control/)).toBeVisible();
+    await userEvent.click(cut);
+    expect(commandCount).toBe(0);
+  });
   it('does not clear awaiting state on unrelated topic, M/E, corr or media loading', async () => {
     const { client } = page();
-    await userEvent.click(await screen.findByRole('button', { name: 'Cut' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Cut preview to air' }));
     await waitFor(() => { expect(commandCount).toBe(1); });
     const tracker = getOperationTracker(client);
     for (const event of [
@@ -58,28 +72,28 @@ describe('SwitcherPage single-authority completion', () => {
       frame('op-1', { player: 'me1', state: { kind: 'loading' } }, { t: 'media.player_state' }),
     ]) act(() => { tracker.onEnvelope(event); });
     expect(screen.getByText(/waiting for the applied event/i)).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Cut' })).toHaveProperty('disabled', true);
+    expect(screen.getByRole('button', { name: 'Cut preview to air' })).toHaveProperty('disabled', true);
     act(() => { tracker.onEnvelope(frame('op-1', outcome('op-1', false, 'engine rejected'))); });
     await waitFor(() => { expect(screen.getByText(/Switcher failed/i)).toBeTruthy(); });
-    expect(screen.getByRole('button', { name: 'Cut' })).toHaveProperty('disabled', false);
+    expect(screen.getByRole('button', { name: 'Cut preview to air' })).toHaveProperty('disabled', false);
   });
 
   it('keeps unknown outcome visibly unresolved and prevents a second cut', async () => {
     const { client } = page();
-    await userEvent.click(await screen.findByRole('button', { name: 'Cut' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Cut preview to air' }));
     await waitFor(() => { expect(commandCount).toBe(1); });
     act(() => { getOperationTracker(client).onGap(); });
     await waitFor(() => { expect(screen.getByText(/Switcher outcome unknown/i)).toBeTruthy(); });
-    expect(screen.getByRole('button', { name: 'Cut' })).toHaveProperty('disabled', true);
+    expect(screen.getByRole('button', { name: 'Cut preview to air' })).toHaveProperty('disabled', true);
     expect(commandCount).toBe(1);
   });
 
   it('accepts exact completed true output-tick event and allows the next cut', async () => {
     const { client } = page();
-    await userEvent.click(await screen.findByRole('button', { name: 'Cut' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Cut preview to air' }));
     await waitFor(() => { expect(commandCount).toBe(1); });
     act(() => { getOperationTracker(client).onEnvelope(frame('op-1', outcome('op-1', true))); });
     await waitFor(() => { expect(screen.getByText(/Switcher applied/i)).toBeTruthy(); });
-    expect(screen.getByRole('button', { name: 'Cut' })).toHaveProperty('disabled', false);
+    expect(screen.getByRole('button', { name: 'Cut preview to air' })).toHaveProperty('disabled', false);
   });
 });

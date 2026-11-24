@@ -185,18 +185,18 @@ describe('useJpegPreview', () => {
     expect(result.current.state).toBe('fresh');
     await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
     await fail(1, 200, 'text/html');
-    expect(result.current).toEqual({ url: undefined, state: 'unavailable' });
+    expect(result.current).toEqual({ url: undefined, state: 'unavailable', requestFailed: true });
   });
 
   it('keeps the last good frame across failed polls and goes stale only after the bounded age', async () => {
     const { result } = renderHook(() => useJpegStill('/preview/a.jpg', 2000));
     await settle(0, 'good');
-    expect(result.current).toEqual({ url: 'blob:preview-0', state: 'fresh' });
+    expect(result.current).toEqual({ url: 'blob:preview-0', state: 'fresh', requestFailed: false });
     // 503 polls every 2 s: the frame stays, still fresh within the bound.
     for (let i = 1; i <= 3; i += 1) {
       await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
       await fail(i, 503, 'application/problem+json');
-      expect(result.current).toEqual({ url: 'blob:preview-0', state: 'fresh' });
+      expect(result.current).toEqual({ url: 'blob:preview-0', state: 'fresh', requestFailed: true });
     }
     expect(staleAfterMs(2000)).toBe(10_000);
     await act(async () => { await vi.advanceTimersByTimeAsync(4000); });
@@ -206,6 +206,44 @@ describe('useJpegPreview', () => {
     const next = requests.length - 1;
     await settle(next, 'again');
     expect(result.current.state).toBe('fresh');
+  });
+
+  it('distinguishes a failed first request from waiting and clears failure after recovery', async () => {
+    const { result } = renderHook(() => useJpegStill('/preview/a.jpg', 1000));
+    expect(result.current.requestFailed).toBe(false);
+    await fail(0, 503, 'application/problem+json');
+    expect(result.current.requestFailed).toBe(true);
+    expect(result.current.url).toBeUndefined();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    await settle(1, 'recovered');
+    expect(result.current.requestFailed).toBe(false);
+    expect(result.current.state).toBe('fresh');
+  });
+
+  it('clears previous failure evidence when disabled or switched to another input', async () => {
+    const { result, rerender } = renderHook(({ path, enabled }) => useJpegStill(path, 1000, enabled), {
+      initialProps: { path: '/preview/a.jpg', enabled: true },
+    });
+    await fail(0, 503, 'application/problem+json');
+    expect(result.current.requestFailed).toBe(true);
+    rerender({ path: '/preview/a.jpg', enabled: false });
+    expect(result.current.requestFailed).toBe(false);
+    rerender({ path: '/preview/a.jpg', enabled: true });
+    expect(result.current.requestFailed).toBe(false);
+    await fail(1, 503, 'application/problem+json');
+    rerender({ path: '/preview/b.jpg', enabled: true });
+    expect(result.current).toEqual({ url: undefined, state: 'loading', requestFailed: false });
+  });
+
+  it('does not expose a revoked image when re-enabled', async () => {
+    const { result, rerender } = renderHook(({ enabled }) => useJpegStill('/preview/a.jpg', 1000, enabled), { initialProps: { enabled: true } });
+    await settle(0, 'good');
+    expect(result.current.url).toBeDefined();
+    rerender({ enabled: false });
+    expect(result.current.url).toBeUndefined();
+    rerender({ enabled: true });
+    expect(result.current.url).toBeUndefined();
+    expect(result.current.state).toBe('loading');
   });
 
   it('re-probes an unserved route only slowly (30 s), not every poll', async () => {
