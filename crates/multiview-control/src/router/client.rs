@@ -315,7 +315,7 @@ mod tests {
             .contains("disconnected"));
         until(|| client.status().connections >= 2);
         client.try_send(query).unwrap();
-        until(|| table.source_of(1, 42) == Some(8));
+        until(|| table.source_of(1, 42) == Some(8) && client.status().reports == 1);
         let status = client.status();
         assert!(status.connected);
         assert!(status.last_route.is_some());
@@ -348,7 +348,7 @@ mod tests {
         .unwrap();
         assert!(report.bytes.windows(3).any(|w| w == [0x10, 0x10, 0x03]));
         socket.write_all(&report.bytes).unwrap();
-        until(|| table.source_of(1, 0x10) == Some(0x300));
+        until(|| table.source_of(1, 0x10) == Some(0x300) && client.status().reports == 1);
         assert!(client.status().connected);
         assert_eq!(client.status().reports, 1);
     }
