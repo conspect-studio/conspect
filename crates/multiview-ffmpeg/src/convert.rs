@@ -248,9 +248,8 @@ pub fn color_to_ff(color: ColorInfo) -> FfColorTag {
             ColorPrimaries::Unspecified | _ => ff_color::Primaries::Unspecified,
         },
         transfer: match color.transfer {
-            TransferCharacteristic::Bt709 | TransferCharacteristic::Bt601 => {
-                ff_color::TransferCharacteristic::BT709
-            }
+            TransferCharacteristic::Bt709 => ff_color::TransferCharacteristic::BT709,
+            TransferCharacteristic::Bt601 => ff_color::TransferCharacteristic::SMPTE170M,
             TransferCharacteristic::Bt2020 => ff_color::TransferCharacteristic::BT2020_10,
             TransferCharacteristic::Srgb => ff_color::TransferCharacteristic::IEC61966_2_1,
             TransferCharacteristic::Pq => ff_color::TransferCharacteristic::SMPTE2084,
@@ -353,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn smpte170m_space_maps_to_bt601_matrix() {
+    fn smpte170m_space_maps_to_bt601_matrix_and_round_trips_all_axes() {
         let info = color_from_ff(
             ff_color::Space::SMPTE170M,
             ff_color::Primaries::SMPTE170M,
@@ -364,5 +363,13 @@ mod tests {
         assert_eq!(info.primaries, ColorPrimaries::Bt601_525);
         assert_eq!(info.transfer, TransferCharacteristic::Bt601);
         assert_eq!(info.range, ColorRange::Full);
+        let encoded = color_to_ff(info);
+        assert_eq!(encoded.space, ff_color::Space::SMPTE170M);
+        assert_eq!(encoded.primaries, ff_color::Primaries::SMPTE170M);
+        assert_eq!(
+            encoded.transfer,
+            ff_color::TransferCharacteristic::SMPTE170M
+        );
+        assert_eq!(encoded.range, ff_color::Range::JPEG);
     }
 }

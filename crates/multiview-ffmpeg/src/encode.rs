@@ -70,12 +70,11 @@ pub struct VideoEncodeTarget {
     /// suffix in [`VideoEncoder::new`]). A bind failure (no GPU / no such
     /// ordinal) degrades gracefully to a default-device open, never a panic.
     pub cuda_device: Option<String>,
-    /// The canvas colour this encode must tag (CICP range/primaries/transfer/
-    /// matrix, #161). Written onto the encoder context before it opens, so the
-    /// coded stream parameters carry the tag. Frames are not stamped: for the
-    /// encoders this opens, the context tag is what the sequence header and a
-    /// later ffprobe read both carry. `None` leaves the encoder untagged — the
-    /// pre-#161 behaviour, kept for callers that do not know a canvas profile.
+    /// The requested encoder-context color tag (CICP range/primaries/transfer/
+    /// matrix, #161). Written before the codec opens. `None` leaves the context
+    /// untagged. Bitstream/container signaling varies by codec: a context tag
+    /// alone is not proof that a decoder reports that axis. `None` preserves
+    /// the pre-#161 behavior for callers without a canvas profile.
     /// Tagging only labels; it does not convert pixels (invariant #8).
     pub color: Option<ColorInfo>,
 }

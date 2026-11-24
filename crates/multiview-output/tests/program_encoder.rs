@@ -283,11 +283,12 @@ fn video_pts_follows_the_tick_index_across_dropped_ticks() {
     assert_eq!(pts, expected, "video PTS must equal the output tick index");
 }
 
-/// #161: the encoded program carries the canvas colour tags. The SDR BT.709
-/// limited canvas (`EncodeConfig::mpeg2`'s default, the profile every program
-/// encode tags) must read back as limited range and BT.709 primaries, transfer
-/// and matrix — never `unknown`. Verified by ffprobe on a muxed segment, the
-/// same read a player does.
+/// #161: verifies that the program encoder context is tagged BT.709 limited.
+/// This MPEG-2 transport-stream test proves matrix/primaries/transfer tags at
+/// the muxed output; MPEG-2 TS does not signal range, so `tv` is container
+/// defaulting, not proof that the context range was carried on wire. The H.264
+/// Matroska bitstream test in `multiview-ffmpeg/tests/color_tags.rs` verifies
+/// all four wire fields, including range.
 #[test]
 fn encoded_program_carries_bt709_limited_colour_tags() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -312,19 +313,28 @@ fn encoded_program_carries_bt709_limited_colour_tags() {
             "-show_entries",
             "stream=color_range,color_space,color_transfer,color_primaries",
             "-of",
-            "csv=p=0",
+            "default=noprint_wrappers=1",
         ])
         .arg(&out)
         .output()
         .expect("ffprobe");
     assert!(probe.status.success(), "ffprobe failed: {probe:?}");
     let text = String::from_utf8_lossy(&probe.stdout);
-    let line = text.lines().next().unwrap_or("").trim();
-    assert!(
-        line.contains("tv")
-            && line.contains("bt709")
-            && !line.contains("unknown")
-            && line.matches("bt709").count() == 3,
-        "expected range=tv and bt709 primaries/transfer/matrix, got {line:?}"
+    println!("ffprobe produced stream color fields:\n{}", text.trim());
+    let fields: std::collections::HashMap<&str, &str> = text
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    assert_eq!(fields.get("color_range"), Some(&"tv"), "range: {text}");
+    assert_eq!(fields.get("color_space"), Some(&"bt709"), "matrix: {text}");
+    assert_eq!(
+        fields.get("color_primaries"),
+        Some(&"bt709"),
+        "primaries: {text}"
+    );
+    assert_eq!(
+        fields.get("color_transfer"),
+        Some(&"bt709"),
+        "transfer: {text}"
     );
 }
