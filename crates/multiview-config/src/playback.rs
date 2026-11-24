@@ -654,6 +654,8 @@ mod tests {
             metadata: None,
             orientation: None,
             srt: Some(srt),
+
+            program: None,
         };
         let ctx = ctx_with_host("viewer.example");
         let urls = output.playback_urls(&ctx);
@@ -694,6 +696,8 @@ mod tests {
             metadata: None,
             orientation: None,
             srt: Some(srt),
+
+            program: None,
         };
         let ctx = ctx_with_host("viewer.example");
         let urls = output.playback_urls(&ctx);
@@ -722,6 +726,8 @@ mod tests {
             metadata: None,
             orientation: None,
             srt: Some(srt),
+
+            program: None,
         };
         let ctx = ctx_with_host("viewer.example");
         let urls = output.playback_urls(&ctx);
@@ -752,6 +758,8 @@ mod tests {
             metadata: None,
             orientation: None,
             srt: Some(srt),
+
+            program: None,
         };
         let ctx = ctx_with_host("viewer.example");
         let urls = output.playback_urls(&ctx);
@@ -778,6 +786,8 @@ mod tests {
             metadata: None,
             orientation: None,
             srt: Some(srt),
+
+            program: None,
         };
         let ctx = ctx_with_host("viewer.example");
         let urls = output.playback_urls(&ctx);
@@ -804,6 +814,8 @@ mod tests {
             metadata: None,
             orientation: None,
             srt: None,
+
+            program: None,
         };
         let ctx = ctx_with_host("viewer.example");
         let urls = output.playback_urls(&ctx);
@@ -827,6 +839,8 @@ mod tests {
             metadata: None,
             orientation: None,
             srt: Some(srt),
+
+            program: None,
         };
         let ctx = ctx_with_host("203.0.113.5");
         let urls = output.playback_urls(&ctx);
@@ -853,6 +867,8 @@ mod tests {
             metadata: None,
             orientation: None,
             srt: Some(srt),
+
+            program: None,
         };
         let ctx = PlaybackContext::default();
         let urls = output.playback_urls(&ctx);
@@ -873,6 +889,8 @@ mod tests {
             metadata: None,
             orientation: None,
             rist: None,
+
+            program: None,
         };
         let ctx = ctx_with_host("viewer.example");
         let urls = output.playback_urls(&ctx);
@@ -892,6 +910,8 @@ mod tests {
             metadata: None,
             orientation: None,
             rist: None,
+
+            program: None,
         };
         let ctx = ctx_with_host("viewer.example");
         let urls = output.playback_urls(&ctx);
@@ -912,6 +932,8 @@ mod tests {
             audio: None,
             metadata: None,
             orientation: None,
+
+            program: None,
         };
         let ctx = ctx_with_host("viewer.example");
         let urls = output.playback_urls(&ctx);
@@ -932,6 +954,8 @@ mod tests {
             audio: None,
             metadata: None,
             orientation: None,
+
+            program: None,
         };
         let ctx = ctx_with_host("viewer.example");
         let urls = output.playback_urls(&ctx);
@@ -951,6 +975,8 @@ mod tests {
             audio: None,
             metadata: None,
             orientation: None,
+
+            program: None,
         };
         let ctx = PlaybackContext {
             public_host: Some("viewer.example"),
@@ -979,6 +1005,8 @@ mod tests {
             audio: None,
             metadata: None,
             orientation: None,
+
+            program: None,
         };
         let ctx = PlaybackContext {
             public_host: Some("viewer.example"),
@@ -1011,6 +1039,8 @@ mod tests {
             audio: None,
             metadata: None,
             orientation: None,
+
+            program: None,
         };
         let ctx = ctx_with_host("viewer.example");
         let urls = output.playback_urls(&ctx);
@@ -1031,6 +1061,8 @@ mod tests {
             audio: None,
             metadata: None,
             orientation: None,
+
+            program: None,
         };
         let ctx = PlaybackContext::default();
         let urls = output.playback_urls(&ctx);
@@ -1163,6 +1195,8 @@ mod tests {
             audio: None,
             metadata: None,
             orientation: None,
+
+            program: None,
         };
         let ctx = PlaybackContext {
             public_host: Some("viewer.example"),
