@@ -356,14 +356,15 @@ class PlaybackSession(
 
     private fun scheduleReport(@Suppress("UNUSED_PARAMETER") gen: Int) = ticker.start()
 
-    private fun sendReport() {
+    private fun sendReport(final: Boolean = false) {
         val p = load ?: return
         val json = Report.build(
             receiver, state, rung, firstFrameMs, frames.frames, null, stalls, softResets, lastError,
             clock.nowMs(),
         )
         onReportJson(json)
-        net.report(gate.current, p.base + "report", json)
+        if (final) net.finalReport(p.base + "report", json)
+        else net.report(gate.current, p.base + "report", json)
     }
 
     private fun setState(s: String) {
@@ -392,9 +393,9 @@ class PlaybackSession(
     private fun end(kind: String) {
         lastError = kind
         setState("error")
-        sendReport()
         gate.invalidate()
         net.cancelAll()
+        sendReport(final = true)
         tokenCheck.reset()
         ticker.cancel()
         main.removeCallbacksAndMessages(null)

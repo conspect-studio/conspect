@@ -312,6 +312,29 @@ class NetWorkerTest {
         w.dispose()
     }
 
+    @Test fun finalReportSurvivesGenerationCancellation() {
+        val gate = GenerationGate()
+        val posts = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val sent = CountDownLatch(1)
+        val http = object : Http {
+            override fun get(url: String, scope: CallScope) = HttpResult(200, "", null)
+            override fun post(url: String, json: String, scope: CallScope): HttpResult {
+                posts.add(json)
+                sent.countDown()
+                return HttpResult(200, "", null)
+            }
+        }
+        val w = NetWorker(gate, http)
+        val g = gate.next()
+        w.report(g, "u", "obsolete")
+        gate.invalidate()
+        w.cancelAll()
+        w.finalReport("u", "terminal")
+        assertTrue("terminal report sent off main thread", sent.await(2, TimeUnit.SECONDS))
+        assertEquals(listOf("terminal"), posts.toList())
+        w.dispose()
+    }
+
     @Test fun cancelAllCancelsInFlightCallsAndDropsPending() {
         val gate = GenerationGate()
         val w = NetWorker(gate, SlowHttp())

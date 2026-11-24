@@ -24,6 +24,9 @@ class NetWorker(
     private val lock = Object()
     private val control = ArrayDeque<Task>()
     private var report: Report? = null
+    // A terminal report survives generation cancellation. One slot only; it is
+    // dispatched after pending control work is cleared, off the main thread.
+    private var finalReport: Report? = null
     private var scope = CallScope()
     private var disposed = false
     val rejected = AtomicInteger(0)
@@ -63,17 +66,26 @@ class NetWorker(
         }
     }
 
+    /** One terminal report survives [cancelAll] and generation invalidation. */
+    fun finalReport(url: String, json: String) {
+        synchronized(lock) {
+            if (disposed) return
+            finalReport = Report(-1, url, json, CallScope())
+            lock.notifyAll()
+        }
+    }
+
     private fun loop() {
         while (true) {
             var task: Task? = null
             var rep: Report? = null
             synchronized(lock) {
-                while (!disposed && control.isEmpty() && report == null) lock.wait()
+                while (!disposed && control.isEmpty() && report == null && finalReport == null) lock.wait()
                 if (disposed) return
                 task = control.removeFirstOrNull()
                 if (task == null) {
-                    rep = report
-                    report = null
+                    rep = finalReport ?: report
+                    if (finalReport != null) finalReport = null else report = null
                 }
             }
             val t = task
@@ -81,7 +93,7 @@ class NetWorker(
             try {
                 if (t != null) {
                     if (gate.isCurrent(t.gen) && !t.scope.cancelled) t.run(t.scope)
-                } else if (r != null && gate.isCurrent(r.gen) && !r.scope.cancelled) {
+                } else if (r != null && (r.gen == -1 || gate.isCurrent(r.gen)) && !r.scope.cancelled) {
                     http.post(r.url, r.json, r.scope)
                 }
             } catch (e: Throwable) {
