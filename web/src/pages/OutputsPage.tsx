@@ -903,12 +903,15 @@ function OutputAdvancedFields({
         }}
       />
       {form.audioMode === 'tracks' ? (
+        <>
+        <p className="text-sm text-muted-foreground" data-testid="output-tracks-restart-note"><Trans>Track selection applies on restart. Live switching of this output’s complete track list is not available yet.</Trans></p>
         <AudioTracksField
           form={form}
           setForm={setForm}
           error={errors.audioTracks}
           selectableTracks={selectableTracks}
         />
+        </>
       ) : null}
       <CheckboxField
         id="output-gpu-pin"

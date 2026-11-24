@@ -109,9 +109,19 @@ describe('RoutingSurface', () => {
     );
     const cell = screen.getByTestId('xpt-a-cell-1');
     expect(cell).toHaveTextContent('?');
+    expect(cell).toHaveTextContent('Unknown');
+    expect(cell).toHaveAccessibleName(/current route unknown/i);
     expect(cell).not.toHaveTextContent('ON');
     await user.click(cell);
     expect(picks).toEqual(['a>video:cell-1']);
+  });
+
+  it.each([[false, 'selected'], [true, 'planned']] as const)('announces the %s selected cell state', (planned, state) => {
+    renderWithProviders(<CrosspointGrid sources={[{ id: 'a', name: 'A' }]} dests={[{ kind: 'video', id: 'cell-1', label: 'cell-1' }]} selectedSource="a" selectedDest="cell-1" planned={planned} onPick={() => undefined} />);
+    const cell = screen.getByTestId('xpt-a-cell-1');
+    expect(cell).toHaveAttribute('aria-pressed', 'true');
+    expect(cell).toHaveAccessibleName(new RegExp(state, 'i'));
+    expect(cell).toHaveTextContent(planned ? 'Plan' : 'Selected');
   });
 
   it('crosspoint grid is replaced by a note when no destinations are known', () => {

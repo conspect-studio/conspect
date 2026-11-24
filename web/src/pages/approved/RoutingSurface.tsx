@@ -104,6 +104,8 @@ export function RoutingHead(): JSX.Element {
               stream.
             </Trans>
           </p>
+          <p><Trans>PGM (Program) is what is on air. PVW (Preview) is what you prepare before taking it to Program. A crosspoint connects one source to one destination. A salvo is a saved group of routes recalled together. Punch means take a route immediately.</Trans></p>
+          <p><Trans>MIX blends between pictures; WIPE replaces one picture with another along a moving edge; DIP fades through a colour; STING uses a short animated transition.</Trans></p>
           <p>
             <b><Trans>Configured ≠ on-air:</Trans></b>{" "}
             <Trans>
@@ -224,14 +226,14 @@ export function CrosspointGrid({
                       type="button"
                       className={isSel ? "xpt plan" : "xpt"}
                       aria-pressed={isSel}
-                      aria-label={t`Select ${src.name} to ${d.label}`}
+                      aria-label={isSel ? (planned ? t`Select ${src.name} to ${d.label}; planned; current route unknown` : t`Select ${src.name} to ${d.label}; selected; current route unknown`) : t`Select ${src.name} to ${d.label}; current route unknown`}
                       title={t`Crosspoint state Unknown — no readback`}
                       data-testid={`xpt-${src.id}-${d.id}`}
                       onClick={(): void => {
                         onPick(src.id, d);
                       }}
                     >
-                      {isSel ? (planned ? "? PLAN" : <><Diamond aria-hidden="true" size={11} /> SEL</>) : "?"}
+                      {isSel ? (planned ? <><span aria-hidden="true">? </span><Trans>Plan</Trans></> : <><Diamond aria-hidden="true" size={11} /><Trans>Selected</Trans></>) : <><span aria-hidden="true">? </span><Trans>Unknown</Trans></>}
                     </button>
                   </td>
                 );
@@ -242,8 +244,8 @@ export function CrosspointGrid({
       </table>
       <p className="patch-legend">
         <Trans>
-          Crosspoint states: ? Unknown (no readback) · ◇ SEL selected · ? PLAN
-          dry-run plan. A take applies only from the plan panel.
+          Crosspoint states: Unknown (no readback) · Selected · Plan (dry run).
+          A take applies only from the plan panel.
         </Trans>
         {" "}
         <Trans>

@@ -68,6 +68,7 @@ describe('OutputsPage audio track picker', () => {
     const dialog = await screen.findByRole('dialog');
     await user.click(within(dialog).getByText(/advanced/i));
     await chooseExplicitTrackList(user, dialog);
+    expect(within(dialog).getByTestId('output-tracks-restart-note')).toHaveTextContent(/applies on restart/i);
 
     // Exactly the server's selectable tracks are offered as checkboxes — no
     // free-text entry that could name a track that doesn't exist.

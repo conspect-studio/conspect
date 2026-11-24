@@ -524,6 +524,8 @@ function ChannelStrip({
         )}
         {' · '}
         {route.includeInProgramBus ? <Trans>in PGM</Trans> : <Trans>off PGM</Trans>}
+        {' · '}
+        <Trans>draft mix membership; not on-air tally</Trans>
         {track !== '' ? (
           <>
             {' · '}
@@ -1573,9 +1575,10 @@ export function AudioPage(): JSX.Element {
             </div>
             <p data-testid="audio-pfl-note" className="max-w-md text-xs text-muted-foreground">
               <Trans>
-                Pre-fade listen (PFL / solo monitoring) is not available on
-                this control plane — there is no monitoring path to configure,
-                so the console carries no listen key.
+                Pre-fade listen (PFL / solo monitoring) is not available here.
+                To check a source before it goes on air, listen on a separate
+                external monitor connected to that source. The Program player on
+                Monitoring can check the on-air mix, but it cannot solo an input.
               </Trans>
             </p>
           </DetailsDisclosure>
