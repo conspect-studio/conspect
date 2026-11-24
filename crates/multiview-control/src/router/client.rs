@@ -35,9 +35,17 @@ fn configure_keepalive(socket: &TcpStream) -> io::Result<()> {
 pub enum Protocol {
     /// SW-P-08 DLE framing.
     Swp08,
-    /// Ember+ S101 framing.
+    /// Ember+ S101 framing (codec only; no standardized crosspoint mapping).
     Ember,
 }
+/// Start refusal for a protocol without a defined route-report mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum StartError {
+    /// Ember+ GlowNode has no standard source/destination crosspoint schema.
+    #[error("Ember+ route reports need a configured parameter mapping")]
+    EmberRouteMappingRequired,
+}
+
 /// Observable status of the last connection attempt.
 #[derive(Clone, Debug, Default)]
 pub struct LinkStatus {
@@ -60,9 +68,21 @@ pub struct Client {
     thread: Option<thread::JoinHandle<()>>,
 }
 impl Client {
-    /// Start a supervised control-plane connection.
+    /// Start a supervised SW-P-08 control-plane connection.
+    ///
+    /// # Errors
+    ///
+    /// Ember+ needs a router-specific Glow parameter-to-crosspoint mapping;
+    /// the pure S101/BER codec exists, but no live route-report mapping does.
     #[allow(clippy::too_many_lines)] // One socket lifecycle: connect, bounded I/O, classify, reconnect.
-    pub fn start(address: SocketAddr, protocol: Protocol, table: Arc<RouteTable>) -> Self {
+    pub fn start(
+        address: SocketAddr,
+        protocol: Protocol,
+        table: Arc<RouteTable>,
+    ) -> Result<Self, StartError> {
+        if matches!(protocol, Protocol::Ember) {
+            return Err(StartError::EmberRouteMappingRequired);
+        }
         let (tx, rx) = mpsc::sync_channel::<OutboundFrame>(32);
         let stop = Arc::new(AtomicBool::new(false));
         let status = Arc::new(Mutex::new(LinkStatus::default()));
@@ -222,12 +242,12 @@ impl Client {
                 }
             }
         });
-        Self {
+        Ok(Self {
             tx,
             stop,
             status,
             thread: Some(thread),
-        }
+        })
     }
     /// Submit a bounded frame without waiting.
     ///
@@ -301,7 +321,7 @@ mod tests {
         let listener = TcpListener::bind("[::1]:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let table = Arc::new(RouteTable::new());
-        let client = Client::start(addr, Protocol::Swp08, Arc::clone(&table));
+        let client = Client::start(addr, Protocol::Swp08, Arc::clone(&table)).unwrap();
         let stub_table = Arc::clone(&table);
         let stub = thread::spawn(move || {
             for source in [7, 8] {
@@ -378,7 +398,8 @@ mod tests {
             listener.local_addr().unwrap(),
             Protocol::Swp08,
             Arc::clone(&table),
-        );
+        )
+        .unwrap();
         let (mut socket, _) = listener.accept().unwrap();
         // Destination low byte DLE, then source high byte ETX. Byte stuffing
         // yields DLE DLE ETX *inside* the body; a suffix-only detector mistakes
@@ -401,50 +422,16 @@ mod tests {
     }
 
     #[test]
-    fn ember_starts_at_bof_and_a_corrupt_crc_reconnects() {
-        use crate::router::{
-            ember::{GlowNode, GlowValue},
-            transport::frame_ember,
-        };
+    fn ember_without_route_mapping_is_rejected_before_opening_a_socket() {
         let listener = TcpListener::bind("[::1]:0").unwrap();
-        let client = Client::start(
+        let result = Client::start(
             listener.local_addr().unwrap(),
             Protocol::Ember,
             Arc::new(RouteTable::new()),
         );
-        let (mut socket, _) = listener.accept().unwrap();
-        socket.write_all(&[0x00, 0x10, 0xff]).unwrap(); // partial-frame garbage before BOF
-        let frame = frame_ember(
-            RouterLink::Tcp,
-            &GlowNode {
-                number: 7,
-                identifier: "route".into(),
-                value: Some(GlowValue::integer(5)),
-            },
-        );
-        let split = frame.bytes.len() / 2;
-        socket.write_all(&frame.bytes[..split]).unwrap();
-        thread::sleep(Duration::from_millis(10));
-        socket.write_all(&frame.bytes[split..]).unwrap();
-        until(|| client.status().connected);
-        thread::sleep(Duration::from_millis(150));
-        assert!(
-            client.status().last_error.is_none(),
-            "valid S101 frame keeps link healthy"
-        );
-        assert_eq!(
-            client.status().reports,
-            0,
-            "GlowNode is not a mapped crosspoint"
-        );
-        let mut corrupt = frame.bytes;
-        corrupt[4] ^= 0x01; // Payload changes; trailing CRC remains unchanged.
-        socket.write_all(&corrupt).unwrap();
-        until(|| !client.status().connected);
-        assert!(client.status().last_error.as_ref().unwrap().contains("CRC"));
-        drop(socket);
-        let (_reconnected, _) = listener.accept().unwrap();
-        until(|| client.status().connections >= 2);
+        assert!(matches!(result, Err(StartError::EmberRouteMappingRequired)));
+        listener.set_nonblocking(true).unwrap();
+        assert!(matches!(listener.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
     }
 
     #[test]
@@ -454,7 +441,8 @@ mod tests {
             listener.local_addr().unwrap(),
             Protocol::Swp08,
             Arc::new(RouteTable::new()),
-        );
+        )
+        .unwrap();
         assert!(client
             .try_send(OutboundFrame {
                 link: RouterLink::Serial,
