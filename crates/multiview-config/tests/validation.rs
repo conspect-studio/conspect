@@ -83,6 +83,91 @@ fn base_document_is_valid() {
     cfg.validate().expect("base document should validate");
 }
 
+/// ADR-0037 / REC-8: an existing document gains recording without changing,
+/// and a declared recording is checked against the rules in the brief.
+#[test]
+fn recording_is_additive_and_its_rules_reject_bad_input() {
+    let cfg = MultiviewConfig::load_from_toml(BASE).unwrap();
+    assert!(cfg.sources.iter().all(|source| source.iso.is_none()));
+    assert!(cfg.outputs.iter().all(|output| output.program().is_none()));
+    let rewritten = toml::to_string(&cfg).unwrap();
+    assert!(
+        !rewritten.contains("[outputs.program]"),
+        "an unrecorded document must not grow a recording section: {rewritten}"
+    );
+
+    let good = format!(
+        "{BASE}\n\
+         [[sources]]\n\
+         id = \"cam1\"\n\
+         kind = \"srt\"\n\
+         url = \"srt://[::1]:9000\"\n\
+         [sources.iso]\n\
+         armed = true\n\
+         [sources.iso.segment]\n\
+         duration_seconds = 6\n\
+         [sources.iso.retention]\n\
+         keep_duration_seconds = 3600\n\
+         [sources.iso.disk]\n\
+         min_free_gib = 10\n\
+         stop_at_pct = 80\n\
+         \n\
+         [outputs.program]\n\
+         armed = true\n\
+         [outputs.program.segment]\n\
+         duration_seconds = 6\n\
+         [outputs.program.retention]\n\
+         keep_size_gib = 50\n\
+         [outputs.program.disk]\n\
+         min_free_gib = 10\n\
+         stop_at_pct = 80\n"
+    );
+    let cfg = MultiviewConfig::load_from_toml(&good).unwrap();
+    cfg.validate().expect("a well-formed recording validates");
+    let cam = cfg.sources.iter().find(|s| s.id == "cam1").unwrap();
+    assert!(cam.iso.as_ref().unwrap().armed);
+    let program = cfg.outputs[0].program();
+    assert!(program.unwrap().armed);
+
+    let json = serde_json::to_string(&cfg).unwrap();
+    let back = MultiviewConfig::load_from_json(&json).unwrap();
+    assert_eq!(back.outputs[0].program(), cfg.outputs[0].program());
+    assert_eq!(
+        back.sources.iter().find(|s| s.id == "cam1").unwrap().iso,
+        cam.iso
+    );
+
+    let unarmed = good.replace("armed = true", "armed = false");
+    let mut broken = unarmed.replace("keep_duration_seconds = 3600\n", "");
+    broken = broken.replace("armed = false", "armed = true");
+    let cfg = MultiviewConfig::load_from_toml(&broken).unwrap();
+    let err = cfg.validate().expect_err("no retention bound");
+    assert!(err.to_string().contains("retention"), "{err}");
+
+    let bad_pct = good.replace("stop_at_pct = 80", "stop_at_pct = 100");
+    let cfg = MultiviewConfig::load_from_toml(&bad_pct).unwrap();
+    let err = cfg.validate().expect_err("stop_at_pct 100");
+    assert!(err.to_string().contains("stop_at_pct"), "{err}");
+
+    let zero = good.replace("duration_seconds = 6", "duration_seconds = 0");
+    let cfg = MultiviewConfig::load_from_toml(&zero).unwrap();
+    let err = cfg.validate().expect_err("zero duration");
+    assert!(err.to_string().contains("duration_seconds"), "{err}");
+
+    let byte_exact = format!("{good}\n[sources.iso.container]\nkind = \"byte_exact\"\n");
+    let cfg = MultiviewConfig::load_from_toml(&byte_exact).unwrap();
+    cfg.validate()
+        .expect("byte_exact is legal on an srt source");
+
+    let bars_exact = byte_exact.replace(
+        "kind = \"srt\"\nurl = \"srt://[::1]:9000\"\n",
+        "kind = \"bars\"\n",
+    );
+    let cfg = MultiviewConfig::load_from_toml(&bars_exact).unwrap();
+    let err = cfg.validate().expect_err("byte_exact on bars");
+    assert!(err.to_string().contains("byte_exact"), "{err}");
+}
+
 #[test]
 fn source_capacity_is_validated_without_silent_truncation() {
     let mut cfg = MultiviewConfig::load_from_toml(BASE).unwrap();
