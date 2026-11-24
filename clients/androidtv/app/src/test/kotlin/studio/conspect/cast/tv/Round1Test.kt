@@ -418,8 +418,6 @@ class NetWorkerTest {
         val w = NetWorker(gate, http)
         val g = gate.next()
         val controlRan = CountDownLatch(1)
-        w.report(g, "u", "IN_FLIGHT")
-        assertTrue("first report started", reportStarted.await(2, TimeUnit.SECONDS))
         val stop = java.util.concurrent.atomic.AtomicBoolean(false)
         val feeder = Thread {
             var i = 0
@@ -428,19 +426,22 @@ class NetWorkerTest {
                 Thread.sleep(20)
             }
         }
-        feeder.start()
-        // A pending report is guaranteed: a feeder continuously replaces the
-        // one-slot report while the first POST is held by releaseReport.
-        w.report(g, "u", "PENDING")
-        assertTrue(w.run(g) { posts.add("CONTROL"); controlRan.countDown() })
         try {
+            w.report(g, "u", "IN_FLIGHT")
+            assertTrue("first report started", reportStarted.await(2, TimeUnit.SECONDS))
+            feeder.start()
+            // A pending report is guaranteed: a feeder continuously replaces
+            // the one-slot report while the first POST is held by releaseReport.
+            w.report(g, "u", "PENDING")
+            assertTrue(w.run(g) { posts.add("CONTROL"); controlRan.countDown() })
             releaseReport.countDown()
             assertTrue("control runs before continuous reports", controlRan.await(2, TimeUnit.SECONDS))
             assertEquals(listOf("IN_FLIGHT", "CONTROL"), posts.take(2))
             assertTrue("feeder kept reports arriving", feeder.isAlive)
         } finally {
+            releaseReport.countDown() // no failure path may leave the daemon worker blocked
             stop.set(true)
-            feeder.join()
+            if (feeder.isAlive) feeder.join()
             w.dispose()
         }
     }
