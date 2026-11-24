@@ -3,13 +3,12 @@
 //! The SW-P-08 and Ember+ **codecs** ([`super::swp08`] / [`super::ember`]) are
 //! pure and always compiled; this module is the thin, feature-gated seam that
 //! carries a framed message over a real byte stream (TCP to a router, or a
-//! serial line). It is **compile-only** in this environment — there is no router
-//! to connect to — so it deliberately holds no live client, only the typed
-//! transport contract and the framing direction the codecs plug into.
+//! serial line). The live supervised TCP socket is in [`super::client`]; this
+//! module holds the typed frame contract and the codec boundary. Serial remains
+//! a future transport, not a live implementation.
 //!
-//! Keeping the socket here (and out of the default build) preserves the pure,
-//! CI-green baseline: nothing in this module is reachable unless a deployment
-//! opts into `router`.
+//! Keeping the live socket feature-gated preserves the pure, CI-green default
+//! build: a deployment opts into `router` explicitly.
 use super::ember::{EmberError, GlowNode};
 use super::swp08::{SwP08Error, SwP08Message};
 
