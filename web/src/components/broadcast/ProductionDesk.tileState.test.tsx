@@ -14,7 +14,7 @@ vi.mock('../../preview/PreviewSurface', () => ({ PreviewSurface: () => null }));
 
 /** Stills are stubbed per path; the mock records whether polling was enabled. */
 const stills = vi.hoisted(() => ({
-  byPath: new Map<string, { url: string | undefined; state: string }>(),
+  byPath: new Map<string, { url: string | undefined; state: string; requestFailed?: boolean }>(),
   enabled: [] as { path: string; enabled: boolean }[],
 }));
 vi.mock('../../preview/useJpegPreview', () => ({
@@ -94,6 +94,25 @@ function tile(container: HTMLElement, name: string): HTMLElement {
 const stillPath = (id: string): string => `/api/v1/preview/inputs/${id}.jpg`;
 
 describe('desk wall tile states', () => {
+  it('distinguishes failed preview requests from input failure and starting state', async () => {
+    stills.byPath.set(stillPath('cam-a'), { url: undefined, state: 'loading', requestFailed: true });
+    stills.byPath.set(stillPath('cam-c'), { url: undefined, state: 'loading', requestFailed: true });
+    server.use(http.get('*/api/v1/sources/status', () => HttpResponse.json([
+      demand('cam-a', 'starting'), demand('cam-c', 'failed', { detail: 'Input connection refused' }),
+    ])));
+    const { container } = page();
+    await screen.findByTestId('tile-failed');
+    expect(tile(container, 'CAM A')).toHaveTextContent('Preview request failed — retrying');
+    expect(tile(container, 'CAM A').querySelector('[data-testid="tile-starting"]')).toBeNull();
+    expect(tile(container, 'CAM C')).toHaveTextContent('No signal');
+    expect(tile(container, 'CAM C')).toHaveTextContent('Input connection refused');
+  });
+
+  it('reports the Preview monitor request failure instead of waiting forever', async () => {
+    stills.byPath.set('/api/v1/preview/switcher/me1/preview.jpg', { url: undefined, state: 'loading', requestFailed: true });
+    page();
+    expect(await screen.findByText('Preview request failed — retrying')).toBeVisible();
+  });
   it('states a failed source with a no-signal slate and the engine reason as literal text', async () => {
     server.use(http.get('*/api/v1/sources/status', () => HttpResponse.json([
       // A bidi override and a zero-width space must not survive into the tile.
