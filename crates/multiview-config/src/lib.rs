@@ -881,7 +881,6 @@ impl MultiviewConfig {
             timing.validate()?;
         }
         self.cast.validate()?;
-        self.validate_program_recordings()?;
 
         // Solving + the core structural check covers geometry (rects in 0..1,
         // positive extent, valid cadence) and grid wiring (areas resolve).
@@ -903,16 +902,6 @@ impl MultiviewConfig {
     /// Returns [`ConfigError::Validation`] naming the first violated invariant.
     pub fn validate_with_now(&self, now: DateTime<Utc>) -> Result<(), ConfigError> {
         self.validate_with(None, Some(now))
-    }
-
-    /// A Program recording belongs to one output by construction.
-    fn validate_program_recordings(&self) -> Result<(), ConfigError> {
-        for output in &self.outputs {
-            if let Some(program) = output.program() {
-                recording::validate_program(&output.id(), program)?;
-            }
-        }
-        Ok(())
     }
 
     /// Validate per-source kind-specific fields so a config that validates cannot
@@ -2670,6 +2659,9 @@ impl Output {
         // `auto`/`pixels`/flip are always valid.
         if let Some(orientation) = self.orientation() {
             orientation.validate(&self.label(), self.orientation_tag_capability())?;
+        }
+        if let Some(program) = self.program() {
+            recording::validate_program(&self.id(), program)?;
         }
         self.validate_cast_rules()?;
         self.validate_webrtc_rules()

@@ -355,11 +355,10 @@ fn validate_common(
             disk.stop_at_pct
         )));
     }
-    if disk.resume_hysteresis_pct == 0 || disk.resume_hysteresis_pct >= disk.stop_at_pct {
+    if disk.resume_hysteresis_pct == 0 || disk.resume_hysteresis_pct > 99 {
         return Err(ConfigError::Validation(format!(
-            "{what}: disk.resume_hysteresis_pct must be 1..stop_at_pct so the resume band \
-             sits strictly below the stop threshold (got {}, stop {})",
-            disk.resume_hysteresis_pct, disk.stop_at_pct
+            "{what}: disk.resume_hysteresis_pct must be 1..=99 (got {})",
+            disk.resume_hysteresis_pct
         )));
     }
     if armed && !retention.has_bound() {
@@ -463,6 +462,14 @@ mod tests {
             let err = validate_iso("cam1", &recording, &SourceKind::Bars).unwrap_err();
             assert!(err.to_string().contains("stop_at_pct"), "{err}");
         }
+    }
+
+    #[test]
+    fn low_stop_percent_resumes_at_saturated_one_percent() {
+        let mut recording = iso(false);
+        recording.disk.stop_at_pct = 1;
+        validate_iso("cam1", &recording, &SourceKind::Bars).unwrap();
+        assert_eq!(recording.disk.resume_pct(), 1);
     }
 
     #[test]
