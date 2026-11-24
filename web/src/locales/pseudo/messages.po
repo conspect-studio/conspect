@@ -768,7 +768,7 @@ msgstr ""
 msgid "A source is an ingest input referenced by id for production, routing, and monitoring."
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:178
+#: src/pages/SwitcherPage.tsx:179
 msgid "A switcher request is in flight"
 msgstr ""
 
@@ -1447,7 +1447,7 @@ msgstr ""
 msgid "Another slot already uses this menu label (name, else language); give this slot a distinct name or language."
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:336
+#: src/pages/SwitcherPage.tsx:337
 msgid "Another switcher request is in flight"
 msgstr ""
 
@@ -1831,7 +1831,7 @@ msgid "AUTO {kindLabel} over {autoFrames} frames"
 msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:369
-#: src/pages/SwitcherPage.tsx:279
+#: src/pages/SwitcherPage.tsx:280
 msgid "Auto frames"
 msgstr ""
 
@@ -2648,7 +2648,7 @@ msgstr ""
 msgid "Checking permission…"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:244
+#: src/pages/SwitcherPage.tsx:245
 msgid "Checking switcher engine…"
 msgstr ""
 
@@ -2678,7 +2678,7 @@ msgid "Choose a salvo…"
 msgstr ""
 
 #: src/components/switcher/KeyerPanel.tsx:240
-#: src/pages/SwitcherPage.tsx:269
+#: src/pages/SwitcherPage.tsx:270
 msgid "Choose a source"
 msgstr ""
 
@@ -4068,7 +4068,7 @@ msgstr ""
 msgid "CUT — Preview and Program carry the same source"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:278
+#: src/pages/SwitcherPage.tsx:279
 msgid "Cut preview to air"
 msgstr ""
 
@@ -6641,8 +6641,8 @@ msgstr ""
 msgid "Keyer {0} strip"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:303
 #: src/pages/SwitcherPage.tsx:304
+#: src/pages/SwitcherPage.tsx:305
 msgid "Keyers"
 msgstr ""
 
@@ -6727,6 +6727,10 @@ msgstr ""
 
 #: src/pages/graphics/DataView.tsx:362
 msgid "Last fetched"
+msgstr ""
+
+#: src/pages/SwitcherPage.tsx:44
+msgid "Last received image — live video cannot be verified"
 msgstr ""
 
 #: src/pages/FillRefreshStatus.tsx:53
@@ -9202,7 +9206,7 @@ msgstr ""
 msgid "Operation id"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:178
+#: src/pages/SwitcherPage.tsx:179
 msgid "Operation in flight or outcome pending"
 msgstr ""
 
@@ -9273,7 +9277,7 @@ msgstr ""
 msgid "outcome unknown; do not repeat"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:251
+#: src/pages/SwitcherPage.tsx:252
 msgid "Outcome unknown; refresh the engine state before taking again"
 msgstr ""
 
@@ -9857,11 +9861,13 @@ msgstr ""
 msgid "Preview of input {0}"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:129
+#: src/components/broadcast/ProductionDesk.tsx:52
+#: src/components/broadcast/ProductionDesk.tsx:125
+#: src/pages/SwitcherPage.tsx:42
 msgid "Preview request failed — retrying"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:273
+#: src/pages/SwitcherPage.tsx:274
 msgid "Preview selected source"
 msgstr ""
 
@@ -9997,7 +10003,7 @@ msgstr ""
 msgid "Program (follows the switcher)"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:242
+#: src/pages/SwitcherPage.tsx:243
 msgid "Program / Preview switcher"
 msgstr ""
 
@@ -10309,7 +10315,7 @@ msgstr ""
 msgid "Realtime streams"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:307
+#: src/pages/SwitcherPage.tsx:308
 msgid "Realtime updates are not connected: keyer lamps and tally may be stale."
 msgstr ""
 
@@ -10442,7 +10448,7 @@ msgstr ""
 msgid "Refreshes every {0} min"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:173
+#: src/pages/SwitcherPage.tsx:174
 msgid "Refreshing the switcher state after the last operation"
 msgstr ""
 
@@ -10819,7 +10825,7 @@ msgstr ""
 msgid "Retry load"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:286
+#: src/pages/SwitcherPage.tsx:287
 msgid "Retry reading the switcher state"
 msgstr ""
 
@@ -11474,7 +11480,7 @@ msgstr ""
 msgid "Send reply"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:274
+#: src/pages/SwitcherPage.tsx:275
 msgid "Send selected source to air"
 msgstr ""
 
@@ -11720,7 +11726,7 @@ msgstr ""
 #: src/pages/approved/SourcesSurface.tsx:365
 #: src/pages/IptvPage.tsx:232
 #: src/pages/OutputFormatFields.tsx:321
-#: src/pages/SwitcherPage.tsx:267
+#: src/pages/SwitcherPage.tsx:268
 msgid "Source"
 msgstr ""
 
@@ -11781,8 +11787,8 @@ msgstr ""
 msgid "Source preview"
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:126
-#: src/components/broadcast/ProductionDesk.tsx:128
+#: src/components/broadcast/ProductionDesk.tsx:127
+#: src/components/broadcast/ProductionDesk.tsx:129
 msgid "Source still preview"
 msgstr ""
 
@@ -11898,7 +11904,7 @@ msgstr ""
 msgid "Stale — last successful poll; the status poll is failing."
 msgstr ""
 
-#: src/components/broadcast/ProductionDesk.tsx:128
+#: src/components/broadcast/ProductionDesk.tsx:129
 msgid "Stale frame"
 msgstr ""
 
@@ -11948,8 +11954,8 @@ msgid "started by an operator"
 msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:70
-#: src/components/broadcast/ProductionDesk.tsx:126
 #: src/components/broadcast/ProductionDesk.tsx:127
+#: src/components/broadcast/ProductionDesk.tsx:128
 #: src/components/SourceDemandBadge.tsx:89
 #: src/pages/approved/SourcesSurface.tsx:350
 msgid "Starting"
@@ -12332,12 +12338,12 @@ msgstr ""
 
 #: src/app/navigation.tsx:63
 #: src/components/broadcast/ProductionDesk.tsx:361
-#: src/pages/SwitcherPage.tsx:248
+#: src/pages/SwitcherPage.tsx:249
 msgid "Switcher"
 msgstr ""
 
 #: src/components/broadcast/ProductionDesk.tsx:361
-#: src/pages/SwitcherPage.tsx:250
+#: src/pages/SwitcherPage.tsx:251
 msgid "Switcher operation rejected"
 msgstr ""
 
@@ -12345,15 +12351,15 @@ msgstr ""
 msgid "switcher required"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:178
+#: src/pages/SwitcherPage.tsx:179
 msgid "Switcher unavailable"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:243
+#: src/pages/SwitcherPage.tsx:244
 msgid "Switcher unavailable: no real Program/Preview bus is attached. Controls are disabled."
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:243
+#: src/pages/SwitcherPage.tsx:244
 msgid "Switcher unavailable: this server does not provide it yet (backend not deployed). Controls are disabled."
 msgstr ""
 
@@ -12488,7 +12494,7 @@ msgstr ""
 msgid "Takes are locked and this set changes a crosspoint that currently carries Program. Confirm to apply it."
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:276
+#: src/pages/SwitcherPage.tsx:277
 msgid "Takes are locked. Use the Takes locked control in the header to unlock. A confirmed engine state is also required."
 msgstr ""
 
@@ -12502,9 +12508,9 @@ msgstr ""
 msgid "Takes locked"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:178
-#: src/pages/SwitcherPage.tsx:264
-#: src/pages/SwitcherPage.tsx:332
+#: src/pages/SwitcherPage.tsx:179
+#: src/pages/SwitcherPage.tsx:265
+#: src/pages/SwitcherPage.tsx:333
 msgid "Takes locked — unlock in the header"
 msgstr ""
 
@@ -12749,11 +12755,11 @@ msgstr ""
 msgid "The applied event was not observed on the realtime stream. The command may or may not have been applied."
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:296
+#: src/pages/SwitcherPage.tsx:297
 msgid "The arm set cannot change during a transition"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:202
+#: src/pages/SwitcherPage.tsx:203
 msgid "The arm set was refused"
 msgstr ""
 
@@ -13012,7 +13018,7 @@ msgstr ""
 msgid "The keyer state changed; review the new plan before applying"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:184
+#: src/pages/SwitcherPage.tsx:185
 msgid "The keyer verb was refused"
 msgstr ""
 
@@ -13130,7 +13136,7 @@ msgstr ""
 msgid "The output's own rendition"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:134
+#: src/pages/SwitcherPage.tsx:135
 msgid "The patch cannot be taken"
 msgstr ""
 
@@ -13295,7 +13301,7 @@ msgstr ""
 msgid "The switcher is on: Program is the M/E bus. Take this layout to an output from <0>Outputs</0>."
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:175
+#: src/pages/SwitcherPage.tsx:176
 msgid "The switcher state could not be refreshed after the last operation; keyer and arm controls stay disabled until it is"
 msgstr ""
 
@@ -13666,7 +13672,7 @@ msgstr ""
 msgid "This would capture {nominalFrames} frames, above the server's cap of {MAX_NOMINAL_FRAMES}. Lower max steps, frame duration or end hold."
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:253
+#: src/pages/SwitcherPage.tsx:254
 msgid "Tick"
 msgstr ""
 
@@ -13896,11 +13902,11 @@ msgstr ""
 msgid "Transition parameters"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:280
+#: src/pages/SwitcherPage.tsx:281
 msgid "Transition preview to air"
 msgstr ""
 
-#: src/pages/SwitcherPage.tsx:253
+#: src/pages/SwitcherPage.tsx:254
 msgid "Transition running"
 msgstr ""
 

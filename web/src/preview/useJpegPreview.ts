@@ -48,6 +48,15 @@ export function useJpegStill(path: string, refreshMs: number, enabled = true): J
   const [status, setStatus] = useState<{ path: string; state: StillState }>();
   const current = useRef<string | undefined>(undefined);
   const [failedPath, setFailedPath] = useState<string>();
+  // Reset render-visible evidence when the request identity changes. In particular,
+  // never expose an object URL revoked by the preceding effect cleanup.
+  const [identity, setIdentity] = useState({ path, enabled });
+  if (identity.path !== path || identity.enabled !== enabled) {
+    setIdentity({ path, enabled });
+    setFrame(undefined);
+    setStatus(undefined);
+    setFailedPath(undefined);
+  }
 
   useEffect(() => {
     if (!enabled) return;
