@@ -80,7 +80,8 @@ class TsContinuityDetector {
  * continuity gap inside it is never released. After a gap, every video unit is dropped until one contains an IDR
  * slice (NAL type 5); that unit and everything after it flow again. Audio and other PIDs always pass: every
  * audio frame is independently decodable. The extractor therefore never sees a frame that depends on lost data.
- * The held unit is bounded by [MAX_UNIT_BYTES]; a unit larger than that is passed on without further holding.
+ * The held unit is bounded by [MAX_UNIT_BYTES]; an oversized unit is discarded through the next PES start so later
+ * continuity loss cannot retract data that has already reached the extractor.
  */
 class TsIdrFilter(private val nowMs: () -> Long = { System.nanoTime() / 1_000_000L }) {
     private var lastRecoveryMs = Long.MIN_VALUE / 2
@@ -90,7 +91,7 @@ class TsIdrFilter(private val nowMs: () -> Long = { System.nanoTime() / 1_000_00
     private val payload = java.io.ByteArrayOutputStream() // payload bytes only: a start code can straddle TS headers
     private var scanFrom = 0
     private var idrSeen = false
-    private var passRest = false
+    private var discardUntilStart = false
 
     /** Gaps that started a recovery. */
     var recoveries = 0
@@ -121,7 +122,6 @@ class TsIdrFilter(private val nowMs: () -> Long = { System.nanoTime() / 1_000_00
         payload.reset()
         scanFrom = 0
         idrSeen = false
-        passRest = false
     }
 
     /**
@@ -163,13 +163,14 @@ class TsIdrFilter(private val nowMs: () -> Long = { System.nanoTime() / 1_000_00
             }
         }
         if (pusi) {
-            if (!dropping) pending.writeTo(out) // the previous unit is complete and intact
-            clearPending()
+            if (!dropping && !discardUntilStart) pending.writeTo(out) // the previous unit is complete and intact
+            pending.reset()
+            payload.reset()
+            scanFrom = 0
+            idrSeen = false
+            discardUntilStart = false
         }
-        if (passRest) {
-            out.write(buf, i, TsContinuityDetector.PACKET)
-            return
-        }
+        if (discardUntilStart) return // discard the rest of the oversized unit, including any later-lost packets
         if (!pusi && pending.size() == 0) {
             // the tail of a unit that was never released (a gap, or a unit dropped in recovery)
             if (!dropping) out.write(buf, i, TsContinuityDetector.PACKET) // before the first unit: nothing to hold
@@ -192,13 +193,10 @@ class TsIdrFilter(private val nowMs: () -> Long = { System.nanoTime() / 1_000_00
             }
         }
         if (pending.size() > MAX_UNIT_BYTES) {
-            if (dropping) {
-                clearPending() // an unbounded candidate is no use
-            } else {
-                pending.writeTo(out)
-                pending.reset()
-                passRest = true
-            }
+            // Never emit an access unit whose completeness cannot be established after loss.
+            // Bound memory by discarding the unit until the next PES start, then resume buffering.
+            clearPending()
+            discardUntilStart = true
         }
     }
 
@@ -221,6 +219,7 @@ class TsIdrFilter(private val nowMs: () -> Long = { System.nanoTime() / 1_000_00
         dropping = false
         lastRecoveryMs = Long.MIN_VALUE / 2
         clearPending()
+        discardUntilStart = false
         recoveries = 0
     }
 

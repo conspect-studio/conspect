@@ -84,6 +84,26 @@ class IdrFilterTest {
         assertEquals(0, f.recoveries)
     }
 
+    @Test fun oversizedAccessUnitIsWithheldUntilContinuityLossCanBeRetracted() {
+        val f = TsIdrFilter()
+        val oversized = unit(1, TsIdrFilter.MAX_UNIT_BYTES / 188 + 4)
+        val beforeGap = run(f, oversized)
+        assertTrue("oversized unit must not be emitted early", beforeGap.isEmpty())
+
+        // Skip one payload counter before the next PES boundary. The oversized unit is still incomplete,
+        // so its already-received bytes must not have reached the extractor.
+        cc = (cc + 1) and 0x0f
+        val gap = pkt(vpid, cc, false, byteArrayOf(9))
+        cc = (cc + 1) and 0x0f
+        assertTrue(run(f, listOf(gap)).isEmpty())
+        assertEquals(1, f.recoveries)
+
+        val idr = unit(5, 2)
+        val recovered = run(f, idr + tail())
+        assertEquals(c(idr), c(recovered))
+        assertFalse(f.recovering)
+    }
+
     @Test fun droppedVideoPacketAfterKeyframeDiscardsToNextIdrWithoutReconnect() {
         val f = TsIdrFilter()
         val idr1 = unit(5, 3)
