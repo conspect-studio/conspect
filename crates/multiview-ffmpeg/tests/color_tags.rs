@@ -87,6 +87,44 @@ fn encode_segment(path: &std::path::Path, color: Option<ColorInfo>) {
     muxer.finish().expect("finish container");
 }
 
+fn h264_vui_flags(path: &std::path::Path) -> std::collections::HashMap<String, String> {
+    let output = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "trace", "-i"])
+        .arg(path)
+        .args([
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "copy",
+            "-bsf:v",
+            "trace_headers",
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .expect("run ffmpeg trace_headers");
+    assert!(
+        output.status.success(),
+        "trace_headers failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let trace = String::from_utf8_lossy(&output.stderr);
+    println!(
+        "H.264 trace_headers output captured ({} bytes)",
+        trace.len()
+    );
+    trace
+        .lines()
+        .filter_map(|line| {
+            let (_, field) = line.rsplit_once("] ")?;
+            let (description, value) = field.rsplit_once(" = ")?;
+            let name = description.split_whitespace().rev().nth(1)?;
+            Some((name.to_owned(), value.trim().to_owned()))
+        })
+        .collect()
+}
+
 fn ffprobe_stream_fields(path: &std::path::Path) -> std::collections::HashMap<String, String> {
     let output = Command::new("ffprobe")
         .args([
@@ -122,6 +160,16 @@ fn h264_bitstream_signals_all_four_sdr_bt709_limited_axes() {
     encode_segment(&path, Some(bt709_limited()));
     let fields = ffprobe_stream_fields(&path);
     println!("ffprobe stream fields: {fields:?}");
+    let vui = h264_vui_flags(&path);
+    assert_eq!(
+        vui.get("video_signal_type_present_flag")
+            .map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        vui.get("video_full_range_flag").map(String::as_str),
+        Some("0")
+    );
     assert_eq!(fields.get("color_range").map(String::as_str), Some("tv"));
     assert_eq!(fields.get("color_space").map(String::as_str), Some("bt709"));
     assert_eq!(
