@@ -70,6 +70,7 @@ impl Client {
                         }
                         let mut frame = Vec::with_capacity(4096);
                         let mut swp08_bcc_next = false;
+                        let mut swp08_dle = false;
                         let mut buf = [0u8; 512];
                         while !s.load(Ordering::Acquire) {
                             // Drain at most the channel capacity per loop, so an
@@ -114,10 +115,16 @@ impl Client {
                                                 // DLE ETX terminates the body, but the NEXT
                                                 // byte is the BCC. Never decode before it arrives.
                                                 let complete = swp08_bcc_next;
-                                                swp08_bcc_next = !complete
-                                                    && frame.len() >= 2
-                                                    && frame.get(frame.len() - 2..)
-                                                        == Some(&[0x10, 0x03][..]);
+                                                if !complete {
+                                                    if b == 0x10 {
+                                                        // A doubled DLE is body data. Only an
+                                                        // unmatched DLE may introduce ETX.
+                                                        swp08_dle = !swp08_dle;
+                                                    } else {
+                                                        swp08_bcc_next = swp08_dle && b == 0x03;
+                                                        swp08_dle = false;
+                                                    }
+                                                }
                                                 complete
                                             }
                                         };
@@ -162,6 +169,7 @@ impl Client {
                                             }
                                             frame.clear();
                                             swp08_bcc_next = false;
+                                            swp08_dle = false;
                                         }
                                     }
                                 }
@@ -313,6 +321,36 @@ mod tests {
         assert!(status.last_route.is_some());
         assert_eq!(status.reports, 1);
         stub.join().unwrap();
+    }
+
+    #[test]
+    fn stuffed_dle_then_etx_inside_body_does_not_end_the_frame() {
+        let listener = TcpListener::bind("[::1]:0").unwrap();
+        let table = Arc::new(RouteTable::new());
+        let client = Client::start(
+            listener.local_addr().unwrap(),
+            Protocol::Swp08,
+            Arc::clone(&table),
+        );
+        let (mut socket, _) = listener.accept().unwrap();
+        // Destination low byte DLE, then source high byte ETX. Byte stuffing
+        // yields DLE DLE ETX *inside* the body; a suffix-only detector mistakes
+        // this for the real DLE ETX marker and reads the next byte as a BCC.
+        let report = frame_swp08(
+            RouterLink::Tcp,
+            &SwP08Message::Connected {
+                matrix: 0,
+                level: 1,
+                destination: 0x10,
+                source: 0x300,
+            },
+        )
+        .unwrap();
+        assert!(report.bytes.windows(3).any(|w| w == [0x10, 0x10, 0x03]));
+        socket.write_all(&report.bytes).unwrap();
+        until(|| table.source_of(1, 0x10) == Some(0x300));
+        assert!(client.status().connected);
+        assert_eq!(client.status().reports, 1);
     }
 
     #[test]
