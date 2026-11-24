@@ -301,7 +301,7 @@ pub fn validate_iso(
         &format!("source {owner:?} iso"),
         recording.armed,
         recording.location.as_deref(),
-        &recording.segment,
+        recording.segment,
         &recording.retention,
         &recording.disk,
     )?;
@@ -324,7 +324,7 @@ pub fn validate_program(owner: &str, recording: &ProgramRecording) -> Result<(),
         &format!("output {owner:?} program"),
         recording.armed,
         recording.location.as_deref(),
-        &recording.segment,
+        recording.segment,
         &recording.retention,
         &recording.disk,
     )
@@ -340,7 +340,7 @@ fn validate_common(
     what: &str,
     armed: bool,
     location: Option<&str>,
-    segment: &SegmentPolicy,
+    segment: SegmentPolicy,
     retention: &RetentionPolicy,
     disk: &DiskPolicy,
 ) -> Result<(), ConfigError> {
