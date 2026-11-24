@@ -597,6 +597,11 @@ export function RoutingPage(): JSX.Element {
                 </Label>
               </div>
 
+              {planRoute.isError && <div role="alert" className="space-y-2 rounded border border-destructive p-3">
+                <p><Trans>Plan failed — no valid plan was obtained. Nothing was sent to the output.</Trans></p>
+                <p>{planRoute.error.detail ?? planRoute.error.message}</p>
+                <Button type="button" variant="outline" disabled={!valid || planRoute.isPending} onClick={onPlan}><Trans>Retry plan</Trans></Button>
+              </div>}
               {plan !== null ? (
                 <div
                   role="status"
