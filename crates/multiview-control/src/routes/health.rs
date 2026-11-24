@@ -24,7 +24,9 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use multiview_events::{HealthWarning, WarningCode};
+use multiview_events::{HealthWarning, WarningCode, WarningSeverity};
+
+use crate::source_demand::SourceDemandPhase;
 use serde::Deserialize;
 
 use crate::auth::{Action, Principal};
@@ -40,7 +42,8 @@ use crate::warning_store::WarningFilter;
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
 pub struct HealthQuery {
     /// Keep only active (`true`, the default) or include cleared (`false`)
-    /// warnings.
+    /// warnings. Current wanted source failures are also included; those are
+    /// live projections, not retained historical entries after recovery.
     #[serde(default)]
     pub active: Option<bool>,
 }
@@ -65,7 +68,7 @@ impl HealthQuery {
         tag = "health",
         params(HealthQuery),
         responses(
-            (status = 200, description = "Active health warnings, code-sorted.", body = [crate::openapi_schemas::HealthWarningDoc]),
+            (status = 200, description = "Active health warnings, code-sorted. Wanted failed sources appear individually as source-failed warnings scoped to authorized source IDs; they clear on recovery without changing liveness.", body = [crate::openapi_schemas::HealthWarningDoc]),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Authenticated but not authorized to read.", body = crate::problem::Problem),
         ),
@@ -78,7 +81,44 @@ pub(crate) async fn list_health(
 ) -> ControlResult<Json<Vec<HealthWarning>>> {
     principal.role.require(Action::Read)?;
     let filter = query.into_filter();
-    let warnings = state.warnings.list(&filter)?;
+    let mut warnings = state.warnings.list(&filter)?;
+    // Demand status is the authoritative *current* source phase. Project it on
+    // this control-plane read rather than publishing one event per source into a
+    // store keyed only by WarningCode (which would coalesce different sources).
+    // Start with accepted sources, then authorize each id before inspecting its
+    // demand status: a scoped key must never enumerate another source via health.
+    let demand = state.source_demand.as_ref();
+    for source in crate::routes::sources::accepted_sources(&state)? {
+        let id = &source.resource.id;
+        if crate::auth::authorize_object(&principal, id).is_err() {
+            continue;
+        }
+        let Some(demand) = demand else { continue };
+        let view = demand.status(id);
+        if view.phase != SourceDemandPhase::Failed || !(view.video_wanted || view.audio_wanted) {
+            continue;
+        }
+        // Never place arbitrary provider detail, a URL, or a credential in a
+        // health entry. The source status route provides operator-safe detail.
+        warnings.push(HealthWarning {
+            code: WarningCode::SourceFailed,
+            severity: WarningSeverity::Critical,
+            subsystem: format!("source:{id}"),
+            message: format!("Source {id} is wanted but has failed to produce media."),
+            remediation: "Inspect the source status and repair its media input or connection."
+                .to_owned(),
+            since: 0, // Unknown; current snapshot has no failure timestamp.
+            active: true,
+        });
+    }
+    // Historical (`active=false`) results retain store order; current source
+    // warnings are a live projection and vanish as soon as a source recovers.
+    warnings.sort_by(|a, b| {
+        a.code
+            .as_str()
+            .cmp(b.code.as_str())
+            .then(a.subsystem.cmp(&b.subsystem))
+    });
     Ok(Json(warnings))
 }
 

@@ -9417,6 +9417,7 @@ export interface components {
             /** @description Optional `User-Agent` header (printable, no CR/LF, <= 1 KiB). */
             user_agent?: string | null;
         } | {
+            address_family?: null | components["schemas"]["YoutubeAddressFamilyDoc"];
             /** @enum {string} */
             kind: "youtube";
             /** @description Watch/live/channel URL. */
@@ -10694,7 +10695,7 @@ export interface components {
          *     Serde-equivalent: a unit enum rendered as its `kebab-case` variant name.
          * @enum {string}
          */
-        WarningCodeDoc: "gpu-present-no-vulkan-adapter" | "container-no-host-networking" | "catalogue-link-attention" | "accepted-state-rejected" | "tls-certificate" | "config-file-removed-accepted";
+        WarningCodeDoc: "gpu-present-no-vulkan-adapter" | "container-no-host-networking" | "catalogue-link-attention" | "accepted-state-rejected" | "tls-certificate" | "config-file-removed-accepted" | "source-failed";
         /**
          * @description `OpenAPI` mirror of [`multiview_events::WarningSeverity`] (SA-0).
          *
@@ -10851,6 +10852,11 @@ export interface components {
              */
             ticket: string;
         };
+        /**
+         * @description `OpenAPI` mirror of [`multiview_config::YoutubeAddressFamily`].
+         * @enum {string}
+         */
+        YoutubeAddressFamilyDoc: "auto" | "v4" | "v6";
         /**
          * @description The `youtube` source kind's resolve capability (ADR-0015): whether this
          *     build can actually resolve a live `YouTube` URL right now.
@@ -14464,7 +14470,8 @@ export interface operations {
             query?: {
                 /**
                  * @description Keep only active (`true`, the default) or include cleared (`false`)
-                 *     warnings.
+                 *     warnings. Current wanted source failures are also included; those are
+                 *     live projections, not retained historical entries after recovery.
                  */
                 active?: boolean | null;
             };
@@ -14474,7 +14481,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Active health warnings, code-sorted. */
+            /** @description Active health warnings, code-sorted. Wanted failed sources appear individually as source-failed warnings scoped to authorized source IDs; they clear on recovery without changing liveness. */
             200: {
                 headers: {
                     [name: string]: unknown;

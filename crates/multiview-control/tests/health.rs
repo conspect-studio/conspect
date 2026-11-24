@@ -203,6 +203,115 @@ async fn cleared_warning_drops_out_of_the_active_list() {
 }
 
 #[tokio::test]
+async fn failed_wanted_source_is_visible_on_health_and_clears_on_recovery_without_leaking_scope() {
+    use std::sync::{Arc, Mutex};
+
+    use multiview_control::{
+        SourceDemandLease, SourceDemandPhase, SourceDemandProvider, SourceDemandView,
+    };
+    use serde_json::json;
+    use support::{harness_with, OPERATOR_TOKEN, SCOPED_TOKEN};
+
+    struct Demand(Mutex<SourceDemandPhase>);
+    impl SourceDemandProvider for Demand {
+        fn status(&self, id: &str) -> SourceDemandView {
+            let mut view = SourceDemandView::idle(id);
+            view.phase = if id == "cam" || id == "scoped-layout" {
+                *self.0.lock().unwrap()
+            } else {
+                SourceDemandPhase::Idle
+            };
+            view.video_wanted = id == "cam" || id == "scoped-layout";
+            view.video_running = view.video_wanted;
+            view.detail = Some("secret URL must never leak".into());
+            view
+        }
+        fn active(&self) -> Vec<SourceDemandView> {
+            vec![self.status("cam")]
+        }
+        fn preview_lease(&self, _id: &str, _label: &str) -> Option<Box<dyn SourceDemandLease>> {
+            None
+        }
+        fn touch_preview(&self, _id: &str) -> Option<SourceDemandPhase> {
+            None
+        }
+    }
+
+    let config: multiview_config::MultiviewConfig = serde_json::from_value(json!({
+        "schema_version": 1,
+        "canvas": {"width": 640, "height": 360, "fps": "25/1", "pixel_format": "nv12",
+                   "background": "#000000", "color": {"profile": "sdr-bt709-limited"}},
+        "layout": {"kind": "grid", "columns": ["1fr"], "rows": ["1fr"], "areas": ["a"]},
+        "sources": [{"id": "cam", "kind": "bars"},
+                    {"id": "scoped-layout", "kind": "bars"},
+                    {"id": "idle", "kind": "hls", "url": "https://example.test/i.m3u8",
+                     "activation": "on_demand"}],
+        "cells": [{"id": "cell", "area": "a", "source": {"input_id": "cam"}}],
+        "outputs": []
+    }))
+    .unwrap();
+    let resources = multiview_control::seed_resources(&config).unwrap();
+    let demand = Arc::new(Demand(Mutex::new(SourceDemandPhase::Ready)));
+    let provider = Arc::clone(&demand);
+    let h = harness_with(move |state| {
+        state
+            .with_seeded_resources(resources)
+            .with_source_demand(provider)
+    });
+    let read = |token| get("/api/v1/health", token);
+    assert_eq!(
+        body_json(send(&h.router, read(OPERATOR_TOKEN)).await).await,
+        json!([])
+    );
+    *demand.0.lock().unwrap() = SourceDemandPhase::Failed;
+    let resp = send(&h.router, read(OPERATOR_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let failed = body_json(resp).await;
+    assert_eq!(failed.as_array().unwrap().len(), 2);
+    assert_eq!(failed[0]["code"], "source-failed");
+    assert_eq!(failed[0]["severity"], "critical");
+    assert_eq!(failed[0]["subsystem"], "source:cam");
+    assert_eq!(failed[1]["subsystem"], "source:scoped-layout");
+    assert!(failed[0]["message"].as_str().unwrap().contains("cam"));
+    assert!(!failed.to_string().contains("secret URL"));
+    // The scoped principal sees its authorized failed source, not cam; the
+    // intentionally idle on-demand source contributes no entry to either view.
+    let scoped = body_json(send(&h.router, read(SCOPED_TOKEN)).await).await;
+    assert_eq!(scoped.as_array().unwrap().len(), 1);
+    assert_eq!(scoped[0]["subsystem"], "source:scoped-layout");
+    assert!(!scoped.to_string().contains("source:cam"));
+    let historical = body_json(
+        send(
+            &h.router,
+            get("/api/v1/health?active=false", OPERATOR_TOKEN),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        historical, failed,
+        "historical view also includes live failures"
+    );
+    *demand.0.lock().unwrap() = SourceDemandPhase::Ready;
+    assert_eq!(
+        body_json(send(&h.router, read(OPERATOR_TOKEN)).await).await,
+        json!([])
+    );
+    assert_eq!(
+        body_json(
+            send(
+                &h.router,
+                get("/api/v1/health?active=false", OPERATOR_TOKEN)
+            )
+            .await
+        )
+        .await,
+        json!([]),
+        "a recovered source is not fabricated as history without a timestamp"
+    );
+}
+
+#[tokio::test]
 async fn unauthenticated_health_listing_is_401() {
     let h = harness();
     let resp = send(&h.router, get("/api/v1/health", "bogus.token")).await;

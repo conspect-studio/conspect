@@ -2624,7 +2624,8 @@
           "catalogue-link-attention",
           "accepted-state-rejected",
           "tls-certificate",
-          "config-file-removed-accepted"
+          "config-file-removed-accepted",
+          "source-failed"
         ],
         "type": "string"
       },
