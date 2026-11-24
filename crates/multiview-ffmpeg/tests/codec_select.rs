@@ -69,6 +69,7 @@ fn encode_to_container(encoder_name: &str, muxer_name: &str, path: &Path) -> u64
         bit_rate: 800_000,
         gop: 12,
         cuda_device: None,
+        color: None,
     };
     let mut encoder = VideoEncoder::new(&target).expect("open selected encoder");
     let time_base = encoder.time_base();

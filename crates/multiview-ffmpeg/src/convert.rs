@@ -212,6 +212,60 @@ fn range_from_ff(range: ff_color::Range) -> ColorRange {
     }
 }
 
+/// The libav form of one [`ColorInfo`], ready to stamp onto an encoder
+/// context or a frame (#161). An axis this crate cannot express stays
+/// unspecified rather than being guessed.
+pub struct FfColorTag {
+    /// Matrix coefficients.
+    pub space: ff_color::Space,
+    /// Primaries.
+    pub primaries: ff_color::Primaries,
+    /// Transfer characteristic.
+    pub transfer: ff_color::TransferCharacteristic,
+    /// Quantization range.
+    pub range: ff_color::Range,
+}
+
+/// Translate a [`ColorInfo`] into libav colour enums for output tagging.
+///
+/// The inverse of [`color_from_ff`] for the axes the output canvas uses.
+/// Tagging only labels; it never converts pixels (invariant #8).
+#[must_use]
+pub fn color_to_ff(color: ColorInfo) -> FfColorTag {
+    FfColorTag {
+        space: match color.matrix {
+            MatrixCoefficients::Bt709 => ff_color::Space::BT709,
+            MatrixCoefficients::Bt601 => ff_color::Space::SMPTE170M,
+            MatrixCoefficients::Bt2020Ncl => ff_color::Space::BT2020NCL,
+            MatrixCoefficients::Rgb => ff_color::Space::RGB,
+            MatrixCoefficients::Unspecified | _ => ff_color::Space::Unspecified,
+        },
+        primaries: match color.primaries {
+            ColorPrimaries::Bt709 => ff_color::Primaries::BT709,
+            ColorPrimaries::Bt601_525 => ff_color::Primaries::SMPTE170M,
+            ColorPrimaries::Bt601_625 => ff_color::Primaries::BT470BG,
+            ColorPrimaries::Bt2020 => ff_color::Primaries::BT2020,
+            ColorPrimaries::Unspecified | _ => ff_color::Primaries::Unspecified,
+        },
+        transfer: match color.transfer {
+            TransferCharacteristic::Bt709 => ff_color::TransferCharacteristic::BT709,
+            TransferCharacteristic::Bt601 => ff_color::TransferCharacteristic::SMPTE170M,
+            TransferCharacteristic::Bt2020 => ff_color::TransferCharacteristic::BT2020_10,
+            TransferCharacteristic::Srgb => ff_color::TransferCharacteristic::IEC61966_2_1,
+            TransferCharacteristic::Pq => ff_color::TransferCharacteristic::SMPTE2084,
+            TransferCharacteristic::Hlg => ff_color::TransferCharacteristic::ARIB_STD_B67,
+            TransferCharacteristic::Unspecified | _ => {
+                ff_color::TransferCharacteristic::Unspecified
+            }
+        },
+        range: match color.range {
+            ColorRange::Limited => ff_color::Range::MPEG,
+            ColorRange::Full => ff_color::Range::JPEG,
+            ColorRange::Unspecified | _ => ff_color::Range::Unspecified,
+        },
+    }
+}
+
 /// Build a [`ColorInfo`] (the four independent axes) from a decoded frame's
 /// libav color tags.
 ///
@@ -298,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn smpte170m_space_maps_to_bt601_matrix() {
+    fn smpte170m_space_maps_to_bt601_matrix_and_round_trips_all_axes() {
         let info = color_from_ff(
             ff_color::Space::SMPTE170M,
             ff_color::Primaries::SMPTE170M,
@@ -309,5 +363,13 @@ mod tests {
         assert_eq!(info.primaries, ColorPrimaries::Bt601_525);
         assert_eq!(info.transfer, TransferCharacteristic::Bt601);
         assert_eq!(info.range, ColorRange::Full);
+        let encoded = color_to_ff(info);
+        assert_eq!(encoded.space, ff_color::Space::SMPTE170M);
+        assert_eq!(encoded.primaries, ff_color::Primaries::SMPTE170M);
+        assert_eq!(
+            encoded.transfer,
+            ff_color::TransferCharacteristic::SMPTE170M
+        );
+        assert_eq!(encoded.range, ff_color::Range::JPEG);
     }
 }

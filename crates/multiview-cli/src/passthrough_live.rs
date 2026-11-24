@@ -1392,6 +1392,12 @@ mod tests {
             bit_rate: 100_000,
             audio: None,
             cuda_ordinal: None,
+            color: Some(multiview_core::color::ColorInfo {
+                primaries: multiview_core::color::ColorPrimaries::Bt709,
+                transfer: multiview_core::color::TransferCharacteristic::Bt709,
+                matrix: multiview_core::color::MatrixCoefficients::Bt709,
+                range: multiview_core::color::ColorRange::Limited,
+            }),
         };
         let black = Nv12Image::solid(
             64,
@@ -1922,6 +1928,12 @@ mod tests {
             bit_rate: 300_000,
             audio: None,
             cuda_ordinal: None,
+            color: Some(multiview_core::color::ColorInfo {
+                primaries: multiview_core::color::ColorPrimaries::Bt709,
+                transfer: multiview_core::color::TransferCharacteristic::Bt709,
+                matrix: multiview_core::color::MatrixCoefficients::Bt709,
+                range: multiview_core::color::ColorRange::Limited,
+            }),
         };
         let black = Nv12Image::solid(
             160,

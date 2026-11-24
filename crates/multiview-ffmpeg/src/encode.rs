@@ -23,9 +23,10 @@ use ffmpeg::util::frame::{Audio, Video};
 use ffmpeg::{codec, encoder, ChannelLayout, Dictionary};
 use ffmpeg_next as ffmpeg;
 
+use multiview_core::color::ColorInfo;
 use multiview_core::time::Rational;
 
-use crate::convert::to_ff_rational;
+use crate::convert::{color_to_ff, to_ff_rational};
 use crate::decode::ensure_initialized;
 use crate::encode_options::CodecOptions;
 use crate::error::{FfmpegError, Result};
@@ -69,6 +70,13 @@ pub struct VideoEncodeTarget {
     /// suffix in [`VideoEncoder::new`]). A bind failure (no GPU / no such
     /// ordinal) degrades gracefully to a default-device open, never a panic.
     pub cuda_device: Option<String>,
+    /// The requested encoder-context color tag (CICP range/primaries/transfer/
+    /// matrix, #161). Written before the codec opens. `None` leaves the context
+    /// untagged. Bitstream/container signaling varies by codec: a context tag
+    /// alone is not proof that a decoder reports that axis. `None` preserves
+    /// the pre-#161 behavior for callers without a canvas profile.
+    /// Tagging only labels; it does not convert pixels (invariant #8).
+    pub color: Option<ColorInfo>,
 }
 
 /// A configured-and-opened video encoder.
@@ -152,6 +160,16 @@ impl VideoEncoder {
         }
         if target.gop > 0 {
             ctx.set_gop(target.gop);
+        }
+        // #161: tag the encoder context before it opens, so the coded stream's
+        // parameters (and every packet the muxer writes from them) carry the
+        // canvas CICP. Tagging only labels; pixels are not converted here.
+        if let Some(color) = target.color {
+            let tag = color_to_ff(color);
+            ctx.set_color_range(tag.range);
+            ctx.set_color_primaries(tag.primaries);
+            ctx.set_color_transfer_characteristic(tag.transfer);
+            ctx.set_colorspace(tag.space);
         }
 
         // NVENC device-affinity pin (Tier-2 P1a): when an ordinal is requested

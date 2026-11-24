@@ -133,6 +133,7 @@ fn target(fps: u32, gop: u32) -> VideoEncodeTarget {
         bit_rate: 2_000_000,
         gop,
         cuda_device: None,
+        color: None,
     }
 }
 

@@ -44,6 +44,7 @@ fn encoder() -> VideoEncoder {
         bit_rate: 20_000_000,
         gop: 1,
         cuda_device: None,
+        color: None,
     })
     .expect("mpeg2video")
 }
