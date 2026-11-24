@@ -47,6 +47,7 @@ pub struct Client {
 }
 impl Client {
     /// Start a supervised control-plane connection.
+    #[allow(clippy::too_many_lines)] // One socket lifecycle: connect, bounded I/O, classify, reconnect.
     pub fn start(address: SocketAddr, protocol: Protocol, table: Arc<RouteTable>) -> Self {
         let (tx, rx) = mpsc::sync_channel::<OutboundFrame>(32);
         let stop = Arc::new(AtomicBool::new(false));
@@ -97,7 +98,7 @@ impl Client {
                                     ))
                                 }
                                 Ok(n) => {
-                                    for &b in &buf[..n] {
+                                    for &b in buf.get(..n).unwrap_or(&[]) {
                                         frame.push(b);
                                         if frame.len() > 4096 {
                                             return Err(io::Error::new(
@@ -115,7 +116,8 @@ impl Client {
                                                 let complete = swp08_bcc_next;
                                                 swp08_bcc_next = !complete
                                                     && frame.len() >= 2
-                                                    && frame[frame.len() - 2..] == [0x10, 0x03];
+                                                    && frame.get(frame.len() - 2..)
+                                                        == Some(&[0x10, 0x03][..]);
                                                 complete
                                             }
                                         };
@@ -129,20 +131,24 @@ impl Client {
                                                                 e,
                                                             )
                                                         })?;
-                                                    if let SwP08Message::Connected { .. } = message
-                                                    {
-                                                        let route =
+                                                    if matches!(
+                                                        message,
+                                                        SwP08Message::Connected { .. }
+                                                    ) {
+                                                        if let Some(route) =
                                                             RouterRoute::from_swp08(&message)
-                                                                .expect(
-                                                                "connected report carries a source",
+                                                        {
+                                                            table.apply(route);
+                                                            let mut status = st
+                                                                .lock()
+                                                                .unwrap_or_else(
+                                                                std::sync::PoisonError::into_inner,
                                                             );
-                                                        table.apply(route);
-                                                        let mut status = st.lock().unwrap_or_else(
-                                                            std::sync::PoisonError::into_inner,
-                                                        );
-                                                        status.last_route = Some(Instant::now());
-                                                        status.reports =
-                                                            status.reports.saturating_add(1);
+                                                            status.last_route =
+                                                                Some(Instant::now());
+                                                            status.reports =
+                                                                status.reports.saturating_add(1);
+                                                        }
                                                     }
                                                 }
                                                 Protocol::Ember => {
@@ -192,6 +198,10 @@ impl Client {
         }
     }
     /// Submit a bounded frame without waiting.
+    ///
+    /// # Errors
+    ///
+    /// A serial or oversized frame is rejected, as is a full/disconnected queue.
     pub fn try_send(&self, frame: OutboundFrame) -> Result<(), mpsc::TrySendError<OutboundFrame>> {
         if frame.bytes.len() > 4096 || frame.link != RouterLink::Tcp {
             return Err(mpsc::TrySendError::Full(frame));
