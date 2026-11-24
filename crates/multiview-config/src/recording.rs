@@ -131,14 +131,14 @@ impl DiskPolicy {
 
     /// Used-percent at or below which a paused recording may resume.
     ///
-    /// Saturates at 1 so a `stop_at_pct` of 1 with a wide hysteresis still has
-    /// a resume point the sensor can observe.
+    /// Saturates at zero to keep a strict hysteresis band even when the stop
+    /// threshold is one percent.
     #[must_use]
     pub const fn resume_pct(self) -> u8 {
         let band = self.resume_hysteresis_pct;
         let stop = self.stop_at_pct;
         if band >= stop {
-            1
+            0
         } else {
             stop - band
         }
@@ -377,7 +377,7 @@ fn validate_common(
         )));
     }
     if let Some(path) = location {
-        if path.is_empty() || !path.starts_with('/') {
+        if path.is_empty() || !std::path::Path::new(path).is_absolute() {
             return Err(ConfigError::Validation(format!(
                 "{what}: location must be an absolute path (got {path:?})"
             )));
@@ -465,11 +465,12 @@ mod tests {
     }
 
     #[test]
-    fn low_stop_percent_resumes_at_saturated_one_percent() {
+    fn low_stop_percent_resumes_below_stop_threshold() {
         let mut recording = iso(false);
         recording.disk.stop_at_pct = 1;
         validate_iso("cam1", &recording, &SourceKind::Bars).unwrap();
-        assert_eq!(recording.disk.resume_pct(), 1);
+        assert_eq!(recording.disk.resume_pct(), 0);
+        assert!(recording.disk.resume_pct() < recording.disk.stop_pct());
     }
 
     #[test]
