@@ -443,7 +443,7 @@ msgstr ""
 msgid "<0>Output clock</0> — decides <1>when</1> each frame is emitted (monotonic, fixed cadence)."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1253
+#: src/pages/SourcesPage.tsx:1254
 msgid "<0>Read the row:</0> Signal (frames arriving), Lifecycle (idle → starting → ready → failed), Activation (always-on / on-demand) and Tally (red = on programme) are separate facts. Anything this page cannot confirm reads Unknown."
 msgstr ""
 
@@ -487,7 +487,7 @@ msgstr ""
 msgid "<0>Wikidata</0> city coordinates — CC0."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1260
+#: src/pages/SourcesPage.tsx:1261
 msgid "<0>YouTube restream:</0> the inbound ingest and the outbound destination publishing (Routing) are separate paths — one failing never means the other is broken."
 msgstr ""
 
@@ -764,7 +764,7 @@ msgstr ""
 msgid "A source is a managed input. Each one owns its ingest, decode, color handling, and reconnect behaviour, and is referenced by tiles via a stable id. Supported kinds include RTSP, HLS, MPEG-TS, SRT, RTMP, NDI, file, and a built-in synthetic test pattern. When a source stops delivering frames, its tile holds the last good frame and moves through a clear state machine — live, stale, reconnecting, no-signal — while the engine reconnects without disturbing the rest of the wall."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1227
+#: src/pages/SourcesPage.tsx:1228
 msgid "A source is an ingest input referenced by id for production, routing, and monitoring."
 msgstr ""
 
@@ -822,7 +822,7 @@ msgid "About display nodes"
 msgstr ""
 
 #: src/layout/components/GridLayoutEditor.tsx:300
-#: src/pages/LayoutsPage.tsx:657
+#: src/pages/LayoutsPage.tsx:658
 msgid "About layouts"
 msgstr ""
 
@@ -853,8 +853,8 @@ msgid "About probes and alarms"
 msgstr ""
 
 #: src/pages/docs/FeaturesPage.tsx:53
-#: src/pages/SourcesPage.tsx:1266
-#: src/pages/SourcesPage.tsx:1349
+#: src/pages/SourcesPage.tsx:1267
+#: src/pages/SourcesPage.tsx:1350
 msgid "About source transports"
 msgstr ""
 
@@ -899,7 +899,7 @@ msgstr ""
 msgid "Accepted"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:733
+#: src/pages/LayoutsPage.tsx:734
 msgid "Accessible editing path: Cells form + Inspector in the editor"
 msgstr ""
 
@@ -1279,11 +1279,11 @@ msgstr ""
 msgid "All cells showing this source"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:700
+#: src/pages/LayoutsPage.tsx:701
 msgid "All configured layouts."
 msgstr ""
 
-#: src/pages/MediaPlayersPage.tsx:844
+#: src/pages/MediaPlayersPage.tsx:845
 msgid "All configured media players."
 msgstr ""
 
@@ -1359,7 +1359,7 @@ msgstr ""
 msgid "An armed key's sources are hidden from you, so the arm set cannot be changed here"
 msgstr ""
 
-#: src/pages/MediaPlayersPage.tsx:907
+#: src/pages/MediaPlayersPage.tsx:908
 msgid "An asset id is required"
 msgstr ""
 
@@ -1387,7 +1387,7 @@ msgstr ""
 msgid "An ordinary managed source was created carrying device_ref {deviceId}."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1540
+#: src/pages/OutputsPage.tsx:1542
 msgid "An output is a sink/server that publishes the program."
 msgstr ""
 
@@ -1598,7 +1598,7 @@ msgid "Arm vamp exit"
 msgstr ""
 
 #. placeholder {0}: player.name
-#: src/pages/MediaPlayersPage.tsx:687
+#: src/pages/MediaPlayersPage.tsx:688
 msgid "Arm vamp exit on {0}"
 msgstr ""
 
@@ -1630,7 +1630,7 @@ msgstr ""
 msgid "Asset"
 msgstr ""
 
-#: src/pages/MediaPlayersPage.tsx:881
+#: src/pages/MediaPlayersPage.tsx:882
 msgid "Asset id"
 msgstr ""
 
@@ -2119,7 +2119,7 @@ msgid "Broadcast area"
 msgstr ""
 
 #: src/iptv/IptvOrgPage.tsx:363
-#: src/pages/SourcesPage.tsx:1242
+#: src/pages/SourcesPage.tsx:1243
 msgid "Browse IPTV-ORG"
 msgstr ""
 
@@ -2224,11 +2224,11 @@ msgstr ""
 #: src/pages/graphics/DataView.tsx:320
 #: src/pages/graphics/LibraryView.tsx:155
 #: src/pages/LayoutsPage.tsx:499
-#: src/pages/LayoutsPage.tsx:771
-#: src/pages/MediaPlayersPage.tsx:919
+#: src/pages/LayoutsPage.tsx:772
+#: src/pages/MediaPlayersPage.tsx:920
 #: src/pages/OutputFeedRow.tsx:458
-#: src/pages/OutputsPage.tsx:1612
-#: src/pages/OutputsPage.tsx:1661
+#: src/pages/OutputsPage.tsx:1614
+#: src/pages/OutputsPage.tsx:1663
 #: src/pages/RelayManagementPage.tsx:80
 #: src/pages/RoutingPage.tsx:668
 #: src/pages/SalvosPage.tsx:281
@@ -2237,8 +2237,8 @@ msgstr ""
 #: src/pages/SystemActionsPage.tsx:151
 #: src/pages/TallyPage.tsx:432
 #: src/pages/WindyFillDialog.tsx:1347
-#: src/resources/CrudPage.tsx:380
-#: src/resources/CrudPage.tsx:425
+#: src/resources/CrudPage.tsx:383
+#: src/resources/CrudPage.tsx:428
 msgid "Cancel"
 msgstr ""
 
@@ -2259,7 +2259,7 @@ msgid "Cancel vamp exit"
 msgstr ""
 
 #. placeholder {0}: player.name
-#: src/pages/MediaPlayersPage.tsx:691
+#: src/pages/MediaPlayersPage.tsx:692
 msgid "Cancel vamp exit on {0}"
 msgstr ""
 
@@ -3163,7 +3163,7 @@ msgstr ""
 msgid "Configure a media player to use a stinger"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1445
+#: src/pages/OutputsPage.tsx:1447
 msgid "Configure output servers and renditions."
 msgstr ""
 
@@ -3181,7 +3181,7 @@ msgstr ""
 
 #: src/pages/approved/SourcesSurface.tsx:362
 #: src/pages/approved/SourcesSurface.tsx:408
-#: src/pages/SourcesPage.tsx:1228
+#: src/pages/SourcesPage.tsx:1229
 msgid "Configured ingest sources."
 msgstr ""
 
@@ -3189,7 +3189,7 @@ msgstr ""
 msgid "Configured multiview layouts."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1484
+#: src/pages/OutputsPage.tsx:1486
 msgid "Configured output sinks."
 msgstr ""
 
@@ -3250,7 +3250,7 @@ msgstr ""
 msgid "Confirm token revocation"
 msgstr ""
 
-#: src/app/AppLayout.tsx:17
+#: src/app/AppLayout.tsx:23
 #: src/components/ConnectionStatus.tsx:29
 #: src/iptv/NetworkDialog.tsx:111
 msgid "Connected"
@@ -3261,7 +3261,7 @@ msgstr ""
 msgid "Connected ({0})"
 msgstr ""
 
-#: src/app/AppLayout.tsx:17
+#: src/app/AppLayout.tsx:23
 #: src/components/ConnectionStatus.tsx:35
 #: src/pages/OutputsPage.tsx:206
 msgid "Connecting"
@@ -3532,8 +3532,8 @@ msgstr ""
 msgid "Could not copy diagnostics. Select the safe technical details and copy them manually."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1387
-#: src/resources/CrudPage.tsx:279
+#: src/pages/OutputsPage.tsx:1388
+#: src/resources/CrudPage.tsx:281
 msgid "Could not create"
 msgstr ""
 
@@ -3545,8 +3545,8 @@ msgstr ""
 msgid "Could not create sources"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1410
-#: src/resources/CrudPage.tsx:298
+#: src/pages/OutputsPage.tsx:1411
+#: src/resources/CrudPage.tsx:300
 msgid "Could not delete"
 msgstr ""
 
@@ -3611,8 +3611,8 @@ msgid "Could not load discovery:"
 msgstr ""
 
 #: src/pages/DevicesPage.tsx:518
-#: src/pages/OutputsPage.tsx:1347
-#: src/resources/CrudPage.tsx:246
+#: src/pages/OutputsPage.tsx:1348
+#: src/resources/CrudPage.tsx:248
 msgid "Could not load for editing"
 msgstr ""
 
@@ -3620,15 +3620,15 @@ msgstr ""
 msgid "Could not load graphics channels."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:684
+#: src/pages/LayoutsPage.tsx:685
 msgid "Could not load layouts:"
 msgstr ""
 
-#: src/pages/MediaPlayersPage.tsx:830
+#: src/pages/MediaPlayersPage.tsx:831
 msgid "Could not load media players:"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1476
+#: src/pages/OutputsPage.tsx:1478
 msgid "Could not load outputs:"
 msgstr ""
 
@@ -3656,7 +3656,7 @@ msgstr ""
 msgid "Could not load salvos:"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1231
+#: src/pages/SourcesPage.tsx:1232
 msgid "Could not load sources:"
 msgstr ""
 
@@ -3768,8 +3768,8 @@ msgid "Could not reboot"
 msgstr ""
 
 #: src/pages/IptvPage.tsx:104
-#: src/pages/OutputsPage.tsx:1387
-#: src/resources/CrudPage.tsx:279
+#: src/pages/OutputsPage.tsx:1388
+#: src/resources/CrudPage.tsx:281
 msgid "Could not save"
 msgstr ""
 
@@ -3883,8 +3883,8 @@ msgstr ""
 
 #: src/pages/DeviceDetailPage.tsx:1095
 #: src/pages/DeviceDetailPage.tsx:1214
-#: src/pages/OutputsPage.tsx:1619
-#: src/resources/CrudPage.tsx:383
+#: src/pages/OutputsPage.tsx:1621
+#: src/resources/CrudPage.tsx:386
 msgid "Create"
 msgstr ""
 
@@ -3921,7 +3921,7 @@ msgstr ""
 msgid "Create today source"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:694
+#: src/pages/LayoutsPage.tsx:695
 msgid "Create your first layout"
 msgstr ""
 
@@ -3931,8 +3931,8 @@ msgstr ""
 
 #: src/iptv/BulkAddDialog.tsx:105
 #: src/iptv/BulkAddDialog.tsx:184
-#: src/pages/OutputsPage.tsx:1378
-#: src/resources/CrudPage.tsx:272
+#: src/pages/OutputsPage.tsx:1379
+#: src/resources/CrudPage.tsx:274
 msgid "Created"
 msgstr ""
 
@@ -4014,7 +4014,7 @@ msgid "Cue"
 msgstr ""
 
 #. placeholder {0}: player.name
-#: src/pages/MediaPlayersPage.tsx:677
+#: src/pages/MediaPlayersPage.tsx:678
 msgid "Cue {0}"
 msgstr ""
 
@@ -4026,7 +4026,7 @@ msgstr ""
 msgid "Cue player to in-point"
 msgstr ""
 
-#: src/pages/MediaPlayersPage.tsx:657
+#: src/pages/MediaPlayersPage.tsx:658
 msgid "Cued"
 msgstr ""
 
@@ -4262,16 +4262,16 @@ msgstr ""
 
 #: src/pages/approved/SourcesSurface.tsx:277
 #: src/pages/LayoutsPage.tsx:196
-#: src/pages/LayoutsPage.tsx:774
+#: src/pages/LayoutsPage.tsx:775
 #: src/pages/OutputsPage.tsx:1106
-#: src/pages/OutputsPage.tsx:1224
-#: src/pages/OutputsPage.tsx:1669
+#: src/pages/OutputsPage.tsx:1225
+#: src/pages/OutputsPage.tsx:1671
 #: src/pages/SalvosPage.tsx:307
 #: src/pages/SalvosPage.tsx:436
 #: src/pages/TallyPage.tsx:392
 #: src/pages/TallyPage.tsx:435
 #: src/resources/CrudPage.tsx:109
-#: src/resources/CrudPage.tsx:432
+#: src/resources/CrudPage.tsx:435
 msgid "Delete"
 msgstr ""
 
@@ -4291,12 +4291,12 @@ msgstr ""
 msgid "Delete layout"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:748
+#: src/pages/LayoutsPage.tsx:749
 msgid "Delete layout?"
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:1100
-#: src/pages/OutputsPage.tsx:1218
+#: src/pages/OutputsPage.tsx:1219
 msgid "Delete output"
 msgstr ""
 
@@ -4336,13 +4336,13 @@ msgstr ""
 msgid "Delete this relay? Active clients can disconnect. Imported resources also require explicit deletion."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1638
-#: src/resources/CrudPage.tsx:402
+#: src/pages/OutputsPage.tsx:1640
+#: src/resources/CrudPage.tsx:405
 msgid "Delete this resource?"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1404
-#: src/resources/CrudPage.tsx:294
+#: src/pages/OutputsPage.tsx:1405
+#: src/resources/CrudPage.tsx:296
 msgid "Deleted"
 msgstr ""
 
@@ -4400,12 +4400,12 @@ msgstr ""
 msgid "Detail"
 msgstr ""
 
-#: src/components/broadcast/TaskWorkspace.tsx:82
+#: src/components/broadcast/TaskWorkspace.tsx:86
 #: src/events/JournalPanel.tsx:127
 #: src/iptv/IptvOrgPage.tsx:841
 #: src/pages/approved/SourcesSurface.tsx:297
 #: src/pages/approved/SourcesSurface.tsx:300
-#: src/pages/MediaPlayersPage.tsx:567
+#: src/pages/MediaPlayersPage.tsx:568
 msgid "Details"
 msgstr ""
 
@@ -4414,8 +4414,12 @@ msgstr ""
 msgid "Details for {name}"
 msgstr ""
 
+#. placeholder {0}: output.name
+#. placeholder {0}: player.name
 #. placeholder {0}: record.record_id
 #: src/events/JournalPanel.tsx:49
+#: src/pages/MediaPlayersPage.tsx:565
+#: src/pages/OutputsPage.tsx:1182
 msgid "Details: {0}"
 msgstr ""
 
@@ -4531,7 +4535,7 @@ msgstr ""
 msgid "Discard the source wall-clock"
 msgstr ""
 
-#: src/app/AppLayout.tsx:17
+#: src/app/AppLayout.tsx:23
 #: src/components/ConnectionStatus.tsx:47
 #: src/pages/approved/PatchMatrix.tsx:853
 msgid "Disconnected"
@@ -4808,7 +4812,7 @@ msgstr ""
 
 #: src/devices/InputStreamsInspector.tsx:62
 #: src/pages/RoutingPage.tsx:472
-#: src/pages/SourcesPage.tsx:1325
+#: src/pages/SourcesPage.tsx:1326
 msgid "e.g. cam-north"
 msgstr ""
 
@@ -4861,7 +4865,7 @@ msgstr ""
 msgid "e.g. out-foyer"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1564
+#: src/pages/OutputsPage.tsx:1566
 msgid "e.g. program-hls"
 msgstr ""
 
@@ -4948,7 +4952,7 @@ msgstr ""
 #: src/pages/approved/SourcesSurface.tsx:274
 #: src/pages/LayoutsPage.tsx:173
 #: src/pages/OutputsPage.tsx:1096
-#: src/pages/OutputsPage.tsx:1214
+#: src/pages/OutputsPage.tsx:1215
 #: src/pages/SalvosPage.tsx:296
 #: src/resources/CrudPage.tsx:97
 msgid "Edit"
@@ -4988,9 +4992,9 @@ msgstr ""
 
 #: src/pages/OutputsPage.tsx:1082
 #: src/pages/OutputsPage.tsx:1083
-#: src/pages/OutputsPage.tsx:1200
 #: src/pages/OutputsPage.tsx:1201
-#: src/pages/OutputsPage.tsx:1537
+#: src/pages/OutputsPage.tsx:1202
+#: src/pages/OutputsPage.tsx:1539
 msgid "Edit output"
 msgstr ""
 
@@ -5011,7 +5015,7 @@ msgstr ""
 
 #: src/pages/approved/SourcesSurface.tsx:267
 #: src/pages/approved/SourcesSurface.tsx:267
-#: src/pages/SourcesPage.tsx:1226
+#: src/pages/SourcesPage.tsx:1227
 msgid "Edit source"
 msgstr ""
 
@@ -5089,7 +5093,7 @@ msgstr ""
 msgid "End hold (ms)"
 msgstr ""
 
-#: src/pages/MediaPlayersPage.tsx:667
+#: src/pages/MediaPlayersPage.tsx:668
 msgid "End of file"
 msgstr ""
 
@@ -5520,8 +5524,8 @@ msgstr ""
 msgid "fits"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1607
-#: src/resources/CrudPage.tsx:375
+#: src/pages/OutputsPage.tsx:1609
+#: src/resources/CrudPage.tsx:378
 msgid "Fix the highlighted fields, then save again."
 msgstr ""
 
@@ -6063,7 +6067,7 @@ msgstr ""
 #: src/pages/approved/MediaSurface.tsx:135
 #: src/pages/approved/RoutingSurface.tsx:94
 #: src/pages/approved/ShowPage.tsx:41
-#: src/pages/SourcesPage.tsx:1220
+#: src/pages/SourcesPage.tsx:1221
 msgid "Help"
 msgstr ""
 
@@ -6171,10 +6175,10 @@ msgid "Hosts, IPv4 vs IPv6"
 msgstr ""
 
 #: src/pages/AudioPage.tsx:1533
-#: src/pages/OutputsPage.tsx:1467
+#: src/pages/OutputsPage.tsx:1469
 #: src/pages/OverlaysPage.tsx:234
 #: src/pages/ProbesPage.tsx:496
-#: src/pages/SourcesPage.tsx:1270
+#: src/pages/SourcesPage.tsx:1271
 msgid "How configuration applies"
 msgstr ""
 
@@ -6256,12 +6260,12 @@ msgstr ""
 #: src/pages/DeviceDetailPage.tsx:1135
 #: src/pages/DevicesPage.tsx:113
 #: src/pages/LayoutsPage.tsx:96
-#: src/pages/OutputsPage.tsx:1560
+#: src/pages/OutputsPage.tsx:1562
 #: src/pages/OverlaysPage.tsx:268
 #: src/pages/ProbesPage.tsx:520
 #: src/pages/SalvosPage.tsx:211
 #: src/pages/SalvosPage.tsx:341
-#: src/pages/SourcesPage.tsx:1321
+#: src/pages/SourcesPage.tsx:1322
 #: src/pages/SyncGroupsPage.tsx:379
 #: src/pages/TallyPage.tsx:364
 msgid "Identifier"
@@ -6659,7 +6663,7 @@ msgstr ""
 #: src/pages/OverlaysPage.tsx:289
 #: src/pages/ProbesPage.tsx:419
 #: src/pages/ProbesPage.tsx:542
-#: src/pages/SourcesPage.tsx:1342
+#: src/pages/SourcesPage.tsx:1343
 #: src/pages/SystemActionsPage.tsx:234
 msgid "Kind"
 msgstr ""
@@ -6804,7 +6808,7 @@ msgstr ""
 msgid "Latency"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1448
+#: src/pages/OutputsPage.tsx:1450
 msgid "Latency & protocol guide"
 msgstr ""
 
@@ -6896,7 +6900,6 @@ msgstr ""
 #: src/pages/approved/PatchMatrix.tsx:191
 #: src/pages/DashboardPage.tsx:58
 #: src/pages/docs/FeaturesPage.tsx:25
-#: src/pages/LayoutsPage.tsx:648
 #: src/pages/OutputFeedRow.tsx:323
 msgid "Layouts"
 msgstr "التخطيطات"
@@ -7120,7 +7123,7 @@ msgstr ""
 msgid "Live sessions"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1212
+#: src/pages/SourcesPage.tsx:1213
 msgid "Live source lifecycle — exceptions sort first."
 msgstr ""
 
@@ -7146,21 +7149,21 @@ msgid "LL-HLS (Low-Latency HLS)"
 msgstr ""
 
 #: src/pages/MediaPlayersPage.tsx:459
-#: src/pages/MediaPlayersPage.tsx:928
+#: src/pages/MediaPlayersPage.tsx:929
 #: src/pages/WindyFillDialog.tsx:1279
 msgid "Load"
 msgstr ""
 
 #. placeholder {0}: player.name
-#: src/pages/MediaPlayersPage.tsx:675
+#: src/pages/MediaPlayersPage.tsx:676
 msgid "Load {0}"
 msgstr ""
 
-#: src/pages/MediaPlayersPage.tsx:868
+#: src/pages/MediaPlayersPage.tsx:869
 msgid "Load a media-library asset into this player. It cues to the asset's in-point, ready to take."
 msgstr ""
 
-#: src/pages/MediaPlayersPage.tsx:865
+#: src/pages/MediaPlayersPage.tsx:866
 msgid "Load asset"
 msgstr ""
 
@@ -7193,7 +7196,7 @@ msgid "Loaded"
 msgstr ""
 
 #: src/pages/approved/PatchMatrix.tsx:849
-#: src/pages/MediaPlayersPage.tsx:655
+#: src/pages/MediaPlayersPage.tsx:656
 msgid "Loading"
 msgstr ""
 
@@ -7250,7 +7253,7 @@ msgstr ""
 msgid "Loading layout…"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:680
+#: src/pages/LayoutsPage.tsx:681
 msgid "Loading layouts…"
 msgstr ""
 
@@ -7266,7 +7269,7 @@ msgstr ""
 msgid "Loading logs…"
 msgstr ""
 
-#: src/pages/MediaPlayersPage.tsx:826
+#: src/pages/MediaPlayersPage.tsx:827
 msgid "Loading media players…"
 msgstr ""
 
@@ -7278,7 +7281,7 @@ msgstr ""
 msgid "Loading on the TV…"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1472
+#: src/pages/OutputsPage.tsx:1474
 msgid "Loading outputs…"
 msgstr ""
 
@@ -7319,7 +7322,7 @@ msgid "Loading source events…"
 msgstr ""
 
 #: src/pages/approved/RoutingSurface.tsx:412
-#: src/pages/SourcesPage.tsx:1230
+#: src/pages/SourcesPage.tsx:1231
 msgid "Loading sources…"
 msgstr ""
 
@@ -7734,7 +7737,7 @@ msgstr ""
 msgid "Media time"
 msgstr ""
 
-#: src/pages/MediaPlayersPage.tsx:886
+#: src/pages/MediaPlayersPage.tsx:887
 msgid "Media-library asset id"
 msgstr ""
 
@@ -7895,7 +7898,7 @@ msgstr ""
 msgid "MoQ video was refused: this account has no access to it. Showing the next available preview."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1236
+#: src/pages/SourcesPage.tsx:1237
 msgid "More"
 msgstr ""
 
@@ -8014,13 +8017,13 @@ msgstr ""
 #: src/pages/IptvPage.tsx:253
 #: src/pages/LayoutsPage.tsx:87
 #: src/pages/OutputFormatFields.tsx:313
-#: src/pages/OutputsPage.tsx:1572
+#: src/pages/OutputsPage.tsx:1574
 #: src/pages/OverlaysPage.tsx:168
 #: src/pages/OverlaysPage.tsx:280
 #: src/pages/ProbesPage.tsx:414
 #: src/pages/ProbesPage.tsx:532
 #: src/pages/SalvosPage.tsx:210
-#: src/pages/SourcesPage.tsx:1333
+#: src/pages/SourcesPage.tsx:1334
 #: src/pages/SyncGroupsPage.tsx:234
 #: src/pages/SyncGroupsPage.tsx:391
 #: src/pages/TallyPage.tsx:241
@@ -8158,13 +8161,13 @@ msgid "New instances blocked"
 msgstr ""
 
 #: src/pages/LayoutEditorPage.tsx:338
-#: src/pages/LayoutsPage.tsx:671
+#: src/pages/LayoutsPage.tsx:672
 msgid "New layout"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1432
-#: src/pages/OutputsPage.tsx:1457
-#: src/pages/OutputsPage.tsx:1537
+#: src/pages/OutputsPage.tsx:1433
+#: src/pages/OutputsPage.tsx:1459
+#: src/pages/OutputsPage.tsx:1539
 msgid "New output"
 msgstr ""
 
@@ -8183,8 +8186,8 @@ msgstr ""
 msgid "New salvo"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1224
 #: src/pages/SourcesPage.tsx:1225
+#: src/pages/SourcesPage.tsx:1226
 msgid "New source"
 msgstr ""
 
@@ -8256,7 +8259,7 @@ msgstr ""
 msgid "No analysis for this mode — no analysis service supplied it."
 msgstr ""
 
-#: src/pages/MediaPlayersPage.tsx:899
+#: src/pages/MediaPlayersPage.tsx:900
 msgid "No asset browser is available here yet: this control plane has no library listing to pick from, so the asset id must be typed exactly as the media library defines it."
 msgstr ""
 
@@ -8419,7 +8422,7 @@ msgstr ""
 msgid "No layout cells found — enter the cell id to watch."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:689
+#: src/pages/LayoutsPage.tsx:690
 msgid "No layouts are defined yet."
 msgstr ""
 
@@ -8475,7 +8478,7 @@ msgstr ""
 msgid "No media"
 msgstr ""
 
-#: src/pages/MediaPlayersPage.tsx:835
+#: src/pages/MediaPlayersPage.tsx:836
 msgid "No media players are configured. Declare them under<0>media_players</0> in the config."
 msgstr ""
 
@@ -8507,7 +8510,7 @@ msgstr ""
 msgid "No output tick observed"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1480
+#: src/pages/OutputsPage.tsx:1482
 msgid "No outputs configured."
 msgstr ""
 
@@ -8620,7 +8623,7 @@ msgid "No sources available"
 msgstr ""
 
 #: src/pages/approved/RoutingSurface.tsx:422
-#: src/pages/SourcesPage.tsx:1229
+#: src/pages/SourcesPage.tsx:1230
 msgid "No sources configured."
 msgstr ""
 
@@ -8778,8 +8781,8 @@ msgstr ""
 msgid "not currently declared"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1338
-#: src/resources/CrudPage.tsx:237
+#: src/pages/OutputsPage.tsx:1339
+#: src/resources/CrudPage.tsx:239
 msgid "Not editable in this UI"
 msgstr ""
 
@@ -9139,7 +9142,7 @@ msgid "open documentation"
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:1050
-#: src/pages/OutputsPage.tsx:1191
+#: src/pages/OutputsPage.tsx:1192
 msgid "Open HLS playlist"
 msgstr ""
 
@@ -9333,7 +9336,7 @@ msgstr ""
 msgid "Output playback unavailable: the configured playlist path is missing."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1426
+#: src/pages/OutputsPage.tsx:1427
 msgid "Output sinks"
 msgstr ""
 
@@ -9356,7 +9359,7 @@ msgstr ""
 #: src/docs/registry.ts:237
 #: src/pages/docs/ConfigPage.tsx:258
 #: src/pages/docs/FeaturesPage.tsx:65
-#: src/pages/OutputsPage.tsx:1442
+#: src/pages/OutputsPage.tsx:1443
 msgid "Outputs"
 msgstr "المخرجات"
 
@@ -9489,7 +9492,7 @@ msgid "Pause"
 msgstr ""
 
 #. placeholder {0}: player.name
-#: src/pages/MediaPlayersPage.tsx:681
+#: src/pages/MediaPlayersPage.tsx:682
 msgid "Pause {0}"
 msgstr ""
 
@@ -9497,7 +9500,7 @@ msgstr ""
 msgid "Pause player"
 msgstr ""
 
-#: src/pages/MediaPlayersPage.tsx:661
+#: src/pages/MediaPlayersPage.tsx:662
 msgid "Paused"
 msgstr ""
 
@@ -9709,7 +9712,7 @@ msgid "Play"
 msgstr ""
 
 #. placeholder {0}: player.name
-#: src/pages/MediaPlayersPage.tsx:679
+#: src/pages/MediaPlayersPage.tsx:680
 msgid "Play {0}"
 msgstr ""
 
@@ -9734,7 +9737,7 @@ msgstr ""
 msgid "Playback URLs are unavailable: this server does not provide them yet (backend not deployed)."
 msgstr ""
 
-#: src/pages/MediaPlayersPage.tsx:877
+#: src/pages/MediaPlayersPage.tsx:878
 #: src/pages/WindyFillDialog.tsx:736
 msgid "Player"
 msgstr ""
@@ -9753,7 +9756,7 @@ msgid "Players"
 msgstr ""
 
 #: src/cast/castLabels.ts:21
-#: src/pages/MediaPlayersPage.tsx:659
+#: src/pages/MediaPlayersPage.tsx:660
 msgid "Playing"
 msgstr ""
 
@@ -10397,7 +10400,7 @@ msgstr ""
 msgid "Reconnect behaviour"
 msgstr ""
 
-#: src/app/AppLayout.tsx:17
+#: src/app/AppLayout.tsx:23
 #: src/components/ConnectionStatus.tsx:41
 #: src/components/TileStateBadge.tsx:41
 #: src/pages/OutputsPage.tsx:208
@@ -10622,7 +10625,7 @@ msgstr ""
 msgid "Removed from the registry. A device still referenced by a Source or Output (device_ref) is refused with a conflict instead."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1405
+#: src/pages/OutputsPage.tsx:1406
 #: src/pages/ProbesPage.tsx:500
 msgid "Removed from the store. The running engine is unchanged until a config export + restart."
 msgstr ""
@@ -10635,7 +10638,7 @@ msgstr ""
 msgid "Removed. Member devices keep running; only the alignment grouping is gone."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1288
+#: src/pages/SourcesPage.tsx:1289
 msgid "Removed. The running engine drops the source immediately (the response header confirms) — tiles bound to it show the no-signal slate until re-routed."
 msgstr ""
 
@@ -11163,10 +11166,10 @@ msgstr ""
 #: src/pages/CastPage.tsx:609
 #: src/pages/IptvPage.tsx:125
 #: src/pages/LayoutsPage.tsx:502
-#: src/pages/OutputsPage.tsx:1619
+#: src/pages/OutputsPage.tsx:1621
 #: src/pages/SalvosPage.tsx:398
 #: src/pages/SettingsPage.tsx:422
-#: src/resources/CrudPage.tsx:383
+#: src/resources/CrudPage.tsx:386
 msgid "Save"
 msgstr ""
 
@@ -11219,8 +11222,8 @@ msgid "Save Windy account"
 msgstr ""
 
 #: src/pages/AudioPage.tsx:425
-#: src/pages/OutputsPage.tsx:1378
-#: src/resources/CrudPage.tsx:272
+#: src/pages/OutputsPage.tsx:1379
+#: src/resources/CrudPage.tsx:274
 msgid "Saved"
 msgstr ""
 
@@ -11378,7 +11381,7 @@ msgid "Seeding from a preset replaces every cell in this draft. Nothing is saved
 msgstr ""
 
 #. placeholder {0}: player.name
-#: src/pages/MediaPlayersPage.tsx:685
+#: src/pages/MediaPlayersPage.tsx:686
 msgid "Seek {0}"
 msgstr ""
 
@@ -11722,7 +11725,7 @@ msgstr ""
 msgid "Skip cue"
 msgstr ""
 
-#: src/app/AppLayout.tsx:19
+#: src/app/AppLayout.tsx:25
 msgid "Skip to content"
 msgstr ""
 
@@ -11878,11 +11881,11 @@ msgstr "المصادر"
 msgid "Sources & library"
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:651
+#: src/pages/LayoutsPage.tsx:652
 msgid "Sources → Layouts → Outputs. The accessible editor offers a form-based path equivalent to the drag-and-drop canvas. Save keeps a layout; apply asks the running engine to use it now. Saved layouts are not separate live renderers."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1251
+#: src/pages/SourcesPage.tsx:1252
 msgid "Sources help"
 msgstr ""
 
@@ -12127,7 +12130,7 @@ msgid "Stop"
 msgstr ""
 
 #. placeholder {0}: player.name
-#: src/pages/MediaPlayersPage.tsx:683
+#: src/pages/MediaPlayersPage.tsx:684
 msgid "Stop {0}"
 msgstr ""
 
@@ -12162,7 +12165,7 @@ msgid "Stop this cast session?"
 msgstr ""
 
 #: src/components/broadcast/ProducerStatus.tsx:66
-#: src/pages/MediaPlayersPage.tsx:663
+#: src/pages/MediaPlayersPage.tsx:664
 msgid "Stopped"
 msgstr ""
 
@@ -12202,7 +12205,7 @@ msgstr ""
 msgid "Stored, not applied live: this change needs a restart (for example a changed sample rate, or an input with no audio on this run). The running program mix is unchanged until then."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1380
+#: src/pages/OutputsPage.tsx:1381
 msgid "Stored. A format or bitrate change resets this output (about 1 s); Program and other outputs are not affected. Any other change applies on the next restart."
 msgstr ""
 
@@ -12214,12 +12217,12 @@ msgstr ""
 msgid "Stored. Drift is measured against the group's target skew; the achieved tier is reported, never over-claimed."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1381
+#: src/pages/OutputsPage.tsx:1382
 #: src/pages/ProbesPage.tsx:499
 msgid "Stored. It goes live via config export + restart; the running engine is unchanged until then."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1287
+#: src/pages/SourcesPage.tsx:1288
 msgid "Stored. Synthetic sources (bars, solid colour, clock, timer) and — on a full-engine run — network/file sources apply to the running engine immediately; NDI / YouTube / AES67 (and any kind on the software engine) go live via config export + restart. The response header declares which applied."
 msgstr ""
 
@@ -12435,7 +12438,7 @@ msgstr ""
 msgid "Synchronized output"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:1272
+#: src/pages/SourcesPage.tsx:1273
 msgid "Synthetic sources (bars, solid colour, clock, timer) apply to the running engine immediately when saved, and deleting any source removes it from the running engine immediately. Network and file sources (RTSP, HLS, MPEG-TS, SRT, RTMP, RIST, file) also apply live on a full-engine run; on the software engine, and for NDI / YouTube / AES67, they are stored and go live via config export + restart. Each save response declares which applied (X-Multiview-Apply: live or restart)."
 msgstr ""
 
@@ -12518,7 +12521,7 @@ msgid "Take vamp exit"
 msgstr ""
 
 #. placeholder {0}: player.name
-#: src/pages/MediaPlayersPage.tsx:689
+#: src/pages/MediaPlayersPage.tsx:690
 msgid "Take vamp exit on {0}"
 msgstr ""
 
@@ -12875,7 +12878,7 @@ msgstr ""
 msgid "The condition must stay clear this long before the alarm clears."
 msgstr ""
 
-#: src/pages/MediaPlayersPage.tsx:744
+#: src/pages/MediaPlayersPage.tsx:745
 msgid "The control plane did not answer. The command may or may not have been applied."
 msgstr ""
 
@@ -13522,8 +13525,8 @@ msgstr ""
 msgid "this document's shape isn't editable in this UI; it is preserved as authored"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1339
-#: src/resources/CrudPage.tsx:238
+#: src/pages/OutputsPage.tsx:1340
+#: src/resources/CrudPage.tsx:240
 msgid "This entry's kind has no form here; the stored document is preserved as authored."
 msgstr ""
 
@@ -13615,7 +13618,7 @@ msgstr ""
 msgid "This page is not served over HTTPS. A TV only plays an HTTPS address with a valid certificate."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:751
+#: src/pages/LayoutsPage.tsx:752
 msgid "This permanently removes the layout. Running outputs are not affected until a new layout is applied."
 msgstr ""
 
@@ -13627,8 +13630,8 @@ msgstr ""
 msgid "This permanently removes the salvo definition."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:1641
-#: src/resources/CrudPage.tsx:405
+#: src/pages/OutputsPage.tsx:1643
+#: src/resources/CrudPage.tsx:408
 msgid "This permanently removes the stored resource. The running engine is not affected until a new configuration is applied."
 msgstr ""
 
@@ -13977,7 +13980,7 @@ msgstr ""
 #: src/pages/DataPage.tsx:109
 #: src/pages/docs/concepts/TransportsPage.tsx:257
 #: src/pages/LicencePage.tsx:247
-#: src/pages/OutputsPage.tsx:1581
+#: src/pages/OutputsPage.tsx:1583
 msgid "Transport"
 msgstr ""
 
@@ -14395,7 +14398,7 @@ msgstr ""
 msgid "Vamp exit"
 msgstr ""
 
-#: src/pages/MediaPlayersPage.tsx:665
+#: src/pages/MediaPlayersPage.tsx:666
 msgid "Vamping"
 msgstr ""
 
@@ -14451,6 +14454,10 @@ msgstr ""
 msgid "Video feed for {outputName}"
 msgstr ""
 
+#: src/pages/LayoutsPage.tsx:648
+msgid "Video layouts"
+msgstr ""
+
 #: src/preview/PreviewDiagnostics.tsx:21
 msgid "Video progress could not be determined from browser statistics."
 msgstr ""
@@ -14468,7 +14475,7 @@ msgstr ""
 msgid "Video using a brightness curve (PQ or HLG) and usually the BT.2020 gamut that represents far brighter highlights and deeper shadows than standard dynamic range (SDR). HDR tiles must be tone-mapped onto an SDR canvas or they look dim and grey."
 msgstr ""
 
-#: src/pages/LayoutsPage.tsx:665
+#: src/pages/LayoutsPage.tsx:666
 msgid "View current engine program"
 msgstr ""
 
@@ -14619,7 +14626,7 @@ msgid "Watch / live / channel URL"
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:1046
-#: src/pages/OutputsPage.tsx:1187
+#: src/pages/OutputsPage.tsx:1188
 msgid "Watch program"
 msgstr ""
 

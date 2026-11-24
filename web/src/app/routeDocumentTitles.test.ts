@@ -23,6 +23,25 @@ describe('operator route document titles', () => {
       return [];
     });
     expect(titledPaths.sort()).toEqual([...paths].sort());
+    // Classify every router leaf, including nested documentation and dynamic routes.
+    // A new route must be intentionally titled or added to this reviewed exclusion.
+    const excluded = [
+      '/outputs', '/dashboard', '/show', '/layouts/new', '/layouts/:id', '/sources/iptv-org',
+      '/overlays', '/audio', '/iptv', '/devices', '/devices/:id', '/cast', '/sync-groups',
+      '/graphics', '/graphics/:view', '/weather', '/probes', '/monitoring', '/tally', '/salvos',
+      '/media-players', '/alarms', '/system', '/system/capabilities', '/system/actions', '/logs',
+      '/audit', '/settings', '/welcome', '/settings/licence', '/settings/data', '/settings/mesh',
+      '/settings/relays', '/settings/account', '/help/support', '/help', '/help/containers',
+      '/help/compose', '/help/config', '/help/api', '/help/features', '/help/devices',
+      '/help/devices/adopt', '/help/display-nodes', '/help/sync', '/help/concepts/transports',
+      '/help/concepts/timing-sync', '/help/concepts/codecs', '/help/concepts/color',
+      '/help/concepts/resilience', '/help/concepts/latency', '/help/concepts/glossary', '/*',
+    ];
+    const leaves = (routes: typeof router.routes, parent = ''): string[] => routes.flatMap((route) => {
+      const path = route.index ? (parent || '/') : route.path === '/' ? '' : `${parent}/${route.path ?? ''}`;
+      return route.children ? leaves(route.children, path) : [path || '/'];
+    });
+    expect(leaves(router.routes).sort()).toEqual([...paths, ...excluded].sort());
     expect(OPERATOR_ROUTE_TITLES['/']).toBe('Production desk — Conspect');
     expect(OPERATOR_ROUTE_TITLES['/routing']).toBe('Routing & outputs — Conspect');
     expect(OPERATOR_ROUTE_TITLES['/sources']).toBe('Sources & library — Conspect');
