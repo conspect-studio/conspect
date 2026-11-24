@@ -16,6 +16,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+use socket2::{SockRef, TcpKeepalive};
+
+/// Enable kernel TCP probes after ten idle seconds, every five seconds, with
+/// three unanswered probes before the kernel reports a dead peer. The link can
+/// remain apparently open for roughly twenty-five seconds after blackholing;
+/// `last_route` remains exposed so a caller can detect a silent route mirror.
+fn configure_keepalive(socket: &TcpStream) -> io::Result<()> {
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(10))
+        .with_interval(Duration::from_secs(5))
+        .with_retries(3);
+    SockRef::from(socket).set_tcp_keepalive(&keepalive)
+}
+
 /// Framing protocol of a TCP link.
 #[derive(Clone, Copy)]
 pub enum Protocol {
@@ -60,6 +74,7 @@ impl Client {
                     |mut socket| {
                         socket.set_read_timeout(Some(Duration::from_millis(100)))?;
                         socket.set_write_timeout(Some(Duration::from_millis(100)))?;
+                        configure_keepalive(&socket)?;
                         {
                             let mut status =
                                 st.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -256,6 +271,29 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(condition(), "router state did not converge");
+    }
+
+    #[test]
+    fn tcp_keepalive_is_enabled_with_bounded_kernel_probe_interval() {
+        let listener = TcpListener::bind("[::1]:0").unwrap();
+        let connector =
+            thread::spawn(move || TcpStream::connect(listener.local_addr().unwrap()).unwrap());
+        let socket = connector.join().unwrap();
+        configure_keepalive(&socket).unwrap();
+        let options = SockRef::from(&socket);
+        assert!(options.keepalive().unwrap(), "SO_KEEPALIVE must be active");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            assert_eq!(
+                options.tcp_keepalive_time().unwrap(),
+                Duration::from_secs(10)
+            );
+            assert_eq!(
+                options.tcp_keepalive_interval().unwrap(),
+                Duration::from_secs(5)
+            );
+            assert_eq!(options.tcp_keepalive_retries().unwrap(), 3);
+        }
     }
 
     #[test]

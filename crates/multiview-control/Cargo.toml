@@ -63,6 +63,9 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["net", "sync"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Kernel TCP keepalive tuning for the opt-in supervised router client. Already
+# transitively present via Tokio/hyper-util; no default-feature cost.
+socket2 = { version = "0.6.4", features = ["all"], optional = true }
 
 # HTTP stack (pure Rust; the default-feature build pulls no native libs).
 axum = { version = "0.8.9", features = ["ws", "macros"] }
@@ -393,10 +396,9 @@ moq-browser-integration = ["moq-transport"]
 # and handlers are always compiled and tested in-process; only the discovery +
 # socket seam needs this feature, so it stays out of the CI-green default build.
 "nmos" = []
-# Off-by-default router transport: the live TCP/serial socket to a SW-P-08 or
-# Ember+ router. The protocol codecs are always compiled and tested; only the
-# socket seam needs this feature, so it stays out of the CI-green default build.
-"router" = []
+# Off-by-default supervised TCP router transport. Pure SW-P-08 and Ember+ codecs
+# remain always compiled; live TCP keepalive uses the already-locked socket2.
+"router" = ["dep:socket2"]
 # Off-by-default mDNS/DNS-SD device discovery (ADR-M008 §6 / ADR-0041 doctrine):
 # the real multicast browse for `_googlecast._tcp` (Cast), `_ndi._tcp` (NDI
 # sources incl. ZowieBox), and any configured zowietek-control service type. The
