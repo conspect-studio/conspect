@@ -20,9 +20,9 @@
 //! fed lossily, and the lamp it computes is *submitted* to the engine arbiter
 //! exactly like a manual override.
 //!
-//! The live TCP/serial socket to a router is behind the off-by-default `router`
-//! feature (`transport`); the codecs and the route-follow logic above are
-//! always compiled and tested.
+//! The live TCP socket to a router is behind the off-by-default `router`
+//! feature (`client`); serial transport is not implemented. The codecs and
+//! route-follow logic above are always compiled and tested.
 use std::collections::HashMap;
 use std::sync::Mutex;
 
