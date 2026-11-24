@@ -18,8 +18,8 @@ vi.mock('../preview/useJpegPreview', () => ({
     return preview;
   },
 }));
-vi.mock('../api/switcher', () => ({ getSwitcher: async () => ({ program_source: 'a', preview_source: 'b', tick: 1 }), commandSwitcher: vi.fn(), planSwitcher: vi.fn() }));
-vi.mock('../api/patch', () => ({ getPatch: async () => ({ mixer: [] }), planPatch: vi.fn(), takePatch: vi.fn() }));
+vi.mock('../api/switcher', () => ({ getSwitcher: () => Promise.resolve({ program_source: 'a', preview_source: 'b', tick: 1 }), commandSwitcher: vi.fn(), planSwitcher: vi.fn() }));
+vi.mock('../api/patch', () => ({ getPatch: () => Promise.resolve({ mixer: [] }), planPatch: vi.fn(), takePatch: vi.fn() }));
 vi.mock('../resources/queries', () => ({ useSources: () => ({ data: [] }) }));
 vi.mock('../realtime/shared', () => ({ subscribeRealtime: () => () => undefined }));
 i18n.load('en', messages);
