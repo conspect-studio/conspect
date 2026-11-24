@@ -220,6 +220,32 @@ describe('useJpegPreview', () => {
     expect(result.current.state).toBe('fresh');
   });
 
+  it('clears previous failure evidence when disabled or switched to another input', async () => {
+    const { result, rerender } = renderHook(({ path, enabled }) => useJpegStill(path, 1000, enabled), {
+      initialProps: { path: '/preview/a.jpg', enabled: true },
+    });
+    await fail(0, 503, 'application/problem+json');
+    expect(result.current.requestFailed).toBe(true);
+    rerender({ path: '/preview/a.jpg', enabled: false });
+    expect(result.current.requestFailed).toBe(false);
+    rerender({ path: '/preview/a.jpg', enabled: true });
+    expect(result.current.requestFailed).toBe(false);
+    await fail(1, 503, 'application/problem+json');
+    rerender({ path: '/preview/b.jpg', enabled: true });
+    expect(result.current).toEqual({ url: undefined, state: 'loading', requestFailed: false });
+  });
+
+  it('does not expose a revoked image when re-enabled', async () => {
+    const { result, rerender } = renderHook(({ enabled }) => useJpegStill('/preview/a.jpg', 1000, enabled), { initialProps: { enabled: true } });
+    await settle(0, 'good');
+    expect(result.current.url).toBeDefined();
+    rerender({ enabled: false });
+    expect(result.current.url).toBeUndefined();
+    rerender({ enabled: true });
+    expect(result.current.url).toBeUndefined();
+    expect(result.current.state).toBe('loading');
+  });
+
   it('re-probes an unserved route only slowly (30 s), not every poll', async () => {
     renderHook(() => useJpegStill('/preview/a.jpg', 1000));
     await fail(0, 200, 'text/html');
