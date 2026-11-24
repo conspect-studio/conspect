@@ -14,7 +14,6 @@ import { Play, Route as RouteIcon } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 
 import { usePlanRoute, useTakeRoute } from "../api/routingQueries";
-import { OperationApiError } from "../api/operations";
 import type {
   RouteClass,
   RouteKind,
@@ -600,7 +599,7 @@ export function RoutingPage(): JSX.Element {
 
               {planRoute.isError && <div role="alert" className="space-y-2 rounded border border-destructive p-3">
                 <p><Trans>Plan failed — no valid plan was obtained. Nothing was sent to the output.</Trans></p>
-                <p>{planRoute.error instanceof OperationApiError ? (planRoute.error.detail ?? planRoute.error.message) : planRoute.error.message}</p>
+                <p>{planRoute.error.detail ?? planRoute.error.message}</p>
                 <Button type="button" variant="outline" disabled={!valid || planRoute.isPending} onClick={onPlan}><Trans>Retry plan</Trans></Button>
               </div>}
               {plan !== null ? (
