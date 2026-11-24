@@ -100,6 +100,15 @@ impl Client {
                                 }
                                 Ok(n) => {
                                     for &b in buf.get(..n).unwrap_or(&[]) {
+                                        // S101 begins at BOF. Discard stray bytes from a
+                                        // half frame or noisy peer without waiting for the
+                                        // entire 4096-byte cap before accepting a good frame.
+                                        if matches!(protocol, Protocol::Ember)
+                                            && frame.is_empty()
+                                            && b != 0xfe
+                                        {
+                                            continue;
+                                        }
                                         frame.push(b);
                                         if frame.len() > 4096 {
                                             return Err(io::Error::new(
@@ -351,6 +360,53 @@ mod tests {
         until(|| table.source_of(1, 0x10) == Some(0x300) && client.status().reports == 1);
         assert!(client.status().connected);
         assert_eq!(client.status().reports, 1);
+    }
+
+    #[test]
+    fn ember_starts_at_bof_and_a_corrupt_crc_reconnects() {
+        use crate::router::{
+            ember::{GlowNode, GlowValue},
+            transport::frame_ember,
+        };
+        let listener = TcpListener::bind("[::1]:0").unwrap();
+        let client = Client::start(
+            listener.local_addr().unwrap(),
+            Protocol::Ember,
+            Arc::new(RouteTable::new()),
+        );
+        let (mut socket, _) = listener.accept().unwrap();
+        socket.write_all(&[0x00, 0x10, 0xff]).unwrap(); // partial-frame garbage before BOF
+        let frame = frame_ember(
+            RouterLink::Tcp,
+            &GlowNode {
+                number: 7,
+                identifier: "route".into(),
+                value: Some(GlowValue::integer(5)),
+            },
+        );
+        let split = frame.bytes.len() / 2;
+        socket.write_all(&frame.bytes[..split]).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        socket.write_all(&frame.bytes[split..]).unwrap();
+        until(|| client.status().connected);
+        thread::sleep(Duration::from_millis(150));
+        assert!(
+            client.status().last_error.is_none(),
+            "valid S101 frame keeps link healthy"
+        );
+        assert_eq!(
+            client.status().reports,
+            0,
+            "GlowNode is not a mapped crosspoint"
+        );
+        let mut corrupt = frame.bytes;
+        corrupt[4] ^= 0x01; // Payload changes; trailing CRC remains unchanged.
+        socket.write_all(&corrupt).unwrap();
+        until(|| !client.status().connected);
+        assert!(client.status().last_error.as_ref().unwrap().contains("CRC"));
+        drop(socket);
+        let (_reconnected, _) = listener.accept().unwrap();
+        until(|| client.status().connections >= 2);
     }
 
     #[test]
