@@ -49,8 +49,9 @@ track unsupported by the output capability is rejected.
 `[[outputs.slots.subtitle]]` declares one subtitle rendition. Fields are:
 
 - `format`: `webvtt` (default), `cea608`, or `dvb`. The currently built
-  combination is WebVTT on HLS or Cast, up to eight slots. Other medium/format
-  combinations are rejected as unsupported or mismatched.
+  combination is WebVTT on plain HLS or Cast, up to eight slots. LL-HLS
+  WebVTT is not built. Other medium/format combinations are rejected as
+  unsupported or mismatched.
 - `language`: optional; if present, 1–35 ASCII letters, digits or hyphens.
 - `name`: optional menu name; at most 64 characters, with no control characters
   or double quote. The effective label is `name`, otherwise `language`,
