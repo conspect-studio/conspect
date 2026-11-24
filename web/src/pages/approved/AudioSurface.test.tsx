@@ -108,6 +108,9 @@ describe('AudioSurface', () => {
     renderWithProviders(<AudioMasterRegion />);
     expect(screen.getByTestId('audio-master-unavailable')).toHaveTextContent(/unavailable/i);
     expect(screen.getByTestId('audio-monitor-unavailable')).toHaveTextContent(/LISTEN.*unavailable/i);
+    expect(screen.getByTestId('audio-monitor-unavailable')).toHaveTextContent(/external monitor/i);
+    expect(screen.getByTestId('audio-monitor-unavailable')).toHaveTextContent(/cannot isolate an input/i);
+    expect(screen.getByTestId('audio-master-unavailable')).toHaveTextContent(/adjust each included input strip/i);
     // The master strip is shown but every control is disabled (no invented function).
     const buttons = screen.getAllByRole('button');
     expect(buttons.length).toBeGreaterThan(0);

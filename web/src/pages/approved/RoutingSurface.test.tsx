@@ -109,6 +109,8 @@ describe('RoutingSurface', () => {
     );
     const cell = screen.getByTestId('xpt-a-cell-1');
     expect(cell).toHaveTextContent('?');
+    expect(cell).toHaveTextContent('Unknown');
+    expect(cell).toHaveAccessibleName(/current route unknown/i);
     expect(cell).not.toHaveTextContent('ON');
     await user.click(cell);
     expect(picks).toEqual(['a>video:cell-1']);

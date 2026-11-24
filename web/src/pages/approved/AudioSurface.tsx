@@ -185,15 +185,17 @@ export function AudioMasterRegion({
           </Button>
         </div>
         <p className="strip-status" data-testid="audio-master-unavailable">
-          {reason}.
+          {reason}. <Trans>Adjust each included input strip to change the mix; this is not a single master control.</Trans>
         </p>
         {children}
       </section>
       <div className="mix-note">
         <p className="monitor-line" data-testid="audio-monitor-unavailable">
           <Trans>
-            MONITOR OUT — LISTEN (PFL) is unavailable: no headphone monitoring
-            path exists on this control plane.
+            LISTEN (PFL) is unavailable: it cannot solo a source here. Use a separate external
+            monitor connected to the source before taking it on air. To hear the
+            current on-air mix instead, use the Program player on Monitoring;
+            it cannot isolate an input.
           </Trans>
         </p>
         <p>
