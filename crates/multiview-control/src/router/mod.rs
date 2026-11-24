@@ -1,6 +1,6 @@
-//! External **router/switcher control** — SW-P-08 and Ember+ drivers, the route
-//! table, and **route-follow** into the tally arbiter (broadcast-multiviewer
-//! brief §2/§8).
+//! External **router/switcher control** — SW-P-08 and Ember+ pure codecs, a
+//! supervised SW-P-08 TCP client, and route-follow control-plane values
+//! (broadcast-multiviewer brief §2/§8).
 //!
 //! A broadcast router crosspoints sources to destinations. Multiview uses this for
 //! two operator features:
@@ -16,13 +16,13 @@
 //! crosspoint state) and the pure [`route_follow`] step that turns a router route
 //! report plus a [`RouteBinding`] into a tally/UMD update the existing
 //! [`TallyMirror`](crate::tally_state::TallyMirror) records — with **no engine
-//! back-pressure** (invariant #10): the route mirror is control-plane state only,
-//! fed lossily, and the lamp it computes is *submitted* to the engine arbiter
-//! exactly like a manual override.
+//! back-pressure** (invariant #10). The current `ingest_route` path updates
+//! only that control-plane mirror; submission to the engine arbiter is a
+//! separate, unimplemented integration and must not be claimed here.
 //!
-//! The live TCP/serial socket to a router is behind the off-by-default `router`
-//! feature (`transport`); the codecs and the route-follow logic above are
-//! always compiled and tested.
+//! The live TCP socket to a router is behind the off-by-default `router`
+//! feature (`client`); serial transport is not implemented. The codecs and
+//! route-follow logic above are always compiled and tested.
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -33,6 +33,8 @@ use serde::{Deserialize, Serialize};
 pub mod ember;
 pub mod swp08;
 
+#[cfg(feature = "router")]
+pub mod client;
 #[cfg(feature = "router")]
 pub mod transport;
 

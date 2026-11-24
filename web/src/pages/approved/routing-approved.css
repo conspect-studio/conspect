@@ -166,3 +166,10 @@
   [data-approved-page="routing"] .matrix-actions button { width:100%; }
   [data-approved-page="routing"] .route-form { grid-template-columns:minmax(0,1fr); }
 }
+
+/* Status is readable text, not an unexplained glyph. Keep scrolling local. */
+[data-approved-page="routing"] .patch-table th.src-h,
+[data-approved-page="routing"] .patch-table th.patch-src{width:160px;min-width:160px;max-width:160px;white-space:normal;text-overflow:clip;overflow-wrap:break-word}
+[data-approved-page="routing"] .patch-table th.dest-h,
+[data-approved-page="routing"] .patch-table td{width:120px;min-width:120px;max-width:120px}
+[data-approved-page="routing"] .xpt{width:116px;min-height:48px;height:auto;padding:6px;white-space:normal;flex-direction:column;gap:2px;line-height:1.3}

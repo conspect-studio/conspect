@@ -241,7 +241,8 @@ RUN ldconfig \
 # `docker run` time (e.g. compose `group_add`) for VAAPI /dev/dri access.
 RUN groupadd --gid 10001 multiview \
  && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin multiview \
- && mkdir -p /etc/multiview /var/lib/multiview/hls \
+ && mkdir -p /etc/multiview/.multiview /var/lib/multiview/hls \
+ && chmod 0700 /etc/multiview/.multiview \
  && chown -R 10001:10001 /etc/multiview /var/lib/multiview
 
 COPY --from=builder /usr/local/bin/multiview /usr/local/bin/multiview
