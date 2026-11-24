@@ -1826,6 +1826,92 @@ mod failure_class_tests {
 }
 
 #[cfg(test)]
+mod run_output_audio_capability_tests {
+    use super::Pipeline;
+    use multiview_config::{MultiviewConfig, TrackCapacity, TrackDelivery};
+
+    #[test]
+    fn running_outputs_report_their_declared_audio_transport_capability() {
+        let doc = r##"schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#000000"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "a"
+kind = "bars"
+[[cells]]
+id = "c"
+area = "a"
+[cells.source]
+input_id = "a"
+[[outputs]]
+id = "hls-out"
+kind = "hls"
+path = "/tmp/run-capability/index.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+[[outputs]]
+id = "srt-out"
+kind = "srt"
+url = "srt://[::1]:9000"
+codec = "mpeg2video"
+"##;
+        let config = MultiviewConfig::load_from_toml(doc).expect("parse");
+        config.validate().expect("validate");
+        let pipeline = Pipeline::build(&config).expect("build");
+        let binding_ids = vec![Some("hls-out".to_owned()), Some("srt-out".to_owned())];
+        let outputs = pipeline.run_outputs(&binding_ids, &[vec![], vec![]]);
+        let hls = outputs
+            .iter()
+            .find(|out| out.id.as_deref() == Some("hls-out"))
+            .expect("HLS");
+        let srt = outputs
+            .iter()
+            .find(|out| out.id.as_deref() == Some("srt-out"))
+            .expect("SRT");
+        assert_eq!(hls.audio_capability.delivery, TrackDelivery::SelectOne);
+        assert_eq!(
+            hls.audio_capability.discrete_capacity,
+            TrackCapacity::Unlimited
+        );
+        assert_eq!(srt.audio_capability.delivery, TrackDelivery::Simultaneous);
+        assert_eq!(
+            srt.audio_capability.discrete_capacity,
+            TrackCapacity::Unlimited
+        );
+        // Offline rendering prepends an internal program.ts anchor. It has no
+        // declared transport; configured capabilities retain their identities.
+        let mut pipeline = pipeline;
+        let (runners, ids) = pipeline.build_sink_runners(false);
+        assert_eq!(runners.len(), 3);
+        let ids: Vec<Option<String>> = ids;
+        let reported = pipeline.run_outputs(&ids, &[vec![], vec![], vec![]]);
+        assert_eq!(reported[0].id, None);
+        assert_eq!(reported[0].audio_capability.delivery, TrackDelivery::None);
+        assert_eq!(reported[1].id.as_deref(), Some("hls-out"));
+        assert_eq!(
+            reported[1].audio_capability.delivery,
+            TrackDelivery::SelectOne
+        );
+        assert_eq!(reported[2].id.as_deref(), Some("srt-out"));
+        assert_eq!(
+            reported[2].audio_capability.delivery,
+            TrackDelivery::Simultaneous
+        );
+    }
+}
+
+#[cfg(test)]
 mod output_feed_guard_tests {
     use super::ensure_outputs_carry_program;
     use multiview_config::MultiviewConfig;
@@ -2533,6 +2619,8 @@ pub struct Pipeline {
     /// (#344 D2b: HLS with TS segments, slot-0 H.264/HEVC, a known format).
     output_passthrough: Vec<crate::output_routing::PassEligibility>,
     output_audio_tracks: Vec<Vec<usize>>,
+    /// The declared transport capability for each Program-rate output.
+    output_audio_capabilities: Vec<multiview_config::OutputAudioCapability>,
     /// Outputs that EXPLICITLY declared an audio selection (per output: the id
     /// and its full declared track list). Drives the run-time truthful binding:
     /// a run without a program-audio encode strips the implicit default's
@@ -3560,9 +3648,19 @@ impl Pipeline {
         let mut output_live_reset = Vec::with_capacity(outputs.len());
         let mut output_passthrough = Vec::with_capacity(outputs.len());
         let mut output_audio_tracks = Vec::with_capacity(outputs.len());
+        let mut output_audio_capabilities = Vec::with_capacity(outputs.len());
         let mut declared_audio_outputs: Vec<(String, Vec<usize>)> = Vec::new();
         for output in &outputs {
             let declared = config.outputs.iter().find(|item| item.id() == output.id());
+            output_audio_capabilities.push(declared.map_or_else(
+                || {
+                    multiview_config::OutputAudioCapability::new(
+                        multiview_config::TrackDelivery::None,
+                        multiview_config::TrackCapacity::AtMost(0),
+                    )
+                },
+                multiview_config::Output::audio_capability,
+            ));
             // #342: video slot 0's codec (absent = the output's `codec`).
             let requested = declared
                 .and_then(|item| item.video_slot0().and_then(|v| v.codec.as_deref()))
@@ -3885,6 +3983,7 @@ impl Pipeline {
             output_live_reset,
             output_passthrough,
             output_audio_tracks,
+            output_audio_capabilities,
             declared_audio_outputs,
             outputs,
             subtitle_outputs,
@@ -4142,6 +4241,10 @@ impl Pipeline {
         binding_ids: &[Option<String>],
         audio_tracks: &[Vec<usize>],
     ) -> Vec<crate::output_routing::RunOutput> {
+        debug_assert_eq!(
+            self.output_audio_capabilities.len(),
+            self.output_video_keys.len()
+        );
         self.output_video_keys
             .iter()
             .enumerate()
@@ -4156,6 +4259,12 @@ impl Pipeline {
                 // The routed audio rides the binding's program-audio slot
                 // (track 0, present only when this run encodes program audio).
                 program_audio: audio_tracks.get(index).is_some_and(|t| t.contains(&0)),
+                audio_capability: self.output_audio_capabilities.get(index).copied().unwrap_or_else(
+                    || multiview_config::OutputAudioCapability::new(
+                        multiview_config::TrackDelivery::None,
+                        multiview_config::TrackCapacity::AtMost(0),
+                    ),
+                ),
                 // #342 B3: a live format reset keeps the running encoder.
                 codec_name: self
                     .rendition_configs
@@ -5329,6 +5438,13 @@ impl Pipeline {
                     .insert(0, crate::output_routing::PassEligibility::NotSupported);
                 self.output_audio_tracks
                     .insert(0, hls_audio.unwrap_or_default());
+                self.output_audio_capabilities.insert(
+                    0,
+                    multiview_config::OutputAudioCapability::new(
+                        multiview_config::TrackDelivery::None,
+                        multiview_config::TrackCapacity::AtMost(0),
+                    ),
+                );
             }
         }
         // The prepended `program.ts` anchor occupies runner index 0 and is

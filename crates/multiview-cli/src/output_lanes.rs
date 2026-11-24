@@ -82,6 +82,8 @@ const CONSUMER_STEP: Duration = Duration::from_millis(5);
 pub(super) struct LaneOutputSpec {
     /// The output's config id.
     pub(super) id: String,
+    /// The declared transport's audio capability, independent of selected slots.
+    pub(super) audio_capability: multiview_config::OutputAudioCapability,
     /// The runnable sink.
     pub(super) output: RunnableOutput,
     /// The encoder settings at the output's rate (cadence, GOP, size).
@@ -274,6 +276,7 @@ pub(super) fn rate_output_specs(
         }
         specs.push(LaneOutputSpec {
             id,
+            audio_capability: declared.audio_capability(),
             output,
             encode,
             format,
@@ -295,6 +298,7 @@ pub(super) fn unroutable_run_output(spec: &LaneOutputSpec) -> crate::output_rout
         base_format: spec.format,
         routable: false,
         program_audio: false,
+        audio_capability: spec.audio_capability,
         codec_name: spec.encode.codec_name.clone(),
     }
 }
