@@ -243,6 +243,8 @@ function MatrixGrid({
   }
   const groupHeaders = rows.map((row, index) => index === 0 || row.group !== rows[index - 1]?.group);
   return (
+    // A scroll container must be keyboard-focusable (WCAG 2.1.1); region provides its name.
+    // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
     <div className="patch-wrap" role="region" aria-label={t`Source to output routing matrix`} tabIndex={0} data-testid={`matrix-grid-${plane}`}>
       <table className="patch-table">
         <thead>
