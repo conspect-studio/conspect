@@ -398,8 +398,8 @@ class NetWorkerTest {
         w.dispose()
     }
 
-    // R2-B: control work preempts the pending report after the in-flight report completes.
-    @Test fun controlWorkPreemptsPendingReportAfterOneInFlightCompletes() {
+    // R2-B: continuous slow reports cannot starve control; a deterministic latch proves order.
+    @Test fun controlWorkPreemptsContinuousReportsAfterOneInFlightCompletes() {
         val gate = GenerationGate()
         val posts = java.util.concurrent.CopyOnWriteArrayList<String>()
         val reportStarted = CountDownLatch(1)
@@ -410,7 +410,7 @@ class NetWorkerTest {
                 posts.add(json)
                 if (json == "IN_FLIGHT") {
                     reportStarted.countDown()
-                    releaseReport.await(2, TimeUnit.SECONDS)
+                    releaseReport.await()
                 }
                 return HttpResult(200, "", null)
             }
@@ -420,12 +420,29 @@ class NetWorkerTest {
         val controlRan = CountDownLatch(1)
         w.report(g, "u", "IN_FLIGHT")
         assertTrue("first report started", reportStarted.await(2, TimeUnit.SECONDS))
+        val stop = java.util.concurrent.atomic.AtomicBoolean(false)
+        val feeder = Thread {
+            var i = 0
+            while (!stop.get()) {
+                w.report(g, "u", "CONTINUOUS-${i++}")
+                Thread.sleep(20)
+            }
+        }
+        feeder.start()
+        // A pending report is guaranteed: a feeder continuously replaces the
+        // one-slot report while the first POST is held by releaseReport.
         w.report(g, "u", "PENDING")
         assertTrue(w.run(g) { posts.add("CONTROL"); controlRan.countDown() })
-        releaseReport.countDown()
-        assertTrue("control runs before pending report", controlRan.await(2, TimeUnit.SECONDS))
-        assertEquals(listOf("IN_FLIGHT", "CONTROL"), posts.take(2))
-        w.dispose()
+        try {
+            releaseReport.countDown()
+            assertTrue("control runs before continuous reports", controlRan.await(2, TimeUnit.SECONDS))
+            assertEquals(listOf("IN_FLIGHT", "CONTROL"), posts.take(2))
+            assertTrue("feeder kept reports arriving", feeder.isAlive)
+        } finally {
+            stop.set(true)
+            feeder.join()
+            w.dispose()
+        }
     }
 
     // R2-D: cancelAll removes obsolete tasks, so a burst of replacement LOADs always admits the newest negotiation.
