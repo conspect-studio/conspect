@@ -226,7 +226,7 @@ export function CrosspointGrid({
                       type="button"
                       className={isSel ? "xpt plan" : "xpt"}
                       aria-pressed={isSel}
-                      aria-label={t`Select ${src.name} to ${d.label}; current route unknown`}
+                      aria-label={isSel ? (planned ? t`Select ${src.name} to ${d.label}; planned; current route unknown` : t`Select ${src.name} to ${d.label}; selected; current route unknown`) : t`Select ${src.name} to ${d.label}; current route unknown`}
                       title={t`Crosspoint state Unknown — no readback`}
                       data-testid={`xpt-${src.id}-${d.id}`}
                       onClick={(): void => {
@@ -244,8 +244,8 @@ export function CrosspointGrid({
       </table>
       <p className="patch-legend">
         <Trans>
-          Crosspoint states: ? Unknown (no readback) · ◇ SEL selected · ? PLAN
-          dry-run plan. A take applies only from the plan panel.
+          Crosspoint states: Unknown (no readback) · Selected · Plan (dry run).
+          A take applies only from the plan panel.
         </Trans>
         {" "}
         <Trans>

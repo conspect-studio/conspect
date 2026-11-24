@@ -3989,8 +3989,8 @@ msgid "Crosspoint state Unknown — no readback"
 msgstr "Crosspoint state Unknown — no readback"
 
 #: src/pages/approved/RoutingSurface.tsx:246
-msgid "Crosspoint states: ? Unknown (no readback) · ◇ SEL selected · ? PLAN dry-run plan. A take applies only from the plan panel."
-msgstr "Crosspoint states: ? Unknown (no readback) · ◇ SEL selected · ? PLAN dry-run plan. A take applies only from the plan panel."
+msgid "Crosspoint states: Unknown (no readback) · Selected · Plan (dry run). A take applies only from the plan panel."
+msgstr "Crosspoint states: Unknown (no readback) · Selected · Plan (dry run). A take applies only from the plan panel."
 
 #: src/pages/approved/RoutingSurface.tsx:327
 msgid "Crosspoint: Unknown"
@@ -11357,6 +11357,18 @@ msgstr "Select"
 #: src/pages/approved/RoutingSurface.tsx:229
 msgid "Select {0} to {1}; current route unknown"
 msgstr "Select {0} to {1}; current route unknown"
+
+#. placeholder {0}: src.name
+#. placeholder {1}: d.label
+#: src/pages/approved/RoutingSurface.tsx:229
+msgid "Select {0} to {1}; planned; current route unknown"
+msgstr "Select {0} to {1}; planned; current route unknown"
+
+#. placeholder {0}: src.name
+#. placeholder {1}: d.label
+#: src/pages/approved/RoutingSurface.tsx:229
+msgid "Select {0} to {1}; selected; current route unknown"
+msgstr "Select {0} to {1}; selected; current route unknown"
 
 #: src/iptv/IptvOrgPage.tsx:768
 msgid "Select {name} for bulk add"

@@ -820,6 +820,8 @@ describe("AudioPage", () => {
     expect(listen).toHaveAttribute("title", "unavailable: no monitor path");
     expect(within(focused).queryByRole("button", { name: /PFL|solo/i })).not.toBeInTheDocument();
     expect(screen.getByTestId("audio-pfl-note")).toHaveTextContent(/pre-fade listen.*not available/i);
+    expect(screen.getByTestId("audio-pfl-note")).toHaveTextContent(/external monitor/i);
+    expect(screen.getByTestId("audio-pfl-note")).toHaveTextContent(/cannot solo an input/i);
   });
 });
 
