@@ -157,7 +157,8 @@ def resources():
             f'free disk below {MIN_FREE // GIB} GiB floor')
     total = target_bytes()
     require(total <= MAX_TARGET,
-            f'combined local targets {total // GIB} GiB exceed {MAX_TARGET // GIB} GiB cap; '
+            f'combined local targets {total} bytes exceed {MAX_TARGET} bytes '
+            f'({MAX_TARGET // GIB} GiB cap); '
             'stop and inspect owned artifacts')
     return total
 
