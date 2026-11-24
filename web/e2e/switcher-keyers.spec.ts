@@ -86,6 +86,8 @@ const PASS = () => ({ can_take: true, class: 'class1', keyer: 'main/dsk1', on_ai
 test('renders the DSK strip, the keyer panels and the BKGD/KEY arm strip from the armed snapshot', async ({ page }) => {
   await mockEngine(page, PASS);
   await page.goto('/switcher');
+  await page.getByRole('button', { name: 'Takes locked', exact: true }).click();
+  await page.getByRole('button', { name: 'Unlock takes', exact: true }).click();
   await expect(page.getByTestId('keyer-strip-dsk1')).toBeVisible({ timeout: 10000 });
   await expect(page.getByTestId('keyer-panel-dsk1')).toBeVisible();
   await expect(page.getByTestId('keyer-lamp-dsk1')).toHaveAttribute('data-on-air', 'false');
@@ -98,6 +100,8 @@ test('renders the DSK strip, the keyer panels and the BKGD/KEY arm strip from th
 test('arming a key plans then commands arm; the toggle lights from the next armed snapshot; a key-only CUT with PGM == PVW takes it on air', async ({ page }) => {
   const engine = await mockEngine(page, (body) => body.action === 'cut' ? { can_take: true, class: 'class1', scene_version: 1 } : PASS());
   await page.goto('/switcher');
+  await page.getByRole('button', { name: 'Takes locked', exact: true }).click();
+  await page.getByRole('button', { name: 'Unlock takes', exact: true }).click();
   await expect(page.getByTestId('keyer-arm-usk1')).toBeVisible({ timeout: 10000 });
   await page.getByTestId('keyer-arm-usk1').click();
   await expect(page.getByTestId('keyer-arm-usk1')).toHaveAttribute('aria-pressed', 'true', { timeout: 10000 });
@@ -108,7 +112,7 @@ test('arming a key plans then commands arm; the toggle lights from the next arme
   await page.getByTestId('keyer-arm-background').click();
   await expect(page.getByTestId('keyer-arm-background')).toHaveAttribute('aria-pressed', 'false', { timeout: 10000 });
   expect(engine.calls[3]?.body).toEqual({ me: 'me1', program: 'main', action: 'arm', background: false, keys: ['usk1'] });
-  const backgroundCut = page.getByRole('button', { name: 'Cut', exact: true }).first();
+  const backgroundCut = page.getByRole('button', { name: 'Cut preview to air', exact: true });
   await expect(backgroundCut).toBeEnabled({ timeout: 10000 });
   await backgroundCut.click();
   await expect(page.getByTestId('keyer-arm-lamp-usk1')).toHaveAttribute('data-on-air', 'true', { timeout: 10000 });
@@ -118,6 +122,8 @@ test('arming a key plans then commands arm; the toggle lights from the next arme
 test('an arm plan refusal shows its reason and commands nothing', async ({ page }) => {
   const engine = await mockEngine(page, () => ({ can_take: false, class: 'class1', keyer: 'me1', on_air: false, refusal: { type: 'in-flight', detail: 'the arm set cannot change during a transition' } }));
   await page.goto('/switcher');
+  await page.getByRole('button', { name: 'Takes locked', exact: true }).click();
+  await page.getByRole('button', { name: 'Unlock takes', exact: true }).click();
   await expect(page.getByTestId('keyer-arm-usk1')).toBeVisible({ timeout: 10000 });
   await page.getByTestId('keyer-arm-usk1').click();
   await expect(page.getByTestId('arm-error')).toContainText('the arm set cannot change during a transition');
@@ -127,6 +133,8 @@ test('an arm plan refusal shows its reason and commands nothing', async ({ page 
 test('CUT plans before the command, sends an Idempotency-Key, and the lamp follows the outcome/keyer events', async ({ page }) => {
   const engine = await mockEngine(page, PASS);
   await page.goto('/switcher');
+  await page.getByRole('button', { name: 'Takes locked', exact: true }).click();
+  await page.getByRole('button', { name: 'Unlock takes', exact: true }).click();
   const strip = page.getByTestId('keyer-strip-dsk1');
   await expect(strip).toBeVisible({ timeout: 10000 });
   await strip.getByRole('button', { name: 'Cut' }).click();
@@ -141,6 +149,8 @@ test('a source-loss switcher.keyer event with no operation drops the lamp', asyn
   const engine = await mockEngine(page, PASS);
   engine.dsk1 = { ...engine.dsk1, on_air: true };
   await page.goto('/switcher');
+  await page.getByRole('button', { name: 'Takes locked', exact: true }).click();
+  await page.getByRole('button', { name: 'Unlock takes', exact: true }).click();
   await expect(page.getByTestId('keyer-lamp-dsk1')).toHaveAttribute('data-on-air', 'true', { timeout: 10000 });
   await expect.poll(() => engine.socket !== undefined).toBe(true);
   engine.dsk1 = { ...engine.dsk1, on_air: false };
@@ -153,6 +163,8 @@ test('a source-loss switcher.keyer event with no operation drops the lamp', asyn
 test('a reviewed keyer_set is applied separately and the next snapshot shows it', async ({ page }) => {
   const engine = await mockEngine(page, PASS);
   await page.goto('/switcher');
+  await page.getByRole('button', { name: 'Takes locked', exact: true }).click();
+  await page.getByRole('button', { name: 'Unlock takes', exact: true }).click();
   const panel = page.getByTestId('keyer-panel-dsk1');
   await expect(panel).toBeVisible({ timeout: 10000 });
   await panel.getByLabel('Fill').selectOption('cam-1');
@@ -170,6 +182,8 @@ test('a reviewed keyer_set is applied separately and the next snapshot shows it'
 test('a capacity plan refusal shows the detail and submits no command', async ({ page }) => {
   const engine = await mockEngine(page, () => ({ can_take: false, class: 'class1', keyer: 'main/dsk1', on_air: false, cost: { delta: 1.5, fits: false }, refusal: { type: 'capacity', detail: 'DSK budget exceeded' } }));
   await page.goto('/switcher');
+  await page.getByRole('button', { name: 'Takes locked', exact: true }).click();
+  await page.getByRole('button', { name: 'Unlock takes', exact: true }).click();
   const panel = page.getByTestId('keyer-panel-dsk1');
   await expect(panel).toBeVisible({ timeout: 10000 });
   await panel.getByRole('checkbox', { name: 'Invert matte' }).check();

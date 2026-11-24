@@ -103,6 +103,7 @@
 @layer base {
   * {
     border-color: var(--color-border);
+    box-sizing: border-box;
   }
 
   html {
@@ -133,4 +134,16 @@
       scroll-behavior: auto !important;
     }
   }
+}
+
+/* Reflow the management list into labelled cards, not a clipped table. */
+@media (max-width: 639px) {
+  .layout-list, .layout-list tbody { display: block; width: 100%; }
+  .layout-list thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .layout-list tr { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px; margin-bottom: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); }
+  .layout-list td { display: block; padding: 0; min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+  .layout-list td[data-column="name"], .layout-list td[data-column="actions"] { width: 100%; }
+  .layout-list td[data-column="id"] { width: 100%; font-size: 12px; }
+  .layout-list td[data-column="cells"]::before, .layout-list td[data-column="layers"]::before { content: attr(data-label) ": "; color: var(--muted-foreground); }
+  .layout-list td[data-column="actions"] button, .layout-list td[data-column="actions"] a { min-height: 44px; }
 }

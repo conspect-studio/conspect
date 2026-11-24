@@ -24,8 +24,17 @@ GIB = 1024 ** 3
 # outside this script (no cross-worktree lock here), and the host-wide residual depends on
 # what other gates and other users write. Lowered from
 # 300 to 150 GiB on 2026-11-13, when the sample sat at 277-313 GiB for hours and blocked
-# every gate while this repository used 65 GiB.
-MIN_FREE = 150 * GIB
+# every gate while this repository used 65 GiB. Lowered to 75 GiB on 2026-11-23
+# following grok-4.7 review: the host swung from 47 to 7 GiB in ten minutes and
+# later to 110 GiB. The 75 GiB sample covered a 60 GiB swing plus the 15 GiB
+# target cap. Later measurements attributed much of the swing to our own bounded
+# concurrent targets (~23 GiB during one run); five gates failed at 71–74 GiB.
+# Independent review rejected 45 GiB: that single sample is not a bound on other
+# writers. On 2026-11-23, review recommended a 60 GiB running floor. This retains
+# 45 GiB beyond this gate's 15 GiB target
+# cap, but remains only a sample: a dip between checks can still cause ENOSPC.
+# Other writers must remain bounded and space must be monitored.
+MIN_FREE = 60 * GIB
 # Authoring stays <=2 GiB; this proposed execution cap needs separate review.
 MAX_TARGET = 15 * GIB
 

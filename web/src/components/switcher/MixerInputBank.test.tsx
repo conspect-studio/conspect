@@ -1,6 +1,8 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../realtime/shared', () => ({ subscribeRealtime: () => () => undefined }));
+const takeLock = vi.hoisted(() => ({ locked: false }));
+vi.mock('../broadcast/BroadcastShell', () => ({ useTakeLock: () => takeLock }));
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
@@ -45,7 +47,7 @@ const server = setupServer(
   }),
 );
 beforeAll(() => { server.listen(); });
-afterEach(() => { server.resetHandlers(); takes = []; selects = []; });
+afterEach(() => { server.resetHandlers(); takes = []; selects = []; takeLock.locked = false; });
 afterAll(() => { server.close(); });
 
 function page() {
@@ -54,6 +56,18 @@ function page() {
 }
 
 describe('MixerInputBank on the Switcher page', () => {
+  it('allows safe preview but blocks program and re-patch while locked', async () => {
+    takeLock.locked = true;
+    page();
+    const input = await screen.findByRole('listitem', { name: 'Input 3' });
+    expect(within(input).getByRole('button', { name: 'PGM' })).toBeDisabled();
+    expect(within(input).getByRole('button', { name: 'Patch' })).toBeDisabled();
+    const preview = within(input).getByRole('button', { name: 'PVW' });
+    expect(preview).toBeEnabled();
+    await userEvent.click(preview);
+    await waitFor(() => { expect(selects).toHaveLength(1); });
+    expect(takes).toHaveLength(0);
+  });
   it('renders numbered inputs with label, source, tally and redaction', async () => {
     page();
     const one = await screen.findByRole('listitem', { name: 'Input 1' });

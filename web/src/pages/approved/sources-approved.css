@@ -160,8 +160,8 @@
 }
 [data-approved-page="sources"] .src-pill svg,
 [data-approved-page="sources"] .src-pill-host > * svg { width: 12px; height: 12px; flex: none; }
-[data-approved-page="sources"] .src-pill-host[data-phase="signal"] > *,
-[data-approved-page="sources"] .src-pill-host[data-phase="ready"] > * { color: var(--green); border-color: var(--green-dim); background: rgba(61,214,140,.1); }
+[data-approved-page="sources"] .src-pill-host[data-phase="signal"] > * { color: var(--text-1); border-color: var(--line-2); background: var(--bg-2); }
+[data-approved-page="sources"] .src-pill-host[data-phase="ready"] > * { color: var(--text-2); border-color: var(--line-2); background: var(--bg-2); }
 [data-approved-page="sources"] .src-pill-host[data-phase="starting"] > * { color: var(--blue); border-color: #2c4a7d; background: rgba(106,166,255,.1); }
 [data-approved-page="sources"] .src-pill-host[data-phase="failed"] > * { color: #ff8a8e; border-color: var(--red); background: rgba(229,72,77,.12); }
 [data-approved-page="sources"] .src-pill-host[data-phase="idle"] > *,

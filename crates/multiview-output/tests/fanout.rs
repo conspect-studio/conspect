@@ -43,14 +43,16 @@ impl PacketSink for RecordingSink {
 }
 
 fn key_packet(rendition: RenditionId, pts: i64) -> EncodedPacket {
-    EncodedPacket {
+    EncodedPacket::new(
         rendition,
-        kind: PacketKind::VideoKeyframe,
+        PacketKind::VideoKeyframe,
+        multiview_core::encoded_packet::StreamKind::Video,
+        false,
         pts,
-        dts: pts,
-        duration: 1500,
-        data: Arc::from(vec![0u8, 1, 2, 3].into_boxed_slice()),
-    }
+        pts,
+        1500,
+        Arc::<[u8]>::from(vec![0u8, 1, 2, 3].into_boxed_slice()),
+    )
 }
 
 /// Registering N sinks under one rendition and routing a packet delivers the
