@@ -46,6 +46,9 @@ describe('Sources touch cards', () => {
     expect(within(card).queryByRole('button', { name: /^(Start|Stop)/ })).not.toBeInTheDocument();
     expect(within(card).queryByText('Idle')).not.toBeInTheDocument();
     expect(within(card).queryByText('Ready')).not.toBeInTheDocument();
+    const heading = screen.getByRole('heading', { level: 1, name: 'Sources & library' });
+    expect(heading).toBeInTheDocument();
+    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
     expect(screen.getByRole('button', { name: 'New source' })).toBeInTheDocument();
   });
 

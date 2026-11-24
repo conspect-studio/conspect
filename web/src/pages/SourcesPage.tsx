@@ -1207,6 +1207,7 @@ export function SourcesPage(): JSX.Element {
       kind="sources"
       dialogClassName="[&_button]:min-h-12 [&_button]:min-w-12 [&_button]:h-auto [&_button]:whitespace-normal [&_button]:[overflow-wrap:anywhere] [&_summary]:min-h-12 [&_summary]:content-center [&_input]:min-h-12 [&_input]:min-w-12 [&_select:not([aria-hidden=true])]:min-h-12 [&_select:not([aria-hidden=true])]:min-w-12 [&_[role=combobox]]:min-h-12 [&_[role=combobox]]:min-w-12 [&_a]:min-h-12 [&_a]:min-w-12 [&_a]:inline-flex [&_a]:items-center [&_a]:whitespace-normal [&_a]:[overflow-wrap:anywhere] [&_*]:min-w-0"
       title={<Trans>Sources &amp; library</Trans>}
+      routeKey="/sources"
       description={
         <span className="src-sub">
           <Trans>Live source lifecycle — exceptions sort first.</Trans>

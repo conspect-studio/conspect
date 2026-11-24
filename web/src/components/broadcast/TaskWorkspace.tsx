@@ -32,6 +32,7 @@ export type TaskWorkspaceProps = TaskWorkspaceBaseProps &
         readonly detailsOpen?: undefined;
         readonly onDetailsToggle?: undefined;
         readonly detailsLabel?: undefined;
+        readonly detailsAccessibleLabel?: undefined;
       }
     | {
         /** Secondary detail; collapses behind the Details key on narrow viewports. */
@@ -42,6 +43,8 @@ export type TaskWorkspaceProps = TaskWorkspaceBaseProps &
         readonly onDetailsToggle: (open: boolean) => void;
         /** Overrides the default `Details` key label. */
         readonly detailsLabel?: string | undefined;
+        /** Accessible name override for a repeated card disclosure key. */
+        readonly detailsAccessibleLabel?: string | undefined;
       }
   );
 
@@ -75,6 +78,7 @@ export function TaskWorkspace(props: TaskWorkspaceProps): JSX.Element {
               className="md:hidden"
               aria-expanded={props.detailsOpen}
               aria-controls={panelId}
+              aria-label={props.detailsAccessibleLabel}
               onPress={(): void => {
                 props.onDetailsToggle(!props.detailsOpen);
               }}

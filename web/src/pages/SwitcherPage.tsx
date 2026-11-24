@@ -243,7 +243,7 @@ export function SwitcherPage(): JSX.Element {
   });
   return (
     <section className="space-y-5 p-4">
-      <PageHeader title={t`Program / Preview switcher`} />
+      <PageHeader title={t`Program / Preview switcher`} routeKey="/switcher" />
       {state.isError && <p role="status" className="rounded border border-amber-600 p-3">{isBackendUnavailable(state.error) ? <Trans>Switcher unavailable: this server does not provide it yet (backend not deployed). Controls are disabled.</Trans> : <Trans>Switcher unavailable: no real Program/Preview bus is attached. Controls are disabled.</Trans>}</p>}
       {state.isLoading && <p role="status"><Trans>Checking switcher engine…</Trans></p>}
       {error !== undefined && <p role="alert" className="text-destructive">{error}</p>}

@@ -181,6 +181,8 @@ describe('OutputsPage broadcast cards (configured facts)', () => {
     const create = within(actions).getByRole('button', { name: 'New output' });
     expect(create).toHaveClass('h-auto', 'min-h-12', 'min-w-12', 'max-w-full', 'whitespace-normal', 'break-words');
     expect(within(actions).getByRole('button', { name: /Export/ })).toBeVisible();
+    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
+    expect(screen.getByRole('heading', { level: 1, name: 'Outputs' })).toHaveAttribute('data-route-heading', '/outputs');
   });
 
   it('keeps the 48px touch floor on every card action and the phone disclosure classes', async () => {
@@ -196,9 +198,10 @@ describe('OutputsPage broadcast cards (configured facts)', () => {
 
     // The Details disclosure is the phone-only (md:hidden) 48px key, fully
     // controlled: aria-expanded flips on press and the panel follows it.
-    const detailsKeys = screen.getAllByRole('button', { name: 'Details' });
+    const detailsKeys = screen.getAllByRole('button', { name: /^Details:/ });
     expect(detailsKeys.length).toBe(OUTPUTS.length);
-    const key = detailsKeys[0]!;
+    expect(new Set(detailsKeys.map((button) => button.getAttribute('aria-label'))).size).toBe(OUTPUTS.length);
+    const key = screen.getByRole('button', { name: 'Details: Program HLS' });
     expect(key).toHaveClass('h-12');
     expect(key).toHaveClass('md:hidden');
     expect(key).toHaveAttribute('aria-expanded', 'false');

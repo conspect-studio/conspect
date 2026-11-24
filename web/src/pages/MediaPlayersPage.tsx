@@ -562,6 +562,7 @@ function MediaPlayerCard({
         className="mt-2 md:hidden"
         aria-expanded={detailsOpen}
         aria-controls={detailsId}
+        aria-label={t`Details: ${player.name}`}
         onPress={(): void => { onDetailsToggle(!detailsOpen); }}
       >
         <Trans>Details</Trans>

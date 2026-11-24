@@ -291,7 +291,10 @@ describe('MediaPlayersPage touch targets', () => {
       expect(key.className).toMatch(/\bmin-w-12\b/);
     }
     // The per-card Details disclosure is a 48px TouchAction too.
-    for (const key of screen.getAllByRole('button', { name: 'Details' })) {
+    const detailsKeys = screen.getAllByRole('button', { name: /^Details:/ });
+    expect(detailsKeys).toHaveLength(2);
+    expect(detailsKeys.map((key) => key.getAttribute('aria-label'))).toEqual(['Details: VT 1', 'Details: VT 2']);
+    for (const key of detailsKeys) {
       expect(key.className).toMatch(/\bh-12\b/);
     }
   });
@@ -348,7 +351,7 @@ describe('MediaPlayersPage operation feedback', () => {
     expect(region?.textContent).not.toMatch(/applied(?! event)/);
     expect(region?.textContent).not.toMatch(/Command accepted/);
     // The region is inline and persistent — it survives re-renders.
-    await userEvent.click(screen.getAllByRole('button', { name: 'Details' })[0]!);
+    await userEvent.click(screen.getByRole('button', { name: 'Details: VT 1' }));
     expect(
       screen.getByText(/Play VT 1 accepted — waiting for the applied event\./),
     ).toBeInTheDocument();
