@@ -1882,6 +1882,10 @@ fn the_control_adapter_refuses_audio_takes_on_an_unroutable_output() {
             base_format: None,
             routable: true,
             program_audio: true,
+            audio_capability: multiview_config::OutputAudioCapability::new(
+                multiview_config::TrackDelivery::None,
+                multiview_config::TrackCapacity::AtMost(0),
+            ),
             codec_name: String::new(),
         },
         RunOutput {
@@ -1891,6 +1895,10 @@ fn the_control_adapter_refuses_audio_takes_on_an_unroutable_output() {
             base_format: None,
             routable: false,
             program_audio: true,
+            audio_capability: multiview_config::OutputAudioCapability::new(
+                multiview_config::TrackDelivery::None,
+                multiview_config::TrackCapacity::AtMost(0),
+            ),
             codec_name: String::new(),
         },
     ]);
@@ -1951,6 +1959,10 @@ fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
             base_format: None,
             routable: true,
             program_audio: true,
+            audio_capability: multiview_config::OutputAudioCapability::new(
+                multiview_config::TrackDelivery::None,
+                multiview_config::TrackCapacity::AtMost(0),
+            ),
             codec_name: String::new(),
         },
         RunOutput {
@@ -1960,6 +1972,10 @@ fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
             base_format: None,
             routable: true,
             program_audio: true,
+            audio_capability: multiview_config::OutputAudioCapability::new(
+                multiview_config::TrackDelivery::None,
+                multiview_config::TrackCapacity::AtMost(0),
+            ),
             codec_name: String::new(),
         },
         RunOutput {
@@ -1969,6 +1985,10 @@ fn the_control_adapter_maps_renamed_ids_to_their_own_index() {
             base_format: None,
             routable: false,
             program_audio: true,
+            audio_capability: multiview_config::OutputAudioCapability::new(
+                multiview_config::TrackDelivery::None,
+                multiview_config::TrackCapacity::AtMost(0),
+            ),
             codec_name: String::new(),
         },
     ]);
@@ -2372,6 +2392,10 @@ fn the_plan_counts_a_lingering_encoder_as_plus_zero() {
             base_format: None,
             routable: true,
             program_audio: true,
+            audio_capability: multiview_config::OutputAudioCapability::new(
+                multiview_config::TrackDelivery::None,
+                multiview_config::TrackCapacity::AtMost(0),
+            ),
             codec_name: String::new(),
         },
         RunOutput {
@@ -2381,6 +2405,10 @@ fn the_plan_counts_a_lingering_encoder_as_plus_zero() {
             base_format: None,
             routable: true,
             program_audio: true,
+            audio_capability: multiview_config::OutputAudioCapability::new(
+                multiview_config::TrackDelivery::None,
+                multiview_config::TrackCapacity::AtMost(0),
+            ),
             codec_name: String::new(),
         },
     ]);
@@ -4546,6 +4574,10 @@ fn the_plan_counts_a_different_format_as_plus_one() {
             base_format: None,
             routable: true,
             program_audio: true,
+            audio_capability: multiview_config::OutputAudioCapability::new(
+                multiview_config::TrackDelivery::None,
+                multiview_config::TrackCapacity::AtMost(0),
+            ),
             codec_name: String::new(),
         },
         RunOutput {
@@ -4555,6 +4587,10 @@ fn the_plan_counts_a_different_format_as_plus_one() {
             base_format: None,
             routable: true,
             program_audio: true,
+            audio_capability: multiview_config::OutputAudioCapability::new(
+                multiview_config::TrackDelivery::None,
+                multiview_config::TrackCapacity::AtMost(0),
+            ),
             codec_name: String::new(),
         },
     ]);
@@ -4664,6 +4700,10 @@ fn plan_slot_reports_the_cheapest_path() {
         base_format,
         routable: true,
         program_audio: true,
+        audio_capability: multiview_config::OutputAudioCapability::new(
+            multiview_config::TrackDelivery::None,
+            multiview_config::TrackCapacity::AtMost(0),
+        ),
         codec_name: String::new(),
     };
     let h =
@@ -6653,6 +6693,10 @@ fn a_subtitle_take_repoints_the_route_table_for_the_next_sampler_tick() {
             base_format: None,
             routable: true,
             program_audio: true,
+            audio_capability: multiview_config::OutputAudioCapability::new(
+                multiview_config::TrackDelivery::None,
+                multiview_config::TrackCapacity::AtMost(0),
+            ),
             codec_name: String::new(),
         }])
         .with_subtitles(
@@ -7677,6 +7721,10 @@ fn the_control_adapter_maps_a_set_onto_its_members_and_refuses_it_whole() {
         base_format: None,
         routable,
         program_audio: false,
+        audio_capability: multiview_config::OutputAudioCapability::new(
+            multiview_config::TrackDelivery::None,
+            multiview_config::TrackCapacity::AtMost(0),
+        ),
     };
     let h = h.with_outputs(vec![
         run_output("a", true),
@@ -7764,6 +7812,10 @@ fn the_control_adapter_refuses_clean_with_a_dsk_on_single_takes_and_every_set_me
         base_format: None,
         routable: true,
         program_audio: false,
+        audio_capability: multiview_config::OutputAudioCapability::new(
+            multiview_config::TrackDelivery::None,
+            multiview_config::TrackCapacity::AtMost(0),
+        ),
     };
     let member = |output: &str, video: RoutedFeed| OutputTakeRequest {
         operation_id: "ignored".into(),
@@ -8757,6 +8809,10 @@ fn the_encoder_identity_includes_the_output_settings_and_format() {
         base_format: None,
         routable: true,
         program_audio: true,
+        audio_capability: multiview_config::OutputAudioCapability::new(
+            multiview_config::TrackDelivery::None,
+            multiview_config::TrackCapacity::AtMost(0),
+        ),
         codec_name: String::new(),
     };
     let h = x.h.clone().with_outputs(vec![

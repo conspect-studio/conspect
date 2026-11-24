@@ -622,15 +622,31 @@ mod tests {
 
     #[test]
     fn a_panicking_convert_raises_failed_and_publishes_nothing_more() {
-        let hook: ConvertHook = Arc::new(|tick| assert!(tick < 3, "injected convert panic"));
-        let stage = ConvertStage::spawn(vertical(), Some(hook)).unwrap();
+        let panic_seen = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&panic_seen);
+        let hook: ConvertHook = Arc::new(move |tick| {
+            if tick == 3 {
+                seen.store(true, Ordering::Release);
+            }
+            assert!(tick < 3, "injected convert panic");
+        });
+        let mut stage = ConvertStage::spawn(vertical(), Some(hook)).unwrap();
         let slot = stage.slot();
         for tick in 0..3 {
             stage.offer(tick, &picture(192, 108));
             assert!(wait_for(|| slot.latest().is_some_and(|c| c.tick == tick)));
         }
         stage.offer(3, &picture(192, 108));
-        assert!(wait_for(|| slot.failed.load(Ordering::Acquire)));
+        // Join the worker instead of racing its exit against a wall-clock
+        // deadline. The injected panic is caught by the worker; joining proves
+        // its RaiseOnExit guard ran before inspecting the failed flag.
+        stage.tx = None;
+        stage.join.take().unwrap().join().unwrap();
+        assert!(
+            panic_seen.load(Ordering::Acquire),
+            "panic hook ran at tick 3"
+        );
+        assert!(slot.failed.load(Ordering::Acquire));
         assert_eq!(slot.published.load(Ordering::Relaxed), 3);
     }
 
