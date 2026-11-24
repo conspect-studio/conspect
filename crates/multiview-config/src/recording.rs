@@ -391,7 +391,12 @@ mod tests {
     fn iso(armed: bool) -> IsoRecording {
         IsoRecording {
             armed,
-            location: Some("/var/lib/conspect/rec/cam1".to_owned()),
+            location: Some(
+                std::env::temp_dir()
+                    .join("conspect-rec-cam1")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             segment: SegmentPolicy::new(6),
             retention: RetentionPolicy {
                 keep_duration_seconds: Some(3600),
@@ -446,6 +451,14 @@ mod tests {
         recording.retention.max_segments = None;
         recording.disk.min_free_gib = 0;
         assert!(validate_iso("cam1", &recording, &kind).is_err());
+    }
+
+    #[test]
+    fn relative_recording_location_is_rejected() {
+        let mut recording = iso(false);
+        recording.location = Some("relative/path".to_owned());
+        let error = validate_iso("cam1", &recording, &SourceKind::Bars).unwrap_err();
+        assert!(error.to_string().contains("absolute path"));
     }
 
     #[test]

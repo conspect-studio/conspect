@@ -104,7 +104,6 @@ fn recording_is_additive_and_its_rules_reject_bad_input() {
          url = \"srt://[::1]:9000\"\n\
          [sources.iso]\n\
          armed = true\n\
-         location = \"/var/lib/conspect/rec/cam1\"\n\
          [sources.iso.segment]\n\
          duration_seconds = 6\n\
          [sources.iso.retention]\n\
