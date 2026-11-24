@@ -326,13 +326,22 @@ class NetWorkerTest {
         }
         val w = NetWorker(gate, http)
         val g = gate.next()
-        w.report(g, "u", "obsolete")
-        gate.invalidate()
-        w.cancelAll()
-        w.finalReport("u", "terminal")
-        assertTrue("terminal report sent off main thread", sent.await(2, TimeUnit.SECONDS))
-        assertEquals(listOf("terminal"), posts.toList())
-        w.dispose()
+        val blockerStarted = CountDownLatch(1)
+        val releaseBlocker = CountDownLatch(1)
+        assertTrue(w.run(g) { blockerStarted.countDown(); releaseBlocker.await() })
+        try {
+            assertTrue("worker occupied by control", blockerStarted.await(2, TimeUnit.SECONDS))
+            w.report(g, "u", "obsolete") // cannot be picked before cancellation
+            gate.invalidate()
+            w.cancelAll()
+            w.finalReport("u", "terminal")
+            releaseBlocker.countDown()
+            assertTrue("terminal report sent off main thread", sent.await(2, TimeUnit.SECONDS))
+            assertEquals(listOf("terminal"), posts.toList())
+        } finally {
+            releaseBlocker.countDown()
+            w.dispose()
+        }
     }
 
     @Test fun cancelAllCancelsInFlightCallsAndDropsPending() {

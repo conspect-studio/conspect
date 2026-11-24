@@ -142,7 +142,7 @@ class TsIdrFilter(private val nowMs: () -> Long = { System.nanoTime() / 1_000_00
             if (partialLength == 0 && buf[i] != TsContinuityDetector.SYNC) {
                 // No reliable packet boundary: discard until the next TS sync.
                 // A damaged video packet cannot be emitted before an intact IDR.
-                beginDropping()
+                if (!dropping) beginDropping()
                 i += 1
                 continue
             }
