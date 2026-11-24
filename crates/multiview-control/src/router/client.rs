@@ -384,7 +384,10 @@ mod tests {
         client.try_send(query).unwrap();
         until(|| table.source_of(1, 42) == Some(8) && client.status().reports == 1);
         let status = client.status();
-        assert!(status.connected);
+        // The stub closes its second socket after the report. A disconnected
+        // snapshot is correct if that EOF wins the race; the report and the
+        // successful second connection prove the reconnect path completed.
+        assert!(status.connections >= 2);
         assert!(status.last_route.is_some());
         assert_eq!(status.reports, 1);
         stub.join().unwrap();
