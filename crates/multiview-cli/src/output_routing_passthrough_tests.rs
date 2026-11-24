@@ -671,6 +671,10 @@ fn the_plan_reports_p0_from_the_engines_own_predicate() {
         base_format: None,
         routable: true,
         program_audio: false,
+        audio_capability: multiview_config::OutputAudioCapability::new(
+            multiview_config::TrackDelivery::None,
+            multiview_config::TrackCapacity::AtMost(0),
+        ),
         codec_name: String::new(),
     };
     let slot = output_routing_slot();

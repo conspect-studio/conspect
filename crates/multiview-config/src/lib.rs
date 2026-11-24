@@ -57,6 +57,7 @@ pub mod placement;
 pub mod playback;
 pub mod probe;
 pub mod program;
+pub mod recording;
 pub mod rendition;
 pub mod routing;
 pub mod salvo;
@@ -139,6 +140,10 @@ pub use playback::{
 };
 pub use probe::{DetectionZone, Dwell, LoudnessTarget, Probe, ProbeKind};
 pub use program::{ProgramId, ProgramKind, ProgramSpec};
+pub use recording::{
+    validate_iso, validate_program, DiskPolicy, IsoContainer, IsoRecording, ProgramFeed,
+    ProgramRecording, RemuxFormat, RetentionPolicy, SegmentPolicy,
+};
 pub use rendition::{
     plan_from_config, AudioRenditionKey, AudioTrackId, EncodeCapabilities, MuxBinding,
     OutputTransport, RenditionAudioCodec, RenditionColorKey, RenditionPlan, RenditionPlanError,
@@ -2415,6 +2420,9 @@ impl Source {
         }
         self.validate_automation()?;
         self.validate_origin_and_headers()?;
+        if let Some(iso) = &self.iso {
+            recording::validate_iso(&self.id, iso, &self.kind)?;
+        }
         match &self.kind {
             SourceKind::Solid { color } => {
                 if parse_hex_color(color).is_none() {
@@ -2651,6 +2659,9 @@ impl Output {
         // `auto`/`pixels`/flip are always valid.
         if let Some(orientation) = self.orientation() {
             orientation.validate(&self.label(), self.orientation_tag_capability())?;
+        }
+        if let Some(program) = self.program() {
+            recording::validate_program(&self.id(), program)?;
         }
         self.validate_cast_rules()?;
         self.validate_webrtc_rules()

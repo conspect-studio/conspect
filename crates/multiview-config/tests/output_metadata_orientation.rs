@@ -84,6 +84,8 @@ fn metadata_json_roundtrips() {
             None,
         )),
         orientation: None,
+
+        program: None,
     };
     let json = serde_json::to_string(&out).expect("serialize");
     let back: Output = serde_json::from_str(&json).expect("deserialize");
@@ -212,6 +214,8 @@ fn hls_with(meta: OutputMetadata) -> Output {
         audio: None,
         metadata: Some(meta),
         orientation: None,
+
+        program: None,
     }
 }
 
@@ -227,6 +231,8 @@ fn srt_with(meta: OutputMetadata) -> Output {
         metadata: Some(meta),
         orientation: None,
         srt: None,
+
+        program: None,
     }
 }
 
@@ -242,6 +248,8 @@ fn rtmp_with(meta: OutputMetadata) -> Output {
         audio: None,
         metadata: Some(meta),
         orientation: None,
+
+        program: None,
     }
 }
 
@@ -340,6 +348,8 @@ fn no_metadata_is_empty_plan() {
         audio: None,
         metadata: None,
         orientation: None,
+
+        program: None,
     };
     let plan = out.metadata_plan();
     assert_eq!(plan.dropped(), Vec::<(&str, &str)>::new());
@@ -404,6 +414,8 @@ fn orientation_json_roundtrips() {
             OrientationMode::Tag,
             OutputFlip::None,
         )),
+
+        program: None,
     };
     let json = serde_json::to_string(&out).expect("serialize");
     let back: Output = serde_json::from_str(&json).expect("deserialize");
@@ -433,6 +445,8 @@ fn tag_mode_rejected_on_mpegts_transport() {
             OutputFlip::None,
         )),
         srt: None,
+
+        program: None,
     };
     let err = srt.validate().expect_err("tag on TS is rejected");
     assert!(format!("{err}").contains("tag"), "names the mode");
@@ -459,6 +473,8 @@ fn tag_mode_accepted_on_hls() {
             OrientationMode::Tag,
             OutputFlip::None,
         )),
+
+        program: None,
     };
     hls.validate().expect("HLS carries a display-matrix tag");
     assert_eq!(

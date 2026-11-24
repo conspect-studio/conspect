@@ -243,7 +243,9 @@ function MatrixGrid({
   }
   const groupHeaders = rows.map((row, index) => index === 0 || row.group !== rows[index - 1]?.group);
   return (
-    <div className="patch-wrap" data-testid={`matrix-grid-${plane}`}>
+    // A scroll container must be keyboard-focusable (WCAG 2.1.1); region provides its name.
+    // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
+    <div className="patch-wrap" role="region" aria-label={t`Source to output routing matrix`} tabIndex={0} data-testid={`matrix-grid-${plane}`}>
       <table className="patch-table">
         <thead>
           <tr>
@@ -883,6 +885,11 @@ export function PatchMatrix(): JSX.Element {
           {readError instanceof OperationApiError ? (readError.detail ?? readError.message) : t`The patch readback could not be read.`}
         </p>
       ) : null}
+      {writeQuery.isError && <div role="alert" className="space-y-2 rounded border border-destructive p-3">
+        <p><Trans>Route permission check failed. No valid plan was obtained.</Trans></p>
+        <p>{writeQuery.error instanceof OperationApiError ? (writeQuery.error.detail ?? writeQuery.error.message) : t`Cannot verify route permission`}</p>
+        <Button type="button" variant="outline" disabled={writeQuery.isFetching} onClick={() => { void writeQuery.refetch(); }}><Trans>Retry status</Trans></Button>
+      </div>}
       <Tabs
         value={plane}
         onValueChange={(value): void => {
