@@ -34,6 +34,8 @@ pub mod ember;
 pub mod swp08;
 
 #[cfg(feature = "router")]
+pub mod client;
+#[cfg(feature = "router")]
 pub mod transport;
 
 /// A single router crosspoint: `destination` is fed from `source` on a `level`.
