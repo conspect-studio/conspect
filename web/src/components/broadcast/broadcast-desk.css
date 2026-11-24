@@ -19,7 +19,7 @@
 .bd-brand small{font-size:12px;font-weight:400;letter-spacing:.12em;color:var(--bd-muted);text-transform:uppercase}
 .bd-mark{width:14px;height:14px;border-radius:2px;background:conic-gradient(#e5484d 0 25%,#e8a33d 0 50%,#3dd68c 0 75%,#6aa6ff 0)}
 .bd-tabs{display:flex;gap:4px;flex:1}
-.bd-tabs a{display:flex;align-items:center;gap:8px;padding:0 14px;border-radius:8px;color:var(--bd-muted);font-size:14px;font-weight:600;white-space:nowrap}
+.bd-tabs a{display:flex;align-items:center;gap:8px;padding:0 14px;border-radius:8px;color:#c2cbd6;font-size:14px;font-weight:600;white-space:nowrap}
 .bd-tabs a span{border:1px solid var(--bd-line2);border-radius:3px;padding:1px 5px;font:12px monospace}
 .bd-tabs a[aria-current]{background:var(--bd-bg3);color:var(--bd-text);box-shadow:inset 0 -2px #6aa6ff}
 .bd-top-actions{display:flex;align-items:center;gap:8px;margin-left:auto}
