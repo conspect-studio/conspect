@@ -294,7 +294,8 @@ function MatrixGrid({
                             onToggle(row, col);
                           }}
                         >
-                          {glyphOf(cell)}{pathGlyph(cell)}
+                          <span aria-hidden="true">{glyphOf(cell)}{pathGlyph(cell)}</span>
+                          <span>{cell.state === 'unknown' ? t`Cannot verify` : cell.state === 'available' ? t`Not routed` : cell.state === 'on-air' ? label : stateLabel(cell)}</span>
                         </button>
                       </td>
                     );
@@ -862,6 +863,7 @@ export function PatchMatrix(): JSX.Element {
 
   return (
     <div className="space-y-4">
+      <p className="text-sm"><Trans>Select a source → select an output → review the route → send to output. A crosspoint is one source-to-output connection. A salvo is a saved group of routes.</Trans></p>
       <p role="status" data-testid="matrix-page-state" aria-live="polite">
         {pageStateLabel()}
         {selections.length > 0 ? <span data-testid="matrix-arming"> · {t`Salvo arming (${String(selections.length)} selected)`}</span> : null}
@@ -959,14 +961,14 @@ export function PatchMatrix(): JSX.Element {
         {actDisabledReason !== undefined ? <p data-testid="matrix-act-reason" className="text-xs">{actDisabledReason}</p> : null}
         {currentPlanError !== undefined ? <p role="alert" className="text-destructive text-xs">{currentPlanError}</p> : null}
         {planLine !== undefined ? <p data-testid="matrix-plan-line" className="text-xs">{planLine}</p> : null}
-        <div className="flex items-center gap-2">
+        <div className="matrix-actions flex flex-wrap items-center gap-2">
           <TouchAction
             onPress={(): void => { void runPlan(); }}
             disabled={planDisabledReason !== undefined}
             disabledReason={planDisabledReason}
             pending={planning}
           >
-            <Trans>Classify selection</Trans>
+            <Trans>Review selected routes</Trans>
           </TouchAction>
           <TouchAction
             onPress={onTakeAll}
@@ -1013,7 +1015,7 @@ export function PatchMatrix(): JSX.Element {
 
       <div className="plan-panel" data-testid="matrix-recall-panel">
         <h3><Trans>Recall a stored salvo</Trans></h3>
-        <div className="flex items-end gap-2">
+        <div className="matrix-actions flex flex-wrap items-end gap-2">
           <div className="grid gap-1.5">
             <Label htmlFor="recall-salvo"><Trans>Salvo</Trans></Label>
             <Select

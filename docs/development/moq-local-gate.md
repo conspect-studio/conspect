@@ -82,8 +82,9 @@ The runner reuses the resource/process machinery reviewed in `0b20f816`, not its
 old task ledger. It forces `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`, rejects
 Cargo target-directory overrides, and uses only worktree-local targets.
 The three root/tool targets count together. Free capacity must remain at least
-150 GiB (`MIN_FREE` in `bin/check`; the build host disk is shared with other
-repositories, so the floor sits below their short-term swings). Source authoring must keep this new lane below **2 GiB**. The runner
+60 GiB (`MIN_FREE` in `bin/check`; changed from 75 GiB on 2026-11-23 after
+independent review). It is a sample, not a reservation, and other writers can
+still exhaust space between checks. Source authoring must keep this new lane below **2 GiB**. The runner
 proposes a **15 GiB combined execution target cap**, not permission to execute.
 A separate execution-budget review must approve that bound against measured
 warm aggregate size and projected cold growth before any expensive gate runs.

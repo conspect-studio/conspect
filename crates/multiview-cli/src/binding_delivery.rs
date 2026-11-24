@@ -379,6 +379,12 @@ impl WindowDelivery for BindingDelivery {
         BindingDelivery::statuses(self)
     }
 
+    fn pump(&mut self, now: Instant) {
+        for binding in &mut self.bindings {
+            Self::pump_binding(binding, now);
+        }
+    }
+
     fn finish(&mut self) {
         BindingDelivery::finish(self);
     }
@@ -412,6 +418,7 @@ struct Binding {
     lease_tx: SyncSender<BatchLease>,
     /// A lease popped but not yet handed to the pump (at most one).
     pending: Option<BatchLease>,
+    max_age: Duration,
     #[cfg(test)]
     staged: Vec<EncodedPacket>,
     wedged: Arc<AtomicBool>,
@@ -593,6 +600,7 @@ impl BindingDelivery {
                 queue,
                 lease_tx,
                 pending: None,
+                max_age: limits.max_age.min(MAX_QUEUE_AGE),
                 #[cfg(test)]
                 staged: Vec::new(),
                 wedged,
@@ -823,6 +831,27 @@ impl BindingDelivery {
     /// queued window to the binding's pump without waiting. A full lease
     /// handoff leaves the window queued (and age-bounded) rather than blocking.
     fn pump_binding(binding: &mut Binding, now: Instant) {
+        if let Some(lease) = binding.pending.as_ref() {
+            let error = match now.checked_duration_since(lease.offered_at()) {
+                None => Some(OfferError::ClockReversed),
+                Some(age) if age > binding.max_age => Some(OfferError::OldestAge),
+                Some(_) => None,
+            };
+            if let Some(error) = error {
+                if let Some(lease) = binding.pending.take() {
+                    count_discarded_lease(&binding.policy, &lease);
+                }
+                binding.queue.report_loss(error);
+                binding.last_rejection = Some(RejectionReason::from_offer(error));
+                sync_drop_counted_flushed(binding);
+                return;
+            }
+        }
+        if let Err(error) = binding.queue.expire_at(now) {
+            binding.last_rejection = Some(RejectionReason::from_offer(error));
+            sync_drop_counted_flushed(binding);
+            return;
+        }
         if binding.failed {
             // The pump is gone (abandoned or disconnected): every window
             // popped here is discarded without ever reaching the sink. Count
@@ -1374,24 +1403,24 @@ mod tests {
                 "admission must never wait on a wedged sink"
             );
         }
-        // The flush loop above runs far faster than real ticks, so both queues
-        // are briefly behind their sinks. With the same producer and the same
-        // elapsed time the wedged binding's backlog must be strictly larger:
-        // its pump is blocked on a sink that never reads, while its sibling's
-        // pump keeps handing whole windows to a sink that does. The wait
-        // ends as soon as that holds; its bound only covers a loaded host's
-        // scheduling of the healthy pump and collector threads (#385).
+        // The producer owns the queue: keep driving the per-tick tail pump
+        // until the healthy sink has actually consumed its entire backlog.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
+            delivery.pump(Instant::now());
             let statuses = delivery.statuses();
-            let wedged = statuses[0].reserved_packets + statuses[0].queued_windows;
             let healthy = statuses[1].reserved_packets + statuses[1].queued_windows;
-            if healthy < wedged || Instant::now() >= deadline {
+            if healthy == 0 || Instant::now() >= deadline {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(1));
         }
         let statuses = delivery.statuses();
+        assert_eq!(
+            statuses[1].reserved_packets + statuses[1].queued_windows,
+            0,
+            "healthy binding must drain before comparing backlogs"
+        );
         assert_eq!(statuses[1].admitted_batches, 20);
         assert_eq!(statuses[1].rejected_batches, 0);
         assert!(!statuses[1].failed);
@@ -1427,6 +1456,84 @@ mod tests {
         );
         delivery.finish();
         assert_eq!(collector.join().expect("collector").len(), 22);
+    }
+
+    #[test]
+    fn quiet_full_handoff_expires_pending_and_queued_windows() {
+        let (mut delivery, receivers) = BindingDelivery::new(
+            vec![BindingPolicy::Bounded],
+            DeliveryLimits {
+                max_packets: 64,
+                max_bytes: 1024 * 1024,
+                max_age: Duration::from_millis(10),
+            },
+            vec![None],
+        );
+        let start = Instant::now();
+        let span = tick_span(Rational::new(30_000, 1001));
+        for _ in 0..20 {
+            delivery.stage(&[packet(2)]);
+            delivery.flush_tick(start, span);
+        }
+        assert!(delivery.bindings[0].pending.is_some());
+        assert!(delivery.statuses()[0].queued_windows > 0);
+        delivery.pump(start + Duration::from_millis(11));
+        let status = delivery.statuses()[0];
+        assert_eq!(status.last_rejection, Some(RejectionReason::OldestAge));
+        assert!(status.generation > 0);
+        assert_eq!(status.queued_windows, 0);
+        assert!(delivery.bindings[0].pending.is_none());
+        drop(receivers);
+        delivery.finish();
+    }
+
+    #[test]
+    fn quiet_expiry_counts_pending_and_queue_once() {
+        let drops = Arc::new(AtomicU64::new(0));
+        let (mut delivery, receivers) = BindingDelivery::new(
+            vec![BindingPolicy::DropCounted(Arc::clone(&drops))],
+            DeliveryLimits {
+                max_packets: 64,
+                max_bytes: 1024 * 1024,
+                max_age: Duration::from_millis(10),
+            },
+            vec![None],
+        );
+        let start = Instant::now();
+        let span = tick_span(Rational::new(30_000, 1001));
+        for _ in 0..20 {
+            delivery.stage(&[packet(2)]);
+            delivery.flush_tick(start, span);
+        }
+        assert!(delivery.bindings[0].pending.is_some());
+        let expected = 1 + u64::try_from(delivery.statuses()[0].queued_windows).unwrap();
+        assert!(expected >= 2);
+        delivery.pump(start + Duration::from_millis(11));
+        assert_eq!(drops.load(Ordering::Acquire), expected);
+        delivery.pump(start + Duration::from_millis(12));
+        assert_eq!(drops.load(Ordering::Acquire), expected);
+        drop(receivers);
+        delivery.finish();
+    }
+
+    #[test]
+    fn quiet_pending_rejects_reversed_clock() {
+        let (mut delivery, receivers) =
+            BindingDelivery::new(vec![BindingPolicy::Bounded], limits(64), vec![None]);
+        let start = Instant::now();
+        let span = tick_span(Rational::new(30_000, 1001));
+        for _ in 0..20 {
+            delivery.stage(&[packet(2)]);
+            delivery.flush_tick(start, span);
+        }
+        assert!(delivery.bindings[0].pending.is_some());
+        delivery.pump(start.checked_sub(Duration::from_nanos(1)).unwrap());
+        let status = delivery.statuses()[0];
+        assert_eq!(status.last_rejection, Some(RejectionReason::ClockReversed));
+        assert!(status.generation > 0);
+        assert!(delivery.bindings[0].pending.is_none());
+        drop(receivers);
+        delivery.finish();
     }
 
     #[test]

@@ -157,6 +157,7 @@ describe('PatchMatrix readback', () => {
     emitStatus('open');
     const cell = await screen.findByTestId('cell-video-source:cnn-usa-output:srt-1:0');
     await waitFor(() => { expect(cell).toHaveTextContent('●⇢'); });
+    expect(cell).toHaveTextContent('CNN USA');
   });
 
   it('renders the available glyph for a row not currently patched', async () => {
@@ -164,6 +165,7 @@ describe('PatchMatrix readback', () => {
     emitStatus('open');
     const cell = await screen.findByTestId('cell-video-source:abc-news-output:srt-1:0');
     await waitFor(() => { expect(cell).toHaveTextContent('○'); });
+    expect(cell).toHaveTextContent('Not routed');
   });
 
   it('exposes the cell state in the accessible name', async () => {
@@ -192,7 +194,7 @@ describe('PatchMatrix multi-select set arming', () => {
     await user.click(await screen.findByTestId('cell-video-source:abc-news-output:hls-1:0'));
     await user.click(await screen.findByTestId('cell-video-source:abc-news-output:srt-1:0'));
     expect(screen.getByTestId('matrix-arming')).toHaveTextContent('2 selected');
-    await user.click(screen.getByRole('button', { name: 'Classify selection' }));
+    await user.click(screen.getByRole('button', { name: 'Review selected routes' }));
     await waitFor(() => { expect(planRequests).toHaveLength(1); });
     expect(planRequests[0]).toEqual({
       crosspoints: [
@@ -214,7 +216,7 @@ describe('PatchMatrix multi-select set arming', () => {
     emitStatus('open');
     await user.click(await screen.findByTestId('cell-video-source:abc-news-output:hls-1:0'));
     await user.click(await screen.findByTestId('cell-video-source:abc-news-output:srt-1:0'));
-    await user.click(screen.getByRole('button', { name: 'Classify selection' }));
+    await user.click(screen.getByRole('button', { name: 'Review selected routes' }));
     await waitFor(() => { expect(screen.getByTestId('matrix-plan-line')).toBeInTheDocument(); });
     await user.click(screen.getByRole('button', { name: 'Take all' }));
     await waitFor(() => { expect(takeRequests).toHaveLength(1); });
@@ -232,7 +234,7 @@ describe('PatchMatrix multi-select set arming', () => {
     emitStatus('open');
     await user.click(await screen.findByTestId('cell-video-source:abc-news-output:hls-1:0'));
     await user.click(await screen.findByTestId('cell-video-source:abc-news-output:srt-1:0'));
-    await user.click(screen.getByRole('button', { name: 'Classify selection' }));
+    await user.click(screen.getByRole('button', { name: 'Review selected routes' }));
     await waitFor(() => { expect(screen.getByTestId('matrix-plan-line')).toBeInTheDocument(); });
     await user.click(screen.getByRole('button', { name: 'Take all' }));
     await waitFor(() => { expect(takeRequests).toHaveLength(1); });
@@ -249,7 +251,7 @@ describe('PatchMatrix multi-select set arming', () => {
     renderMatrix();
     emitStatus('open');
     await user.click(await screen.findByTestId('cell-video-source:abc-news-output:hls-1:0'));
-    expect(screen.getByRole('button', { name: 'Classify selection' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Review selected routes' })).toBeEnabled();
     expect(screen.queryByRole('button', { name: 'Take all' })).toBeNull();
     expect(screen.getByRole('button', { name: 'Take this crosspoint' })).toBeInTheDocument();
   });
@@ -276,7 +278,7 @@ describe('PatchMatrix take lock', () => {
     emitStatus('open');
     await user.click(await screen.findByTestId('cell-video-source:abc-news-output:hls-1:0'));
     await user.click(await screen.findByTestId('cell-video-source:abc-news-output:srt-1:0'));
-    await user.click(screen.getByRole('button', { name: 'Classify selection' }));
+    await user.click(screen.getByRole('button', { name: 'Review selected routes' }));
     await waitFor(() => { expect(screen.getByTestId('matrix-plan-line')).toBeInTheDocument(); });
     await user.click(screen.getByRole('button', { name: 'Take all' }));
     expect(await screen.findByText('Confirm a program-affecting take?')).toBeInTheDocument();
@@ -348,7 +350,7 @@ const mixerPatch = (tick = 7) => ({
 
 async function armAndClassify(user: ReturnType<typeof userEvent.setup>, ...testIds: string[]): Promise<void> {
   for (const id of testIds) await user.click(await screen.findByTestId(id));
-  await user.click(screen.getByRole('button', { name: 'Classify selection' }));
+  await user.click(screen.getByRole('button', { name: 'Review selected routes' }));
 }
 
 describe('E3-01 salvo recall goes through the Program confirm gate', () => {
@@ -458,7 +460,7 @@ describe('E3-03 write capability and connection gate every action', () => {
     renderMatrix();
     await waitFor(() => { expect(screen.getByTestId('matrix-page-state')).toHaveTextContent('Read-only'); });
     expect(await screen.findByTestId('cell-video-source:abc-news-output:hls-1:0')).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Classify selection' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Review selected routes' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Classify salvo' })).toBeDisabled();
     expect(screen.getAllByText('Read-only: your role lacks Write').length).toBeGreaterThan(0);
   });
@@ -470,7 +472,7 @@ describe('E3-03 write capability and connection gate every action', () => {
     emitStatus('reconnecting');
     await waitFor(() => { expect(screen.getByTestId('matrix-page-state')).toHaveTextContent('Disconnected'); });
     expect(screen.getByTestId('cell-video-source:abc-news-output:srt-1:0')).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Classify selection' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Review selected routes' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Take this crosspoint' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Store as salvo…' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Classify salvo' })).toBeDisabled();
@@ -571,7 +573,7 @@ describe('E3-06 stale follows the engine tick', () => {
     await waitFor(() => { expect(screen.getByTestId('matrix-page-state')).toHaveTextContent('stale'); }, { timeout: 5000 });
     expect(screen.getByTestId('matrix-stale-warning')).toBeInTheDocument();
     expect(screen.getByTestId('cell-video-source:cnn-usa-output:srt-1:0')).toHaveTextContent('?');
-    expect(screen.getByRole('button', { name: 'Classify selection' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Review selected routes' })).toBeEnabled();
   }, 10_000);
 
   it('an advancing tick stays live even though each fetch is fresh', async () => {
@@ -621,7 +623,7 @@ describe('E3-08 plans bind to the selection revision', () => {
     await waitFor(() => { expect(planRequests).toHaveLength(1); });
     await user.click(screen.getByTestId('cell-video-source:abc-news-output:srt-1:0'));
     release();
-    await waitFor(() => { expect(screen.getByRole('button', { name: 'Classify selection' })).toBeEnabled(); });
+    await waitFor(() => { expect(screen.getByRole('button', { name: 'Review selected routes' })).toBeEnabled(); });
     expect(screen.queryByTestId('matrix-plan-line')).toBeNull();
     expect(screen.getByRole('button', { name: 'Take all' })).toBeDisabled();
   });
@@ -690,11 +692,11 @@ describe('E3-10 audio and subtitle planes', () => {
     await screen.findByTestId('cell-video-source:abc-news-output:hls-1:0');
     await user.click(screen.getByRole('tab', { name: 'Audio' }));
     await user.click(screen.getByTestId('cell-audio-audio:follow-output:hls-1:0'));
-    expect(screen.getByRole('button', { name: 'Classify selection' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Review selected routes' })).toBeDisabled();
     expect(screen.getAllByText(/Audio Follow rides its output's video take/).length).toBeGreaterThan(0);
     await user.click(screen.getByRole('tab', { name: 'Video' }));
     await user.click(screen.getByTestId('cell-video-source:abc-news-output:hls-1:0'));
-    await user.click(screen.getByRole('button', { name: 'Classify selection' }));
+    await user.click(screen.getByRole('button', { name: 'Review selected routes' }));
     await waitFor(() => { expect(planRequests).toHaveLength(1); });
     expect(planRequests[0]).toEqual({
       crosspoints: [
@@ -723,7 +725,7 @@ describe('E3-10 audio and subtitle planes', () => {
     const cell = await screen.findByTestId('cell-subtitle-source:cnn-usa-output:hls-1:0');
     expect(cell).toBeDisabled();
     expect(cell).toHaveAccessibleName(/patch subtitles in the Subtitle patch panel/);
-    expect(screen.getByRole('button', { name: 'Classify selection' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Review selected routes' })).toBeDisabled();
   });
 });
 
@@ -792,6 +794,7 @@ describe('E3-06 round 2: no visible engine tick is unknown, never Live', () => {
     expect(screen.getByTestId('matrix-no-tick-warning')).toBeInTheDocument();
     expect(cell).toHaveTextContent('?');
     expect(cell).toHaveAccessibleName(/CNN USA to srt-1: unknown/);
+    expect(cell).toHaveTextContent('Cannot verify');
   });
 });
 
@@ -802,7 +805,7 @@ describe('E3-03 round 2: only a definite Write answer enables mutations', () => 
     const cell = await screen.findByTestId('cell-video-source:abc-news-output:hls-1:0');
     expect(cell).toBeDisabled();
     expect(screen.getAllByText('Checking permission…').length).toBeGreaterThan(0);
-    expect(screen.getByRole('button', { name: 'Classify selection' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Review selected routes' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Store as salvo…' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Classify salvo' })).toBeDisabled();
   });

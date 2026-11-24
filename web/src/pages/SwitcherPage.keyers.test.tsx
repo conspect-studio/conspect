@@ -2,6 +2,9 @@
 // the real plan→command flow (design note §10, K5): the shared submission
 // gate, realtime refresh on `switcher.keyer`, stream freshness, the ramp clock.
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+// Outcome tests exercise an explicitly unlocked desk; lock behavior has separate coverage.
+const takeLock = vi.hoisted(() => ({ locked: false }));
+vi.mock('../components/broadcast/BroadcastShell', () => ({ useTakeLock: () => takeLock }));
 import type { Envelope } from '../realtime/envelope';
 import type { RealtimeStatus } from '../realtime/connection';
 
@@ -71,6 +74,7 @@ const server = setupServer(
 beforeAll(() => { server.listen(); });
 afterEach(() => {
   server.resetHandlers();
+  takeLock.locked = false;
   calls = [];
   planAnswer = { can_take: true, class: 'class1', keyer: 'main/dsk1', on_air: false };
   planGate = undefined;
@@ -98,6 +102,18 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 describe('SwitcherPage keyer desk (K5)', () => {
+  it('blocks keyer Cut and Auto on the page while locked without posting', async () => {
+    takeLock.locked = true;
+    page();
+    const strip = await screen.findByTestId('keyer-strip-dsk1');
+    for (const name of ['Cut', 'Auto']) {
+      const action = within(strip).getByRole('button', { name });
+      expect(action).toBeDisabled();
+      await userEvent.click(action);
+    }
+    expect(calls).toEqual([]);
+    expect(within(strip).getByText('Takes locked — unlock in the header')).toBeVisible();
+  });
   it('CUT plans before it commands keyer_cut, with an Idempotency-Key', async () => {
     page();
     const strip = await screen.findByTestId('keyer-strip-dsk1');
@@ -117,7 +133,7 @@ describe('SwitcherPage keyer desk (K5)', () => {
     await waitFor(() => { expect(cut).toHaveProperty('disabled', true); });
     expect(cut).toHaveAttribute('title', 'A switcher request is in flight');
     // Every switcher and keyer control is behind the same gate.
-    const backgroundCut = screen.getAllByRole('button', { name: 'Cut' }).find((b) => !strip.contains(b));
+    const backgroundCut = screen.getAllByRole('button', { name: 'Cut preview to air' }).find((b) => !strip.contains(b));
     expect(backgroundCut).toHaveProperty('disabled', true);
     expect(screen.getByRole('button', { name: 'Review' })).toHaveProperty('disabled', true);
     expect(within(strip).getByRole('checkbox', { name: 'Tie' })).toHaveProperty('disabled', true);
@@ -134,7 +150,7 @@ describe('SwitcherPage keyer desk (K5)', () => {
     await userEvent.click(screen.getByRole('checkbox', { name: 'Invert matte' }));
     await userEvent.click(screen.getByRole('button', { name: 'Review' }));
     const strip = screen.getByTestId('keyer-strip-dsk1');
-    const backgroundCut = screen.getAllByRole('button', { name: 'Cut' }).find((b) => !strip.contains(b));
+    const backgroundCut = screen.getAllByRole('button', { name: 'Cut preview to air' }).find((b) => !strip.contains(b));
     await waitFor(() => { expect(backgroundCut).toHaveProperty('disabled', true); });
     gate.resolve();
     await waitFor(() => { expect(backgroundCut).toHaveProperty('disabled', false); });
@@ -204,7 +220,7 @@ describe('SwitcherPage keyer desk (K5)', () => {
   it('renders nothing when the snapshot carries no keyers (no backend keyers deployed)', async () => {
     state = { ...BASE_STATE, keyers: [] };
     page();
-    await screen.findByRole('button', { name: 'Cut' });
+    await screen.findByRole('button', { name: 'Cut preview to air' });
     expect(screen.queryByText('Keyers')).toBeNull();
     expect(screen.queryByTestId('arm-strip')).toBeNull();
   });
@@ -247,7 +263,7 @@ describe('SwitcherPage arm strip (K3 #388)', () => {
     await waitFor(() => { expect(bkgd).toHaveProperty('disabled', true); });
     expect(bkgd).toHaveAttribute('title', 'A switcher request is in flight');
     expect(bkgd.getAttribute('aria-describedby')).toBeTruthy();
-    const backgroundCut = screen.getAllByRole('button', { name: 'Cut' }).find((b) => !screen.getByTestId('keyer-strip-dsk1').contains(b));
+    const backgroundCut = screen.getAllByRole('button', { name: 'Cut preview to air' }).find((b) => !screen.getByTestId('keyer-strip-dsk1').contains(b));
     expect(backgroundCut).toHaveProperty('disabled', true);
     gate.resolve();
     await waitFor(() => { expect(calls.filter((c) => c.path.startsWith('commands/'))).toHaveLength(1); });
@@ -300,7 +316,7 @@ describe('SwitcherPage arm strip (K3 #388)', () => {
     page();
     await screen.findByTestId('keyer-arm-usk1');
     const strip = screen.getByTestId('keyer-strip-dsk1');
-    const backgroundCut = screen.getAllByRole('button', { name: 'Cut' }).find((b) => !strip.contains(b) && !screen.getByTestId('keyer-strip-usk1').contains(b));
+    const backgroundCut = screen.getAllByRole('button', { name: 'Cut preview to air' }).find((b) => !strip.contains(b) && !screen.getByTestId('keyer-strip-usk1').contains(b));
     expect(backgroundCut).toHaveProperty('disabled', false);
     await userEvent.click(backgroundCut!);
     await waitFor(() => { expect(calls.map((c) => c.path)).toEqual(['plan', 'commands/cut']); });

@@ -17,6 +17,7 @@ export default defineConfig({
     baseURL: "http://localhost:4173",
     // Containers/CI: chromium needs the sandbox disabled.
     launchOptions: {
+      ...(process.env.CHROME_PATH ? { executablePath: process.env.CHROME_PATH } : {}),
       args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
     },
   },
