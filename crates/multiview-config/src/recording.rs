@@ -135,13 +135,7 @@ impl DiskPolicy {
     /// threshold is one percent.
     #[must_use]
     pub const fn resume_pct(self) -> u8 {
-        let band = self.resume_hysteresis_pct;
-        let stop = self.stop_at_pct;
-        if band >= stop {
-            0
-        } else {
-            stop - band
-        }
+        self.stop_at_pct.saturating_sub(self.resume_hysteresis_pct)
     }
 
     /// Minimum free bytes (`f_bavail`), saturating.
