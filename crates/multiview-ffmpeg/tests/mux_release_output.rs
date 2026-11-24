@@ -30,6 +30,7 @@ fn encoder() -> VideoEncoder {
         bit_rate: 500_000,
         gop: 5,
         cuda_device: None,
+        color: None,
     })
     .expect("open mpeg2video")
 }

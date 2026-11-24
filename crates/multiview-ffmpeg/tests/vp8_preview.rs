@@ -76,6 +76,7 @@ mod gated {
             // GOP comes from the preview option set (`g`), not the target.
             gop: 0,
             cuda_device: None,
+            color: None,
         }
     }
 

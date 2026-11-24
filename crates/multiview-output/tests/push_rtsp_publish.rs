@@ -246,6 +246,12 @@ fn rtsp_live_push_reaches_a_listening_sidecar() {
         bit_rate: 1_500_000,
         audio: None,
         cuda_ordinal: None,
+        color: Some(multiview_core::color::ColorInfo {
+            primaries: multiview_core::color::ColorPrimaries::Bt709,
+            transfer: multiview_core::color::TransferCharacteristic::Bt709,
+            matrix: multiview_core::color::MatrixCoefficients::Bt709,
+            range: multiview_core::color::ColorRange::Limited,
+        }),
     };
     let sink = PushSink::new(config, target.protocol(), target.publish_url());
     let mut source = GrayNv12Source { remaining: FRAMES };

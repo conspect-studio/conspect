@@ -51,6 +51,12 @@ fn config(fps: i64, gop: u32) -> EncodeConfig {
         bit_rate: 2_000_000,
         audio: None,
         cuda_ordinal: None,
+        color: Some(multiview_core::color::ColorInfo {
+            primaries: multiview_core::color::ColorPrimaries::Bt709,
+            transfer: multiview_core::color::TransferCharacteristic::Bt709,
+            matrix: multiview_core::color::MatrixCoefficients::Bt709,
+            range: multiview_core::color::ColorRange::Limited,
+        }),
     }
 }
 
@@ -275,4 +281,60 @@ fn video_pts_follows_the_tick_index_across_dropped_ticks() {
     pts.sort_unstable();
     let expected: Vec<i64> = ticks.iter().map(|&t| i64::try_from(t).unwrap()).collect();
     assert_eq!(pts, expected, "video PTS must equal the output tick index");
+}
+
+/// #161: verifies that the program encoder context is tagged BT.709 limited.
+/// This MPEG-2 transport-stream test proves matrix/primaries/transfer tags at
+/// the muxed output; MPEG-2 TS does not signal range, so `tv` is container
+/// defaulting, not proof that the context range was carried on wire. The H.264
+/// bitstream test in `multiview-ffmpeg/tests/color_tags.rs` verifies all four
+/// named wire fields, plus a full-range control to distinguish `tv` from `pc`.
+#[test]
+fn encoded_program_carries_bt709_limited_colour_tags() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clip = dir.path().join("src.ts");
+    generate_clip(&clip, 1, 10);
+    let cfg = config(10, 10);
+    let (packets, encoder) = encode_clip(&clip, &cfg);
+    assert!(!packets.is_empty(), "the clip encoded");
+    let out = dir.path().join("tagged.ts");
+    let mut src = VecPackets::new(packets);
+    PacketMuxSink::file(&out)
+        .run(&mut src, encoder.codec_params(), encoder.time_base())
+        .expect("mux");
+
+    let probe = Command::new("ffprobe")
+        .args([
+            "-hide_banner",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=color_range,color_space,color_transfer,color_primaries",
+            "-of",
+            "default=noprint_wrappers=1",
+        ])
+        .arg(&out)
+        .output()
+        .expect("ffprobe");
+    assert!(probe.status.success(), "ffprobe failed: {probe:?}");
+    let text = String::from_utf8_lossy(&probe.stdout);
+    println!("ffprobe produced stream color fields:\n{}", text.trim());
+    let fields: std::collections::HashMap<&str, &str> = text
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    assert_eq!(fields.get("color_range"), Some(&"tv"), "range: {text}");
+    assert_eq!(fields.get("color_space"), Some(&"bt709"), "matrix: {text}");
+    assert_eq!(
+        fields.get("color_primaries"),
+        Some(&"bt709"),
+        "primaries: {text}"
+    );
+    assert_eq!(
+        fields.get("color_transfer"),
+        Some(&"bt709"),
+        "transfer: {text}"
+    );
 }

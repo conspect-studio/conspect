@@ -435,6 +435,10 @@ pub enum WarningCode {
     /// edit was kept (`.multiview/rejected/replaced-*.json`). **Latched**
     /// critical: the removal stands until someone restores it.
     ConfigFileRemovedAccepted,
+    /// A wanted source has entered the failed phase and is not producing media.
+    /// The control-plane health route reports one entry per authorized source;
+    /// it clears on recovery or intentional idle without affecting liveness.
+    SourceFailed,
 }
 
 /// Which end of a RIST link a [`RistLinkStats`] sample describes.
@@ -571,6 +575,7 @@ impl WarningCode {
             Self::AcceptedStateRejected => "accepted-state-rejected",
             Self::TlsCertificate => "tls-certificate",
             Self::ConfigFileRemovedAccepted => "config-file-removed-accepted",
+            Self::SourceFailed => "source-failed",
         }
     }
 }

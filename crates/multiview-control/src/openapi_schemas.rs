@@ -621,6 +621,8 @@ pub enum WarningCodeDoc {
     TlsCertificate,
     /// A boot-file edit removed items the accepted state had (#367).
     ConfigFileRemovedAccepted,
+    /// A wanted source has failed to produce media; one entry per authorized source.
+    SourceFailed,
 }
 
 /// `OpenAPI` mirror of [`multiview_events::HealthWarning`] (SA-0).

@@ -1176,6 +1176,7 @@ mod shared_mux_input_tests {
             bit_rate: 500_000,
             gop: 12,
             cuda_device: None,
+            color: None,
         })
         .expect("open encoder");
         let params = StreamCodecParameters::from_encoder(&encoder);

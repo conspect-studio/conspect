@@ -93,6 +93,7 @@ fn encode_video_frames(
         bit_rate,
         gop: GOP,
         cuda_device: None,
+        color: None,
     };
     let mut encoder = VideoEncoder::new(&target).expect("open video encoder");
     let time_base = encoder.time_base();

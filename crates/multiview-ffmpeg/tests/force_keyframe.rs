@@ -34,6 +34,7 @@ fn target() -> VideoEncodeTarget {
         // (the unavoidable first intra) and whatever the seam forces.
         gop: 240,
         cuda_device: None,
+        color: None,
     }
 }
 

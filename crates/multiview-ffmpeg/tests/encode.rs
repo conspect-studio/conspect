@@ -31,6 +31,7 @@ fn target(codec: &str) -> VideoEncodeTarget {
         // Default: no device pin — behaviour is unchanged from before the NVENC
         // affinity seam existed (P1a). Tests that exercise the pin set it below.
         cuda_device: None,
+        color: None,
     }
 }
 
