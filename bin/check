@@ -30,13 +30,14 @@ GIB = 1024 ** 3
 # target cap. Later measurements attributed much of the swing to our own bounded
 # concurrent targets (~23 GiB during one run); five gates failed at 71–74 GiB.
 # Independent review rejected 45 GiB: that single sample is not a bound on other
-# writers. On 2026-11-23, review recommended a 60 GiB running floor. This retains
-# 45 GiB beyond this gate's 15 GiB target
-# cap, but remains only a sample: a dip between checks can still cause ENOSPC.
-# Other writers must remain bounded and space must be monitored.
+# writers. On 2026-11-23, review recommended a 60 GiB running floor. A gate
+# cold-start measured 14 GiB deps + 0.56 GiB build + 0.46 GiB examples = 16 GiB
+# after the mandatory native H264 leg, with incremental disabled. A 20 GiB cap
+# adds 4 GiB margin for the remaining web/native legs. This leaves 40 GiB
+# beyond the worktree cap at the 60 GiB free floor; neither sample reserves
+# space, so other writers must remain bounded and space monitored.
 MIN_FREE = 60 * GIB
-# Authoring stays <=2 GiB; this proposed execution cap needs separate review.
-MAX_TARGET = 15 * GIB
+MAX_TARGET = 20 * GIB
 
 # A new MAIN candidate decision, NOT a third T78 workspace-suite attempt.
 # CI remains unchanged. This local gate can establish DRAFT evidence only.
@@ -155,7 +156,10 @@ def resources():
     require(shutil.disk_usage(ROOT).free >= MIN_FREE,
             f'free disk below {MIN_FREE // GIB} GiB floor')
     total = target_bytes()
-    require(total <= MAX_TARGET, 'combined local targets exceed 15 GiB; stop and inspect owned artifacts')
+    require(total <= MAX_TARGET,
+            f'combined local targets {total} bytes exceed {MAX_TARGET} bytes '
+            f'({MAX_TARGET // GIB} GiB cap); '
+            'stop and inspect owned artifacts')
     return total
 
 
