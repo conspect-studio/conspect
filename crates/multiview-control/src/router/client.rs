@@ -41,7 +41,7 @@ pub enum Protocol {
 /// Start refusal for a protocol without a defined route-report mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum StartError {
-    /// Ember+ GlowNode has no standard source/destination crosspoint schema.
+    /// Ember+ `GlowNode` has no standard source/destination crosspoint schema.
     #[error("Ember+ route reports need a configured parameter mapping")]
     EmberRouteMappingRequired,
 }
