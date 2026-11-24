@@ -92,6 +92,10 @@ class TsIdrFilter(private val nowMs: () -> Long = { System.nanoTime() / 1_000_00
     private var scanFrom = 0
     private var idrSeen = false
     private var discardUntilStart = false
+    // SRT message boundaries are independent of 188-byte MPEG-TS packet boundaries.
+    // Retain at most one incomplete packet; never bypass continuity on a short read.
+    private val partialPacket = ByteArray(TsContinuityDetector.PACKET)
+    private var partialLength = 0
 
     /** Gaps that started a recovery. */
     var recoveries = 0
@@ -125,23 +129,35 @@ class TsIdrFilter(private val nowMs: () -> Long = { System.nanoTime() / 1_000_00
     }
 
     /**
-     * Filters [len] bytes of whole TS packets at [off]. Input that is not packet aligned passes through
-     * unchanged. Returns the bytes to hand to the extractor (may be empty).
+     * Reassembles TS packets across arbitrary SRT message boundaries. Only complete, sync-aligned packets
+     * reach continuity and IDR filtering. At most 187 trailing bytes are retained between calls; invalid
+     * sync alignment fails closed into recovery instead of passing unchecked video to the extractor.
      */
     fun process(buf: ByteArray, off: Int, len: Int): ByteArray {
+        require(off >= 0 && len >= 0 && off <= buf.size - len)
         val out = java.io.ByteArrayOutputStream(len + TsContinuityDetector.PACKET)
-        if (len % TsContinuityDetector.PACKET != 0 || len == 0) {
-            out.write(buf, off, len)
-            return out.toByteArray()
-        }
         var i = off
-        while (i < off + len) {
-            if (buf[i] != TsContinuityDetector.SYNC) { // lost alignment: pass the rest as it is
-                out.write(buf, i, off + len - i)
-                break
+        val end = off + len
+        while (i < end) {
+            if (partialLength == 0 && buf[i] != TsContinuityDetector.SYNC) {
+                // No reliable packet boundary: discard until the next TS sync.
+                // A damaged video packet cannot be emitted before an intact IDR.
+                beginDropping()
+                i += 1
+                continue
             }
-            packet(buf, i, out)
-            i += TsContinuityDetector.PACKET
+            val count = minOf(TsContinuityDetector.PACKET - partialLength, end - i)
+            System.arraycopy(buf, i, partialPacket, partialLength, count)
+            partialLength += count
+            i += count
+            if (partialLength == TsContinuityDetector.PACKET) {
+                if (partialPacket[0] == TsContinuityDetector.SYNC) {
+                    packet(partialPacket, 0, out)
+                } else {
+                    beginDropping()
+                }
+                partialLength = 0
+            }
         }
         return out.toByteArray()
     }
@@ -220,6 +236,7 @@ class TsIdrFilter(private val nowMs: () -> Long = { System.nanoTime() / 1_000_00
         lastRecoveryMs = Long.MIN_VALUE / 2
         clearPending()
         discardUntilStart = false
+        partialLength = 0
         recoveries = 0
     }
 

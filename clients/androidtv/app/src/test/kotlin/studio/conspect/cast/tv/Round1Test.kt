@@ -75,6 +75,31 @@ class IdrFilterTest {
     /** A last one-packet unit releases the unit before it (a unit is released when the next one starts). */
     private fun tail() = unit(1, 1)
 
+    @Test fun unalignedSrtMessagesStillFilterVideoContinuityAndRecoverAtIdr() {
+        val f = TsIdrFilter()
+        val idr = unit(5, 3)
+        val broken = unit(1, 4, skip = 2)
+        val dependent = unit(1, 2)
+        val restored = unit(5, 2)
+        val following = unit(1, 2)
+        val all = idr + broken + dependent + restored + following + tail()
+        val bytes = all.fold(ByteArray(0)) { acc, packet -> acc + packet }
+        val out = java.io.ByteArrayOutputStream()
+        // None of these SRT message boundaries is constrained to a TS packet boundary.
+        val chunks = listOf(1, 186, 3, 377, 5, 188, 11)
+        var pos = 0
+        var n = 0
+        while (pos < bytes.size) {
+            val count = minOf(chunks[n % chunks.size], bytes.size - pos)
+            out.write(f.process(bytes, pos, count))
+            pos += count
+            n += 1
+        }
+        val packets = out.toByteArray().toList().chunked(188).map { it.toByteArray() }
+        assertEquals(c(idr + restored + following), c(packets))
+        assertEquals(1, f.recoveries)
+    }
+
     @Test fun healthyStreamPassesUntouched() {
         val f = TsIdrFilter()
         val input = unit(5, 3) + unit(1, 3) + unit(1, 2)
