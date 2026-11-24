@@ -2,7 +2,7 @@
 //!
 //! MPEG-2 TS does not signal the quantization-range flag; ffprobe reports `tv`
 //! even when the encoder context was tagged `pc`. Test H.264 in MPEG-TS and
-//! ask x264 to write the CICP values into its sequence metadata. This test is
+//! verify which context tags x264 writes into sequence metadata. The test is
 //! GPL-gated and does not affect the default LGPL-only build.
 #![cfg(all(feature = "ffmpeg", feature = "gpl-codecs"))]
 #![allow(
@@ -22,7 +22,6 @@ use multiview_core::color::{
     ColorInfo, ColorPrimaries, ColorRange, MatrixCoefficients, TransferCharacteristic,
 };
 use multiview_core::time::Rational;
-use multiview_ffmpeg::encode_options::program_h264_options;
 use multiview_ffmpeg::{Muxer, VideoEncodeTarget, VideoEncoder};
 
 const WIDTH: u32 = 128;
@@ -47,12 +46,7 @@ fn gray_frame(pts: i64) -> Video {
 }
 
 fn encode_segment(path: &std::path::Path, color: Option<ColorInfo>) {
-    let color_options = program_h264_options("libx264")
-        .try_set(
-            "x264-params",
-            "colorprim=bt709:transfer=bt709:colormatrix=bt709:range=limited:repeat-headers=1",
-        )
-        .expect("valid x264 CICP options");
+    let color_options = multiview_ffmpeg::encode_options::CodecOptions::new();
     let target = VideoEncodeTarget {
         codec_name: "libx264".to_owned(),
         width: WIDTH,
