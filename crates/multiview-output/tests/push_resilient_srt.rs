@@ -100,7 +100,6 @@ impl LiveSource {
             time_base: Rational::new(1, FPS),
             bit_rate: 500_000,
             gop: 10,
-            color: multiview_core::color::ColorInfo::default(),
             cuda_device: None,
         })
         .expect("encoder");
