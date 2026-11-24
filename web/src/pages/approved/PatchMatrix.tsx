@@ -885,6 +885,11 @@ export function PatchMatrix(): JSX.Element {
           {readError instanceof OperationApiError ? (readError.detail ?? readError.message) : t`The patch readback could not be read.`}
         </p>
       ) : null}
+      {writeQuery.isError && <div role="alert" className="space-y-2 rounded border border-destructive p-3">
+        <p><Trans>Route permission check failed. No valid plan was obtained.</Trans></p>
+        <p>{writeQuery.error instanceof OperationApiError ? (writeQuery.error.detail ?? writeQuery.error.message) : t`Cannot verify route permission`}</p>
+        <Button type="button" variant="outline" disabled={writeQuery.isFetching} onClick={() => { void writeQuery.refetch(); }}><Trans>Retry status</Trans></Button>
+      </div>}
       <Tabs
         value={plane}
         onValueChange={(value): void => {
