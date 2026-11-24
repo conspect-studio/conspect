@@ -37,7 +37,7 @@ function SwitcherMonitor({ bus, path }: { readonly bus: string; readonly path: s
   const { url: src, state, requestFailed } = useJpegStill(path, 1000);
   return (
     <section className="space-y-2 rounded-md border p-3" aria-label={bus}>
-      <h2 className="font-semibold">{bus}</h2>
+      <h2 className="font-semibold">{bus === 'PGM' ? <Trans>Program (on air)</Trans> : <Trans>Preview (not on air)</Trans>}</h2>
       {src === undefined
         ? <div role="img" aria-label={`${bus} unavailable`} className="flex aspect-video items-center justify-center bg-black text-sm text-white">{requestFailed ? <Trans>Preview request failed — retrying</Trans> : <Trans>Waiting for a real frame</Trans>}</div>
         : <img src={src} alt={`${bus} monitor`} className="aspect-video w-full bg-black object-contain" />}
@@ -59,6 +59,9 @@ export function SwitcherPage(): JSX.Element {
   const mixer = patch.data?.mixer.find((m) => m.me === 'me1');
   const [selected, setSelected] = useState('');
   const [duration, setDuration] = useState('25');
+  const durationSeconds = state.data?.fps_num && state.data.fps_den && Number.isFinite(Number(duration))
+    ? (Number(duration) * state.data.fps_den / state.data.fps_num).toFixed(2)
+    : undefined;
   const [operationId, setOperationId] = useState<string | undefined>();
   const operation = useOperationFeedback(operationId);
   const [failureReason, setFailureReason] = useState<string | undefined>();
@@ -278,6 +281,7 @@ export function SwitcherPage(): JSX.Element {
       <div className="flex flex-wrap items-end gap-3 rounded-lg border p-3">
         <Button disabled={!ready || locked} onClick={() => { take('cut'); }}><Trans>Cut preview to air</Trans></Button>
         <div className="space-y-1"><Label htmlFor="switcher-duration"><Trans>Auto frames</Trans></Label><Input id="switcher-duration" type="number" min="1" max="1000" value={duration} onChange={(event) => { setDuration(event.target.value); }} /></div>
+        <p className="text-sm text-muted-foreground">{durationSeconds === undefined ? <Trans>Duration in seconds cannot be verified until the engine reports its frame rate.</Trans> : <Trans>Transition duration: {durationSeconds} seconds</Trans>}</p>
         <Button disabled={!ready || locked || !Number.isInteger(Number(duration)) || Number(duration) < 1} onClick={() => { take('auto'); }}><Trans>Transition preview to air</Trans></Button>
       </div>
       {refreshFailed && (
