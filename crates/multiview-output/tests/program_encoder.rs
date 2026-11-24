@@ -287,8 +287,8 @@ fn video_pts_follows_the_tick_index_across_dropped_ticks() {
 /// This MPEG-2 transport-stream test proves matrix/primaries/transfer tags at
 /// the muxed output; MPEG-2 TS does not signal range, so `tv` is container
 /// defaulting, not proof that the context range was carried on wire. The H.264
-/// Matroska bitstream test in `multiview-ffmpeg/tests/color_tags.rs` verifies
-/// all four wire fields, including range.
+/// bitstream test in `multiview-ffmpeg/tests/color_tags.rs` verifies all four
+/// named wire fields, plus a full-range control to distinguish `tv` from `pc`.
 #[test]
 fn encoded_program_carries_bt709_limited_colour_tags() {
     let dir = tempfile::tempdir().expect("tempdir");

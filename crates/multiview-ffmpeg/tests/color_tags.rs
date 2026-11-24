@@ -132,4 +132,18 @@ fn h264_bitstream_signals_all_four_sdr_bt709_limited_axes() {
         fields.get("color_transfer").map(String::as_str),
         Some("bt709")
     );
+
+    // Discriminating full-range control: ffprobe's tv default cannot make
+    // both distinct encoder-context profiles produce the same report.
+    let mut full_range = bt709_limited();
+    full_range.range = ColorRange::Full;
+    let full_path = dir.path().join("full-range.ts");
+    encode_segment(&full_path, Some(full_range));
+    let full_fields = ffprobe_stream_fields(&full_path);
+    println!("ffprobe full-range control fields: {full_fields:?}");
+    assert_eq!(
+        full_fields.get("color_range").map(String::as_str),
+        Some("pc"),
+        "full-range profile must be distinguishable on wire"
+    );
 }
