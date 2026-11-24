@@ -416,6 +416,10 @@ jobs:
             feature: is07-mqtt
           - crate: multiview-control
             feature: nmos
+          # Opt-in supervised router TCP client: real [::1] SW-P-08 wire,
+          # reconnect, and keepalive kernel option assertions.
+          - crate: multiview-control
+            feature: router
           # The live Cast driver + mDNS discovery (ADR-M011, ADR-0111):
           # `devices-net` = zowietek + cast (CASTV2 TLS + protobuf framing) +
           # discovery (mdns-sd). Pure Rust, no device needed: the cast tests
