@@ -22,7 +22,8 @@ Proposed attachment: on that **bake-consumer thread**, after encoded events are
 received and before ownership is moved into the selected rendition's staging
 path, offer a bounded copy of each selected Program encoded packet to its
 recorder. Include program and selected discrete audio and preserve stream kind,
-PTS, DTS, duration, keyframe and codec parameters; do not copy raw canvas frames
+PTS, DTS, duration and keyframe; obtain codec parameters separately from the
+encoder/lease metadata, not from `EncodedPacket`. Do not copy raw canvas frames
 or re-encode. `EncodedPacket::payload` exposes borrowed coded bytes and timing
 accessors (`crates/multiview-ffmpeg/src/packet.rs:99-114,170-200`). Exact
 ordering, dynamic rendition moves, codec-parameter changes and multi-track
@@ -31,7 +32,7 @@ claim a muxable atomic output window merely because individual packets arrived.
 
 The off-clock claim is conditional on the thread boundary above and the live
 nonblocking queue. Copy cost still consumes bake-consumer capacity: excessive
-copying can fill the hot queue, cause output substitution/fatal behavior, and
+copying can fill the hot queue, cause shedding, substitution and a FALTERED run verdict, and
 therefore is not automatically safe merely because it is on another thread.
 Admission must impose fixed packet-size and per-tick work bounds and reject
 unsupported loads before arming. Any future move of dispatch or copying onto the
@@ -41,7 +42,9 @@ the clock. Offline blocking mode is not evidence for live isolation.
 
 ## Ownership, bounds and loss
 
-Construct the channel and pool off-clock. Move the unique `Consumer<PacketSlot>`
+The SPSC crate is landed but not wired into the live recorder. Construct the
+channel and pool off-clock. `PacketSlot` below is a proposed type, not an existing
+one. Move the unique `Consumer<PacketSlot>`
 and `BufferRecycler` into exactly one dedicated writer thread; move the unique
 `Producer` and `BufferSource` into the bake consumer. Do not clone or wrap the
 consumer in `Arc<Mutex<_>>`, share it with a shutdown supervisor, or add a second
@@ -61,9 +64,13 @@ allocation. It is a bounded capacity leak, still a recording failure requiring a
 visible count. `Producer::push` returns the item when full (`lib.rs:51-65`): it
 does **not** provide drop-oldest. The producer must not free or recycle an old
 slot it does not own. Define a bounded overload policy explicitly: count and
-reject the new packet when full or no buffer exists; recycle rejected ownership
-safely off-clock and signal loss. This is drop-new, not the earlier drop-oldest
-claim; the panel must approve the policy and GOP/keyframe recovery before code.
+reject the new packet when full or no buffer exists. On a full queue the bake
+consumer retains the returned buffer in one producer-local reusable slot, never
+writes the writer-owned free-list, and counts the rejected packet and bytes. At
+shutdown it releases that slot off-clock, counting any unrecycled buffer. A
+missing free buffer likewise drops and counts the packet. This is drop-new, not
+the earlier drop-oldest claim; the panel must approve the policy, local-slot
+lifetime and GOP/keyframe recovery before code.
 
 The landed ring currently exposes only a leaked-buffer count, not deferred drops,
 hard drops, dropped bytes, stalled state or last error (`lib.rs:218-245`). Add
