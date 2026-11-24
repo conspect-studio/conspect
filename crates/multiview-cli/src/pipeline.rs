@@ -1889,6 +1889,25 @@ codec = "mpeg2video"
             srt.audio_capability.discrete_capacity,
             TrackCapacity::Unlimited
         );
+        // Offline rendering prepends an internal program.ts anchor. It has no
+        // declared transport; configured capabilities retain their identities.
+        let mut pipeline = pipeline;
+        let (runners, ids) = pipeline.build_sink_runners(false);
+        assert_eq!(runners.len(), 3);
+        let ids: Vec<Option<String>> = ids;
+        let reported = pipeline.run_outputs(&ids, &[vec![], vec![], vec![]]);
+        assert_eq!(reported[0].id, None);
+        assert_eq!(reported[0].audio_capability.delivery, TrackDelivery::None);
+        assert_eq!(reported[1].id.as_deref(), Some("hls-out"));
+        assert_eq!(
+            reported[1].audio_capability.delivery,
+            TrackDelivery::SelectOne
+        );
+        assert_eq!(reported[2].id.as_deref(), Some("srt-out"));
+        assert_eq!(
+            reported[2].audio_capability.delivery,
+            TrackDelivery::Simultaneous
+        );
     }
 }
 
@@ -4216,6 +4235,10 @@ impl Pipeline {
         binding_ids: &[Option<String>],
         audio_tracks: &[Vec<usize>],
     ) -> Vec<crate::output_routing::RunOutput> {
+        debug_assert_eq!(
+            self.output_audio_capabilities.len(),
+            self.output_video_keys.len()
+        );
         self.output_video_keys
             .iter()
             .enumerate()
