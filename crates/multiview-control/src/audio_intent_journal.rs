@@ -203,7 +203,28 @@ impl AudioIntentJournal {
     /// File creation or opening can fail.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, JournalError> {
         let path = path.into();
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        // Creation changes the directory entry. Sync the new empty file first,
+        // then its parent; a later append extends only the existing file and
+        // needs only the file's sync_data. Rotation/rename is not implemented.
+        let file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(new_file) => {
+                new_file.sync_all()?;
+                let parent = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                File::open(parent)?.sync_all()?;
+                new_file
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                OpenOptions::new().append(true).open(&path)?
+            }
+            Err(error) => return Err(JournalError::Io(error)),
+        };
+        // Reopen in append mode so concurrent descriptors cannot overwrite
+        // earlier records. The gate serializes admissions within this instance.
+        drop(file);
+        let file = OpenOptions::new().append(true).open(&path)?;
         Ok(Self {
             path,
             gate: Mutex::new(()),
@@ -344,6 +365,7 @@ impl AudioIntentJournal {
         let mut records = Vec::new();
         let mut reader = BufReader::new(file);
         let mut distinct = std::collections::HashMap::<String, OperationId>::new();
+        let mut fresh_keys = 0usize;
         let mut line_number = 0;
         let mut offset = 0u64;
         let mut degraded = None;
@@ -385,15 +407,18 @@ impl AudioIntentJournal {
                 });
                 break;
             }
-            let (used, cap) = self.keys.usage();
-            if used.saturating_add(distinct.len()) >= cap
-                && !distinct.contains_key(&record.idempotency_key)
-            {
-                degraded = Some(DegradedTail {
-                    line: line_number,
-                    offset,
-                });
-                break;
+            let already_in_pass = distinct.contains_key(&record.idempotency_key);
+            let already_imported = self.keys.peek(&record.idempotency_key).is_some();
+            if !already_in_pass && !already_imported {
+                let (used, cap) = self.keys.usage();
+                if used.saturating_add(fresh_keys) >= cap {
+                    degraded = Some(DegradedTail {
+                        line: line_number,
+                        offset,
+                    });
+                    break;
+                }
+                fresh_keys += 1;
             }
             distinct.insert(record.idempotency_key.clone(), record.operation_id.clone());
             records.push(ReplayedIntent(record));
@@ -430,7 +455,7 @@ fn valid_payload(payload: &IntentPayload) -> bool {
 
 fn encode_record(record: &AudioIntentRecord) -> Result<Vec<u8>, JournalError> {
     let bytes = serde_json::to_vec(record).map_err(|_| JournalError::InvalidRecord)?;
-    if bytes.len() + 9 > MAX_RECORD {
+    if bytes.len() + 10 > MAX_RECORD {
         return Err(JournalError::InvalidRecord);
     }
     let crc = crc32(&bytes);
@@ -517,6 +542,112 @@ mod tests {
             }
             Err(io::Error::other("injected fsync failure"))
         }
+    }
+
+    #[test]
+    fn newly_created_journal_has_durable_parent_entry_and_existing_open_preserves_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = journal_path(dir.path());
+        assert!(!path.exists());
+        let journal = AudioIntentJournal::open(&path).unwrap();
+        assert!(
+            path.exists(),
+            "creation syncs new file then parent before returning"
+        );
+        assert!(journal.replay().unwrap().admitted);
+        let (tx, _rx) = command_bus(2);
+        let admission = journal
+            .submit_with_journal(&tx, "audio-intent:created", payload(), |op| {
+                Command::Start { op }
+            })
+            .unwrap();
+        assert!(matches!(admission, Admission::Durable(_)));
+        drop(journal);
+        let reopened = AudioIntentJournal::open(&path).unwrap();
+        assert_eq!(reopened.replay().unwrap().accepted_prefix.len(), 1);
+        // This is a structural test, not a power-loss injection: sync_all()
+        // on the parent appears only in the create_new branch above.
+    }
+
+    #[test]
+    fn record_size_boundary_round_trips_smallest_and_largest_and_refuses_one_over() {
+        let op = OperationId::new();
+        let key = "audio-intent:x".to_owned();
+        let route = RouteIdentity {
+            destination: "d".into(),
+            source: "s".into(),
+        };
+        let smallest = AudioIntentRecord::audio_route(
+            key.clone(),
+            op.clone(),
+            route.clone(),
+            FieldIntent::Absent,
+            FieldIntent::Absent,
+        );
+        let bytes = encode_record(&smallest).unwrap();
+        assert_eq!(decode_record(&bytes[..bytes.len() - 1]), Some(smallest));
+        let mut largest = AudioIntentRecord::audio_route(
+            key,
+            op,
+            route,
+            FieldIntent::Absent,
+            FieldIntent::Absent,
+        );
+        let base = encode_record(&largest).unwrap().len();
+        let padding = MAX_RECORD - base;
+        largest.idempotency_key.push_str(&"x".repeat(padding));
+        let encoded = encode_record(&largest).unwrap();
+        assert_eq!(encoded.len(), MAX_RECORD);
+        assert_eq!(
+            decode_record(&encoded[..encoded.len() - 1]),
+            Some(largest.clone())
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = journal_path(dir.path());
+        std::fs::write(&path, encoded).unwrap();
+        let journal = AudioIntentJournal::open(&path).unwrap();
+        let report = journal.replay().unwrap();
+        assert!(report.admitted);
+        assert_eq!(report.accepted_prefix.len(), 1);
+        largest.idempotency_key.push('x');
+        assert!(matches!(
+            encode_record(&largest),
+            Err(JournalError::InvalidRecord)
+        ));
+    }
+
+    #[test]
+    fn replay_twice_is_idempotent_near_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = journal_path(dir.path());
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let op = OperationId::new();
+        let route = RouteIdentity {
+            destination: "bus-a".into(),
+            source: "source-a".into(),
+        };
+        for i in 0..2_100 {
+            let record = AudioIntentRecord::audio_route(
+                format!("audio-intent:{i}"),
+                op.clone(),
+                route.clone(),
+                FieldIntent::Set(-6.0),
+                FieldIntent::Absent,
+            );
+            file.write_all(&encode_record(&record).unwrap()).unwrap();
+        }
+        file.sync_data().unwrap();
+        let journal = AudioIntentJournal::open(&path).unwrap();
+        let first = journal.replay().unwrap();
+        assert!(first.admitted);
+        assert_eq!(first.accepted_prefix.len(), 2_100);
+        let second = journal.replay().unwrap();
+        assert_eq!(second, first, "replaying an imported prefix is a no-op");
+        assert_eq!(journal.keys.usage().0, 2_100);
     }
 
     #[test]
