@@ -7,19 +7,21 @@ import { ConfigLockBanner, LadderBanner, PendingActionStrip } from '../component
 import { HealthBanner } from '../components/HealthBanner';
 import { BroadcastShell } from '../components/broadcast/BroadcastShell';
 import { useEngineEvents } from '../realtime/useEngineEvents';
-import { OPERATOR_SURFACE_PATHS } from './operatorRoutes';
+import { OPERATOR_SURFACE_HEADINGS, OPERATOR_SURFACE_PATHS } from './operatorRoutes';
 import { routeDocumentTitle } from './routeDocumentTitles';
 
 export function AppLayout(): JSX.Element {
-  const { t } = useLingui();
+  const { t, i18n } = useLingui();
   const { status } = useEngineEvents();
   const location = useLocation();
   const mainRef = useRef<HTMLElement>(null);
   useEffect(() => { mainRef.current?.focus(); }, [location.pathname]);
   const titledRoute = OPERATOR_SURFACE_PATHS.find((path) => path === location.pathname);
   useEffect(() => {
-    document.title = routeDocumentTitle(titledRoute ?? location.pathname);
-  }, [location.pathname, titledRoute]);
+    document.title = titledRoute === undefined
+      ? routeDocumentTitle(location.pathname)
+      : `${i18n._(OPERATOR_SURFACE_HEADINGS[titledRoute])} — Conspect`;
+  }, [i18n, i18n.locale, location.pathname, titledRoute]);
   const managementLabel = status === 'open' ? t`Connected` : status === 'connecting' ? t`Connecting` : status === 'reconnecting' ? t`Reconnecting` : t`Disconnected`;
   return <BroadcastShell managementLabel={managementLabel}>
     <a href="#main-content" className="sr-only focus:not-sr-only bd-skip"><Trans>Skip to content</Trans></a>
