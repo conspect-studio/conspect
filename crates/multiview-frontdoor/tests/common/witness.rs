@@ -150,8 +150,9 @@ pub struct ClockRun {
 /// of at least 5 ms in 3 s with no stall injected, and a 136 ms gap while
 /// another thread merely spun (headless processes there get coalesced
 /// timers), so it can neither prove nor excuse anything; there the suite
-/// asserts what the design guarantees on any host (one frame per tick,
-/// consecutive indices, exact PTS) and reports repeats without judging them.
+/// asserts consecutive indices and exact PTS, and prints the wall-clock tick
+/// count and repeats without judging them (whole-process pause vs output budget
+/// failure is not distinguishable there).
 /// The production target (mda001) is Linux.
 pub const WITNESS_RELIABLE: bool = cfg!(target_os = "linux");
 
@@ -327,9 +328,11 @@ pub fn report(name: &str, r: &ClockRun) {
 }
 
 /// The chaos suite's per-arm assertion (issues #289, #321), also used by the
-/// `stall_witness.rs` controls: [`assert_shape`] on every platform, and where
-/// [`WITNESS_RELIABLE`] (Linux) zero repeats not explained by a whole-process
-/// stall. Absolute, never relative to another arm.
+/// `stall_witness.rs` controls: exact indices and PTS on every platform. Linux,
+/// where [`WITNESS_RELIABLE`] is true, also checks wall-clock tick count and zero
+/// unexplained repeats. Other platforms have shared-runner whole-process pauses,
+/// so wall-clock tick count is not attributable there. Absolute, never relative
+/// to another arm.
 pub fn assert_cadence(name: &str, r: &ClockRun) {
     assert_shape(name, r);
     let c = classify(r);
@@ -350,15 +353,26 @@ pub fn assert_cadence(name: &str, r: &ClockRun) {
     );
 }
 
-/// What the design guarantees on any host, whatever the load: one frame per
-/// tick, consecutive indices, every PTS exactly `from_tick(index)`.
+/// Assert emitted-tick shape. Linux's reliable witness can compare captured
+/// tick count with elapsed wall time. On other platforms, whole-process pauses
+/// make that count budget un-attributable; keep consecutive-index and exact-PTS
+/// assertions there, but judge the wall-clock budget only where the witness is
+/// reliable.
 pub fn assert_shape(name: &str, r: &ClockRun) {
     let ticks = r.ticks.len() as u64;
-    assert!(
-        ticks + 2 >= r.expected && ticks <= r.expected + 2,
-        "{name}: one frame per tick: {ticks} vs expected {}",
-        r.expected
-    );
+    if WITNESS_RELIABLE {
+        assert!(
+            ticks + 2 >= r.expected && ticks <= r.expected + 2,
+            "{name}: one frame per tick: {ticks} vs expected {}",
+            r.expected
+        );
+    } else {
+        eprintln!(
+            "{name}: wall-clock tick budget NOT judged on this platform (stall witness unreliable); \
+             captured {ticks} of expected {} ticks",
+            r.expected
+        );
+    }
     for pair in r.ticks.windows(2) {
         assert_eq!(
             pair[1].index,
