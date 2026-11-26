@@ -12,7 +12,7 @@ publish = false
 chrono = { workspace = true, features = ["std", "serde", "now"] }
 serde = { workspace = true }
 thiserror = { workspace = true }
-quick-xml = { version = "0.41", features = ["serialize", "encoding"] }
+quick-xml = { version = "0.42", features = ["serialize", "encoding"] }
 # The anonymous passive-FTP product fetch (management plane only).
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt"] }
 tracing = { workspace = true }

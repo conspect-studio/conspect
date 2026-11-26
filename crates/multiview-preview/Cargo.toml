@@ -28,7 +28,7 @@ sha2 = "0.11.0"
 # itself `forbid(unsafe_code)` and dependency-free. Both 0.6.1 and the 0.7 line add
 # an extra `IJG` license term that is NOT in our allowlist and would fail
 # `cargo deny`, so we deliberately do not float to them.
-jpeg-encoder = { version = "=0.7.0", default-features = false, features = ["std"] }
+jpeg-encoder = { version = "=0.7.1", default-features = false, features = ["std"] }
 # NOTE: this crate no longer depends on `str0m`. The native ICE/DTLS/SRTP WHEP
 # transport relocated to `multiview-webrtc` (ADR-0048 / ADR-P006 move 1) — exactly
 # one str0m owner per process. `multiview-preview` keeps only the pure, socket-free

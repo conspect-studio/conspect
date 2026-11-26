@@ -27,7 +27,7 @@ socket2 = { version = "0.6", features = ["all"] }
 # `AsyncUdpSocket`/`UdpSender` seam the QUIC lane implements. No TLS here.
 noq = { package = "moq-noq", version = "=1.3.5", default-features = false, features = ["runtime-tokio", "ring"] }
 # Bounded LRU for the per-source new-flow buckets (MIT OR Apache-2.0, in Cargo.lock).
-hashlink = "0.11"
+hashlink = "0.12"
 # Stack-allocated `IoSliceMut` slice for the per-call receive batch (MIT OR
 # Apache-2.0, already in Cargo.lock via other crates): avoids a heap
 # allocation per `try_recv_batch` call.

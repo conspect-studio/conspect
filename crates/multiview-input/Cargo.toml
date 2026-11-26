@@ -21,7 +21,7 @@ multiview-framestore = { workspace = true } # also `SwapCell` for the caption/SA
 # no native deps, LGPL-clean (MIT/Zlib/Apache-2.0) — the crate stays
 # `unsafe_code = forbid`. Always compiled: the SAP packet codec is
 # feature-independent (only the socket transport sits behind `st2110`).
-miniz_oxide = "0.8.9"
+miniz_oxide = "0.9.1"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
@@ -53,7 +53,7 @@ serde = { workspace = true }
 # only behind that off-by-default feature.
 serde_json = { workspace = true, optional = true }
 # Decodes base64 SCTE-35 cue payloads for the journal. Pure Rust, already locked.
-base64 = "0.22"
+base64 = "0.23"
 
 # NDI® ingest (the off-by-default `ndi` feature, ADR-0008 / IN-3). This is the
 # OUT-3 runtime-load FFI leaf crate: it resolves the operator-provided NDI runtime
@@ -74,7 +74,7 @@ proptest = "1.11.0"
 # vs the 64 KiB cap) without a multi-KiB magic const; the parser must reject it
 # AT the cap. Already a normal dependency at this exact version (deny-neutral),
 # and it is safe code — the crate stays `unsafe_code = forbid`.
-miniz_oxide = "0.8.9"
+miniz_oxide = "0.9.1"
 # Self-contained ffmpeg-feature tests generate their own tiny clip at runtime
 # (via the `ffmpeg` CLI) into a tempdir — no checked-in media.
 tempfile = "3"
