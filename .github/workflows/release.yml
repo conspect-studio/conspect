@@ -61,7 +61,7 @@ jobs:
         uses: actions/checkout@v7 # v6.0.3
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.99.1 # matches ci.yml + rust-toolchain.toml (channel = 1.99.1)
+        uses: dtolnay/rust-toolchain@1.120.0 # matches ci.yml + rust-toolchain.toml (channel = 1.99.1)
         with:
           targets: ${{ matrix.target }}
 
@@ -338,12 +338,12 @@ jobs:
           fi
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v4.1.1 # v4 (4.1.0)
+        uses: actions/attest-build-provenance@v4.2.2 # v4 (4.1.0)
         with:
           subject-path: ${{ steps.package.outputs.archive }}
 
       - name: Attach to GitHub Release
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
