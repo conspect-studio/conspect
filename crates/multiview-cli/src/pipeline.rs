@@ -17839,6 +17839,12 @@ fn ingest_open_options(location: &SourceLocation) -> ffmpeg::Dictionary<'static>
         opts.set("strict", "normal");
         opts.set("seg_max_retry", "8");
         opts.set("protocol_whitelist", "file,http,https,tcp,tls,crypto,data");
+        // Extensionless segment URLs (CNN's CloudFront `/v1/segment/<id>/<n>`)
+        // are rejected by libav's default `extension_picky=1` ("is not in
+        // allowed_segment_extensions"), so the video rail never opens and the
+        // source never gets a video anchor. This does NOT touch
+        // `allowed_extensions` (the variant pin still keeps `.vtt` out).
+        opts.set("extension_picky", "0");
     }
     opts
 }
@@ -24587,6 +24593,11 @@ mod reconnect_tests {
         assert_eq!(
             opts.get("protocol_whitelist"),
             Some("file,http,https,tcp,tls,crypto,data")
+        );
+        assert_eq!(
+            opts.get("extension_picky"),
+            Some("0"),
+            "extensionless HLS segment URLs must open on the video rail"
         );
         assert_eq!(
             opts.get("allowed_extensions"),
