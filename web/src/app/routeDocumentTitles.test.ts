@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { createElement } from 'react';
 import { screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
+import { i18n } from '@lingui/core';
 import { OPERATOR_SURFACE_HEADINGS, OPERATOR_SURFACE_PATHS } from './operatorRoutes';
 import { OPERATOR_ROUTE_TITLES, routeDocumentTitle } from './routeDocumentTitles';
 import { router } from './router';
@@ -65,11 +66,11 @@ describe('operator route document titles', () => {
       const { unmount } = renderWithProviders(createElement(MemoryRouter, null, page));
       const headings = screen.getAllByRole('heading', { level: 1 });
       expect(headings).toHaveLength(1);
-      expect(headings[0]).toHaveTextContent(OPERATOR_SURFACE_HEADINGS[path]);
+      expect(headings[0]).toHaveTextContent(i18n._(OPERATOR_SURFACE_HEADINGS[path]));
       unmount();
     }
     expect(paths.map((path) => OPERATOR_ROUTE_TITLES[path]))
-      .toEqual(paths.map((path) => `${OPERATOR_SURFACE_HEADINGS[path]} — Conspect`));
+      .toEqual(paths.map((path) => `${i18n._(OPERATOR_SURFACE_HEADINGS[path])} — Conspect`));
   });
 
   it('keeps the existing app title for other routes', () => {

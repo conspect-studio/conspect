@@ -9986,6 +9986,7 @@ msgid "Product telemetry"
 msgstr "Product telemetry"
 
 #: src/app/navigation.tsx:51
+#: src/app/operatorRoutes.ts:11
 #: src/components/broadcast/ProductionDesk.tsx:359
 #: src/components/broadcast/ProductionDesk.tsx:360
 msgid "Production desk"
@@ -10030,6 +10031,7 @@ msgstr "Program (follows the switcher)"
 msgid "Program (on air)"
 msgstr "Program (on air)"
 
+#: src/app/operatorRoutes.ts:15
 #: src/pages/SwitcherPage.tsx:246
 msgid "Program / Preview switcher"
 msgstr "Program / Preview switcher"
@@ -10990,6 +10992,7 @@ msgstr "Routes to"
 msgid "Routing"
 msgstr "Routing"
 
+#: src/app/operatorRoutes.ts:12
 #: src/pages/approved/RoutingSurface.tsx:78
 msgid "Routing & outputs"
 msgstr "Routing & outputs"
@@ -11877,6 +11880,7 @@ msgstr "Source: {0} ({1})"
 msgid "Sources"
 msgstr "Sources"
 
+#: src/app/operatorRoutes.ts:13
 #: src/pages/SourcesPage.tsx:1209
 msgid "Sources & library"
 msgstr "Sources & library"
@@ -14454,6 +14458,7 @@ msgstr "Video decoder could not be opened"
 msgid "Video feed for {outputName}"
 msgstr "Video feed for {outputName}"
 
+#: src/app/operatorRoutes.ts:14
 #: src/pages/LayoutsPage.tsx:648
 msgid "Video layouts"
 msgstr "Video layouts"
