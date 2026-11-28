@@ -54,7 +54,7 @@ ed25519-dalek = { version = "3", default-features = false, features = ["alloc"] 
 # (RFC 6762/6763) implementation; its closure — `fastrand`, `flume`, `if-addrs`,
 # `mio`, `socket-pktinfo`, `socket2` — is entirely `MIT`/`Apache-2.0`/`BSD`
 # already on the deny.toml allowlist (proven by `cargo deny check --all-features`).
-mdns-sd = { version = "0.20", optional = true }
+mdns-sd = { version = "0.22", optional = true }
 tokio = { workspace = true, optional = true }
 
 [features]

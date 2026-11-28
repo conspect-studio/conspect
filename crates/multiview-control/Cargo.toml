@@ -110,12 +110,12 @@ chrono = { workspace = true, features = ["alloc"] }
 sha2 = "0.11.0"
 hmac = "0.13.0"
 subtle = "2.6.1"
-base64 = "0.22.1"
+base64 = "0.23.1"
 
 # OpenAPI 3.1 (utoipa) + Scalar try-it-out, behind the default `openapi` feature.
-utoipa = { version = "5.5.0", features = ["axum_extras", "uuid"], optional = true }
-utoipa-axum = { version = "0.2.0", optional = true }
-utoipa-scalar = { version = "0.3.0", features = ["axum"], optional = true }
+utoipa = { version = "6.0.0", features = ["axum_extras", "uuid"], optional = true }
+utoipa-axum = { version = "0.3.0", optional = true }
+utoipa-scalar = { version = "0.4.0", features = ["axum"], optional = true }
 
 # Embedded web UI (behind the off-by-default `embed-web` feature). `rust-embed`
 # inlines the built SPA (`web/dist`, staged by the web build) into the binary so
@@ -168,14 +168,14 @@ rumqttc = { version = "0.25.1", default-features = false, optional = true }
 # awaits concurrently across every browse channel, so no service type can
 # starve another and the daemon's bounded blocking send never wedges on an
 # undrained channel.
-mdns-sd = { version = "0.20.0", default-features = false, features = [
+mdns-sd = { version = "0.22.0", default-features = false, features = [
     "async",
 ], optional = true }
 serde_path_to_error = "0.1"
 # IPTV guide passthrough (epg-playlist): bounded streaming XMLTV filter and
 # gzip guide snapshots. quick-xml >= 0.41 (RUSTSEC-2026-0194/0195 fixed);
 # flate2 (MIT/Apache-2.0, pure-Rust miniz backend) was already in the lock.
-quick-xml = "0.41"
+quick-xml = "0.42"
 flate2 = "1.1"
 
 # The live HTTP transport for the `zowietek` managed-device driver: OFF by

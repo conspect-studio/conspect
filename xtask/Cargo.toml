@@ -37,7 +37,7 @@ multiview-events = { workspace = true }
 # soak-report runs the pure multiview-telemetry::soak analyzer over a captured
 # metrics series (DEV-C4, ADR-R012). Pure Rust, no native deps.
 multiview-telemetry = { workspace = true }
-utoipa = { version = "5.5.0" }
+utoipa = { version = "6.0.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

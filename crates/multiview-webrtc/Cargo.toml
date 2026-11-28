@@ -33,7 +33,7 @@ hmac = "0.13.0"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 md-5 = "0.11.0"
-base64 = "0.22.1"
+base64 = "0.23.1"
 # Native WebRTC (ICE/DTLS/SRTP) stack — OPTIONAL, pulled in ONLY by `native`.
 # str0m is sans-IO (`MIT OR Apache-2.0`), pinned EXACTLY to =0.16.2 (ADR-0048 §3,
 # a tightening of multiview-preview's caret requirement; lockfile-resolved to the

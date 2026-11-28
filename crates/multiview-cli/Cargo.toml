@@ -167,7 +167,7 @@ toml = "1.1.2"
 # public key as base64url (ADR-I008's verified raw-32 encoding). Pure Rust
 # (MIT/Apache-2.0); already a dev-dep and in the workspace graph (the licence
 # plane). `default-features = false` keeps it `alloc`-only.
-base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 # The `multiview node` display pairing code is a Crockford-base32 truncation of
 # the SHA-256 of the device public key — deterministic so the displayed code is
 # stable across power cycles. Pure Rust (MIT/Apache-2.0), the same hash the
@@ -192,7 +192,7 @@ tempfile = "3"
 # dev-only — the cli's non-test code has no signer/RNG.
 ed25519-dalek = { version = "3", default-features = false, features = ["alloc"] }
 p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
-base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 serde_json = { workspace = true }
 # Property tests for the pure media-player transport state machine (ADR-0057 /
 # ADR-0097): the exact-once vamp-exit-latch race over a 2–3-frame vamp segment,

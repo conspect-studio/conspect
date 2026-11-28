@@ -72,7 +72,7 @@ p256 = { version = "0.14", default-features = false, features = ["ecdsa"], optio
 # STANDARD-base64 (RFC 4648 §4) decode of `leaseBytes` + base64url decode of the
 # well-known key material/signatures (D3). `MIT OR Apache-2.0`, deny-clean, pure
 # Rust, no native deps.
-base64 = { version = "0.22", default-features = false, features = ["alloc"], optional = true }
+base64 = { version = "0.23", default-features = false, features = ["alloc"], optional = true }
 # Lower-case hex decode of the bare-Ed25519 lease `signature` (64 bytes) + the
 # device-PoP challenge nonce (32 raw bytes from 64-hex). `MIT OR Apache-2.0`,
 # deny-clean, pure Rust.
