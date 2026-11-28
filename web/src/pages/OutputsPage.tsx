@@ -1179,6 +1179,7 @@ function OutputCard({
       }
       detailsOpen={detailsOpen}
       onDetailsToggle={onDetailsToggle}
+      detailsAccessibleLabel={t`Details: ${output.name}`}
     >
       <div className="grid gap-2">
         {feedRow}
@@ -1440,6 +1441,7 @@ export function OutputsSurface({
       >
       <PageHeader
         title={<Trans>Outputs</Trans>}
+        routeKey="/outputs"
         description={
           <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
             <Trans>Configure output servers and renditions.</Trans>

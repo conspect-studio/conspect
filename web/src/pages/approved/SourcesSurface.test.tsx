@@ -72,6 +72,16 @@ describe('SourcesSurface', () => {
     expect(onAir).toHaveAccessibleDescription(/program bus is not confirmed/);
   });
 
+  it('source row actions include their row identity', async () => {
+    setTable(true);
+    mount();
+    for (const name of ['Fine', 'Broken']) {
+      await userEvent.click(screen.getByRole('button', { name: `Details: ${name}` }));
+      expect(screen.getByRole('button', { name: `Edit source: ${name}` })).toBeVisible();
+      expect(screen.getByRole('button', { name: `Delete source: ${name}` })).toBeVisible();
+    }
+  });
+
   it('table: Details reveals the retained Edit and Delete controls', async () => {
     setTable(true);
     const onEdit = vi.fn();

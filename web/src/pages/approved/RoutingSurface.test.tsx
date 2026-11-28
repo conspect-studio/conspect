@@ -84,6 +84,18 @@ describe('RoutingSurface', () => {
     expect(await screen.findByTestId('output-card-program')).toBeInTheDocument();
   });
 
+  it('has one route-level h1 for Routing & outputs', async () => {
+    server.use(
+      http.get('*/api/v1/sources', () => HttpResponse.json([])),
+      http.get('*/api/v1/layouts', () => HttpResponse.json([])),
+      http.get('*/api/v1/outputs', () => HttpResponse.json([])),
+    );
+    renderWithProviders(<MemoryRouter><RoutingPage /></MemoryRouter>);
+    const heading = await screen.findByRole('heading', { level: 1, name: 'Routing & outputs' });
+    expect(heading).toHaveAttribute('data-route-heading', '/routing');
+    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
+  });
+
   it('help disclosure toggles and states 202 is not applied', async () => {
     const user = userEvent.setup();
     renderWithProviders(<RoutingHead />);

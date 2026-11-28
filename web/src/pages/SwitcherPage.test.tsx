@@ -48,6 +48,12 @@ function outcome(id: string, completed: boolean, error?: string) {
 
 // Tracker events are supplied as the shell-owned socket supplies them; no second socket.
 describe('SwitcherPage single-authority completion', () => {
+  it('has one route-level h1 with the switcher title', () => {
+    page();
+    const heading = screen.getByRole('heading', { level: 1, name: 'Program / Preview switcher' });
+    expect(heading).toHaveAttribute('data-route-heading', '/switcher');
+    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
+  });
   it('disables every on-air transition while the global take lock is set', async () => {
     takeLock.locked = true;
     page();

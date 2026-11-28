@@ -74,7 +74,7 @@ export function RoutingHead(): JSX.Element {
   return (
     <div className="screen-head" data-testid="routing-head">
       <div>
-        <h1>
+        <h1 data-route-heading="/routing">
           <Trans>Routing &amp; outputs</Trans>
         </h1>
         <p className="screen-sub">

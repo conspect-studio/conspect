@@ -645,7 +645,8 @@ export function LayoutsPage(): JSX.Element {
   return (
     <>
       <PageHeader
-        title={<Trans>Layouts</Trans>}
+        title={<Trans>Video layouts</Trans>}
+        routeKey="/layouts"
         description={
           <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
             <Trans>

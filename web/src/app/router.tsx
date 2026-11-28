@@ -61,13 +61,16 @@ export const router = createBrowserRouter([
       </RequireAuth>
     ),
     children: [
-      { index: true, element: <ProductionDesk /> },
+      { index: true, element: <ProductionDesk />, handle: { documentTitlePath: "/" } },
+      { path: "routing", element: <RoutingPage />, handle: { documentTitlePath: "/routing" } },
+      { path: "sources", element: <SourcesPage />, handle: { documentTitlePath: "/sources" } },
+      { path: "layouts", element: <LayoutsPage />, handle: { documentTitlePath: "/layouts" } },
+      { path: "switcher", element: <SwitcherPage />, handle: { documentTitlePath: "/switcher" } },
+      { path: "outputs", element: <OutputsPage /> },
       { path: "dashboard", element: <DashboardPage /> },
       { path: "show", element: <ShowPage /> },
-      { path: "layouts", element: <LayoutsPage /> },
       { path: "layouts/new", element: <LayoutEditorPage /> },
       { path: "layouts/:id", element: <LayoutEditorPage /> },
-      { path: "sources", element: <SourcesPage /> },
       {
         // A sub-page of Sources (no nav item): lazy so maplibre-gl stays out of
         // the main bundle.
@@ -76,15 +79,12 @@ export const router = createBrowserRouter([
           Component: (await import("../iptv/IptvOrgPage")).IptvOrgPage,
         }),
       },
-      { path: "outputs", element: <OutputsPage /> },
       { path: "overlays", element: <OverlaysPage /> },
       { path: "audio", element: <AudioPage /> },
       { path: "iptv", element: <IptvPage /> },
       { path: "devices", element: <DevicesPage /> },
       { path: "devices/:id", element: <DeviceDetailPage /> },
       { path: "cast", element: <CastPage /> },
-      { path: "routing", element: <RoutingPage /> },
-      { path: "switcher", element: <SwitcherPage /> },
       { path: "sync-groups", element: <SyncGroupsPage /> },
       { path: "graphics", element: <GraphicsPage /> },
       { path: "graphics/:view", element: <GraphicsPage /> },

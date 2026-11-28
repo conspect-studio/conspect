@@ -116,6 +116,8 @@ export function RowActions<View>({
 export interface CrudPageProps<View, Form, Field extends string> {
   readonly kind: ResourceKind;
   readonly title: ReactNode;
+  /** Route key for the actual visible heading. */
+  readonly routeKey?: string | undefined;
   readonly description: ReactNode;
   readonly newLabel: string;
   readonly dialogCreateTitle: string;
@@ -310,6 +312,7 @@ export function CrudPage<View, Form, Field extends string>(
     <>
       <PageHeader
         title={props.title}
+        routeKey={props.routeKey}
         description={props.description}
         actions={
           <>

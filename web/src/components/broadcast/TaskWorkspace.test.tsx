@@ -33,6 +33,7 @@ describe('TaskWorkspace', () => {
         details={<p>Full metadata</p>}
         detailsOpen={false}
         onDetailsToggle={vi.fn()}
+        detailsAccessibleLabel="Details: VT 1"
       >
         <button type="button">Play</button>
       </TaskWorkspace>,
@@ -45,7 +46,7 @@ describe('TaskWorkspace', () => {
     expect(statusRow?.className).toMatch(/break-words/);
     expect(statusRow?.className).not.toMatch(/whitespace-nowrap|overflow-hidden|truncate/);
     // The details panel must not swallow the status line.
-    const toggle = screen.getByRole('button', { name: 'Details' });
+    const toggle = screen.getByRole('button', { name: 'Details: VT 1' });
     const panel = document.getElementById(toggle.getAttribute('aria-controls') ?? '');
     expect(panel).not.toBeNull();
     expect(panel?.contains(statusRow ?? document.body)).toBe(false);
@@ -59,11 +60,12 @@ describe('TaskWorkspace', () => {
         details={<p>Full metadata</p>}
         detailsOpen={false}
         onDetailsToggle={onToggle}
+        detailsAccessibleLabel="Details: VT 1"
       >
         <button type="button">Play</button>
       </TaskWorkspace>,
     );
-    const toggle = screen.getByRole('button', { name: 'Details' });
+    const toggle = screen.getByRole('button', { name: 'Details: VT 1' });
     expect(toggle.className).toMatch(/\bh-12\b/);
     expect(toggle.className).toMatch(/\bmin-w-12\b/);
     // The toggle only exists on narrow viewports; the panel is in flow on
@@ -87,11 +89,12 @@ describe('TaskWorkspace', () => {
         details={<p>Full metadata</p>}
         detailsOpen
         onDetailsToggle={vi.fn()}
+        detailsAccessibleLabel="Details: VT 1"
       >
         <button type="button">Play</button>
       </TaskWorkspace>,
     );
-    const toggle = screen.getByRole('button', { name: 'Details' });
+    const toggle = screen.getByRole('button', { name: 'Details: VT 1' });
     expect(toggle).toHaveAttribute('aria-expanded', 'true');
     const panel = document.getElementById(toggle.getAttribute('aria-controls') ?? '');
     expect(panel?.className).toMatch(/\bblock\b/);
