@@ -1156,7 +1156,14 @@ fn audio_slot_name_validation() {
     };
     parse(&slot("\"Main mix\"")).validate().expect("valid name");
     let long = format!("\"{}\"", "x".repeat(65));
-    for bad in ["\"\"", "\"   \"", "\"a\\\"b\"", "\"a\\nb\"", long.as_str()] {
+    for bad in [
+        "\"\"",
+        "\"   \"",
+        "\" Main\"",
+        "\"a\\\"b\"",
+        "\"a\\nb\"",
+        long.as_str(),
+    ] {
         let msg = parse(&slot(bad)).validate().expect_err(bad).to_string();
         assert!(msg.contains("audio slot 0 name"), "{bad}: {msg}");
     }

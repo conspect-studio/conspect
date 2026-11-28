@@ -890,6 +890,7 @@ fn validate_audio_slots(
         }
         if let Some(name) = &slot.name {
             let ok = !name.trim().is_empty()
+                && name.trim() == name
                 && name.chars().count() <= MAX_AUDIO_SLOT_NAME_LEN
                 && !name.chars().any(|c| c.is_control() || c == '"');
             if !ok {
