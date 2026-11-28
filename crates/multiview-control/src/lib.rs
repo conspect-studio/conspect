@@ -43,6 +43,8 @@ pub mod account_audit;
 pub mod acme;
 pub mod alarm_ingest;
 pub mod alarm_store;
+/// Private durable control-intent seam; no REST audio capability is exposed yet.
+pub mod audio_intent_journal;
 pub mod audio_routing;
 pub mod audit;
 pub mod auth;
