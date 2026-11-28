@@ -150,7 +150,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -169,9 +169,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
       - name: provision required capture tools
@@ -214,9 +214,9 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
@@ -273,7 +273,7 @@ jobs:
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           df -h /
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       # Default features are pure-Rust (no FFmpeg/GPU), so CI needs no native libs.
       # --locked enforces the committed Cargo.lock — cargo ignores the lockfile
@@ -548,7 +548,7 @@ jobs:
             feature: webrtc
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -621,7 +621,7 @@ jobs:
       PEBBLE_WORK: ${{ github.workspace }}/.pebble
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: acme-pebble
@@ -678,7 +678,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -741,7 +741,7 @@ jobs:
       FFMPEG_PREFIX: /opt/multiview-ffmpeg
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: avc-metadata-native-gpl
@@ -840,7 +840,7 @@ jobs:
       FFMPEG_PREFIX: /opt/multiview-ffmpeg
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: cast-proof
@@ -930,7 +930,7 @@ jobs:
           fi
       - name: Upload the proof output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cast-proof-out
           path: |
@@ -967,7 +967,7 @@ jobs:
       FFMPEG_PREFIX: /opt/multiview-ffmpeg
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -1431,7 +1431,7 @@ jobs:
       - name: FFmpeg prefix outside the checkout (no `..`; actions/cache rejects it)
         run: echo "FF_PREFIX=${RUNNER_WORKSPACE}/multiview-ffmpeg" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -1456,7 +1456,7 @@ jobs:
         run: echo "v=$(brew list --versions opus srt gnutls | tr ' \n' '-_')" >> "$GITHUB_OUTPUT"
       - name: Cache pinned FFmpeg prefix
         id: ffcache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ env.FF_PREFIX }}
           key: ffmpeg-apple-${{ runner.arch }}-${{ steps.brewdeps.outputs.v }}-${{ hashFiles('deploy/ffmpeg-build.sh', 'deploy/ffmpeg-fetch-source.sh', 'deploy/ffmpeg-signing-key.asc', 'deploy/ffmpeg-patches/**', 'deploy/Dockerfile.ffmpeg', '.github/workflows/ci.yml') }}
@@ -1554,7 +1554,7 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -1576,7 +1576,7 @@ jobs:
         run: '"FF_PREFIX_WIN=$env:RUNNER_WORKSPACE\multiview-ffmpeg" | Out-File -Append $env:GITHUB_ENV'
       - name: Cache pinned FFmpeg prefix
         id: ffcache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ env.FF_PREFIX_WIN }}
           key: ffmpeg-windows-${{ hashFiles('deploy/ffmpeg-build.sh', 'deploy/ffmpeg-fetch-source.sh', 'deploy/ffmpeg-patches/**', 'deploy/Dockerfile.ffmpeg', '.github/workflows/ci.yml') }}
@@ -1638,7 +1638,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - name: install @asyncapi/cli
@@ -1679,7 +1679,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
         with:
           # Distinct cache key — this leg builds xtask + the control/events spec
@@ -1716,7 +1716,7 @@ jobs:
       # honour rust-toolchain.toml's pinned toolchain. Default features only:
       # this is the LGPL-clean build; --all-features would pull the opt-in
       # gpl-codecs (GPL) and fail the license allowlist by design.
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
@@ -1788,7 +1788,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
         with:
           # Distinct cache key — this leg builds xtask + the control feature graph,
@@ -1875,7 +1875,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       - name: shellcheck the acceptance-soak harness
         # The Ubuntu runner ships shellcheck; lint the harness so a quoting/word-
@@ -1907,7 +1907,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -1941,7 +1941,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -1949,7 +1949,7 @@ jobs:
       - name: build the UI (web/dist)
         working-directory: web
         run: npm ci && npm run build
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: embed-web
@@ -1977,7 +1977,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -2016,7 +2016,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -2062,7 +2062,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -2101,8 +2101,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # The wrapper jar is executable code in the repo: check it against Gradle's published checksums before use.
-      - uses: gradle/actions/wrapper-validation@v4
-      - uses: actions/setup-java@v4
+      - uses: gradle/actions/wrapper-validation@v6
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
@@ -2112,7 +2112,7 @@ jobs:
           [ -x "$sdkm" ] || sdkm="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)"
           yes | "$sdkm" --licenses > /dev/null || true
           "$sdkm" --install "platforms;android-37.0" "build-tools;36.0.0"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.gradle/caches
@@ -2122,7 +2122,7 @@ jobs:
       - name: assemble, unit tests, lint
         run: ./gradlew --no-daemon assembleDebug testDebugUnitTest lint
       - name: Upload the debug APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: conspect-cast-tv-debug.apk
           path: clients/androidtv/app/build/outputs/apk/debug/app-debug.apk
