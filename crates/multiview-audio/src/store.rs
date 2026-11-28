@@ -1113,6 +1113,24 @@ pub fn audio_decode_loop_live(
     );
 }
 
+/// One 33-bit MPEG-TS PTS wrap period (2^33 ticks at 90 kHz) in ns.
+const TS_WRAP_NS: i64 = 95_443_717_688_889;
+
+/// Reduce a raw-clock delta (audio raw − anchor raw) by whole 33-bit PTS wrap
+/// periods when it exceeds half a period. Video and audio of one source can be
+/// unwrapped by the demuxer onto different wrap cycles (#602: audio exactly
+/// 3 periods behind its video anchor, so every block mapped ~1.37e10 frames
+/// behind the cursor and was dropped as "late"). No real intra-source delta
+/// approaches 13 h, so only a genuine cycle mismatch is touched.
+fn wrap_reduce_ns(delta: i64) -> i64 {
+    let (d, w) = (i128::from(delta), i128::from(TS_WRAP_NS));
+    if d.abs() <= w / 2 {
+        return delta;
+    }
+    let cycles = (d + d.signum() * (w / 2)) / w;
+    i64::try_from(d - cycles * w).unwrap_or(delta)
+}
+
 /// A source's mapping from its container clock to the OUTPUT timeline — the
 /// same mapping its video is stamped with (audio locked to vision). A sample at
 /// raw container time `t` (ns) belongs at output time `out0 + (t - raw_pts0)`.
@@ -1129,9 +1147,9 @@ pub struct PtsAnchor {
 impl PtsAnchor {
     /// The output time (ns) of raw container time `raw_pts_ns`.
     #[must_use]
-    pub const fn output_ns(&self, raw_pts_ns: i64) -> i64 {
+    pub fn output_ns(&self, raw_pts_ns: i64) -> i64 {
         self.out0_ns
-            .saturating_add(raw_pts_ns.saturating_sub(self.raw_pts0_ns))
+            .saturating_add(wrap_reduce_ns(raw_pts_ns.saturating_sub(self.raw_pts0_ns)))
     }
 
     /// The absolute store frame (output time × `rate`, floored) of raw
@@ -2630,6 +2648,42 @@ mod resync_tests {
     /// after a re-anchor (reconnect: video moved 1.5 s later on the output
     /// timeline) the not-yet-played audio moves with it, with no change before
     /// the step.
+    /// #602: audio on a different 33-bit wrap cycle than its video anchor must
+    /// still map next to the picture, not ~1.37e10 frames behind.
+    #[test]
+    fn audio_on_another_pts_wrap_cycle_maps_near_the_anchor() {
+        for cycles in [-3_i64, -1, 1, 3] {
+            let a = anchor(1, 5 * SEC, 1_000 * SEC);
+            let raw = 1_000 * SEC + SEC + cycles * TS_WRAP_NS;
+            assert_eq!(a.frame_for(raw, 48_000), 6 * RATE, "cycles={cycles}");
+        }
+        // Just under half a period is real skew: untouched. Extremes don't panic.
+        assert_eq!(wrap_reduce_ns(TS_WRAP_NS / 2), TS_WRAP_NS / 2);
+        assert_eq!(wrap_reduce_ns(-TS_WRAP_NS / 2), -TS_WRAP_NS / 2);
+        let _ = (wrap_reduce_ns(i64::MIN), wrap_reduce_ns(i64::MAX));
+        // End to end: a late-dropping placer must place, not drop, wrapped audio.
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::timeline(format, 20 * 48_000);
+        let mut queue = DecodedQueue::default();
+        let raw = 1_000 * SEC + 3 * TS_WRAP_NS;
+        queue.push(
+            AudioBlock::from_interleaved(format, vec![0.5; 4_800 * 2]).unwrap(),
+            raw,
+            48_000,
+            DECODED_QUEUE_CAP,
+        );
+        let mut placer = Placer::new(48_000, 16 * RATE, std::time::Duration::from_secs(1))
+            .require_video_anchor();
+        placer.step(
+            &store,
+            &mut queue,
+            Some(anchor(1, 0, 1_000 * SEC)),
+            0,
+            std::time::Instant::now(),
+        );
+        assert_eq!(placer.stats.late, 0, "wrapped audio dropped as late");
+    }
+
     #[test]
     fn audio_at_pts_p_lands_where_video_put_pts_p_across_a_re_anchor() {
         let raws: Vec<i64> = (0..40).map(|i| 100 * SEC + i * SEC / 10).collect();
