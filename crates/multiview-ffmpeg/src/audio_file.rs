@@ -181,7 +181,8 @@ impl AudioFileDecoder {
     /// [`open`](Self::open) for a live network source: a stalled open or read
     /// aborts with [`FfmpegError::ReadTimeout`] within [`LIVE_READ_TIMEOUT`]
     /// instead of hanging the caller, and an `.m3u8` input also gets the video
-    /// ingest's HLS options (`seg_max_retry`, `strict`, `protocol_whitelist`).
+    /// ingest's HLS options (`seg_max_retry`, `strict`, `protocol_whitelist`,
+    /// `extension_picky=0` for extensionless segment URLs).
     ///
     /// # Errors
     /// As [`open`](Self::open), plus [`FfmpegError::ReadTimeout`].
@@ -213,6 +214,12 @@ impl AudioFileDecoder {
                 ("strict", "normal"),
                 ("seg_max_retry", "8"),
                 ("protocol_whitelist", "file,http,https,tcp,tls,crypto,data"),
+                // An audio-only rendition's segments can be extensionless
+                // (CNN's CloudFront `/v1/segment/<id>/<n>`); libav's default
+                // `extension_picky=1` rejects them ("is not in
+                // allowed_segment_extensions") and the rail rides silence.
+                // The scheme/protocol whitelist above still bounds what opens.
+                ("extension_picky", "0"),
             ]);
         }
         let mut decoder = Self::from_demuxer(
