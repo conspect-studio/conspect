@@ -202,6 +202,9 @@ pub struct AudioSelection {
     pub program: bool,
     /// The discrete tracks registered after it, in this order.
     pub tracks: Vec<TrackSelection>,
+    /// Explicit HLS/Cast menu `NAME` of the program rendition; absent ⇒
+    /// `Program`.
+    pub program_name: Option<String>,
 }
 
 impl Default for AudioSelection {
@@ -209,6 +212,7 @@ impl Default for AudioSelection {
         Self {
             program: true,
             tracks: Vec::new(),
+            program_name: None,
         }
     }
 }
@@ -2559,7 +2563,10 @@ impl<'a> SegmentState<'a> {
                     live.set_initial_discontinuity();
                 }
                 master.push_audio(AudioRendition {
-                    name: "Program".to_owned(),
+                    name: selection
+                        .program_name
+                        .clone()
+                        .unwrap_or_else(|| "Program".to_owned()),
                     uri,
                     language: None,
                     default: true,

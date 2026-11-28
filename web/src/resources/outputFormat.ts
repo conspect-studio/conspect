@@ -310,12 +310,17 @@ export function subtitleUnsupportedMedium(kind: OutputKind): boolean {
 /** The read-only audio slots (`extra.slots.audio`). */
 export function audioSlotsOf(
   form: OutputFormState,
-): readonly { readonly track: string | undefined; readonly language: string | undefined }[] {
+): readonly {
+  readonly track: string | undefined;
+  readonly language: string | undefined;
+  readonly name: string | undefined;
+}[] {
   const slots = form.extra.slots;
   if (!isRecord(slots) || !Array.isArray(slots.audio)) return [];
   return slots.audio.filter(isRecord).map((slot) => ({
     track: typeof slot.track === 'string' ? slot.track : undefined,
     language: typeof slot.language === 'string' ? slot.language : undefined,
+    name: typeof slot.name === 'string' ? slot.name : undefined,
   }));
 }
 

@@ -11045,8 +11045,12 @@ fn cast_audio_renditions(
             routes.program = Some(renditions.len());
             renditions.push(CastAudioRendition {
                 config,
-                // The menu label stays "Program"; the language goes in LANGUAGE.
-                name: "Program".to_owned(),
+                // The menu label is the slot's `name`, else "Program"; the
+                // language goes in LANGUAGE.
+                name: selection
+                    .program_name
+                    .clone()
+                    .unwrap_or_else(|| "Program".to_owned()),
                 language: program_language.map(str::to_owned),
                 default: false,
             });
@@ -15957,6 +15961,7 @@ fn output_audio_selection(
     // No selection resolves to the program only (the default).
     let names: Vec<&str> = tracks.iter().map(|t| t.name.as_str()).collect();
     let (program, chosen) = output.carried_audio(&names);
+    let slots = output.slots().map_or(&[][..], |s| s.audio.as_slice());
     multiview_output::AudioSelection {
         program,
         tracks: tracks
@@ -15964,13 +15969,20 @@ fn output_audio_selection(
             .enumerate()
             .filter(|(_, t)| chosen.contains(&t.name.as_str()))
             .filter_map(|(i, t)| {
+                // An audio slot's explicit `name` wins over the route title.
+                let slot_name = slots
+                    .iter()
+                    .skip(1)
+                    .find(|slot| slot.track.as_deref() == Some(t.name.as_str()))
+                    .and_then(|slot| slot.name.clone());
                 Some(multiview_output::TrackSelection {
                     index: u16::try_from(i).ok()?,
                     language: t.language.clone(),
-                    title: t.title.clone(),
+                    title: slot_name.or_else(|| t.title.clone()),
                 })
             })
             .collect(),
+        program_name: slots.first().and_then(|slot| slot.name.clone()),
     }
 }
 
@@ -33584,6 +33596,50 @@ mod media_url_for_log_tests {
             assert!(!logged.contains(secret), "{secret} leaked: {logged}");
         }
         assert_eq!(media_url_for_log("/media/clip.mp4"), "/media/clip.mp4");
+    }
+}
+
+#[cfg(test)]
+mod audio_slot_name_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::{cast_audio_selection, output_audio_selection, DeclaredTrack, Output};
+
+    fn tracks() -> Vec<DeclaredTrack> {
+        vec![DeclaredTrack {
+            name: "eng".to_owned(),
+            input_id: "a".to_owned(),
+            language: Some("en".to_owned()),
+            title: Some("Route title".to_owned()),
+        }]
+    }
+
+    fn output(slots: &str) -> Output {
+        serde_json::from_str(&format!(
+            r#"{{"kind":"cast","id":"c","slots":{{"audio":{slots}}}}}"#
+        ))
+        .expect("output")
+    }
+
+    #[test]
+    fn slot_names_become_rendition_titles() {
+        let out = output(
+            r#"[{"language":"en","name":"Main mix"},{"track":"eng","language":"en","name":"Commentary"}]"#,
+        );
+        let (sel, _) = cast_audio_selection(&out, &tracks());
+        assert_eq!(sel.program_name.as_deref(), Some("Main mix"));
+        assert_eq!(sel.tracks[0].title.as_deref(), Some("Commentary"));
+        // Plain HLS resolves the same names.
+        let hls = output_audio_selection(&out, &tracks());
+        assert_eq!(hls.program_name.as_deref(), Some("Main mix"));
+        assert_eq!(hls.tracks[0].title.as_deref(), Some("Commentary"));
+    }
+
+    #[test]
+    fn absent_names_fall_back_to_existing_behaviour() {
+        let out = output(r#"[{"language":"en"},{"track":"eng"}]"#);
+        let (sel, _) = cast_audio_selection(&out, &tracks());
+        assert_eq!(sel.program_name, None);
+        assert_eq!(sel.tracks[0].title.as_deref(), Some("Route title"));
     }
 }
 
