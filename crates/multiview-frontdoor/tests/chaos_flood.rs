@@ -333,12 +333,12 @@ fn flood_does_not_slip_the_output_clock_or_starve_an_established_viewer() {
     report("flood, door off", &off);
     eprintln!("chaos flood door off: sent {sent_off}");
 
-    // Every arm, every host: one frame per tick, consecutive indices, exact
-    // PTS from the tick. Linux (where the stall witness is reliable, see
-    // `common::WITNESS_RELIABLE`): also 0 ticks behind (repeats) that a
-    // whole-process stall does not explain, in EVERY arm, absolutely
-    // (issue #289 "0 ticks behind"). Elsewhere the repeats are printed, not
-    // judged, and this says so.
+    // Every arm, every host: consecutive indices and exact PTS from the tick.
+    // Linux (where the stall witness is reliable, see `common::WITNESS_RELIABLE`)
+    // also judges the wall-clock tick count and requires 0 ticks behind (repeats)
+    // unexplained by a whole-process stall, in EVERY arm, absolutely (issue #289
+    // "0 ticks behind"). Elsewhere the wall-clock tick-count budget and repeats
+    // are printed, not judged; tick indices and PTS remain asserted.
     if !common::WITNESS_RELIABLE {
         eprintln!(
             "chaos: ticks behind NOT judged on this platform (stall witness unreliable); \

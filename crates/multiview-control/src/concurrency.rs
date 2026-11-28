@@ -259,6 +259,33 @@ impl IdempotencyStore {
         Reservation::Fresh(op)
     }
 
+    /// Adopt a journaled audio-intent key without submitting its command again.
+    /// Only feature-namespaced keys are admitted; a conflict fails closed.
+    ///
+    /// # Errors
+    /// A non-audio key, conflicting operation id, or full store is rejected.
+    pub fn import_audio_intent(&self, key: &str, op: OperationId) -> Result<(), &'static str> {
+        if !key.starts_with("audio-intent:") {
+            return Err("not an audio-intent key");
+        }
+        let mut guard = self
+            .seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = guard.get(key) {
+            return if existing == &op {
+                Ok(())
+            } else {
+                Err("conflicting key and operation")
+            };
+        }
+        if guard.len() >= MAX_IDEMPOTENCY_RESERVATIONS {
+            return Err("idempotency capacity");
+        }
+        guard.insert(key.to_owned(), op);
+        Ok(())
+    }
+
     /// The operation already reserved for `key`, without reserving.
     ///
     /// Lets a route answer a replay before its own pre-reservation checks
