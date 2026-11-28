@@ -8,6 +8,7 @@ import type { RenderResult } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { i18n } from '@lingui/core';
 import type { Messages } from '@lingui/core';
+import { OPERATOR_SURFACE_HEADINGS } from './operatorRoutes';
 
 import { AppLayout } from './AppLayout';
 import { I18nProvider } from '../i18n/I18nProvider';
@@ -18,7 +19,7 @@ import { messages as enMessages } from '../locales/en/messages';
 // Catalog ids are content hashes; the test catalog translates only the Production
 // desk heading. Every other heading is absent on purpose so the fallback path is
 // exercised.
-const PRODUCTION_DESK_ID = '5iwuXp';
+const PRODUCTION_DESK_ID = OPERATOR_SURFACE_HEADINGS['/'].id;
 const TEST_LOCALE = 'xt';
 const TEST_TITLE = 'Bureau du direct';
 
@@ -77,11 +78,13 @@ describe('route document titles follow the active locale (#594)', () => {
     i18n.load(TEST_LOCALE, testMessages);
     i18n.load('en', enMessages);
     try {
+      const view = renderAt('/routing');
       i18n.activate(TEST_LOCALE);
-      renderAt('/routing');
       await waitFor(() => {
+        expect(i18n.locale).toBe(TEST_LOCALE);
         expect(document.title).toBe('Routing & outputs — Conspect');
       });
+      view.unmount();
     } finally {
       i18n.activate('en');
     }
