@@ -218,7 +218,7 @@ impl AudioFileDecoder {
                 // (CNN's CloudFront `/v1/segment/<id>/<n>`); libav's default
                 // `extension_picky=1` rejects them ("is not in
                 // allowed_segment_extensions") and the rail rides silence.
-                // The scheme/protocol whitelist above still bounds what opens.
+                // The scheme/protocol allowlist above still bounds what opens.
                 ("extension_picky", "0"),
             ]);
         }
