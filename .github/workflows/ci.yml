@@ -745,7 +745,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: avc-metadata-native-gpl
-      - uses: docker/login-action@v4.4.0
+      - uses: docker/login-action@v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -844,7 +844,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: cast-proof
-      - uses: docker/login-action@v4.4.0
+      - uses: docker/login-action@v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -977,7 +977,7 @@ jobs:
           key: feature-clippy-ffmpeg-webrtc
       - name: Log in to GHCR
         # The base image package is read via the workflow token (packages: read).
-        uses: docker/login-action@v4.4.0
+        uses: docker/login-action@v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
