@@ -63,6 +63,9 @@ pub const MAX_SUBTITLE_LANGUAGE_LEN: usize = 35;
 /// Longest accepted subtitle slot menu name, in characters.
 pub const MAX_SUBTITLE_NAME_LEN: usize = 64;
 
+/// Longest accepted audio slot menu name, in characters.
+pub const MAX_AUDIO_SLOT_NAME_LEN: usize = 64;
+
 /// The audio grid every audio slot is encoded on (ADR-0108 §5.2): stereo.
 pub const SLOT_AUDIO_CHANNELS: u16 = 2;
 /// The audio grid every audio slot is encoded on: 48 kHz.
@@ -266,6 +269,10 @@ pub struct AudioSlot {
     /// Language tag of this rendition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// Menu label of this rendition (HLS/Cast `EXT-X-MEDIA` `NAME`; ≤ 64
+    /// printable characters, no `"`); absent ⇒ the track's title / `Program`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Channels; when given must be 2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channels: Option<u16>,
@@ -879,6 +886,19 @@ fn validate_audio_slots(
                     )));
                 }
                 seen.push(track);
+            }
+        }
+        if let Some(name) = &slot.name {
+            let ok = !name.trim().is_empty()
+                && name.trim() == name
+                && name.chars().count() <= MAX_AUDIO_SLOT_NAME_LEN
+                && !name.chars().any(|c| c.is_control() || c == '"');
+            if !ok {
+                return Err(ConfigError::Validation(format!(
+                    "output {:?}: audio slot {i} name must be 1..={MAX_AUDIO_SLOT_NAME_LEN} \
+                     printable characters without `\"`",
+                    output.id()
+                )));
             }
         }
         if slot.channels.is_some_and(|c| c != SLOT_AUDIO_CHANNELS) {

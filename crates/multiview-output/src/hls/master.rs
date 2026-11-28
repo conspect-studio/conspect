@@ -198,7 +198,17 @@ impl MasterPlaylist {
             .audio_group_id
             .as_deref()
             .map_or_else(|| "audio".to_owned(), escape_attribute);
-        for (audio, channels) in self.audio.iter().zip(&self.audio_channels) {
+        // RFC 8216 §4.3.4.1.1: distinct NAMEs in the group; a repeat gets
+        // ` (n)` (n = its 1-based position), deterministic, first kept.
+        let mut names: Vec<String> = Vec::with_capacity(self.audio.len());
+        for (i, audio) in self.audio.iter().enumerate() {
+            let mut name = escape_attribute(&audio.name);
+            while names.contains(&name) {
+                name = format!("{name} ({})", i + 1);
+            }
+            names.push(name);
+        }
+        for ((audio, channels), name) in self.audio.iter().zip(&self.audio_channels).zip(&names) {
             let language = audio.language.as_ref().map_or_else(String::new, |tag| {
                 format!(",LANGUAGE=\"{}\"", escape_attribute(tag))
             });
@@ -209,7 +219,7 @@ impl MasterPlaylist {
                 out,
                 "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"{}\",NAME=\"{}\",DEFAULT={},AUTOSELECT={}{},URI=\"{}\"{}",
                 group,
-                escape_attribute(&audio.name),
+                name,
                 if audio.default { "YES" } else { "NO" },
                 if audio.default || self.audio_autoselect_all {
                     "YES"
@@ -289,5 +299,32 @@ mod subtitle_tests {
         let mut master = MasterPlaylist::new();
         master.push_variant(VariantStream::new("video-g0.m3u8", 1));
         assert!(!master.render().contains("SUBTITLES"));
+    }
+}
+
+#[cfg(test)]
+mod audio_name_tests {
+    use super::{AudioRendition, MasterPlaylist, VariantStream};
+
+    fn audio(name: &str, uri: &str, default: bool) -> AudioRendition {
+        AudioRendition {
+            name: name.to_owned(),
+            uri: uri.to_owned(),
+            language: Some("en".to_owned()),
+            default,
+        }
+    }
+
+    #[test]
+    fn duplicate_and_quoted_audio_names_are_made_unique_and_safe() {
+        let mut master = MasterPlaylist::new();
+        master.push_audio(audio("Main", "a0.m3u8", true));
+        master.push_audio(audio("Main", "a1.m3u8", false));
+        master.push_audio(audio("Co\"m\nm", "a2.m3u8", false));
+        master.push_variant(VariantStream::new("video.m3u8", 1_000_000));
+        let text = master.render();
+        assert!(text.contains("NAME=\"Main\",DEFAULT=YES"), "{text}");
+        assert!(text.contains("NAME=\"Main (2)\",DEFAULT=NO"), "{text}");
+        assert!(text.contains("NAME=\"Comm\",DEFAULT=NO"), "{text}");
     }
 }

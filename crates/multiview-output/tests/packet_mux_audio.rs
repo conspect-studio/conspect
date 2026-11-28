@@ -295,6 +295,7 @@ fn live_renditions_prune_and_restart_without_stale_segment_urls() {
                 language: None,
                 title: Some("Clean".to_owned()),
             }],
+            program_name: None,
         });
         // The same AAC packets feed the program and the clean track for this
         // lifecycle test; the CLI test checks distinct decoded content.
@@ -434,6 +435,7 @@ fn restart_removes_obsolete_track_and_advertises_configured_bandwidth() {
             language: None,
             title: Some("Old".into()),
         }],
+        program_name: None,
     });
     sink.run_av_tracks(
         &mut first,
@@ -526,6 +528,7 @@ fn restart_removes_obsolete_track_and_advertises_configured_bandwidth() {
             language: None,
             title: Some("New".into()),
         }],
+        program_name: None,
     });
     sink.run_av_tracks(
         &mut third,
@@ -708,6 +711,7 @@ fn failed_master_publish_preserves_sparse_audio_reference() {
     .with_audio_selection(AudioSelection {
         program: true,
         tracks: vec![],
+        program_name: None,
     })
     .run_av_tracks(
         &mut source,
@@ -765,6 +769,7 @@ fn sparse_audio_keeps_all_manifest_references_and_bounds_stalled_retention() {
     .with_audio_selection(AudioSelection {
         program: true,
         tracks: vec![],
+        program_name: None,
     })
     .run_av_tracks(
         &mut source,

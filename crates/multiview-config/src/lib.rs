@@ -129,9 +129,9 @@ pub use origin::{Origin, OriginParseError};
 pub use output_format::{
     is_output_rate, output_rate, validate_output_format, validate_subtitle_sources, Anchor,
     AudioSlot, CodecFamily, OutputFit, OutputFitMode, OutputFormat, OutputSlots, Scan,
-    SlotCapability, SubtitleFormat, SubtitleSlot, VideoSlot, MAX_CAST_AUDIO_RENDITIONS,
-    MAX_OUTPUT_FPS, MAX_SLOT_BITRATE_KBPS, MAX_SUBTITLE_SLOTS, MIN_OUTPUT_FPS,
-    SLOT_FORMAT_UNSUPPORTED, SLOT_MEDIUM_MISMATCH,
+    SlotCapability, SubtitleFormat, SubtitleSlot, VideoSlot, MAX_AUDIO_SLOT_NAME_LEN,
+    MAX_CAST_AUDIO_RENDITIONS, MAX_OUTPUT_FPS, MAX_SLOT_BITRATE_KBPS, MAX_SUBTITLE_SLOTS,
+    MIN_OUTPUT_FPS, SLOT_FORMAT_UNSUPPORTED, SLOT_MEDIUM_MISMATCH,
 };
 pub use placement::{DevicePin, MigrationPolicy, PinVendor, PlacementConfig, PlacementWeights};
 pub use playback::{

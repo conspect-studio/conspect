@@ -1128,3 +1128,46 @@ fn subtitle_slots_on_a_rate_output_are_slot_format_unsupported() {
         "subtitle slots on a rate output",
     );
 }
+
+#[test]
+fn audio_slot_name_round_trips_and_is_skipped_when_absent() {
+    let slot: multiview_config::AudioSlot =
+        serde_json::from_str(r#"{"language":"en","name":"Main mix"}"#).unwrap();
+    assert_eq!(slot.name.as_deref(), Some("Main mix"));
+    let back = serde_json::to_string(&slot).unwrap();
+    assert_eq!(
+        serde_json::from_str::<multiview_config::AudioSlot>(&back).unwrap(),
+        slot
+    );
+    // Back-compat: a persisted slot without `name` loads and re-serialises
+    // without the key.
+    let old: multiview_config::AudioSlot = serde_json::from_str(r#"{"language":"en"}"#).unwrap();
+    assert_eq!(old.name, None);
+    assert!(!serde_json::to_string(&old).unwrap().contains("name"));
+}
+
+#[test]
+fn audio_slot_name_validation() {
+    let slot = |name: &str| {
+        format!(
+            "[[outputs]]\nkind = \"hls\"\npath = \"/srv/hls/a\"\ncodec = \"h264\"\n\
+             [[outputs.slots.audio]]\nname = {name}\n"
+        )
+    };
+    parse(&slot("\"Main mix\"")).validate().expect("valid name");
+    let long = format!("\"{}\"", "x".repeat(65));
+    for bad in [
+        "\"\"",
+        "\"   \"",
+        "\" Main\"",
+        "\"a\\\"b\"",
+        "\"a\\nb\"",
+        long.as_str(),
+    ] {
+        let msg = parse(&slot(bad)).validate().expect_err(bad).to_string();
+        assert!(msg.contains("audio slot 0 name"), "{bad}: {msg}");
+    }
+    parse(&slot(&format!("\"{}\"", "x".repeat(64))))
+        .validate()
+        .expect("64 chars ok");
+}

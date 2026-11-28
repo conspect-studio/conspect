@@ -34,7 +34,12 @@ The first slot is the program mix and must not name `track`. Every later slot
 must name a distinct declared `target_track`. Optional slot `channels`,
 `sample_rate`, and `codec`, when supplied, must be `2`, `48000`, and `aac`
 (case-insensitive), respectively. `language` is optional; the slot validator
-shown in `output_format.rs` does not impose a language syntax rule.
+shown in `output_format.rs` does not impose a language syntax rule. `name` is
+an optional menu label (1–64 characters, no control characters or double
+quote, no leading/trailing space) used as the `EXT-X-MEDIA` `NAME` of that slot's HLS/Cast audio
+rendition; absent, the track's title (or `Track N`) / `Program` is used as
+before. A program-only plain HLS output muxes audio into the video (no `EXT-X-MEDIA`), so the label shows only where separate audio renditions exist (Cast, or HLS with tracks); the same label also titles the stream in other mux outputs. Names within one master are made unique deterministically (a repeat
+gets ` (n)`, n being its one-based position) and quotes/newlines are stripped.
 
 The separate `outputs.audio` table has `mode = "program"`, `"auto"`, or
 `"tracks"`. `program` carries the program bus; `tracks` requires a non-empty,
