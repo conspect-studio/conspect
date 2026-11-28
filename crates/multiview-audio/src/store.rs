@@ -1122,12 +1122,13 @@ const TS_WRAP_NS: i64 = 95_443_717_688_889;
 /// 3 periods behind its video anchor, so every block mapped ~1.37e10 frames
 /// behind the cursor and was dropped as "late"). No real intra-source delta
 /// approaches 13 h, so only a genuine cycle mismatch is touched.
-const fn wrap_reduce_ns(delta: i64) -> i64 {
-    if delta.abs() <= TS_WRAP_NS / 2 {
+fn wrap_reduce_ns(delta: i64) -> i64 {
+    let (d, w) = (i128::from(delta), i128::from(TS_WRAP_NS));
+    if d.abs() <= w / 2 {
         return delta;
     }
-    let cycles = (delta + delta.signum() * (TS_WRAP_NS / 2)) / TS_WRAP_NS;
-    delta - cycles * TS_WRAP_NS
+    let cycles = (d + d.signum() * (w / 2)) / w;
+    i64::try_from(d - cycles * w).unwrap_or(delta)
 }
 
 /// A source's mapping from its container clock to the OUTPUT timeline — the
@@ -1146,7 +1147,7 @@ pub struct PtsAnchor {
 impl PtsAnchor {
     /// The output time (ns) of raw container time `raw_pts_ns`.
     #[must_use]
-    pub const fn output_ns(&self, raw_pts_ns: i64) -> i64 {
+    pub fn output_ns(&self, raw_pts_ns: i64) -> i64 {
         self.out0_ns
             .saturating_add(wrap_reduce_ns(raw_pts_ns.saturating_sub(self.raw_pts0_ns)))
     }
@@ -2656,6 +2657,31 @@ mod resync_tests {
             let raw = 1_000 * SEC + SEC + cycles * TS_WRAP_NS;
             assert_eq!(a.frame_for(raw, 48_000), 6 * RATE, "cycles={cycles}");
         }
+        // Just under half a period is real skew: untouched. Extremes don't panic.
+        assert_eq!(wrap_reduce_ns(TS_WRAP_NS / 2), TS_WRAP_NS / 2);
+        assert_eq!(wrap_reduce_ns(-TS_WRAP_NS / 2), -TS_WRAP_NS / 2);
+        let _ = (wrap_reduce_ns(i64::MIN), wrap_reduce_ns(i64::MAX));
+        // End to end: a late-dropping placer must place, not drop, wrapped audio.
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::timeline(format, 20 * 48_000);
+        let mut queue = DecodedQueue::default();
+        let raw = 1_000 * SEC + 3 * TS_WRAP_NS;
+        queue.push(
+            AudioBlock::from_interleaved(format, vec![0.5; 4_800 * 2]).unwrap(),
+            raw,
+            48_000,
+            DECODED_QUEUE_CAP,
+        );
+        let mut placer = Placer::new(48_000, 16 * RATE, std::time::Duration::from_secs(1))
+            .require_video_anchor();
+        placer.step(
+            &store,
+            &mut queue,
+            Some(anchor(1, 0, 1_000 * SEC)),
+            0,
+            std::time::Instant::now(),
+        );
+        assert_eq!(placer.stats.late, 0, "wrapped audio dropped as late");
     }
 
     #[test]
